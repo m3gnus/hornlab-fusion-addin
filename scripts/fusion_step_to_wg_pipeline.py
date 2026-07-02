@@ -68,6 +68,14 @@ PASSIVE_CARDIOID_COUPLED_FORWARD_OPTIONS = (
     ("--passive-cardioid-drive-voltage", "passive_cardioid_drive_voltage"),
     ("--passive-cardioid-rg-ohm", "passive_cardioid_rg_ohm"),
 )
+DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS = (
+    ("--driver-lem", "driver_lem"),
+    ("--driver-rear-volume-l", "driver_rear_volume_l"),
+)
+DRIVER_LEM_VALUE_FORWARD_OPTIONS = (
+    ("--drive-voltage", "drive_voltage"),
+    ("--rg-ohm", "rg_ohm"),
+)
 SYMMETRY_PLANE_ALIASES = {
     "": (),
     "none": (),
@@ -651,6 +659,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--passive-cardioid-coupled", action="store_true")
+    parser.add_argument(
+        "--driver-lem",
+        action="append",
+        default=[],
+        help=(
+            "Per-source driver LEM spec NAME:Key=Value or NAME:/path/to/Hornresp.txt. "
+            "Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--driver-rear-volume-l",
+        action="append",
+        default=[],
+        help="Per-source sealed rear chamber volume NAME:L. Repeatable.",
+    )
+    parser.add_argument("--drive-voltage", type=float, default=None)
+    parser.add_argument("--rg-ohm", type=float, default=None)
     # Coupled driver-LEM parameters, forwarded verbatim to the direct solve
     # (None = let the solve script's own default apply).
     parser.add_argument("--passive-cardioid-driver-sd-cm2", type=float, default=None)
@@ -1210,6 +1235,13 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         _extend_option_value(solve_cmd, "--frame-v", frame_v)
         if args.export_vituixcad:
             solve_cmd.append("--export-vituixcad")
+        for option, attr in DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS:
+            for value in getattr(args, attr):
+                solve_cmd.extend([option, str(value)])
+        for option, attr in DRIVER_LEM_VALUE_FORWARD_OPTIONS:
+            value = getattr(args, attr)
+            if value is not None:
+                solve_cmd.extend([option, str(value)])
         if args.passive_cardioid_mf:
             solve_cmd.append("--passive-cardioid-mf")
             if args.passive_cardioid_rear_volume_l is not None:

@@ -94,6 +94,8 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
     assert args.passive_cardioid_driver_cms_mm_per_n == pytest.approx(0.252)
     assert args.passive_cardioid_drive_voltage == pytest.approx(2.83)
     assert args.passive_cardioid_rg_ohm == pytest.approx(0.1)
+    assert args.drive_voltage is None
+    assert args.rg_ohm is None
 
     forwarded = {
         option
@@ -106,6 +108,87 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
         or token in ("--passive-cardioid-drive-voltage", "--passive-cardioid-rg-ohm")
     }
     assert emitted <= forwarded
+
+
+def test_driver_lem_parser_accepts_hornresp_file_and_normalizes_units(tmp_path):
+    helper = _load_helper()
+    driver_file = tmp_path / "BC 10CL51.txt"
+    driver_file.write_text(
+        "\n".join(
+            [
+                "BC 10CL51",
+                "Sd=320.0",
+                "Bl=11.6",
+                "Cms=252.0E-06",
+                "Rms=3.18",
+                "Mmd=26.2",
+                "Le=0.8",
+                "Re=5.2",
+                "Xmax=5.5",
+                "Leb=0.00",
+                "Ke=0.00",
+                "Rss=0.00",
+                "Le=0.00",
+                "Rms=0.00",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    spec = helper.parse_driver_lem_spec("MF", str(driver_file))
+
+    assert spec.name == "MF"
+    assert spec.params["sd_m2"] == pytest.approx(0.032)
+    assert spec.params["cms_m_per_n"] == pytest.approx(252.0e-6)
+    assert spec.params["mmd_kg"] == pytest.approx(0.0262)
+    assert spec.params["le_h"] == pytest.approx(0.0008)
+    assert spec.params["rms_kg_per_s"] == pytest.approx(3.18)
+    assert spec.params["xmax_m"] == pytest.approx(0.0055)
+    assert spec.params["n_drivers"] == 1
+    assert any("Leb" in warning for warning in spec.warnings)
+    assert any("duplicate Le=0.00 ignored" in warning for warning in spec.warnings)
+
+
+def test_driver_lem_parser_accepts_mms_and_lr2_pair():
+    helper = _load_helper()
+
+    spec = helper.parse_driver_lem_cli_entry(
+        "LF:Sd=500,Bl=15,Re=6.1,Mms=55,Cms=3.5e-4,Rms=4.2,Le=1.2,Le2=0.3,Re2=4,N=2"
+    )
+
+    assert spec.params["mms_kg"] == pytest.approx(0.055)
+    assert spec.params["le2_h"] == pytest.approx(0.0003)
+    assert spec.params["re2_ohm"] == pytest.approx(4.0)
+    assert spec.params["n_drivers"] == 2
+    assert "Mms=55" in spec.canonical_payload()
+
+
+def test_pipeline_parser_accepts_and_groups_new_driver_lem_flags():
+    pipeline = _load_pipeline()
+    args = pipeline.parse_args(
+        [
+            "--step", "/out/design.step",
+            "--out", "/out/run",
+            "--sources", "LF:20,MF:10",
+            "--driver-lem", "LF:Sd=320,Bl=11.6,Re=5.2,Mmd=26.2,Cms=2.52e-4,Rms=3.18",
+            "--driver-rear-volume-l", "LF:4.5",
+            "--drive-voltage", "4.0",
+            "--rg-ohm", "0.2",
+        ]
+    )
+
+    assert args.driver_lem == [
+        "LF:Sd=320,Bl=11.6,Re=5.2,Mmd=26.2,Cms=2.52e-4,Rms=3.18"
+    ]
+    assert args.driver_rear_volume_l == ["LF:4.5"]
+    assert args.drive_voltage == pytest.approx(4.0)
+    assert args.rg_ohm == pytest.approx(0.2)
+    assert {
+        option for option, _ in pipeline.DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS
+    } == {"--driver-lem", "--driver-rear-volume-l"}
+    assert {
+        option for option, _ in pipeline.DRIVER_LEM_VALUE_FORWARD_OPTIONS
+    } == {"--drive-voltage", "--rg-ohm"}
 
 
 def test_estimate_clamped_solve_band_flags_shadow_limited_sources():

@@ -63,6 +63,54 @@ def test_voltage_drive_pressure_scales_by_cone_acceleration():
     np.testing.assert_allclose(mass_controlled, np.ones_like(mass_controlled))
 
 
+def test_solver_surface_avg_to_self_impedance_uses_solver_space_then_conjugates():
+    module = _load_script()
+    freqs = np.array([100.0, 250.0])
+    p_avg_solver = np.array([1.0 + 2.0j, -0.25 + 0.5j])
+
+    z_self = module._solver_surface_avg_to_self_impedance(
+        freqs,
+        p_avg_solver,
+        source_area_m2=0.02,
+    )
+
+    omega = 2.0 * np.pi * freqs
+    expected = np.conjugate(1j * omega * p_avg_solver) / 0.02
+    np.testing.assert_allclose(z_self, expected)
+
+
+def test_pressure_basis_npz_embeds_surface_avg_area_and_normalization(tmp_path):
+    module = _load_script()
+    freqs = np.array([100.0, 200.0])
+    result = SimpleNamespace(
+        frequencies_hz=freqs,
+        observation_angles_deg=np.array([0.0, 90.0]),
+        observation_planes=np.array(["horizontal"]),
+        pressure_complex=np.ones((2, 1, 2), dtype=np.complex128),
+        surface_pressure_avg={3: np.array([1.0 + 0.5j, 2.0 + 0.25j])},
+    )
+    path = tmp_path / "MF_pressure_basis.npz"
+
+    module._write_pressure_basis_npz(
+        path,
+        result,
+        source_name="MF",
+        source_tag=3,
+        source_area_m2=0.0123,
+    )
+
+    with np.load(path, allow_pickle=False) as data:
+        assert str(data["source_normalization"].item()) == "unit_normal_acceleration"
+        assert str(data["surface_pressure_avg_phase_convention"].item()) == (
+            module.SURFACE_PRESSURE_AVG_PHASE_CONVENTION
+        )
+        assert float(data["source_area_m2"]) == pytest.approx(0.0123)
+        np.testing.assert_allclose(
+            data["surface_pressure_avg_solver"],
+            np.array([1.0 + 0.5j, 2.0 + 0.25j]),
+        )
+
+
 def _load_regen_driver():
     spec = importlib.util.spec_from_file_location(
         "regenerate_fusion_derived_artifacts",
@@ -1267,14 +1315,19 @@ def test_passive_cardioid_coupled_args_validate_driver_requirements(tmp_path):
     with pytest.raises(SystemExit):
         module._validate_passive_cardioid_args(module.parse_args(base))
 
-    with pytest.raises(SystemExit):
-        module._validate_passive_cardioid_args(
-            module.parse_args(
-                base
-                + _passive_cardioid_driver_cli()
-                + ["--passive-cardioid-driver-mms-g", "20"]
-            )
-        )
+    both_mmd_and_mms = module.parse_args(
+        base
+        + _passive_cardioid_driver_cli()
+        + ["--passive-cardioid-driver-mms-g", "20"]
+    )
+    module._validate_passive_cardioid_args(both_mmd_and_mms)
+    assert both_mmd_and_mms.driver_lem_specs["MF"].params["mmd_kg"] == pytest.approx(
+        0.018
+    )
+    assert any(
+        "both Mmd and Mms supplied" in warning
+        for warning in both_mmd_and_mms.driver_lem_specs["MF"].warnings
+    )
 
     no_compliance = [
         item
@@ -1305,6 +1358,41 @@ def test_passive_cardioid_coupled_skips_matrix_without_mf_aperture(tmp_path, mon
     assert "predates the MF-aperture extension" in payload["coupled"]["reason"]
     assert (tmp_path / "MF_passive_cardioid_results.npz").exists()
     assert not (tmp_path / "MF_passive_cardioid_coupled_results.npz").exists()
+
+
+def test_per_driver_lem_skips_mf_when_passive_cardioid_coupled_owns_it(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "fake.msh"),
+            "--out", str(tmp_path),
+            "--source", "MF:3",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l", "10",
+            "--passive-cardioid-port-length-mm", "20",
+            "--passive-cardioid-coupled",
+            "--driver-lem",
+            "MF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+        ]
+    )
+    module._normalize_driver_lem_args(args)
+
+    payload = module._apply_driver_lem_coupling(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_results=[
+            {
+                "name": "MF",
+                "tag": 3,
+                "pressure_basis_npz": str(tmp_path / "missing.npz"),
+                "results_json": str(tmp_path / "missing.json"),
+            }
+        ],
+    )
+
+    assert payload["sources"]["MF"]["status"] == "skipped"
+    assert "passive-cardioid coupled mode owns" in payload["sources"]["MF"]["reason"]
 
 
 def test_passive_cardioid_skips_when_required_sources_were_skipped(tmp_path):

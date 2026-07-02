@@ -7,6 +7,8 @@ launch metadata can be checked outside Fusion.
 from __future__ import annotations
 
 import json
+import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,238 @@ MIRROR_PLANE_SYMMETRY_PLANES = {
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
+
+
+class DriverLemParseError(ValueError):
+    """Raised when a Driver LEM T/S specification cannot be parsed."""
+
+
+class DriverLemSpec:
+    """Parsed driver LEM input with SI-normalized values.
+
+    Input values follow Hornresp's driver-file units: Sd cm2, Mmd/Mms g,
+    Cms m/N, Le/Le2 mH, Rms kg/s, Xmax mm, Vas L.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        params: dict[str, float | int],
+        source: str,
+        warnings: tuple[str, ...] = (),
+        ignored_keys: tuple[str, ...] = (),
+    ) -> None:
+        self.name = name
+        self.params = params
+        self.source = source
+        self.warnings = warnings
+        self.ignored_keys = ignored_keys
+
+    def canonical_payload(self) -> str:
+        pieces: list[tuple[str, float | int]] = [
+            ("Sd", float(self.params["sd_m2"]) * 1.0e4),
+            ("Bl", float(self.params["bl_tm"])),
+            ("Re", float(self.params["re_ohm"])),
+        ]
+        if "le_h" in self.params:
+            pieces.append(("Le", float(self.params["le_h"]) * 1.0e3))
+        if "le2_h" in self.params:
+            pieces.append(("Le2", float(self.params["le2_h"]) * 1.0e3))
+        if "re2_ohm" in self.params:
+            pieces.append(("Re2", float(self.params["re2_ohm"])))
+        if "mmd_kg" in self.params:
+            pieces.append(("Mmd", float(self.params["mmd_kg"]) * 1.0e3))
+        if "mms_kg" in self.params:
+            pieces.append(("Mms", float(self.params["mms_kg"]) * 1.0e3))
+        if "cms_m_per_n" in self.params:
+            pieces.append(("Cms", float(self.params["cms_m_per_n"])))
+        if "vas_m3" in self.params:
+            pieces.append(("Vas", float(self.params["vas_m3"]) * 1.0e3))
+        if "fs_hz" in self.params:
+            pieces.append(("Fs", float(self.params["fs_hz"])))
+        if "rms_kg_per_s" in self.params:
+            pieces.append(("Rms", float(self.params["rms_kg_per_s"])))
+        if "qms" in self.params:
+            pieces.append(("Qms", float(self.params["qms"])))
+        if "xmax_m" in self.params:
+            pieces.append(("Xmax", float(self.params["xmax_m"]) * 1.0e3))
+        if "n_drivers" in self.params:
+            pieces.append(("N", int(self.params["n_drivers"])))
+        return ",".join(f"{key}={value:g}" for key, value in pieces)
+
+    def cli_entry(self) -> str:
+        return f"{self.name}:{self.canonical_payload()}"
+
+
+_DRIVER_KEY_MAP: dict[str, tuple[str, float, str]] = {
+    "sd": ("sd_m2", 1.0e-4, "Sd"),
+    "bl": ("bl_tm", 1.0, "Bl"),
+    "re": ("re_ohm", 1.0, "Re"),
+    "le": ("le_h", 1.0e-3, "Le"),
+    "le2": ("le2_h", 1.0e-3, "Le2"),
+    "re2": ("re2_ohm", 1.0, "Re2"),
+    "mmd": ("mmd_kg", 1.0e-3, "Mmd"),
+    "mms": ("mms_kg", 1.0e-3, "Mms"),
+    "cms": ("cms_m_per_n", 1.0, "Cms"),
+    "vas": ("vas_m3", 1.0e-3, "Vas"),
+    "fs": ("fs_hz", 1.0, "Fs"),
+    "rms": ("rms_kg_per_s", 1.0, "Rms"),
+    "qms": ("qms", 1.0, "Qms"),
+    "xmax": ("xmax_m", 1.0e-3, "Xmax"),
+    "n": ("n_drivers", 1.0, "N"),
+    "nd": ("n_drivers", 1.0, "Nd"),
+}
+_WARN_IGNORED_DRIVER_KEYS = {"leb", "ke", "rss"}
+_WARN_IGNORED_DRIVER_PREFIXES = ("vrc",)
+
+
+def _normalize_driver_key(raw: str) -> str:
+    return raw.strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _driver_pairs_from_text(text: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.split(r"\s+#|\s+//", line, maxsplit=1)[0].strip()
+        if "=" not in line:
+            continue
+        for token in re.split(r"[,;]+", line):
+            token = token.strip()
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def _driver_payload_text(raw_payload: str) -> tuple[str, str]:
+    payload = str(raw_payload).strip()
+    if not payload:
+        raise DriverLemParseError("driver T/S spec is blank")
+    if "=" in payload:
+        return payload, "text"
+    path = Path(payload).expanduser()
+    if path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace"), str(path)
+    raise DriverLemParseError(
+        f"driver T/S spec is neither Key=Value text nor a readable file: {payload}"
+    )
+
+
+def parse_driver_lem_spec(name: str, raw_payload: str) -> DriverLemSpec:
+    driver_name = str(name).strip()
+    if not driver_name:
+        raise DriverLemParseError("driver LEM entry needs a source name")
+    text, source = _driver_payload_text(raw_payload)
+    params: dict[str, float | int] = {}
+    warnings: list[str] = []
+    ignored: list[str] = []
+    seen_keys: dict[str, str] = {}
+    for raw_key, raw_value in _driver_pairs_from_text(text):
+        key = _normalize_driver_key(raw_key)
+        if key in _WARN_IGNORED_DRIVER_KEYS or any(
+            key.startswith(prefix) for prefix in _WARN_IGNORED_DRIVER_PREFIXES
+        ):
+            ignored.append(raw_key)
+            warnings.append(
+                f"{driver_name}: ignoring unsupported Hornresp/system key {raw_key}"
+            )
+            continue
+        mapped = _DRIVER_KEY_MAP.get(key)
+        if mapped is None:
+            ignored.append(raw_key)
+            continue
+        attr, scale, canonical = mapped
+        if attr in seen_keys:
+            try:
+                duplicate = float(raw_value)
+                previous = float(seen_keys[attr])
+            except ValueError:
+                duplicate = math.nan
+                previous = math.nan
+            if not math.isclose(duplicate, previous, rel_tol=1.0e-12, abs_tol=1.0e-12):
+                warnings.append(
+                    f"{driver_name}: duplicate {canonical}={raw_value} ignored; "
+                    f"using first value {seen_keys[attr]}"
+                )
+            continue
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise DriverLemParseError(
+                f"{driver_name}: {raw_key} must be numeric, got {raw_value!r}"
+            ) from exc
+        if not math.isfinite(value):
+            raise DriverLemParseError(f"{driver_name}: {raw_key} must be finite")
+        if attr == "n_drivers":
+            if value <= 0 or not float(value).is_integer():
+                raise DriverLemParseError(f"{driver_name}: {raw_key} must be a positive integer")
+            params[attr] = int(value)
+        else:
+            if attr not in {"le_h"} and value <= 0.0:
+                raise DriverLemParseError(f"{driver_name}: {raw_key} must be positive")
+            if attr == "le_h" and value < 0.0:
+                raise DriverLemParseError(f"{driver_name}: {raw_key} must be non-negative")
+            params[attr] = value * scale
+        seen_keys[attr] = raw_value
+
+    for attr, label in (
+        ("sd_m2", "Sd"),
+        ("bl_tm", "Bl"),
+        ("re_ohm", "Re"),
+    ):
+        if attr not in params:
+            raise DriverLemParseError(f"{driver_name}: missing required {label}")
+    if "le_h" not in params:
+        params["le_h"] = 0.0
+    if ("le2_h" in params) != ("re2_ohm" in params):
+        raise DriverLemParseError(f"{driver_name}: Le2 and Re2 must be provided together")
+    if "mmd_kg" not in params and "mms_kg" not in params:
+        raise DriverLemParseError(f"{driver_name}: missing required Mmd or Mms")
+    if "mmd_kg" in params and "mms_kg" in params:
+        warnings.append(f"{driver_name}: both Mmd and Mms supplied; Mmd is preferred")
+    if not any(key in params for key in ("cms_m_per_n", "vas_m3", "fs_hz")):
+        raise DriverLemParseError(f"{driver_name}: missing required Cms, Vas, or Fs")
+    if "rms_kg_per_s" in params and "qms" in params:
+        warnings.append(f"{driver_name}: both Rms and Qms supplied; Rms is preferred")
+    if "n_drivers" not in params:
+        params["n_drivers"] = 1
+    return DriverLemSpec(
+        name=driver_name,
+        params=params,
+        source=source,
+        warnings=tuple(warnings),
+        ignored_keys=tuple(ignored),
+    )
+
+
+def parse_driver_lem_cli_entry(raw_entry: str) -> DriverLemSpec:
+    entry = str(raw_entry).strip()
+    if ":" not in entry:
+        raise DriverLemParseError("--driver-lem expects NAME:Key=Value or NAME:/path/to/file")
+    name, payload = entry.split(":", 1)
+    return parse_driver_lem_spec(name, payload)
+
+
+def parse_driver_lem_cli_entries(raw_entries: list[str] | tuple[str, ...]) -> dict[str, DriverLemSpec]:
+    specs: dict[str, DriverLemSpec] = {}
+    for raw in raw_entries:
+        spec = parse_driver_lem_cli_entry(raw)
+        key = spec.name.strip().upper()
+        if key in specs:
+            raise DriverLemParseError(f"duplicate --driver-lem entry for {spec.name}")
+        specs[key] = spec
+    return specs
+
+
+def build_driver_lem_cli_entry(name: str, raw_payload: str | None) -> str | None:
+    if raw_payload is None or not str(raw_payload).strip():
+        return None
+    return parse_driver_lem_spec(name, str(raw_payload)).cli_entry()
 
 
 def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> None:

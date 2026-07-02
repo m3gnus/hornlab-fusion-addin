@@ -45,6 +45,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # sibling HornLab checkout. Elsewhere the imports resolve from the active
 # environment (see requirements.txt).
 for package_dir in (
+    REPO_ROOT / "fusion-addins" / "WGMetalPipeline",
     REPO_ROOT.parent / "hornlab-metal-bem",
     REPO_ROOT.parent / "HornLab" / "hornlab-plots",
     REPO_ROOT.parent / "HornLab" / "hornlab-sim",
@@ -53,6 +54,11 @@ for package_dir in (
         sys.path.insert(0, str(package_dir))
 
 from hornlab_sim.methods import bandpass, driver_coupling, radiation_impedance  # noqa: E402
+from fusion_pipeline_launch import (  # noqa: E402
+    DriverLemParseError,
+    DriverLemSpec,
+    parse_driver_lem_cli_entries,
+)
 from hornlab_plots import (  # noqa: E402
     FrequencyResponseCurve,
     save_directivity_plot,
@@ -96,6 +102,9 @@ class PressureBasis:
         observation_angles_deg: np.ndarray,
         observation_planes: np.ndarray,
         pressure_complex: np.ndarray,
+        source_normalization: str = "unit_normal_acceleration",
+        surface_pressure_avg_solver: np.ndarray | None = None,
+        source_area_m2: float | None = None,
     ) -> None:
         self.source_name = source_name
         self.source_tag = source_tag
@@ -103,6 +112,9 @@ class PressureBasis:
         self.observation_angles_deg = observation_angles_deg
         self.observation_planes = observation_planes
         self.pressure_complex = pressure_complex
+        self.source_normalization = source_normalization
+        self.surface_pressure_avg_solver = surface_pressure_avg_solver
+        self.source_area_m2 = source_area_m2
 
 
 def _normalize_bem_formulation(raw: str) -> str:
@@ -421,6 +433,7 @@ def _result_payload(result, *, source_name: str, source_tag: int) -> dict[str, A
 # raw e^{-i omega t} output is conjugated once at the write boundary; files
 # missing the key predate it and hold raw solver-convention data.
 PRESSURE_NPZ_PHASE_CONVENTION = "engineering_exp_plus_jwt"
+SURFACE_PRESSURE_AVG_PHASE_CONVENTION = "solver_exp_minus_jwt"
 
 
 def _pressure_complex_from_npz(data, *, path: Path) -> np.ndarray:
@@ -440,24 +453,105 @@ def _pressure_complex_from_npz(data, *, path: Path) -> np.ndarray:
     return pressure
 
 
-def _write_pressure_basis_npz(path: Path, result, *, source_name: str, source_tag: int) -> None:
-    np.savez_compressed(
-        path,
-        source_name=np.asarray(source_name),
-        source_tag=np.asarray(source_tag, dtype=np.int32),
-        frequencies_hz=np.asarray(result.frequencies_hz, dtype=np.float64),
-        observation_angles_deg=np.asarray(result.observation_angles_deg, dtype=np.float64),
-        observation_planes=np.asarray(result.observation_planes, dtype=str),
-        pressure_complex=np.conjugate(
+def _surface_pressure_avg_for_tag(result, source_tag: int) -> np.ndarray | None:
+    surface = getattr(result, "surface_pressure_avg", None) or {}
+    if source_tag in surface:
+        return np.asarray(surface[source_tag], dtype=np.complex128)
+    key = str(source_tag)
+    if key in surface:
+        return np.asarray(surface[key], dtype=np.complex128)
+    return None
+
+
+def _write_pressure_basis_npz(
+    path: Path,
+    result,
+    *,
+    source_name: str,
+    source_tag: int,
+    source_area_m2: float | None = None,
+) -> None:
+    arrays: dict[str, Any] = {
+        "source_name": np.asarray(source_name),
+        "source_tag": np.asarray(source_tag, dtype=np.int32),
+        "frequencies_hz": np.asarray(result.frequencies_hz, dtype=np.float64),
+        "observation_angles_deg": np.asarray(
+            result.observation_angles_deg,
+            dtype=np.float64,
+        ),
+        "observation_planes": np.asarray(result.observation_planes, dtype=str),
+        "pressure_complex": np.conjugate(
             np.asarray(result.pressure_complex, dtype=np.complex128)
         ),
-        phase_convention=np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
-        source_normalization=np.asarray("unit_normal_acceleration"),
-    )
+        "phase_convention": np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
+        "source_normalization": np.asarray("unit_normal_acceleration"),
+    }
+    surface_pressure_avg = _surface_pressure_avg_for_tag(result, source_tag)
+    if surface_pressure_avg is not None:
+        arrays["surface_pressure_avg_solver"] = surface_pressure_avg
+        arrays["surface_pressure_avg_phase_convention"] = np.asarray(
+            SURFACE_PRESSURE_AVG_PHASE_CONVENTION
+        )
+    if source_area_m2 is not None:
+        arrays["source_area_m2"] = np.asarray(float(source_area_m2), dtype=np.float64)
+    np.savez_compressed(path, **arrays)
+
+
+def _write_active_pressure_npz(
+    path: Path,
+    basis: PressureBasis,
+    pressure_complex: np.ndarray,
+    *,
+    source_normalization: str,
+    source_area_m2: float | None = None,
+) -> None:
+    arrays: dict[str, Any] = {
+        "source_name": np.asarray(basis.source_name),
+        "source_tag": np.asarray(basis.source_tag, dtype=np.int32),
+        "frequencies_hz": np.asarray(basis.frequencies_hz, dtype=np.float64),
+        "observation_angles_deg": np.asarray(
+            basis.observation_angles_deg,
+            dtype=np.float64,
+        ),
+        "observation_planes": np.asarray(basis.observation_planes, dtype=str),
+        "pressure_complex": np.asarray(pressure_complex, dtype=np.complex128),
+        "phase_convention": np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
+        "source_normalization": np.asarray(source_normalization),
+    }
+    area = source_area_m2 if source_area_m2 is not None else basis.source_area_m2
+    if area is not None:
+        arrays["source_area_m2"] = np.asarray(float(area), dtype=np.float64)
+    np.savez_compressed(path, **arrays)
 
 
 def _load_pressure_basis(path: Path) -> PressureBasis:
     with np.load(path, allow_pickle=False) as data:
+        source_normalization = "unit_normal_acceleration"
+        if "source_normalization" in data:
+            source_normalization = str(np.asarray(data["source_normalization"]).item())
+        surface_pressure_avg = None
+        if "surface_pressure_avg_solver" in data:
+            raw_surface_convention = (
+                data["surface_pressure_avg_phase_convention"]
+                if "surface_pressure_avg_phase_convention" in data
+                else np.asarray(SURFACE_PRESSURE_AVG_PHASE_CONVENTION)
+            )
+            surface_convention = str(
+                np.asarray(raw_surface_convention).item()
+            )
+            if surface_convention != SURFACE_PRESSURE_AVG_PHASE_CONVENTION:
+                raise ValueError(
+                    f"{path} stores surface_pressure_avg_solver with unsupported "
+                    f"phase convention {surface_convention!r}; expected "
+                    f"{SURFACE_PRESSURE_AVG_PHASE_CONVENTION!r}"
+                )
+            surface_pressure_avg = np.asarray(
+                data["surface_pressure_avg_solver"],
+                dtype=np.complex128,
+            )
+        source_area_m2 = None
+        if "source_area_m2" in data:
+            source_area_m2 = float(np.asarray(data["source_area_m2"]).item())
         return PressureBasis(
             source_name=str(data["source_name"].item()),
             source_tag=int(data["source_tag"]),
@@ -468,6 +562,9 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
             ),
             observation_planes=np.asarray(data["observation_planes"], dtype=str),
             pressure_complex=_pressure_complex_from_npz(data, path=path),
+            source_normalization=source_normalization,
+            surface_pressure_avg_solver=surface_pressure_avg,
+            source_area_m2=source_area_m2,
         )
 
 
@@ -1497,7 +1594,7 @@ def _write_vituixcad_export(
     """
     by_name = {str(result["name"]).strip().upper(): result for result in source_results}
     export_bases: list[tuple[str, PressureBasis]] = [
-        (name, _load_pressure_basis(Path(by_name[name]["pressure_basis_npz"])))
+        (name, _load_pressure_basis(_source_active_basis_path(by_name[name])))
         for name in _VITUIXCAD_DRIVER_NAMES
         if name in by_name
     ]
@@ -1530,7 +1627,20 @@ def _write_vituixcad_export(
         return None
 
     export_dir = out_dir / "vituixcad"
-    copied_zma: Path | None = None
+    copied_zmas: dict[str, Path] = {}
+    for source_result in source_results:
+        driver_payload = source_result.get("driver_lem")
+        if not isinstance(driver_payload, dict) or driver_payload.get("status") != "complete":
+            continue
+        outputs = driver_payload.get("outputs", {})
+        if not isinstance(outputs, dict) or not outputs.get("impedance_zma"):
+            continue
+        source_zma = Path(outputs["impedance_zma"])
+        if source_zma.exists():
+            export_dir.mkdir(parents=True, exist_ok=True)
+            copied_zma = export_dir / source_zma.name
+            shutil.copy2(source_zma, copied_zma)
+            copied_zmas[str(source_result["name"])] = copied_zma
     if passive_payload is not None:
         coupled = passive_payload.get("coupled")
         if isinstance(coupled, dict) and coupled.get("status") == "complete":
@@ -1541,10 +1651,16 @@ def _write_vituixcad_export(
                     export_dir.mkdir(parents=True, exist_ok=True)
                     copied_zma = export_dir / source_zma.name
                     shutil.copy2(source_zma, copied_zma)
+                    copied_zmas["MF_cardioid"] = copied_zma
     files_written = 0
     for name, basis in export_bases:
         freqs = np.asarray(basis.frequencies_hz, dtype=np.float64)
         angles = np.asarray(basis.observation_angles_deg, dtype=np.float64)
+        level_note = (
+            "voltage-driven Driver LEM"
+            if basis.source_normalization == "voltage_driven_driver_lem"
+            else "unit source drive"
+        )
         # Remove the shared time of flight to the observation distance so
         # the phase traces wrap less; identical for every driver and angle.
         # Engineering-convention bases carry e^{-jkr}, so multiplying by
@@ -1570,7 +1686,7 @@ def _write_vituixcad_export(
                         pressure,
                         comment=(
                             f"{name} {plane} {label} deg - HornLab WG Metal BEM, "
-                            f"unit source drive, common ToF {polar_distance_m:g} m "
+                            f"{level_note}, common ToF {polar_distance_m:g} m "
                             "removed, shared timing reference (set X/Y/Z=0)"
                         ),
                     )
@@ -1583,20 +1699,22 @@ def _write_vituixcad_export(
         mirror_angles=mirror_angles,
     )
     readme = export_dir / "README.txt"
-    zma_lines = (
-        [
-            "- MF_cardioid includes MF_passive_cardioid_impedance.zma,",
-            "  calculated from the coupled driver/LEM/BEM model.",
-            "- For non-cardioid drivers import measured or datasheet",
-            "  impedance.",
+    if copied_zmas:
+        zma_lines = [
+            "- Coupled driver ZMA files are included:",
+            *[
+                f"  {name}: {path.name}"
+                for name, path in sorted(copied_zmas.items())
+            ],
+            "- Drivers without Driver LEM specs remain unit-source FRDs and",
+            "  need measured or datasheet impedance for passive crossover work.",
         ]
-        if copied_zma is not None
-        else [
-            "- No ZMA is exported: BEM has no electrical side. For passive",
-            "  crossover work import measured or datasheet impedance per",
-            "  driver.",
+    else:
+        zma_lines = [
+            "- No ZMA is exported: no voltage-driven Driver LEM specs were",
+            "  applied. For passive crossover work import measured or",
+            "  datasheet impedance per driver.",
         ]
-    )
     readme.write_text(
         "\n".join(
             [
@@ -1616,9 +1734,9 @@ def _write_vituixcad_export(
                 "- The common time of flight to the observation distance was",
                 "  removed identically from every file; relative data is",
                 "  untouched.",
-                "- Levels are unit-source-drive SPL, not per-volt sensitivity.",
-                "  Scale each driver's level to taste (or to measured",
-                "  sensitivity) before reading absolute SPL off the charts.",
+                "- Driver LEM sources are voltage-driven at the run drive",
+                "  voltage; uncoupled sources are unit-source-drive SPL and",
+                "  still need manual scaling.",
                 *zma_lines,
                 "- 'MF_cardioid' (when present) is the passive-cardioid",
                 "  combined MF+port response; treat it as the MF driver.",
@@ -1649,8 +1767,14 @@ def _write_vituixcad_export(
             "vituixcad_readme_txt": str(readme),
         },
     }
-    if copied_zma is not None:
-        payload["outputs"]["vituixcad_mf_cardioid_zma"] = str(copied_zma)
+    if copied_zmas:
+        payload["outputs"]["vituixcad_driver_zmas"] = {
+            name: str(path) for name, path in sorted(copied_zmas.items())
+        }
+        if "MF_cardioid" in copied_zmas:
+            payload["outputs"]["vituixcad_mf_cardioid_zma"] = str(
+                copied_zmas["MF_cardioid"]
+            )
     if active_vxp is not None:
         payload["active_crossover_project"] = {
             "type": "active_lr4_vxp",
@@ -1685,7 +1809,7 @@ def _write_crossover_alignment_outputs(
     members, crossovers_hz = chain, list(chain_or_reason)
 
     bases = {
-        name: _load_pressure_basis(Path(by_name[name]["pressure_basis_npz"]))
+        name: _load_pressure_basis(_source_active_basis_path(by_name[name]))
         for name in members
     }
     mf_basis_kind = "direct"
@@ -2175,6 +2299,16 @@ def _source_result_by_name(source_results: list[dict[str, Any]]) -> dict[str, di
     return {str(result["name"]): result for result in source_results}
 
 
+def _source_unit_basis_path(source_result: dict[str, Any]) -> Path:
+    return Path(str(source_result["pressure_basis_npz"]))
+
+
+def _source_active_basis_path(source_result: dict[str, Any]) -> Path:
+    return Path(
+        str(source_result.get("active_pressure_basis_npz") or source_result["pressure_basis_npz"])
+    )
+
+
 def _auto_port_source_name(source_results: list[dict[str, Any]]) -> str | None:
     names = [str(result["name"]) for result in source_results]
     if "PORT_EXIT" in names:
@@ -2219,6 +2353,137 @@ def _validate_optional_nonnegative_float(
     value = getattr(args, attr)
     if value is not None and (value < 0.0 or not np.isfinite(value)):
         raise SystemExit(f"{flag} must be non-negative")
+
+
+def _legacy_passive_cardioid_driver_entry(args: argparse.Namespace) -> str | None:
+    legacy_core_attrs = (
+        "passive_cardioid_driver_sd_cm2",
+        "passive_cardioid_driver_bl_tm",
+        "passive_cardioid_driver_re_ohm",
+        "passive_cardioid_driver_mmd_g",
+        "passive_cardioid_driver_mms_g",
+        "passive_cardioid_driver_cms_mm_per_n",
+        "passive_cardioid_driver_vas_l",
+        "passive_cardioid_driver_fs_hz",
+        "passive_cardioid_driver_rms_kg_per_s",
+        "passive_cardioid_driver_qms",
+    )
+    if not any(getattr(args, attr) is not None for attr in legacy_core_attrs):
+        return None
+    pieces: list[str] = []
+    required = (
+        ("Sd", args.passive_cardioid_driver_sd_cm2),
+        ("Bl", args.passive_cardioid_driver_bl_tm),
+        ("Re", args.passive_cardioid_driver_re_ohm),
+    )
+    for key, value in required:
+        if value is not None:
+            pieces.append(f"{key}={float(value):g}")
+    if args.passive_cardioid_driver_le_mh is not None:
+        pieces.append(f"Le={float(args.passive_cardioid_driver_le_mh):g}")
+    if args.passive_cardioid_driver_le2_mh is not None:
+        pieces.append(f"Le2={float(args.passive_cardioid_driver_le2_mh):g}")
+    if args.passive_cardioid_driver_re2_ohm is not None:
+        pieces.append(f"Re2={float(args.passive_cardioid_driver_re2_ohm):g}")
+    if args.passive_cardioid_driver_mmd_g is not None:
+        pieces.append(f"Mmd={float(args.passive_cardioid_driver_mmd_g):g}")
+    if args.passive_cardioid_driver_mms_g is not None:
+        pieces.append(f"Mms={float(args.passive_cardioid_driver_mms_g):g}")
+    if args.passive_cardioid_driver_cms_mm_per_n is not None:
+        cms_m_per_n = float(args.passive_cardioid_driver_cms_mm_per_n) * 1.0e-3
+        pieces.append(f"Cms={cms_m_per_n:g}")
+    if args.passive_cardioid_driver_vas_l is not None:
+        pieces.append(f"Vas={float(args.passive_cardioid_driver_vas_l):g}")
+    if args.passive_cardioid_driver_fs_hz is not None:
+        pieces.append(f"Fs={float(args.passive_cardioid_driver_fs_hz):g}")
+    if args.passive_cardioid_driver_rms_kg_per_s is not None:
+        pieces.append(f"Rms={float(args.passive_cardioid_driver_rms_kg_per_s):g}")
+    if args.passive_cardioid_driver_qms is not None:
+        pieces.append(f"Qms={float(args.passive_cardioid_driver_qms):g}")
+    if args.passive_cardioid_driver_count is not None:
+        pieces.append(f"N={int(args.passive_cardioid_driver_count)}")
+    return "MF:" + ",".join(pieces)
+
+
+def _parse_driver_rear_volume_l(raw_entries: list[str]) -> dict[str, float]:
+    volumes: dict[str, float] = {}
+    for raw in raw_entries:
+        if ":" not in str(raw):
+            raise SystemExit(f"--driver-rear-volume-l expects NAME:VALUE, got {raw!r}")
+        name, value_text = str(raw).split(":", 1)
+        key = name.strip().upper()
+        if not key:
+            raise SystemExit(f"--driver-rear-volume-l expects NAME:VALUE, got {raw!r}")
+        try:
+            value = float(value_text.strip())
+        except ValueError as exc:
+            raise SystemExit(
+                f"--driver-rear-volume-l value must be numeric in {raw!r}"
+            ) from exc
+        if value <= 0.0 or not np.isfinite(value):
+            raise SystemExit(f"--driver-rear-volume-l must be positive in {raw!r}")
+        if key in volumes:
+            raise SystemExit(f"duplicate --driver-rear-volume-l for {name.strip()}")
+        volumes[key] = value
+    return volumes
+
+
+def _normalize_driver_lem_args(args: argparse.Namespace) -> None:
+    entries = list(args.driver_lem or [])
+    legacy_entry = _legacy_passive_cardioid_driver_entry(args)
+    explicit_mf = any(str(entry).split(":", 1)[0].strip().upper() == "MF" for entry in entries)
+    if legacy_entry is not None and not explicit_mf:
+        entries.append(legacy_entry)
+        print(
+            "DRIVER LEM WARNING: --passive-cardioid-driver-* flags are deprecated; "
+            "mapped them to --driver-lem MF:...",
+            flush=True,
+        )
+    elif legacy_entry is not None:
+        print(
+            "DRIVER LEM WARNING: deprecated --passive-cardioid-driver-* flags "
+            "ignored because --driver-lem MF:... was also provided.",
+            flush=True,
+        )
+    try:
+        args.driver_lem_specs = parse_driver_lem_cli_entries(entries)
+    except DriverLemParseError as exc:
+        raise SystemExit(str(exc)) from exc
+    args.driver_rear_volume_l_by_name = _parse_driver_rear_volume_l(
+        args.driver_rear_volume_l or []
+    )
+    for spec in args.driver_lem_specs.values():
+        for warning in spec.warnings:
+            print(f"DRIVER LEM WARNING: {warning}", flush=True)
+    args.drive_voltage = (
+        args.drive_voltage
+        if args.drive_voltage is not None
+        else (
+            args.passive_cardioid_drive_voltage
+            if args.passive_cardioid_drive_voltage is not None
+            else 2.83
+        )
+    )
+    args.rg_ohm = (
+        args.rg_ohm
+        if args.rg_ohm is not None
+        else (
+            args.passive_cardioid_rg_ohm
+            if args.passive_cardioid_rg_ohm is not None
+            else 0.0
+        )
+    )
+    if args.drive_voltage <= 0.0 or not np.isfinite(args.drive_voltage):
+        raise SystemExit("--drive-voltage must be positive")
+    if args.rg_ohm < 0.0 or not np.isfinite(args.rg_ohm):
+        raise SystemExit("--rg-ohm must be non-negative")
+    if args.passive_cardioid_coupled:
+        mf_key = str(args.passive_cardioid_mf_source).strip().upper()
+        if mf_key not in args.driver_lem_specs:
+            raise SystemExit(
+                "--passive-cardioid-coupled requires an MF --driver-lem spec "
+                "(deprecated --passive-cardioid-driver-* aliases still work)"
+            )
 
 
 def _validate_passive_cardioid_coupled_args(args: argparse.Namespace) -> None:
@@ -2335,6 +2600,8 @@ def _validate_passive_cardioid_coupled_args(args: argparse.Namespace) -> None:
 
 
 def _validate_passive_cardioid_args(args: argparse.Namespace) -> None:
+    if not hasattr(args, "driver_lem_specs"):
+        _normalize_driver_lem_args(args)
     if args.passive_cardioid_coupled and not args.passive_cardioid_mf:
         raise SystemExit("--passive-cardioid-coupled requires --passive-cardioid-mf")
     if not args.passive_cardioid_mf:
@@ -2356,8 +2623,6 @@ def _validate_passive_cardioid_args(args: argparse.Namespace) -> None:
             "--passive-cardioid-foam-resistance-pa-s-m3 must be non-negative"
         )
     _parse_optional_positive_m2_from_cm2(args.passive_cardioid_port_area_cm2)
-    if args.passive_cardioid_coupled:
-        _validate_passive_cardioid_coupled_args(args)
 
 
 def _passive_cardioid_driver_from_args(args: argparse.Namespace) -> bandpass.Driver:
@@ -2427,6 +2692,391 @@ def _write_zma(path: Path, freqs: np.ndarray, impedance: np.ndarray, *, comment:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _complex_from_jsonable(value: Any) -> Any:
+    if isinstance(value, dict) and set(value) >= {"real", "imag"}:
+        return complex(float(value["real"]), float(value["imag"]))
+    if isinstance(value, list):
+        return [_complex_from_jsonable(item) for item in value]
+    return value
+
+
+def _surface_pressure_avg_from_results_json(
+    result_json: Path,
+    source_tag: int,
+) -> np.ndarray | None:
+    if not result_json.exists():
+        return None
+    payload = json.loads(result_json.read_text(encoding="utf-8"))
+    surface = payload.get("surface_pressure_avg", {})
+    if not isinstance(surface, dict):
+        return None
+    key = str(source_tag)
+    if key not in surface:
+        return None
+    return np.asarray(_complex_from_jsonable(surface[key]), dtype=np.complex128)
+
+
+def _solver_surface_avg_to_self_impedance(
+    frequencies_hz: np.ndarray,
+    surface_pressure_avg_solver: np.ndarray,
+    *,
+    source_area_m2: float,
+) -> np.ndarray:
+    """Convert unit-acceleration solver p_avg into engineering z_self."""
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    p_avg = np.asarray(surface_pressure_avg_solver, dtype=np.complex128).reshape(-1)
+    if p_avg.shape != freqs.shape:
+        raise ValueError(
+            "surface_pressure_avg length does not match frequencies "
+            f"({p_avg.shape} vs {freqs.shape})"
+        )
+    area = float(source_area_m2)
+    if area <= 0.0 or not np.isfinite(area):
+        raise ValueError(f"source_area_m2 must be positive, got {source_area_m2!r}")
+    omega = 2.0 * np.pi * freqs
+    return np.conjugate(1j * omega * p_avg) / area
+
+
+def _driver_lem_spec_driver(spec: DriverLemSpec) -> bandpass.Driver:
+    params = spec.params
+    return bandpass.Driver(
+        Sd=float(params["sd_m2"]),
+        Bl=float(params["bl_tm"]),
+        Re=float(params["re_ohm"]),
+        Le=float(params.get("le_h", 0.0)),
+        le2_h=None if "le2_h" not in params else float(params["le2_h"]),
+        re2_ohm=None if "re2_ohm" not in params else float(params["re2_ohm"]),
+        Mmd=None if "mmd_kg" not in params else float(params["mmd_kg"]),
+        Mms=None if "mms_kg" not in params else float(params["mms_kg"]),
+        Cms=(
+            None
+            if "cms_m_per_n" not in params
+            else float(params["cms_m_per_n"])
+        ),
+        Vas=None if "vas_m3" not in params else float(params["vas_m3"]),
+        Fs=None if "fs_hz" not in params else float(params["fs_hz"]),
+        Rms=(
+            None
+            if "rms_kg_per_s" not in params
+            else float(params["rms_kg_per_s"])
+        ),
+        Qms=None if "qms" not in params else float(params["qms"]),
+        n_drivers=int(params.get("n_drivers", 1)),
+    )
+
+
+def _driver_lem_parameter_echo(spec: DriverLemSpec, coupled) -> dict[str, Any]:
+    params = spec.params
+    echo: dict[str, Any] = {
+        "sd_m2": float(params["sd_m2"]),
+        "sd_cm2": float(params["sd_m2"]) * 1.0e4,
+        "sd_eff_m2": float(coupled.diagnostics["sd_eff_m2"]),
+        "bl_tm": float(params["bl_tm"]),
+        "re_ohm": float(params["re_ohm"]),
+        "le_h": float(params.get("le_h", 0.0)),
+        "le_mh": float(params.get("le_h", 0.0)) * 1.0e3,
+        "count": int(params.get("n_drivers", 1)),
+        "mmd_eff_kg": float(coupled.diagnostics["mmd_eff_kg"]),
+        "mmd_eff_g": float(coupled.diagnostics["mmd_eff_kg"]) * 1.0e3,
+        "mmd_correction_kg": float(coupled.mmd_correction_kg),
+        "mmd_correction_g": float(coupled.mmd_correction_kg) * 1.0e3,
+        "mmd_source": str(coupled.diagnostics["mmd_source"]),
+    }
+    for key, label, scale in (
+        ("le2_h", "le2_mh", 1.0e3),
+        ("re2_ohm", "re2_ohm", 1.0),
+        ("mmd_kg", "mmd_g", 1.0e3),
+        ("mms_kg", "mms_g", 1.0e3),
+        ("cms_m_per_n", "cms_m_per_n", 1.0),
+        ("vas_m3", "vas_l", 1.0e3),
+        ("fs_hz", "fs_hz", 1.0),
+        ("rms_kg_per_s", "rms_kg_per_s", 1.0),
+        ("qms", "qms", 1.0),
+        ("xmax_m", "xmax_mm", 1.0e3),
+    ):
+        if key in params:
+            echo[label] = float(params[key]) * scale
+    return echo
+
+
+def _write_excursion_plot(
+    path: Path,
+    freqs: np.ndarray,
+    excursion_m: np.ndarray,
+    *,
+    source_name: str,
+    xmax_m: float | None,
+) -> None:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    fig, ax = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
+    ax.semilogx(
+        freqs,
+        np.asarray(excursion_m, dtype=np.float64) * 1.0e3,
+        label=source_name,
+    )
+    if xmax_m is not None:
+        ax.axhline(float(xmax_m) * 1.0e3, color="tab:red", linestyle="--", label="Xmax")
+    ax.set_title(f"{source_name} Cone Excursion")
+    ax.set_xlabel("Frequency [Hz]")
+    ax.set_ylabel("Excursion [mm RMS]")
+    ax.grid(True, which="both", alpha=0.25)
+    ax.legend(loc="best")
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def _driver_spec_for_source(
+    specs: dict[str, DriverLemSpec],
+    source_name: str,
+) -> DriverLemSpec | None:
+    return specs.get(str(source_name).strip().upper())
+
+
+def _driver_rear_volume_m3(args: argparse.Namespace, source_name: str) -> float | None:
+    volumes = getattr(args, "driver_rear_volume_l_by_name", {})
+    value = volumes.get(str(source_name).strip().upper())
+    if value is None:
+        return None
+    return float(value) * 1.0e-3
+
+
+def _source_owned_by_passive_cardioid(args: argparse.Namespace, source_name: str) -> bool:
+    return (
+        bool(args.passive_cardioid_mf)
+        and bool(args.passive_cardioid_coupled)
+        and str(args.passive_cardioid_mf_source).strip().upper()
+        == str(source_name).strip().upper()
+    )
+
+
+def _basis_self_impedance(
+    mesh_path: Path,
+    args: argparse.Namespace,
+    source_result: dict[str, Any],
+    basis: PressureBasis,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    surface = basis.surface_pressure_avg_solver
+    provenance = "pressure_basis_npz"
+    if surface is None:
+        surface = _surface_pressure_avg_from_results_json(
+            Path(str(source_result["results_json"])),
+            int(source_result["tag"]),
+        )
+        provenance = "results_json"
+    if surface is None:
+        raise RuntimeError(
+            f"{source_result['name']} has no surface_pressure_avg; cannot derive z_self"
+        )
+    area = basis.source_area_m2 or source_result.get("source_area_m2")
+    area_provenance = "pressure_basis_npz"
+    if area is None:
+        area = _mesh_tag_area_m2(
+            mesh_path,
+            int(source_result["tag"]),
+            mesh_scale=float(args.mesh_scale),
+        )
+        area_provenance = "mesh_tag_area"
+    z_self = _solver_surface_avg_to_self_impedance(
+        basis.frequencies_hz,
+        surface,
+        source_area_m2=float(area),
+    )
+    return z_self, {
+        "surface_pressure_avg": provenance,
+        "surface_pressure_avg_phase_convention": SURFACE_PRESSURE_AVG_PHASE_CONVENTION,
+        "source_area_m2": float(area),
+        "source_area_provenance": area_provenance,
+        "formula": "z_dd_eng = conj(1j*omega*p_avg_solver)/S_tag",
+        "mutual_coupling": "driver-driver mutual coupling neglected; self-impedance only",
+    }
+
+
+def _apply_driver_lem_coupling(
+    mesh_path: Path,
+    out_dir: Path,
+    args: argparse.Namespace,
+    *,
+    source_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    specs: dict[str, DriverLemSpec] = getattr(args, "driver_lem_specs", {})
+    if not specs:
+        return None
+    by_name = _source_result_by_name(source_results)
+    payload: dict[str, Any] = {
+        "status": "complete",
+        "type": "per_driver_lem_coupling",
+        "drive_voltage_v": float(args.drive_voltage),
+        "rg_ohm": float(args.rg_ohm),
+        "sources": {},
+    }
+    for source_key, spec in specs.items():
+        matching_name = next(
+            (name for name in by_name if name.strip().upper() == source_key),
+            None,
+        )
+        if matching_name is None:
+            payload["sources"][spec.name] = {
+                "status": "skipped",
+                "reason": "driver LEM spec has no solved source",
+            }
+            continue
+        source_result = by_name[matching_name]
+        if _source_owned_by_passive_cardioid(args, matching_name):
+            source_payload = {
+                "status": "skipped",
+                "reason": "passive-cardioid coupled mode owns this MF source",
+            }
+            payload["sources"][matching_name] = source_payload
+            source_result["driver_lem"] = source_payload
+            continue
+
+        basis = _load_pressure_basis(_source_unit_basis_path(source_result))
+        z_self, z_self_payload = _basis_self_impedance(
+            mesh_path,
+            args,
+            source_result,
+            basis,
+        )
+        coupled = driver_coupling.coupled_direct_radiator_response(
+            basis.frequencies_hz,
+            driver=_driver_lem_spec_driver(spec),
+            z_self=z_self,
+            rear_chamber_volume_m3=_driver_rear_volume_m3(args, matching_name),
+            drive_voltage_v=float(args.drive_voltage),
+            rg_ohm=float(args.rg_ohm),
+        )
+        source_area_m2 = float(z_self_payload["source_area_m2"])
+        pressure = _voltage_drive_pressure(
+            coupled.cone_volume_velocity,
+            frequencies_hz=basis.frequencies_hz,
+            diaphragm_area_m2=source_area_m2,
+            basis_pressure=basis.pressure_complex,
+        )
+        safe_name = _safe_stem(matching_name)
+        active_npz = out_dir / f"{safe_name}_driver_lem_pressure.npz"
+        results_npz = out_dir / f"{safe_name}_driver_lem_results.npz"
+        response_png = out_dir / f"{safe_name}_frequency_response.png"
+        impedance_zma = out_dir / f"{safe_name}_impedance.zma"
+        excursion_png = out_dir / f"{safe_name}_excursion.png"
+        _write_active_pressure_npz(
+            active_npz,
+            basis,
+            pressure,
+            source_normalization="voltage_driven_driver_lem",
+            source_area_m2=source_area_m2,
+        )
+        directivity_db = _directivity_from_pressure_array(
+            pressure,
+            basis.observation_angles_deg,
+        )
+        on_axis_idx = int(np.argmin(np.abs(basis.observation_angles_deg)))
+        on_axis_spl_db = _spl_db_from_pressure(pressure[:, 0, on_axis_idx])
+        np.savez_compressed(
+            results_npz,
+            frequencies_hz=basis.frequencies_hz,
+            observation_angles_deg=basis.observation_angles_deg,
+            observation_planes=basis.observation_planes,
+            pressure_complex=pressure,
+            phase_convention=np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
+            directivity_db=directivity_db,
+            on_axis_spl_db=on_axis_spl_db,
+            cone_volume_velocity=coupled.cone_volume_velocity,
+            acoustic_load=coupled.acoustic_load,
+            z_self=z_self,
+            electrical_input_impedance=coupled.electrical_input_impedance,
+            cone_excursion_m=coupled.cone_excursion_m,
+            drive_voltage_v=np.asarray(float(args.drive_voltage), dtype=np.float64),
+            rg_ohm=np.asarray(float(args.rg_ohm), dtype=np.float64),
+            mmd_correction_kg=np.asarray(coupled.mmd_correction_kg, dtype=np.float64),
+        )
+        save_frequency_response_plot(
+            response_png,
+            [
+                FrequencyResponseCurve(
+                    frequencies=basis.frequencies_hz,
+                    spl_db=on_axis_spl_db,
+                    label=f"{matching_name} {args.drive_voltage:g} V",
+                    role=_source_role(matching_name),
+                )
+            ],
+            title=f"{matching_name} Frequency Response",
+            ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+            mesh_valid_hz=source_result.get("mesh_valid_freq_max_hz"),
+            mesh_valid_radiating_hz=source_result.get("aperture_valid_freq_max_hz"),
+        )
+        _write_zma(
+            impedance_zma,
+            basis.frequencies_hz,
+            coupled.electrical_input_impedance,
+            comment=(
+                f"{matching_name} driver LEM electrical input impedance "
+                f"at {args.drive_voltage:g} V RMS"
+            ),
+        )
+        xmax_m = float(spec.params["xmax_m"]) if "xmax_m" in spec.params else None
+        _write_excursion_plot(
+            excursion_png,
+            basis.frequencies_hz,
+            coupled.cone_excursion_m,
+            source_name=matching_name,
+            xmax_m=xmax_m,
+        )
+        excursion_max_idx = int(np.argmax(coupled.cone_excursion_m))
+        z_abs = np.abs(coupled.electrical_input_impedance)
+        warnings = list(spec.warnings)
+        if str(coupled.diagnostics["mmd_source"]) == "Mms_corrected":
+            warning = (
+                f"{matching_name}: Mms input path estimates Mmd by subtracting "
+                "two-face free-air radiation mass before applying the BEM load"
+            )
+            warnings.append(warning)
+            print(f"DRIVER LEM WARNING: {warning}", flush=True)
+        rear_volume = _driver_rear_volume_m3(args, matching_name)
+        source_payload = {
+            "status": "complete",
+            "driver": _driver_lem_parameter_echo(spec, coupled),
+            "parse_source": spec.source,
+            "parse_warnings": warnings,
+            "ignored_keys": list(spec.ignored_keys),
+            "drive_voltage_v": float(args.drive_voltage),
+            "rg_ohm": float(args.rg_ohm),
+            "rear_chamber_volume_l": (
+                None if rear_volume is None else rear_volume * 1.0e3
+            ),
+            "z_self": z_self_payload,
+            "excursion_band_max_mm": float(
+                coupled.cone_excursion_m[excursion_max_idx] * 1.0e3
+            ),
+            "excursion_band_max_hz": float(
+                basis.frequencies_hz[excursion_max_idx]
+            ),
+            "z_in_elec_min_ohm": float(np.min(z_abs)),
+            "z_in_elec_max_ohm": float(np.max(z_abs)),
+            "coupling_assumption": (
+                "driver-driver mutual coupling is neglected; each driver uses "
+                "its own BEM self-impedance only"
+            ),
+            "outputs": {
+                "active_pressure_npz": str(active_npz),
+                "results_npz": str(results_npz),
+                "frequency_response_png": str(response_png),
+                "impedance_zma": str(impedance_zma),
+                "excursion_png": str(excursion_png),
+            },
+        }
+        payload["sources"][matching_name] = source_payload
+        source_result["unit_pressure_basis_npz"] = source_result["pressure_basis_npz"]
+        source_result["active_pressure_basis_npz"] = str(active_npz)
+        source_result["frequency_response_png"] = str(response_png)
+        source_result["on_axis_spl_db"] = on_axis_spl_db
+        source_result["driver_lem"] = source_payload
+        source_result["driver_lem_results_npz"] = str(results_npz)
+        source_result["driver_lem_impedance_zma"] = str(impedance_zma)
+        source_result["driver_lem_excursion_png"] = str(excursion_png)
+    return payload
+
+
 def _preferred_passive_cardioid_results(
     passive_payload: dict[str, Any] | None,
 ) -> tuple[Path, str] | None:
@@ -2451,6 +3101,8 @@ def _solve_passive_cardioid_mf(
     source_results: list[dict[str, Any]],
     radiation_payload: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
+    if not hasattr(args, "driver_lem_specs"):
+        _normalize_driver_lem_args(args)
     if not args.passive_cardioid_mf:
         return None
 
@@ -2485,8 +3137,8 @@ def _solve_passive_cardioid_mf(
             "available_sources": [str(result["name"]) for result in source_results],
         }
 
-    mf_basis = _load_pressure_basis(Path(by_name[mf_name]["pressure_basis_npz"]))
-    port_basis = _load_pressure_basis(Path(by_name[port_name]["pressure_basis_npz"]))
+    mf_basis = _load_pressure_basis(_source_unit_basis_path(by_name[mf_name]))
+    port_basis = _load_pressure_basis(_source_unit_basis_path(by_name[port_name]))
     try:
         _assert_matching_basis_grid(mf_basis, port_basis)
     except ValueError as exc:
@@ -2773,7 +3425,21 @@ def _solve_passive_cardioid_mf(
             }
         else:
             z_mm, z_mf_from_port = mf_impedances
-            driver = _passive_cardioid_driver_from_args(args)
+            mf_driver_spec = _driver_spec_for_source(
+                getattr(args, "driver_lem_specs", {}),
+                mf_name,
+            )
+            if mf_driver_spec is None:
+                payload["coupled"] = {
+                    "status": "skipped",
+                    "reason": (
+                        "passive-cardioid coupled solve requires an MF "
+                        "--driver-lem spec"
+                    ),
+                }
+                _write_json(summary_json, payload)
+                return payload
+            driver = _driver_lem_spec_driver(mf_driver_spec)
             coupled = driver_coupling.coupled_cardioid_response(
                 mf_basis.frequencies_hz,
                 driver=driver,
@@ -2786,8 +3452,8 @@ def _solve_passive_cardioid_mf(
                 port_length_m=port_length_m,
                 series_resistance_pa_s_m3=series_resistance,
                 rear_sign=rear_sign,
-                drive_voltage_v=float(args.passive_cardioid_drive_voltage),
-                rg_ohm=float(args.passive_cardioid_rg_ohm),
+                drive_voltage_v=float(args.drive_voltage),
+                rg_ohm=float(args.rg_ohm),
             )
             legacy_port_to_cone = (
                 branch.exit_to_input_volume_velocity_ratio
@@ -2850,10 +3516,10 @@ def _solve_passive_cardioid_mf(
                 electrical_input_impedance=coupled.electrical_input_impedance,
                 cone_excursion_m=coupled.cone_excursion_m,
                 drive_voltage_v=np.asarray(
-                    float(args.passive_cardioid_drive_voltage),
+                    float(args.drive_voltage),
                     dtype=np.float64,
                 ),
-                rg_ohm=np.asarray(float(args.passive_cardioid_rg_ohm), dtype=np.float64),
+                rg_ohm=np.asarray(float(args.rg_ohm), dtype=np.float64),
                 mmd_correction_kg=np.asarray(
                     coupled.mmd_correction_kg,
                     dtype=np.float64,
@@ -2867,7 +3533,7 @@ def _solve_passive_cardioid_mf(
                         spl_db=coupled_on_axis_spl_db,
                         label=(
                             f"MF passive cardioid coupled "
-                            f"{args.passive_cardioid_drive_voltage:g} V"
+                            f"{args.drive_voltage:g} V"
                         ),
                         role="combined",
                     )
@@ -2881,7 +3547,7 @@ def _solve_passive_cardioid_mf(
                 coupled.electrical_input_impedance,
                 comment=(
                     "MF passive-cardioid coupled electrical input impedance "
-                    f"at {args.passive_cardioid_drive_voltage:g} V RMS"
+                    f"at {args.drive_voltage:g} V RMS"
                 ),
             )
 
@@ -2912,28 +3578,9 @@ def _solve_passive_cardioid_mf(
             payload["outputs"]["impedance_zma"] = str(impedance_zma)
             payload["coupled"] = {
                 "status": "complete",
-                "driver": {
-                    "sd_cm2": float(args.passive_cardioid_driver_sd_cm2),
-                    "sd_eff_cm2": sd_eff_m2 * 1.0e4,
-                    "bl_tm": float(args.passive_cardioid_driver_bl_tm),
-                    "re_ohm": float(args.passive_cardioid_driver_re_ohm),
-                    "le_mh": float(args.passive_cardioid_driver_le_mh),
-                    "le2_mh": args.passive_cardioid_driver_le2_mh,
-                    "re2_ohm": args.passive_cardioid_driver_re2_ohm,
-                    "mmd_g": args.passive_cardioid_driver_mmd_g,
-                    "mms_g": args.passive_cardioid_driver_mms_g,
-                    "mmd_eff_g": float(coupled.diagnostics["mmd_eff_kg"]) * 1000.0,
-                    "mmd_correction_g": coupled.mmd_correction_kg * 1000.0,
-                    "mmd_source": coupled.diagnostics["mmd_source"],
-                    "cms_mm_per_n": args.passive_cardioid_driver_cms_mm_per_n,
-                    "vas_l": args.passive_cardioid_driver_vas_l,
-                    "fs_hz": args.passive_cardioid_driver_fs_hz,
-                    "rms_kg_per_s": args.passive_cardioid_driver_rms_kg_per_s,
-                    "qms": args.passive_cardioid_driver_qms,
-                    "count": int(args.passive_cardioid_driver_count),
-                },
-                "drive_voltage_v": float(args.passive_cardioid_drive_voltage),
-                "rg_ohm": float(args.passive_cardioid_rg_ohm),
+                "driver": _driver_lem_parameter_echo(mf_driver_spec, coupled),
+                "drive_voltage_v": float(args.drive_voltage),
+                "rg_ohm": float(args.rg_ohm),
                 "excursion_band_max_mm": float(np.max(excursion_band) * 1000.0),
                 "z_in_elec_min_ohm": float(np.min(z_abs)),
                 "z_in_elec_max_ohm": float(np.max(z_abs)),
@@ -3114,6 +3761,7 @@ def _solve_port_exit_radiation_impedance_matrix(
 
 def _write_one_source_outputs(
     result,
+    mesh_path: Path,
     out_dir: Path,
     args: argparse.Namespace,
     *,
@@ -3131,11 +3779,19 @@ def _write_one_source_outputs(
     on_axis_spl_db = _on_axis_spl_db(result)
     payload = _result_payload(result, source_name=source_name, source_tag=source_tag)
     _write_json(result_json, payload)
+    source_area_m2 = None
+    if _surface_pressure_avg_for_tag(result, source_tag) is not None:
+        source_area_m2 = _mesh_tag_area_m2(
+            mesh_path,
+            source_tag,
+            mesh_scale=float(args.mesh_scale),
+        )
     _write_pressure_basis_npz(
         basis_npz,
         result,
         source_name=source_name,
         source_tag=source_tag,
+        source_area_m2=source_area_m2,
     )
     save_directivity_plot(
         heatmap_png,
@@ -3174,6 +3830,7 @@ def _write_one_source_outputs(
         "frequencies_hz": result.frequencies_hz,
         "on_axis_spl_db": on_axis_spl_db,
         "timings": result.timings,
+        "source_area_m2": source_area_m2,
     }
 
 
@@ -3219,6 +3876,9 @@ def _write_one_source_derived_outputs_from_basis(
             )
         except json.JSONDecodeError:
             previous_payload = {}
+    surface_pressure_avg = previous_payload.get("surface_pressure_avg", {})
+    if basis.surface_pressure_avg_solver is not None:
+        surface_pressure_avg = {str(source_tag): basis.surface_pressure_avg_solver}
     _write_json(
         result_json,
         {
@@ -3229,7 +3889,7 @@ def _write_one_source_derived_outputs_from_basis(
             "on_axis_spl_db": on_axis_spl_db,
             "normalized_spl_db": directivity_db,
             "impedance": previous_payload.get("impedance", {}),
-            "surface_pressure_avg": previous_payload.get("surface_pressure_avg", {}),
+            "surface_pressure_avg": surface_pressure_avg,
             "timings": previous_payload.get("timings", {}),
             "solver_log": previous_payload.get("solver_log", []),
             "mesh_info": previous_payload.get("mesh_info", {}),
@@ -3277,6 +3937,7 @@ def _write_one_source_derived_outputs_from_basis(
         "frequencies_hz": basis.frequencies_hz,
         "on_axis_spl_db": on_axis_spl_db,
         "timings": previous_payload.get("timings", {}),
+        "source_area_m2": basis.source_area_m2,
         "postprocess_only": True,
     }
 
@@ -3297,6 +3958,7 @@ def _solve_one_source(
     result = solve(str(mesh_path), config)
     return _write_one_source_outputs(
         result,
+        mesh_path,
         out_dir,
         args,
         source_name=source_name,
@@ -3343,6 +4005,7 @@ def _solve_source_group(
     for (source_name, source_tag), result in zip(group, results):
         source_result = _write_one_source_outputs(
             result,
+            mesh_path,
             out_dir,
             args,
             source_name=source_name,
@@ -3378,6 +4041,39 @@ def _apply_post_solve_derived_outputs(
     current_phase_prefix: str = "",
 ) -> None:
     source_index_by_name = {name: idx for idx, (name, _) in enumerate(sources)}
+    source_results.sort(key=lambda entry: source_index_by_name.get(entry["name"], 9999))
+    driver_lem_payload = _apply_driver_lem_coupling(
+        mesh_path,
+        out_dir,
+        args,
+        source_results=source_results,
+    )
+    if driver_lem_payload is not None:
+        manifest["driver_lem"] = driver_lem_payload
+        for source in source_results:
+            driver_payload = source.get("driver_lem")
+            if not isinstance(driver_payload, dict):
+                continue
+            outputs = driver_payload.get("outputs", {})
+            if not isinstance(outputs, dict):
+                continue
+            source_name = source["name"]
+            if outputs.get("results_npz"):
+                manifest["outputs"].setdefault("driver_lem_results_npzs", {})[
+                    source_name
+                ] = outputs["results_npz"]
+            if outputs.get("impedance_zma"):
+                manifest["outputs"].setdefault("driver_lem_impedance_zmas", {})[
+                    source_name
+                ] = outputs["impedance_zma"]
+            if outputs.get("excursion_png"):
+                manifest["outputs"].setdefault("driver_lem_excursion_pngs", {})[
+                    source_name
+                ] = outputs["excursion_png"]
+            if outputs.get("active_pressure_npz"):
+                manifest["outputs"].setdefault("driver_lem_active_pressure_npzs", {})[
+                    source_name
+                ] = outputs["active_pressure_npz"]
     response_curves = [
         FrequencyResponseCurve(
             frequencies=source_result["frequencies_hz"],
@@ -3387,7 +4083,6 @@ def _apply_post_solve_derived_outputs(
         )
         for source_result in source_results
     ]
-    source_results.sort(key=lambda entry: source_index_by_name.get(entry["name"], 9999))
     response_curves.sort(key=lambda curve: source_index_by_name.get(curve.label, 9999))
 
     combined_mesh_valid_hz = min(source_mesh_valid.values()) if source_mesh_valid else None
@@ -3411,6 +4106,13 @@ def _apply_post_solve_derived_outputs(
     manifest["outputs"]["source_pressure_basis_npzs"] = {
         source["name"]: source["pressure_basis_npz"] for source in source_results
     }
+    active_basis_npzs = {
+        source["name"]: source["active_pressure_basis_npz"]
+        for source in source_results
+        if source.get("active_pressure_basis_npz")
+    }
+    if active_basis_npzs:
+        manifest["outputs"]["source_active_pressure_basis_npzs"] = active_basis_npzs
 
     def _run_crossover_sum(
         mf_override_npz: Path | None,
@@ -3915,7 +4617,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--passive-cardioid-driver-sd-cm2", type=float, default=None)
     parser.add_argument("--passive-cardioid-driver-bl-tm", type=float, default=None)
     parser.add_argument("--passive-cardioid-driver-re-ohm", type=float, default=None)
-    parser.add_argument("--passive-cardioid-driver-le-mh", type=float, default=0.0)
+    parser.add_argument("--passive-cardioid-driver-le-mh", type=float, default=None)
     parser.add_argument("--passive-cardioid-driver-le2-mh", type=float, default=None)
     parser.add_argument("--passive-cardioid-driver-re2-ohm", type=float, default=None)
     parser.add_argument("--passive-cardioid-driver-mmd-g", type=float, default=None)
@@ -3933,9 +4635,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--passive-cardioid-driver-qms", type=float, default=None)
-    parser.add_argument("--passive-cardioid-driver-count", type=int, default=1)
-    parser.add_argument("--passive-cardioid-drive-voltage", type=float, default=2.83)
-    parser.add_argument("--passive-cardioid-rg-ohm", type=float, default=0.0)
+    parser.add_argument("--passive-cardioid-driver-count", type=int, default=None)
+    parser.add_argument("--passive-cardioid-drive-voltage", type=float, default=None)
+    parser.add_argument("--passive-cardioid-rg-ohm", type=float, default=None)
+    parser.add_argument(
+        "--driver-lem",
+        action="append",
+        default=[],
+        help=(
+            "Per-source driver LEM spec NAME:Key=Value or NAME:/path/to/Hornresp.txt. "
+            "Hornresp units: Sd cm2, Mmd/Mms g, Cms m/N, Le mH, Xmax mm. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--driver-rear-volume-l",
+        action="append",
+        default=[],
+        help="Per-source sealed rear chamber volume NAME:L. Repeatable.",
+    )
+    parser.add_argument("--drive-voltage", type=float, default=None)
+    parser.add_argument("--rg-ohm", type=float, default=None)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -4023,6 +4742,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--polar-angle-count must be positive")
     if args.complex_k_shift < 0.0:
         raise SystemExit("--complex-k-shift must be non-negative")
+    _normalize_driver_lem_args(args)
     _validate_passive_cardioid_args(args)
 
     frame = _build_frame(args)
@@ -4064,6 +4784,22 @@ def main(argv: list[str] | None = None) -> int:
             "solver_dir": str(METAL_BEM_DIR),
             "linear_solver": "native-dense-cgesv",
             "source_freq_max_hz": dict(source_freq_max),
+            "driver_lem": {
+                "drive_voltage_v": args.drive_voltage,
+                "rg_ohm": args.rg_ohm,
+                "drivers": {
+                    spec.name: {
+                        "canonical": spec.canonical_payload(),
+                        "source": spec.source,
+                        "warnings": list(spec.warnings),
+                    }
+                    for spec in args.driver_lem_specs.values()
+                },
+                "rear_volume_l": {
+                    name: value
+                    for name, value in args.driver_rear_volume_l_by_name.items()
+                },
+            },
             "passive_cardioid": {
                 "enabled": bool(args.passive_cardioid_mf),
                 "mf_source": args.passive_cardioid_mf_source,
@@ -4091,26 +4827,9 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.passive_cardioid_coupled:
         manifest["config"]["passive_cardioid"]["coupled"] = True
-        manifest["config"]["passive_cardioid"]["drive_voltage_v"] = (
-            args.passive_cardioid_drive_voltage
+        manifest["config"]["passive_cardioid"]["driver_source"] = (
+            "driver_lem_mf_spec"
         )
-        manifest["config"]["passive_cardioid"]["rg_ohm"] = args.passive_cardioid_rg_ohm
-        manifest["config"]["passive_cardioid"]["driver"] = {
-            "sd_cm2": args.passive_cardioid_driver_sd_cm2,
-            "bl_tm": args.passive_cardioid_driver_bl_tm,
-            "re_ohm": args.passive_cardioid_driver_re_ohm,
-            "le_mh": args.passive_cardioid_driver_le_mh,
-            "le2_mh": args.passive_cardioid_driver_le2_mh,
-            "re2_ohm": args.passive_cardioid_driver_re2_ohm,
-            "mmd_g": args.passive_cardioid_driver_mmd_g,
-            "mms_g": args.passive_cardioid_driver_mms_g,
-            "cms_mm_per_n": args.passive_cardioid_driver_cms_mm_per_n,
-            "vas_l": args.passive_cardioid_driver_vas_l,
-            "fs_hz": args.passive_cardioid_driver_fs_hz,
-            "rms_kg_per_s": args.passive_cardioid_driver_rms_kg_per_s,
-            "qms": args.passive_cardioid_driver_qms,
-            "count": args.passive_cardioid_driver_count,
-        }
     manifest_path = out_dir / "direct_solve_manifest.json"
 
     if args.dry_run:
@@ -4262,6 +4981,15 @@ def main(argv: list[str] | None = None) -> int:
                     "finished_at": datetime.now().isoformat(timespec="seconds"),
                     "results_json": source_result["results_json"],
                     "pressure_basis_npz": source_result["pressure_basis_npz"],
+                    **(
+                        {
+                            "active_pressure_basis_npz": source_result[
+                                "active_pressure_basis_npz"
+                            ],
+                        }
+                        if source_result.get("active_pressure_basis_npz")
+                        else {}
+                    ),
                     "directivity_heatmap_png": source_result["directivity_heatmap_png"],
                     "frequency_response_png": source_result["frequency_response_png"],
                     "freq_max_hz": source_result["freq_max_hz"],

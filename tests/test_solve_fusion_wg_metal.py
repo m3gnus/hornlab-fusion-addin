@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.util
 import json
+import logging
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -31,6 +33,136 @@ def _load_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_fake_solver_imports(workspace_root: Path, *, origin: str) -> None:
+    sim_methods = workspace_root / "hornlab-sim" / "hornlab_sim" / "methods"
+    sim_methods.mkdir(parents=True)
+    (sim_methods.parent / "__init__.py").write_text(
+        f"ORIGIN = {origin!r}\n",
+        encoding="utf-8",
+    )
+    sim_methods.joinpath("__init__.py").write_text(
+        "\n".join(
+            [
+                f"bandpass = {origin + '-bandpass'!r}",
+                f"driver_coupling = {origin + '-driver-coupling'!r}",
+                "class _RadiationImpedance:",
+                "    RHO_AIR = 1.2",
+                "    C_AIR = 343.0",
+                "radiation_impedance = _RadiationImpedance()",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    plots_pkg = workspace_root / "hornlab-plots" / "hornlab_plots"
+    plots_pkg.mkdir(parents=True)
+    plots_pkg.joinpath("__init__.py").write_text(
+        "\n".join(
+            [
+                f"ORIGIN = {origin!r}",
+                "class FrequencyResponseCurve:",
+                "    def __init__(self, **kwargs):",
+                "        self.__dict__.update(kwargs)",
+                "def save_directivity_plot(*args, **kwargs):",
+                "    return None",
+                "def save_frequency_response_plot(*args, **kwargs):",
+                "    return None",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bem_pkg = workspace_root / "hornlab-metal-bem" / "hornlab_metal_bem"
+    bem_pkg.mkdir(parents=True)
+    bem_pkg.joinpath("__init__.py").write_text(
+        "\n".join(
+            [
+                f"ORIGIN = {origin!r}",
+                "class ObservationConfig:",
+                "    pass",
+                "class ObservationFrame:",
+                "    pass",
+                "class SolveConfig:",
+                "    pass",
+                "def solve(*args, **kwargs):",
+                "    return None",
+                "def solve_multi_source(*args, **kwargs):",
+                "    return None",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_workspace_sibling_path_precedence_prefers_top_level_packages(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "hornlab-fusion-addin"
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True)
+    fake_script = scripts_dir / "solve_fusion_wg_metal.py"
+    fake_script.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+
+    helper_dir = repo / "fusion-addins" / "WGMetalPipeline"
+    helper_dir.mkdir(parents=True)
+    helper_dir.joinpath("fusion_pipeline_launch.py").write_text(
+        "\n".join(
+            [
+                "class DriverLemParseError(Exception):",
+                "    pass",
+                "class DriverLemSpec:",
+                "    pass",
+                "def parse_driver_lem_cli_entries(entries):",
+                "    return {}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _write_fake_solver_imports(tmp_path, origin="top")
+    legacy_root = tmp_path / "HornLab"
+    _write_fake_solver_imports(legacy_root, origin="legacy")
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    for name in list(sys.modules):
+        if name == "fusion_pipeline_launch" or name.startswith(
+            ("hornlab_sim", "hornlab_plots", "hornlab_metal_bem")
+        ):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "solve_fusion_wg_metal_precedence_test",
+            fake_script,
+        )
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        assert module.bandpass == "top-bandpass"
+        assert module.HORNLAB_SIM_DIR == (
+            tmp_path / "hornlab-sim" / "hornlab_sim"
+        ).resolve()
+        assert module.HORNLAB_PLOTS_DIR == (
+            tmp_path / "hornlab-plots" / "hornlab_plots"
+        ).resolve()
+        assert module.METAL_BEM_DIR == (
+            tmp_path / "hornlab-metal-bem" / "hornlab_metal_bem"
+        ).resolve()
+    finally:
+        for name in list(sys.modules):
+            if name == "fusion_pipeline_launch" or name.startswith(
+                ("hornlab_sim", "hornlab_plots", "hornlab_metal_bem")
+            ):
+                sys.modules.pop(name, None)
 
 
 def test_voltage_drive_pressure_scales_by_cone_acceleration():
@@ -146,6 +278,10 @@ def test_dry_run_writes_manifest_for_current_smoke_mesh(tmp_path):
     assert '"native_check_open_edges": true' in manifest
     assert '"bem_formulation": "complex_k"' in manifest
     assert '"complex_k_shift": 0.005' in manifest
+    payload = json.loads(manifest)
+    assert payload["config"]["hornlab_sim_dir"]
+    assert payload["config"]["hornlab_plots_dir"]
+    assert payload["config"]["hornlab_metal_bem_dir"]
     assert '"tag": 2' in manifest
     assert '"tag": 4' in manifest
 
@@ -2140,7 +2276,7 @@ def test_beamwidth_minus6_db_synthetic_beam_per_plane():
         axis=0,
     ).astype(np.complex128)
 
-    widths, limited = module._beamwidth_minus6_db_by_plane(
+    widths, limited, assumed_symmetric = module._beamwidth_minus6_db_by_plane(
         pressure,
         angles,
         planes,
@@ -2150,6 +2286,55 @@ def test_beamwidth_minus6_db_synthetic_beam_per_plane():
     np.testing.assert_allclose(widths["vertical"], 80.0, atol=1.0e-9)
     assert not np.any(limited["horizontal"])
     assert not np.any(limited["vertical"])
+    assert not np.any(assumed_symmetric["horizontal"])
+    assert not np.any(assumed_symmetric["vertical"])
+
+
+def test_beamwidth_flags_one_sided_symmetry_assumption_in_artifacts(tmp_path):
+    module = _load_script()
+    freqs = np.array([500.0, 1000.0], dtype=np.float64)
+    one_sided_angles = np.linspace(0.0, 90.0, 91)
+    planes = np.array(["horizontal"], dtype=str)
+    polar_distance_m = 2.0
+    pattern = 10.0 ** ((-6.0 * (one_sided_angles / 30.0) ** 2) / 20.0)
+    common_delay = np.exp(
+        -1j * 2.0 * np.pi * freqs * polar_distance_m / module.SPEED_OF_SOUND_M_S
+    )
+    pressure = common_delay[:, None, None] * pattern[None, None, :]
+
+    outputs = module._write_pressure_grid_derived_artifacts(
+        tmp_path,
+        "one-sided",
+        label="One sided",
+        frequencies_hz=freqs,
+        angles_deg=one_sided_angles,
+        planes=planes,
+        pressure_complex=pressure,
+        polar_distance_m=polar_distance_m,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    payload = json.loads(Path(outputs["beamwidth_json"]).read_text(encoding="utf-8"))
+    assert payload["assumed_symmetric_from_one_sided_grid"]["horizontal"] == [
+        True,
+        True,
+    ]
+    with Path(outputs["beamwidth_csv"]).open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [
+        row["horizontal_assumed_symmetric_from_one_sided_grid"] for row in rows
+    ] == ["true", "true"]
+
+    full_angles = np.linspace(-90.0, 90.0, 181)
+    full_pattern = 10.0 ** ((-6.0 * (full_angles / 30.0) ** 2) / 20.0)
+    full_pressure = common_delay[:, None, None] * full_pattern[None, None, :]
+    _widths, _limited, full_assumed = module._beamwidth_minus6_db_by_plane(
+        full_pressure,
+        full_angles,
+        planes,
+    )
+    assert not np.any(full_assumed["horizontal"])
 
 
 def test_group_delay_engineering_pure_delay_is_positive():
@@ -2166,6 +2351,27 @@ def test_group_delay_engineering_pure_delay_is_positive():
         -2.0 * np.pi * freqs * tau_s,
         atol=1.0e-12,
     )
+
+
+def test_group_delay_sparse_log_grid_removes_common_propagation_delay(caplog):
+    module = _load_script()
+    freqs = np.geomspace(50.0, 20000.0, 60)
+    polar_distance_m = 2.0
+    tau_s = polar_distance_m / module.SPEED_OF_SOUND_M_S + 0.2e-3
+    pressure = np.exp(-1j * 2.0 * np.pi * freqs * tau_s)
+
+    with caplog.at_level(logging.WARNING):
+        group_delay_s, _phase_rad = module._group_delay_from_pressure(
+            freqs,
+            pressure,
+            polar_distance_m=polar_distance_m,
+            warning_label="synthetic sparse band",
+        )
+
+    assert not [record for record in caplog.records if record.name == module.LOGGER.name]
+    assert np.all(np.isfinite(group_delay_s))
+    assert np.min(group_delay_s) > 0.0
+    np.testing.assert_allclose(group_delay_s, tau_s, rtol=0.01)
 
 
 def test_crossover_combine_skips_single_source_gracefully(tmp_path):

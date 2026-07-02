@@ -155,6 +155,22 @@ _STALE_SETTINGS_KEY_VERSIONS = {
     "passive_cardioid_drive_voltage": 12,
     "passive_cardioid_rg_ohm": 12,
 }
+_LEGACY_PASSIVE_CARDIOID_DRIVER_FIELDS = (
+    ("passive_cardioid_driver_sd_cm2", "Sd", 1.0),
+    ("passive_cardioid_driver_bl_tm", "Bl", 1.0),
+    ("passive_cardioid_driver_re_ohm", "Re", 1.0),
+    ("passive_cardioid_driver_le_mh", "Le", 1.0),
+    ("passive_cardioid_driver_le2_mh", "Le2", 1.0),
+    ("passive_cardioid_driver_re2_ohm", "Re2", 1.0),
+    ("passive_cardioid_driver_mmd_g", "Mmd", 1.0),
+    ("passive_cardioid_driver_mms_g", "Mms", 1.0),
+    ("passive_cardioid_driver_cms_mm_per_n", "Cms", 1.0e-3),
+    ("passive_cardioid_driver_vas_l", "Vas", 1.0),
+    ("passive_cardioid_driver_fs_hz", "Fs", 1.0),
+    ("passive_cardioid_driver_rms_kg_per_s", "Rms", 1.0),
+    ("passive_cardioid_driver_qms", "Qms", 1.0),
+    ("passive_cardioid_driver_count", "N", 1.0),
+)
 
 _handlers = []
 _control = None
@@ -228,6 +244,48 @@ def _input_value(inputs, input_id: str):
     return item.value if item else None
 
 
+def _legacy_passive_cardioid_driver_payload(loaded: dict) -> str:
+    pieces: list[str] = []
+    for key, canonical, scale in _LEGACY_PASSIVE_CARDIOID_DRIVER_FIELDS:
+        raw = str(loaded.get(key, "")).strip()
+        if not raw:
+            continue
+        try:
+            value = float(raw) * scale
+        except ValueError:
+            value_text = raw
+        else:
+            value_text = f"{value:g}"
+        pieces.append(f"{canonical}={value_text}")
+    return ",".join(pieces)
+
+
+def _migrate_v11_passive_cardioid_driver_settings(
+    loaded: dict,
+    loaded_version: int,
+) -> None:
+    if loaded_version >= 12 or not bool(loaded.get("passive_cardioid_coupled")):
+        return
+    if not str(loaded.get("mf_driver_lem", "")).strip():
+        payload = _legacy_passive_cardioid_driver_payload(loaded)
+        if payload:
+            try:
+                spec = _fusion_pipeline_launch.parse_driver_lem_spec("MF", payload)
+            except _fusion_pipeline_launch.DriverLemParseError:
+                loaded["passive_cardioid_coupled"] = False
+            else:
+                loaded["mf_driver_lem"] = spec.canonical_payload()
+        else:
+            loaded["passive_cardioid_coupled"] = False
+    if loaded.get("passive_cardioid_coupled") is not False:
+        drive_voltage = str(loaded.get("passive_cardioid_drive_voltage", "")).strip()
+        rg_ohm = str(loaded.get("passive_cardioid_rg_ohm", "")).strip()
+        if drive_voltage:
+            loaded["drive_voltage"] = drive_voltage
+        if rg_ohm:
+            loaded["rg_ohm"] = rg_ohm
+
+
 def _load_settings() -> dict:
     try:
         loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -241,6 +299,7 @@ def _load_settings() -> dict:
         loaded_version = int(loaded.get("settings_version", 1))
     except (TypeError, ValueError):
         loaded_version = 1
+    _migrate_v11_passive_cardioid_driver_settings(loaded, loaded_version)
     for key, stale_version in _STALE_SETTINGS_KEY_VERSIONS.items():
         if loaded_version < stale_version:
             loaded.pop(key, None)

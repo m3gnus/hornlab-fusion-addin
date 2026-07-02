@@ -17,7 +17,10 @@ folder, and the add-in warns with the reinstall command when that happens.
 The dialog's Advanced > Python field defaults to `<repo>/.venv/bin/python` when
 that interpreter exists. Direct solves also need the HornLab solver packages:
 `hornlab-metal-bem` from `requirements.txt`, plus `hornlab_sim` and
-`hornlab_plots` from the sibling HornLab checkout when present.
+`hornlab_plots`. Discovery order is top-level workspace siblings next to this
+repo (`../hornlab-sim`, `../hornlab-plots`, `../hornlab-metal-bem`), then
+legacy `../HornLab/*` checkouts, then packages installed in the active
+environment.
 
 ## 2. Preparing Your Fusion Design
 

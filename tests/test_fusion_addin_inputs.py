@@ -280,6 +280,80 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
     assert settings["drive_voltage"] == "2.83"
     assert settings["rg_ohm"] == "0"
 
+    # A coupled v11 file migrates the removed passive-cardioid driver controls
+    # into the current MF driver T/S field before the stale keys are dropped.
+    settings_path.write_text(
+        json.dumps(
+            {
+                "settings_version": 11,
+                "passive_cardioid_coupled": True,
+                "passive_cardioid_driver_sd_cm2": "320",
+                "passive_cardioid_driver_bl_tm": "11.6",
+                "passive_cardioid_driver_re_ohm": "5.2",
+                "passive_cardioid_driver_le_mh": "0.8",
+                "passive_cardioid_driver_le2_mh": "0.2",
+                "passive_cardioid_driver_re2_ohm": "3.5",
+                "passive_cardioid_driver_mmd_g": "26.2",
+                "passive_cardioid_driver_mms_g": "29.4",
+                "passive_cardioid_driver_cms_mm_per_n": "0.252",
+                "passive_cardioid_driver_vas_l": "33",
+                "passive_cardioid_driver_fs_hz": "55",
+                "passive_cardioid_driver_rms_kg_per_s": "3.18",
+                "passive_cardioid_driver_qms": "4.1",
+                "passive_cardioid_driver_count": "2",
+                "passive_cardioid_drive_voltage": "4",
+                "passive_cardioid_rg_ohm": "0.2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = addin._load_settings()
+    assert settings["passive_cardioid_coupled"] is True
+    assert settings["drive_voltage"] == "4"
+    assert settings["rg_ohm"] == "0.2"
+    spec = addin._fusion_pipeline_launch.parse_driver_lem_spec(
+        "MF",
+        settings["mf_driver_lem"],
+    )
+    assert spec.params["sd_m2"] == pytest.approx(0.032)
+    assert spec.params["cms_m_per_n"] == pytest.approx(0.000252)
+    assert spec.params["n_drivers"] == 2
+    for stale_key in (
+        "passive_cardioid_driver_sd_cm2",
+        "passive_cardioid_driver_bl_tm",
+        "passive_cardioid_driver_re_ohm",
+        "passive_cardioid_driver_le_mh",
+        "passive_cardioid_driver_le2_mh",
+        "passive_cardioid_driver_re2_ohm",
+        "passive_cardioid_driver_mmd_g",
+        "passive_cardioid_driver_mms_g",
+        "passive_cardioid_driver_cms_mm_per_n",
+        "passive_cardioid_driver_vas_l",
+        "passive_cardioid_driver_fs_hz",
+        "passive_cardioid_driver_rms_kg_per_s",
+        "passive_cardioid_driver_qms",
+        "passive_cardioid_driver_count",
+        "passive_cardioid_drive_voltage",
+        "passive_cardioid_rg_ohm",
+    ):
+        assert stale_key not in settings
+
+    # An incomplete coupled v11 driver cannot launch safely, so migration
+    # disables coupled mode instead of keeping a runnable-looking bad config.
+    settings_path.write_text(
+        json.dumps(
+            {
+                "settings_version": 11,
+                "passive_cardioid_coupled": True,
+                "passive_cardioid_driver_sd_cm2": "320",
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = addin._load_settings()
+    assert settings["passive_cardioid_coupled"] is False
+    assert settings["mf_driver_lem"] == ""
+
     # A pre-v9 file drops the whole stale set.
     settings_path.write_text(
         json.dumps(

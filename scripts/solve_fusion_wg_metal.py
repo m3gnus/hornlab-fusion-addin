@@ -27,6 +27,7 @@ import argparse
 import fcntl
 from datetime import datetime
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -39,18 +40,21 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
+LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # Workspace checkouts win over installed packages when present. The HornLab
 # helper packages may be checked out as top-level siblings or inside a sibling
 # HornLab repo; elsewhere imports resolve from the active environment.
-for package_dir in (
+_WORKSPACE_PACKAGE_CANDIDATES = (
     REPO_ROOT / "fusion-addins" / "WGMetalPipeline",
     REPO_ROOT.parent / "hornlab-metal-bem",
     REPO_ROOT.parent / "hornlab-plots",
     REPO_ROOT.parent / "hornlab-sim",
+    REPO_ROOT.parent / "HornLab" / "hornlab-metal-bem",
     REPO_ROOT.parent / "HornLab" / "hornlab-plots",
     REPO_ROOT.parent / "HornLab" / "hornlab-sim",
-):
+)
+for package_dir in reversed(_WORKSPACE_PACKAGE_CANDIDATES):
     if package_dir.is_dir() and str(package_dir) not in sys.path:
         sys.path.insert(0, str(package_dir))
 
@@ -73,7 +77,9 @@ from hornlab_metal_bem import (  # noqa: E402
     solve_multi_source,
 )
 
-# Recorded in manifests: where the solver package actually resolved from.
+# Recorded in manifests: where the helper packages actually resolved from.
+HORNLAB_SIM_DIR = Path(sys.modules["hornlab_sim"].__file__).resolve().parent
+HORNLAB_PLOTS_DIR = Path(sys.modules["hornlab_plots"].__file__).resolve().parent
 METAL_BEM_DIR = Path(sys.modules["hornlab_metal_bem"].__file__).resolve().parent
 
 
@@ -2292,6 +2298,9 @@ POLAR_POWER_APPROXIMATION_NOTE = (
     "polar angle, solid-angle weighted, and extrapolated to 4*pi; this is not "
     "a full-sphere integration."
 )
+BEAMWIDTH_SYMMETRY_NOTE = (
+    "One-sided angle grid: -6 dB beamwidth assumes symmetry about 0 deg."
+)
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list[float | str | None]]) -> None:
@@ -2424,22 +2433,52 @@ def _phase_deg_from_pressure(pressure: np.ndarray) -> np.ndarray:
 def _group_delay_from_pressure(
     frequencies_hz: np.ndarray,
     pressure: np.ndarray,
+    *,
+    polar_distance_m: float | None = None,
+    warning_label: str = "on-axis response",
 ) -> tuple[np.ndarray, np.ndarray]:
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
     values = np.asarray(pressure, dtype=np.complex128)
-    phase_rad = np.unwrap(np.angle(values))
+    omega = 2.0 * np.pi * freqs
+    common_delay_s = (
+        float(polar_distance_m) / SPEED_OF_SOUND_M_S
+        if polar_distance_m is not None
+        else 0.0
+    )
+    residual_pressure = values * np.exp(1j * omega * common_delay_s)
+    residual_phase_rad = np.unwrap(np.angle(residual_pressure))
+    phase_rad = residual_phase_rad - omega * common_delay_s
     if freqs.size < 2:
         return np.full(freqs.shape, np.nan, dtype=np.float64), phase_rad
-    omega = 2.0 * np.pi * freqs
     edge_order = 2 if freqs.size > 2 else 1
-    return -np.gradient(phase_rad, omega, edge_order=edge_order), phase_rad
+    group_delay_s = (
+        -np.gradient(residual_phase_rad, omega, edge_order=edge_order)
+        + common_delay_s
+    )
+    residual_steps_rad = np.abs(np.diff(residual_phase_rad))
+    ambiguous_intervals = residual_steps_rad > (np.pi + 1.0e-12)
+    if np.any(ambiguous_intervals):
+        ambiguous_bins = np.zeros(freqs.shape, dtype=bool)
+        ambiguous_bins[:-1] |= ambiguous_intervals
+        ambiguous_bins[1:] |= ambiguous_intervals
+        group_delay_s[ambiguous_bins] = np.nan
+        band = freqs[ambiguous_bins]
+        LOGGER.warning(
+            "Group delay residual phase for %s remains ambiguous from %.6g to %.6g Hz; "
+            "marked %d bins NaN.",
+            warning_label,
+            float(np.min(band)),
+            float(np.max(band)),
+            int(np.count_nonzero(ambiguous_bins)),
+        )
+    return group_delay_s, phase_rad
 
 
 def _beamwidth_minus6_db_by_plane(
     pressure_complex: np.ndarray,
     angles_deg: np.ndarray,
     planes: np.ndarray,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
     pressure = np.asarray(pressure_complex, dtype=np.complex128)
     angles = np.asarray(angles_deg, dtype=np.float64)
     order = np.argsort(angles)
@@ -2449,6 +2488,7 @@ def _beamwidth_minus6_db_by_plane(
     threshold_db = -6.0
     widths: dict[str, np.ndarray] = {}
     limited: dict[str, np.ndarray] = {}
+    assumed_symmetric: dict[str, np.ndarray] = {}
 
     def _edge(rel_db: np.ndarray, start: int, step: int) -> tuple[float, bool]:
         idx = start
@@ -2487,7 +2527,12 @@ def _beamwidth_minus6_db_by_plane(
                 plane_limited[freq_index] = left_limited or right_limited
         widths[str(plane)] = plane_widths
         limited[str(plane)] = plane_limited
-    return widths, limited
+        assumed_symmetric[str(plane)] = np.full(
+            pressure.shape[0],
+            one_sided_positive,
+            dtype=bool,
+        )
+    return widths, limited, assumed_symmetric
 
 
 def _apply_mesh_valid_markers(
@@ -2640,6 +2685,7 @@ def _save_beamwidth_plot(
     title: str,
     mesh_valid_hz: float | None,
     mesh_valid_radiating_hz: float | None,
+    assumed_symmetric_from_one_sided_grid: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415
     from hornlab_plots.style import AXES_BG, FIGURE_BG, RESPONSE_COLORS, SPINE_COLOR, TEXT_COLOR  # noqa: PLC0415
@@ -2678,7 +2724,20 @@ def _save_beamwidth_plot(
         labelcolor=TEXT_COLOR,
     )
     legend.get_frame().set_alpha(0.92)
-    fig.tight_layout(pad=1.5)
+    if assumed_symmetric_from_one_sided_grid:
+        fig.text(
+            0.5,
+            0.01,
+            BEAMWIDTH_SYMMETRY_NOTE,
+            ha="center",
+            va="bottom",
+            color=TEXT_COLOR,
+            fontsize=8,
+            alpha=0.78,
+        )
+        fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0), pad=1.5)
+    else:
+        fig.tight_layout(pad=1.5)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
@@ -2815,7 +2874,11 @@ def _write_pressure_grid_derived_artifacts(
     beamwidth_png = out_dir / f"{safe_stem}_beamwidth.png"
     beamwidth_csv = out_dir / f"{safe_stem}_beamwidth.csv"
     beamwidth_json = out_dir / f"{safe_stem}_beamwidth.json"
-    beamwidths, beamwidth_limited = _beamwidth_minus6_db_by_plane(
+    (
+        beamwidths,
+        beamwidth_limited,
+        beamwidth_assumed_symmetric,
+    ) = _beamwidth_minus6_db_by_plane(
         pressure,
         angles,
         plane_names,
@@ -2827,17 +2890,28 @@ def _write_pressure_grid_derived_artifacts(
         title=f"{label} -6 dB Beamwidth",
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        assumed_symmetric_from_one_sided_grid=any(
+            bool(np.any(flags)) for flags in beamwidth_assumed_symmetric.values()
+        ),
     )
     beam_header = ["frequency_hz"]
     for plane in beamwidths:
         beam_header.append(f"{_safe_stem(plane)}_beamwidth_deg")
         beam_header.append(f"{_safe_stem(plane)}_limited_by_grid")
+        beam_header.append(
+            f"{_safe_stem(plane)}_assumed_symmetric_from_one_sided_grid"
+        )
     beam_rows: list[list[float | str | None]] = []
     for freq_index, freq in enumerate(freqs):
         row: list[float | str | None] = [float(freq)]
         for plane in beamwidths:
             row.append(float(beamwidths[plane][freq_index]))
             row.append("true" if bool(beamwidth_limited[plane][freq_index]) else "false")
+            row.append(
+                "true"
+                if bool(beamwidth_assumed_symmetric[plane][freq_index])
+                else "false"
+            )
         beam_rows.append(row)
     _write_csv(beamwidth_csv, beam_header, beam_rows)
     _write_json(
@@ -2847,6 +2921,7 @@ def _write_pressure_grid_derived_artifacts(
             "frequencies_hz": freqs,
             "beamwidth_deg": beamwidths,
             "limited_by_grid": beamwidth_limited,
+            "assumed_symmetric_from_one_sided_grid": beamwidth_assumed_symmetric,
             "threshold_db": -6.0,
         },
     )
@@ -2856,7 +2931,12 @@ def _write_pressure_grid_derived_artifacts(
     group_delay_json = out_dir / f"{safe_stem}_group_delay.json"
     on_axis_idx = int(np.argmin(np.abs(angles)))
     on_axis_pressure = pressure[:, 0, on_axis_idx]
-    group_delay_s, phase_rad = _group_delay_from_pressure(freqs, on_axis_pressure)
+    group_delay_s, phase_rad = _group_delay_from_pressure(
+        freqs,
+        on_axis_pressure,
+        polar_distance_m=polar_distance_m,
+        warning_label=label,
+    )
     _save_group_delay_plot(
         group_delay_png,
         freqs,
@@ -2882,7 +2962,12 @@ def _write_pressure_grid_derived_artifacts(
             "group_delay_ms": group_delay_s * 1000.0,
             "unwrapped_phase_deg": np.degrees(phase_rad),
             "phase_convention": PRESSURE_NPZ_PHASE_CONVENTION,
-            "formula": "-d(unwrap(angle(p_engineering)))/d(omega)",
+            "common_propagation_delay_s": float(polar_distance_m)
+            / SPEED_OF_SOUND_M_S,
+            "formula": (
+                "common_delay_s - d(unwrap(angle(p_engineering * "
+                "exp(+j*omega*common_delay_s))))/d(omega)"
+            ),
         },
     )
     return {
@@ -5724,6 +5809,9 @@ def main(argv: list[str] | None = None) -> int:
             "metal_native_assembly_mode": args.metal_native_assembly_mode,
             "solver_package": "hornlab_metal_bem",
             "solver_dir": str(METAL_BEM_DIR),
+            "hornlab_sim_dir": str(HORNLAB_SIM_DIR),
+            "hornlab_plots_dir": str(HORNLAB_PLOTS_DIR),
+            "hornlab_metal_bem_dir": str(METAL_BEM_DIR),
             "linear_solver": "native-dense-cgesv",
             "source_freq_max_hz": dict(source_freq_max),
             "driver_lem": {

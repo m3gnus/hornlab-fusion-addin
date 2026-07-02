@@ -37,11 +37,11 @@ under Advanced > Python (default: `<repo>/.venv/bin/python` when present).
 - Meshing/diagnostics need `numpy`, `gmsh`, `meshio`.
 - Direct solves need [hornlab-metal-bem](https://github.com/m3gnus/hornlab-metal-bem)
   (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages. The
-  latter two are not yet published standalone; on a HornLab workspace
-  checkout they are discovered automatically from the sibling repo. Without
-  them the mesh-only path (`Mesh only` in the dialog) still works.
-- Workspace checkouts of these packages, when present as siblings of this
-  repo, take precedence over installed copies.
+  latter two are not yet published standalone. Discovery order is top-level
+  workspace siblings next to this repo (`../hornlab-sim`, `../hornlab-plots`,
+  `../hornlab-metal-bem`), then legacy `../HornLab/*` checkouts, then packages
+  installed in the active environment. Without them the mesh-only path
+  (`Mesh only` in the dialog) still works.
 
 ## Tests
 

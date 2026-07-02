@@ -4,7 +4,7 @@ Prioritized improvement plan for the WGMetalPipeline add-in and pipeline.
 Ordered by leverage-per-complexity; the add-in should stay small, so each
 item states what it *removes* or reuses, not just what it adds.
 
-Status 2026-07-02: items 1 and 2 DONE. Item 2 followed the accepted plan in
+Status 2026-07-02: items 1, 2, and 4 DONE. Item 2 followed the accepted plan in
 [plans/per-driver-lem-coupling.md](plans/per-driver-lem-coupling.md).
 Item 3's N-driver table is DEFERRED by owner decision (three fixed slots are
 enough for now); its T/S + Hornresp-import half moved into item 2.
@@ -84,20 +84,25 @@ add-on once the driver table exists. Note Hornresp provides **Mmd** (dialog
 currently exposes Mms with the radiation-mass correction; the CLI already
 accepts Mmd — expose it in the dialog with the import).
 
-## 4. Cheap new outputs from data the pipeline already has
+## 4. Cheap new outputs from data the pipeline already has — DONE
 
 Per-driver complex pressure over the full angle grid is already stored in
-`<source>_pressure_basis.npz`; these fall out of it:
+`<source>_pressure_basis.npz`; these now fall out of it in normal runs and
+`--postprocess-only` reruns:
 
 - **Directivity index + power response** (integrate intensity over the
-  polar grid) and **beamwidth vs frequency** (−6 dB width) — small
-  numerics, big diagnostic value; plot alongside the existing heatmaps
-- **Group delay** (d phase/d f of the exported complex pressure), per driver
-  and for the aligned sum
-- **Port-velocity plots** for coupled ported/cardioid paths with an excursion
-  companion where needed. Per-driver direct excursion plots shipped with item 2.
-- **Phase overlay** on the response plots (phase is already in the FRDs;
-  show it in the PNGs too)
+  polar grid) and **beamwidth vs frequency** (-6 dB width), written per source
+  and for the aligned crossover sum as PNG, CSV, and JSON.
+- **Group delay** from `-d(unwrap(angle(p_engineering)))/d(omega)`, per-driver
+  on axis and for the aligned sum. The implementation uses the stored
+  engineering `e^{+j omega t}` pressure; a synthetic `e^{-j omega tau}` delay
+  reports `+tau`.
+- **Phase overlay** on frequency-response PNGs using wrapped engineering phase.
+
+The DI/power response is a solid-angle-weighted polar-cut approximation:
+stored horizontal/vertical cuts are not a full sphere, so the plot caption and
+JSON report state that intensity is plane-averaged at each polar angle and
+extrapolated to `4*pi`.
 
 Deliberately later: impulse/step responses (needs a dense linear frequency
 grid — a solve-cost decision, not a post-processing one).

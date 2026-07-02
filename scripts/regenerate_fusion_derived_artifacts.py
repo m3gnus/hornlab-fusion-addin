@@ -21,6 +21,9 @@ DERIVED_MARKERS = (
     "driver_time_alignment.txt",
     "combined_frequency_response_time_aligned.png",
     "combined_directivity_heatmap_time_aligned.png",
+    "combined_time_aligned_directivity_index_power_response.png",
+    "combined_time_aligned_beamwidth.png",
+    "combined_time_aligned_group_delay.png",
     "MF_passive_cardioid_results.npz",
     "MF_passive_cardioid_coupled_results.npz",
 )

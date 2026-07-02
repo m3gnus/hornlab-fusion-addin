@@ -816,7 +816,12 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
 
     for path in (
         out_dir / "MF_frequency_response.png",
+        out_dir / "MF_group_delay.png",
+        out_dir / "MF_beamwidth.csv",
+        out_dir / "MF_directivity_index_power_response.json",
         out_dir / "combined_frequency_response_time_aligned.png",
+        out_dir / "combined_time_aligned_group_delay.csv",
+        out_dir / "combined_time_aligned_directivity_index_power_response.json",
         out_dir / "driver_time_alignment.txt",
         out_dir / "vituixcad" / "hor" / "MF 0.frd",
     ):
@@ -840,7 +845,12 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
     assert module.main([*argv, "--postprocess-only"]) == 0
     for path in (
         out_dir / "MF_frequency_response.png",
+        out_dir / "MF_group_delay.png",
+        out_dir / "MF_beamwidth.csv",
+        out_dir / "MF_directivity_index_power_response.json",
         out_dir / "combined_frequency_response_time_aligned.png",
+        out_dir / "combined_time_aligned_group_delay.csv",
+        out_dir / "combined_time_aligned_directivity_index_power_response.json",
         out_dir / "driver_time_alignment.txt",
         out_dir / "vituixcad" / "hor" / "MF 0.frd",
     ):
@@ -854,6 +864,12 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
     manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
     assert manifest["postprocess_only"] is True
     assert manifest["status"] == "complete"
+    assert manifest["outputs"]["source_group_delay_pngs"]["MF"].endswith(
+        "MF_group_delay.png"
+    )
+    assert manifest["outputs"]["combined_time_aligned_group_delay_csv"].endswith(
+        "combined_time_aligned_group_delay.csv"
+    )
 
 
 def test_postprocess_only_without_port_exit_mirrors_original_cardioid_skip(
@@ -2063,6 +2079,93 @@ def test_harmonize_bases_zeroes_clamped_source_above_its_band():
     assert np.all(grids["LF"][above] == 0.0)
     assert np.all(np.abs(grids["LF"][~above]) > 0.0)
     np.testing.assert_allclose(np.abs(grids["HF"]), 0.02)
+
+
+def test_directivity_power_integration_monopole_and_dipole():
+    module = _load_script()
+    freqs = np.array([100.0, 500.0], dtype=np.float64)
+    angles = np.linspace(0.0, 180.0, 721)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    monopole = np.full(
+        (freqs.size, planes.size, angles.size),
+        0.02 + 0.0j,
+        dtype=np.complex128,
+    )
+
+    mono = module._directivity_power_metrics_from_pressure(
+        monopole,
+        angles,
+        polar_distance_m=2.0,
+    )
+
+    np.testing.assert_allclose(mono["directivity_index_db"], 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(mono["power_response_db"], 60.0, atol=1.0e-10)
+    expected_power = (
+        4.0
+        * np.pi
+        * 2.0**2
+        * (0.02**2)
+        / (module.radiation_impedance.RHO_AIR * module.radiation_impedance.C_AIR)
+    )
+    np.testing.assert_allclose(mono["acoustic_power_w"], expected_power, rtol=1.0e-10)
+
+    dipole_pattern = np.cos(np.radians(angles))
+    dipole = dipole_pattern[None, None, :] * np.ones(
+        (freqs.size, planes.size, 1),
+        dtype=np.complex128,
+    )
+    dip = module._directivity_power_metrics_from_pressure(
+        dipole,
+        angles,
+        polar_distance_m=1.0,
+    )
+
+    np.testing.assert_allclose(
+        dip["directivity_index_db"],
+        10.0 * np.log10(3.0),
+        atol=2.0e-4,
+    )
+
+
+def test_beamwidth_minus6_db_synthetic_beam_per_plane():
+    module = _load_script()
+    freqs = np.array([500.0, 1000.0, 2000.0], dtype=np.float64)
+    angles = np.linspace(-90.0, 90.0, 361)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    h_pressure = 10.0 ** ((-6.0 * (angles / 25.0) ** 2) / 20.0)
+    v_pressure = 10.0 ** ((-6.0 * (angles / 40.0) ** 2) / 20.0)
+    pressure = np.repeat(
+        np.stack([h_pressure, v_pressure], axis=0)[None, :, :],
+        freqs.size,
+        axis=0,
+    ).astype(np.complex128)
+
+    widths, limited = module._beamwidth_minus6_db_by_plane(
+        pressure,
+        angles,
+        planes,
+    )
+
+    np.testing.assert_allclose(widths["horizontal"], 50.0, atol=1.0e-9)
+    np.testing.assert_allclose(widths["vertical"], 80.0, atol=1.0e-9)
+    assert not np.any(limited["horizontal"])
+    assert not np.any(limited["vertical"])
+
+
+def test_group_delay_engineering_pure_delay_is_positive():
+    module = _load_script()
+    freqs = np.linspace(100.0, 2000.0, 200)
+    tau_s = 0.0007
+    pressure = np.exp(-1j * 2.0 * np.pi * freqs * tau_s)
+
+    group_delay_s, phase_rad = module._group_delay_from_pressure(freqs, pressure)
+
+    np.testing.assert_allclose(group_delay_s, tau_s, atol=1.0e-12)
+    np.testing.assert_allclose(
+        phase_rad,
+        -2.0 * np.pi * freqs * tau_s,
+        atol=1.0e-12,
+    )
 
 
 def test_crossover_combine_skips_single_source_gracefully(tmp_path):

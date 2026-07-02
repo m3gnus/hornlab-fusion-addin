@@ -85,9 +85,17 @@ Start with per-driver files:
 
 - `<SOURCE>_frequency_response.png`: on-axis SPL for that source. Coupled
   Driver LEM sources are at the run voltage; uncoupled sources are unit-source
-  levels.
+  levels. Dashed overlays show wrapped on-axis phase on the right axis.
 - `<SOURCE>_directivity_heatmap.png`: normalized directivity over the solved
   polar grid.
+- `<SOURCE>_directivity_index_power_response.*`: DI and power-response PNG,
+  CSV, and JSON from solid-angle-weighted polar-cut intensity integration. The
+  report text notes that this is an approximation because the stored cuts are
+  not full-sphere samples.
+- `<SOURCE>_beamwidth.*`: per-plane -6 dB beamwidth vs frequency as PNG, CSV,
+  and JSON.
+- `<SOURCE>_group_delay.*`: on-axis group delay vs frequency as PNG, CSV, and
+  JSON, computed from unwrapped engineering-convention pressure phase.
 - `<SOURCE>_pressure_basis.npz`: saved complex pressure basis used for
   postprocess reruns.
 - `<SOURCE>_impedance.zma` and `<SOURCE>_excursion.png`: written for direct
@@ -96,15 +104,20 @@ Start with per-driver files:
 
 Then read combined outputs:
 
-- `combined_frequency_response.png`: direct source responses together.
+- `combined_frequency_response.png`: direct source responses together, with
+  wrapped phase overlays.
 - `combined_frequency_response_time_aligned.png`: LR4 filtered, level-matched,
-  delay-aligned sum when crossover fields are set.
+  delay-aligned sum when crossover fields are set, with wrapped phase overlays.
 - `combined_directivity_heatmap_time_aligned.png`: directivity of that aligned
   sum.
+- `combined_time_aligned_directivity_index_power_response.*`,
+  `combined_time_aligned_beamwidth.*`, and
+  `combined_time_aligned_group_delay.*`: the same DI/power, beamwidth, and
+  group-delay sidecars for the aligned crossover sum.
 - `combined_interference_heatmap_time_aligned.png`: coherent vs incoherent
   interaction between drivers.
 - `combined_frequency_response_off_axis_<plane>.png`: off-axis aligned sum
-  plots.
+  plots with wrapped phase overlays.
 - `driver_time_alignment.txt`: crossover frequencies, level trims, delays,
   arrival offsets, and any mesh-band alignment warnings.
 

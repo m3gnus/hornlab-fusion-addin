@@ -184,7 +184,18 @@ The output folder contains:
   `source_normalization=unit_normal_acceleration` for postprocess-only
   per-driver coupling.
 - one `<source>_directivity_heatmap.png` per solved source
-- one `<source>_frequency_response.png` per solved source
+- one `<source>_frequency_response.png` per solved source, with a dashed
+  wrapped-phase overlay on the right axis
+- one `<source>_directivity_index_power_response.{png,csv,json}` per solved
+  source. DI and power response are computed by plane-averaging the stored
+  polar cuts at each polar angle, applying solid-angle weights, and
+  extrapolating to `4*pi`; the JSON and plot caption record that this is a
+  polar-cut approximation, not full-sphere sampling.
+- one `<source>_beamwidth.{png,csv,json}` per solved source with per-plane
+  -6 dB beamwidth vs frequency
+- one `<source>_group_delay.{png,csv,json}` per solved source. Group delay is
+  `-d(unwrap(angle(p_engineering)))/d(omega)`, so a synthetic
+  `e^{-j omega tau}` delay reports `+tau`.
 - `<NAME>_driver_lem_results.npz`, `<NAME>_driver_lem_pressure.npz`,
   `<NAME>_impedance.zma`, and `<NAME>_excursion.png` for each direct source
   with a Driver LEM T/S spec. The manifest's per-source `driver_lem` block
@@ -206,16 +217,25 @@ The output folder contains:
   for a two-way with two of LF/MF/HF solved, both fields for a three-way):
   - `combined_frequency_response_time_aligned.png` — per-driver LR4-filtered
     curves plus the level-matched, delay-aligned complex sum (the DSP "best
-    result"), and the sum before delay for comparison
+    result), and the sum before delay for comparison; dashed overlays show
+    wrapped phase on the right axis
   - `combined_directivity_heatmap_time_aligned.png` — directivity of the
     aligned sum
+  - `combined_time_aligned_directivity_index_power_response.{png,csv,json}` —
+    DI and power response of the aligned sum using the same polar-cut
+    solid-angle approximation as the per-source artifacts
+  - `combined_time_aligned_beamwidth.{png,csv,json}` — per-plane -6 dB
+    beamwidth of the aligned sum
+  - `combined_time_aligned_group_delay.{png,csv,json}` — on-axis group delay
+    of the aligned sum
   - `combined_interference_heatmap_time_aligned.png` — coherent-vs-incoherent
     sum ratio per angle/frequency; 0 dB means the drivers add fully in phase,
     deep negatives mark driver-spacing cancellation (watch the crossover
     bands, where two drivers carry comparable level)
   - `combined_frequency_response_off_axis_<plane>.png` — the aligned sum at
     0/15/30/45/60 deg; on-axis delay alignment cannot fix off-axis path
-    differences, so crossover lobing shows here
+    differences, so crossover lobing shows here. Dashed overlays show wrapped
+    phase for each off-axis curve.
   - `driver_time_alignment.txt` — applied delays, implied arrival offsets,
     level trims, and crossover phase checks. When passive-cardioid MF combine
     is enabled, the crossover sum uses the combined MF+port response.

@@ -40,13 +40,14 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Workspace checkouts win over installed packages when present: the
-# hornlab-metal-bem sibling repo, and hornlab-plots/hornlab-sim inside the
-# sibling HornLab checkout. Elsewhere the imports resolve from the active
-# environment (see requirements.txt).
+# Workspace checkouts win over installed packages when present. The HornLab
+# helper packages may be checked out as top-level siblings or inside a sibling
+# HornLab repo; elsewhere imports resolve from the active environment.
 for package_dir in (
     REPO_ROOT / "fusion-addins" / "WGMetalPipeline",
     REPO_ROOT.parent / "hornlab-metal-bem",
+    REPO_ROOT.parent / "hornlab-plots",
+    REPO_ROOT.parent / "hornlab-sim",
     REPO_ROOT.parent / "HornLab" / "hornlab-plots",
     REPO_ROOT.parent / "HornLab" / "hornlab-sim",
 ):
@@ -62,7 +63,7 @@ from fusion_pipeline_launch import (  # noqa: E402
 from hornlab_plots import (  # noqa: E402
     FrequencyResponseCurve,
     save_directivity_plot,
-    save_frequency_response_plot,
+    save_frequency_response_plot as _save_frequency_response_plot,
 )
 from hornlab_metal_bem import (  # noqa: E402
     ObservationConfig,
@@ -84,6 +85,125 @@ CANONICAL_SOLVE_SOURCE_PRIORITY = {
     "LF": 2,
 }
 DEFAULT_DIRECT_SOLVE_LOCK_PATH = Path("/tmp/hornlab-fusion-direct-solve.lock")
+
+
+def _coerce_phase_overlay_curve(curve: Any) -> tuple[np.ndarray, np.ndarray, str, str, bool]:
+    if isinstance(curve, dict):
+        freqs = curve.get("frequencies", curve.get("freqs"))
+        phase = curve.get("phase_deg", curve.get("phase"))
+        label = str(curve.get("label", curve.get("role", "phase")))
+        role = str(curve.get("role", "other"))
+        crossover = bool(curve.get("crossover", False))
+    elif isinstance(curve, (list, tuple)) and len(curve) >= 2:
+        freqs = curve[0]
+        phase = curve[1]
+        label = str(curve[2]) if len(curve) > 2 else "phase"
+        role = str(curve[3]) if len(curve) > 3 else "other"
+        crossover = bool(curve[4]) if len(curve) > 4 else False
+    else:
+        raise TypeError("phase overlay curves must be dicts or tuples")
+    return (
+        np.asarray(freqs, dtype=np.float64),
+        np.asarray(phase, dtype=np.float64),
+        label,
+        role,
+        crossover,
+    )
+
+
+def save_frequency_response_plot(
+    output_path: Path,
+    curves: list[FrequencyResponseCurve],
+    dpi: int | None = None,
+    *,
+    phase_curves: list[Any] | None = None,
+    **kwargs: Any,
+) -> Path | None:
+    """Save the canonical response plot, optionally with wrapped phase overlays."""
+    if not phase_curves:
+        if dpi is None:
+            return _save_frequency_response_plot(output_path, curves, **kwargs)
+        return _save_frequency_response_plot(output_path, curves, dpi=dpi, **kwargs)
+
+    from hornlab_plots.charts import (  # noqa: PLC0415
+        _build_frequency_response_figure,
+        _response_curve_style,
+    )
+    from hornlab_plots.style import (  # noqa: PLC0415
+        AXES_BG,
+        SPINE_COLOR,
+        TEXT_COLOR,
+        TICK_COLOR,
+    )
+
+    fig = _build_frequency_response_figure(curves, **kwargs)
+    if fig is None:
+        return None
+    ax = fig.axes[0]
+    phase_ax = ax.twinx()
+    phase_ax.set_ylabel("Phase [deg]", color=TEXT_COLOR, fontsize=10)
+    phase_ax.set_ylim(-180.0, 180.0)
+    phase_ax.set_yticks([-180.0, -90.0, 0.0, 90.0, 180.0])
+    phase_ax.tick_params(colors=TICK_COLOR, labelsize=8)
+    phase_ax.set_facecolor(AXES_BG)
+    phase_ax.spines["right"].set_color(SPINE_COLOR)
+    for spine_name in ("left", "top", "bottom"):
+        phase_ax.spines[spine_name].set_visible(False)
+
+    for raw_curve in phase_curves:
+        freqs, phase_deg, label, role, crossover = _coerce_phase_overlay_curve(raw_curve)
+        if freqs.size == 0 or phase_deg.size == 0:
+            continue
+        n = min(freqs.size, phase_deg.size)
+        freqs = freqs[:n]
+        phase_deg = phase_deg[:n]
+        finite = np.isfinite(freqs) & np.isfinite(phase_deg) & (freqs > 0.0)
+        if not np.any(finite):
+            continue
+        style = _response_curve_style(
+            FrequencyResponseCurve(
+                frequencies=freqs,
+                spl_db=np.zeros_like(freqs),
+                label=label,
+                role=role,
+                crossover=crossover,
+            )
+        )
+        phase_ax.semilogx(
+            freqs[finite],
+            phase_deg[finite],
+            color=style["color"],
+            linewidth=1.0,
+            linestyle="-." if crossover else "--",
+            alpha=0.36,
+            zorder=1,
+        )
+    phase_ax.text(
+        0.995,
+        0.02,
+        "dashed: wrapped phase",
+        transform=phase_ax.transAxes,
+        ha="right",
+        va="bottom",
+        color=TEXT_COLOR,
+        fontsize=8,
+        alpha=0.68,
+    )
+    fig.tight_layout(pad=1.5)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(
+        str(out),
+        format="png",
+        dpi=150 if dpi is None else dpi,
+        facecolor=fig.get_facecolor(),
+        edgecolor="none",
+        bbox_inches="tight",
+    )
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    plt.close(fig)
+    return out
 
 
 class PressureBasis:
@@ -1038,6 +1158,15 @@ def _save_off_axis_response_plot(
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
         span_db=58.0,
+        phase_curves=[
+            (
+                freqs,
+                _phase_deg_from_pressure(combined_grid[:, plane_index, index]),
+                f"{angles[index]:g} deg",
+                _OFF_AXIS_CURVE_ROLES[min(order, len(_OFF_AXIS_CURVE_ROLES) - 1)],
+            )
+            for order, index in enumerate(picked)
+        ],
     )
 
 
@@ -1938,6 +2067,32 @@ def _write_crossover_alignment_outputs(
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
         span_db=58.0,
+        phase_curves=[
+            (
+                freqs,
+                _phase_deg_from_pressure(aligned[name]),
+                _member_filter_label(
+                    name, index, members, crossovers_hz, level_gains_db[name]
+                ),
+                member_roles.get(name, "other"),
+                True,
+            )
+            for index, name in enumerate(members)
+        ]
+        + [
+            (
+                freqs,
+                _phase_deg_from_pressure(combined_unaligned),
+                "Combined before delay",
+                "raw",
+            ),
+            (
+                freqs,
+                _phase_deg_from_pressure(combined_aligned),
+                "Combined time aligned",
+                "combined",
+            ),
+        ],
     )
 
     aligned_grids = {
@@ -1959,6 +2114,19 @@ def _write_crossover_alignment_outputs(
             angles_deg=angles_deg,
             planes=planes,
         ),
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+
+    derived_outputs = _write_pressure_grid_derived_artifacts(
+        out_dir,
+        "combined_time_aligned",
+        label="Combined time-aligned sum",
+        frequencies_hz=freqs,
+        angles_deg=angles_deg,
+        planes=planes,
+        pressure_complex=combined_pressure_grid,
+        polar_distance_m=polar_distance_m,
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
     )
@@ -2056,6 +2224,23 @@ def _write_crossover_alignment_outputs(
         "outputs": {
             "combined_time_aligned_frequency_response_png": str(output_png),
             "combined_time_aligned_directivity_heatmap_png": str(heatmap_png),
+            "combined_time_aligned_directivity_power_png": derived_outputs[
+                "directivity_power_png"
+            ],
+            "combined_time_aligned_directivity_power_csv": derived_outputs[
+                "directivity_power_csv"
+            ],
+            "combined_time_aligned_directivity_power_json": derived_outputs[
+                "directivity_power_json"
+            ],
+            "combined_time_aligned_beamwidth_png": derived_outputs["beamwidth_png"],
+            "combined_time_aligned_beamwidth_csv": derived_outputs["beamwidth_csv"],
+            "combined_time_aligned_beamwidth_json": derived_outputs["beamwidth_json"],
+            "combined_time_aligned_group_delay_png": derived_outputs["group_delay_png"],
+            "combined_time_aligned_group_delay_csv": derived_outputs["group_delay_csv"],
+            "combined_time_aligned_group_delay_json": derived_outputs[
+                "group_delay_json"
+            ],
             "combined_interference_heatmap_png": str(interference_png),
             "combined_off_axis_frequency_response_pngs": off_axis_pngs,
             "driver_time_alignment_txt": str(report_txt),
@@ -2100,6 +2285,617 @@ def _directivity_from_pressure_array(pressure: np.ndarray, angles_deg: np.ndarra
     amplitudes = np.maximum(np.abs(pressure), floor_amplitude)
     spl_raw = 20.0 * np.log10(amplitudes / P_REF)
     return spl_raw - spl_raw[:, :, on_axis_idx][:, :, None]
+
+
+POLAR_POWER_APPROXIMATION_NOTE = (
+    "Polar-cut estimate: intensity is averaged over the stored planes at each "
+    "polar angle, solid-angle weighted, and extrapolated to 4*pi; this is not "
+    "a full-sphere integration."
+)
+
+
+def _write_csv(path: Path, header: list[str], rows: list[list[float | str | None]]) -> None:
+    def _fmt(value: float | str | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        number = float(value)
+        if not np.isfinite(number):
+            return ""
+        return f"{number:.10g}"
+
+    path.write_text(
+        ",".join(header)
+        + "\n"
+        + "\n".join(",".join(_fmt(value) for value in row) for row in rows)
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _solid_angle_weights_for_polar_angles(angles_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    theta = np.radians(np.abs(np.asarray(angles_deg, dtype=np.float64)))
+    theta = theta[np.isfinite(theta)]
+    theta = theta[(theta >= 0.0) & (theta <= np.pi)]
+    if theta.size == 0:
+        raise ValueError("polar angle grid has no finite angles in 0..180 deg")
+    theta = np.asarray(sorted({round(float(value), 12) for value in theta}), dtype=np.float64)
+    if theta.size == 1:
+        half_width = 0.5 * np.pi
+        lower = np.asarray([max(0.0, float(theta[0]) - half_width)])
+        upper = np.asarray([min(np.pi, float(theta[0]) + half_width)])
+    else:
+        edges = np.empty(theta.size + 1, dtype=np.float64)
+        edges[1:-1] = 0.5 * (theta[:-1] + theta[1:])
+        edges[0] = max(0.0, theta[0] - 0.5 * (theta[1] - theta[0]))
+        edges[-1] = min(np.pi, theta[-1] + 0.5 * (theta[-1] - theta[-2]))
+        lower = edges[:-1]
+        upper = edges[1:]
+    weights = 2.0 * np.pi * (np.cos(lower) - np.cos(upper))
+    return theta, np.maximum(weights, 0.0)
+
+
+def _plane_averaged_intensity_by_polar_angle(
+    pressure_complex: np.ndarray,
+    angles_deg: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    pressure = np.asarray(pressure_complex, dtype=np.complex128)
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    if pressure.ndim != 3:
+        raise ValueError(f"pressure grid must be (freq, plane, angle), got {pressure.shape}")
+    if pressure.shape[2] != angles.size:
+        raise ValueError("pressure angle dimension does not match observation angles")
+    theta_all = np.radians(np.abs(angles))
+    unique_theta, _weights = _solid_angle_weights_for_polar_angles(angles)
+    intensity = np.abs(pressure) ** 2 / (
+        float(radiation_impedance.RHO_AIR) * float(radiation_impedance.C_AIR)
+    )
+    grouped = np.zeros((pressure.shape[0], unique_theta.size), dtype=np.float64)
+    for index, theta in enumerate(unique_theta):
+        mask = np.isclose(theta_all, theta, rtol=0.0, atol=1.0e-11)
+        grouped[:, index] = np.mean(intensity[:, :, mask], axis=(1, 2))
+    return unique_theta, grouped
+
+
+def _directivity_power_metrics_from_pressure(
+    pressure_complex: np.ndarray,
+    angles_deg: np.ndarray,
+    *,
+    polar_distance_m: float,
+) -> dict[str, Any]:
+    theta, weights = _solid_angle_weights_for_polar_angles(angles_deg)
+    intensity_theta, intensity = _plane_averaged_intensity_by_polar_angle(
+        pressure_complex,
+        angles_deg,
+    )
+    if intensity_theta.shape != theta.shape or not np.allclose(
+        intensity_theta,
+        theta,
+        rtol=0.0,
+        atol=1.0e-10,
+    ):
+        raise ValueError("polar angle grouping mismatch while computing power response")
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        raise ValueError("polar solid-angle weights sum to zero")
+    weighted_intensity = intensity @ weights
+    spatial_average_intensity = weighted_intensity / weight_sum
+    on_axis_index = int(np.argmin(theta))
+    on_axis_intensity = intensity[:, on_axis_index]
+    intensity_ref = P_REF**2 / (
+        float(radiation_impedance.RHO_AIR) * float(radiation_impedance.C_AIR)
+    )
+    floor = intensity_ref * 1.0e-30
+    directivity_index_db = 10.0 * np.log10(
+        np.maximum(on_axis_intensity, floor)
+        / np.maximum(spatial_average_intensity, floor)
+    )
+    power_response_db = 10.0 * np.log10(
+        np.maximum(spatial_average_intensity, floor) / intensity_ref
+    )
+    on_axis_spl_db = 10.0 * np.log10(
+        np.maximum(on_axis_intensity, floor) / intensity_ref
+    )
+    acoustic_power_w = (
+        4.0
+        * np.pi
+        * float(polar_distance_m) ** 2
+        * spatial_average_intensity
+    )
+    return {
+        "directivity_index_db": directivity_index_db,
+        "power_response_db": power_response_db,
+        "on_axis_spl_db": on_axis_spl_db,
+        "acoustic_power_w": acoustic_power_w,
+        "spatial_average_intensity_w_m2": spatial_average_intensity,
+        "solid_angle_sum_sr": weight_sum,
+        "solid_angle_coverage_fraction": weight_sum / (4.0 * np.pi),
+        "polar_angles_deg": np.degrees(theta),
+        "polar_weights_sr": weights,
+        "approximation": POLAR_POWER_APPROXIMATION_NOTE,
+    }
+
+
+def _phase_deg_from_pressure(pressure: np.ndarray) -> np.ndarray:
+    return np.degrees(np.angle(np.asarray(pressure, dtype=np.complex128)))
+
+
+def _group_delay_from_pressure(
+    frequencies_hz: np.ndarray,
+    pressure: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    values = np.asarray(pressure, dtype=np.complex128)
+    phase_rad = np.unwrap(np.angle(values))
+    if freqs.size < 2:
+        return np.full(freqs.shape, np.nan, dtype=np.float64), phase_rad
+    omega = 2.0 * np.pi * freqs
+    edge_order = 2 if freqs.size > 2 else 1
+    return -np.gradient(phase_rad, omega, edge_order=edge_order), phase_rad
+
+
+def _beamwidth_minus6_db_by_plane(
+    pressure_complex: np.ndarray,
+    angles_deg: np.ndarray,
+    planes: np.ndarray,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    pressure = np.asarray(pressure_complex, dtype=np.complex128)
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    order = np.argsort(angles)
+    sorted_angles = angles[order]
+    on_axis_sorted_idx = int(np.argmin(np.abs(sorted_angles)))
+    one_sided_positive = sorted_angles[0] >= -1.0e-9 and on_axis_sorted_idx == 0
+    threshold_db = -6.0
+    widths: dict[str, np.ndarray] = {}
+    limited: dict[str, np.ndarray] = {}
+
+    def _edge(rel_db: np.ndarray, start: int, step: int) -> tuple[float, bool]:
+        idx = start
+        next_idx = idx + step
+        while 0 <= next_idx < rel_db.size and rel_db[next_idx] >= threshold_db:
+            idx = next_idx
+            next_idx = idx + step
+        if not (0 <= next_idx < rel_db.size):
+            return float(sorted_angles[idx]), True
+        v0 = float(rel_db[idx])
+        v1 = float(rel_db[next_idx])
+        a0 = float(sorted_angles[idx])
+        a1 = float(sorted_angles[next_idx])
+        if abs(v1 - v0) <= 1.0e-12:
+            return a1, False
+        frac = (threshold_db - v0) / (v1 - v0)
+        return a0 + frac * (a1 - a0), False
+
+    for plane_index, plane in enumerate(planes):
+        plane_widths = np.zeros(pressure.shape[0], dtype=np.float64)
+        plane_limited = np.zeros(pressure.shape[0], dtype=bool)
+        for freq_index in range(pressure.shape[0]):
+            values = pressure[freq_index, plane_index, order]
+            ref = max(float(np.abs(values[on_axis_sorted_idx])), 1.0e-30)
+            rel_db = 20.0 * np.log10(np.maximum(np.abs(values), 1.0e-30) / ref)
+            left_edge, left_limited = _edge(rel_db, on_axis_sorted_idx, -1)
+            right_edge, right_limited = _edge(rel_db, on_axis_sorted_idx, 1)
+            if one_sided_positive:
+                plane_widths[freq_index] = min(
+                    360.0,
+                    2.0 * max(0.0, right_edge - float(sorted_angles[on_axis_sorted_idx])),
+                )
+                plane_limited[freq_index] = right_limited
+            else:
+                plane_widths[freq_index] = max(0.0, right_edge - left_edge)
+                plane_limited[freq_index] = left_limited or right_limited
+        widths[str(plane)] = plane_widths
+        limited[str(plane)] = plane_limited
+    return widths, limited
+
+
+def _apply_mesh_valid_markers(
+    ax: Any,
+    freqs: np.ndarray,
+    *,
+    mesh_valid_hz: float | None,
+    mesh_valid_radiating_hz: float | None,
+) -> None:
+    if mesh_valid_hz is None and mesh_valid_radiating_hz is None:
+        return
+    from hornlab_plots._heatmap import _draw_mesh_valid_markers  # noqa: PLC0415
+
+    _draw_mesh_valid_markers(
+        ax,
+        lo=float(np.min(freqs)),
+        hi=float(np.max(freqs)),
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        span_zorder=0,
+        line_zorder=1,
+    )
+
+
+def _style_line_axes(ax: Any, *, title: str, xlabel: str, ylabel: str) -> None:
+    from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
+    from hornlab_plots._grid import freq_formatter, log_grid_lines, preferred_frequency_ticks  # noqa: PLC0415
+    from hornlab_plots.style import (  # noqa: PLC0415
+        AXES_BG,
+        GRID_COLOR,
+        PRIMARY_GRID_ALPHA,
+        SECONDARY_GRID_ALPHA,
+        SPINE_COLOR,
+        TEXT_COLOR,
+        TICK_COLOR,
+    )
+
+    ax.set_facecolor(AXES_BG)
+    ax.set_title(title, color=TEXT_COLOR, fontsize=13, fontweight="600", pad=8)
+    ax.set_xlabel(xlabel, color=TEXT_COLOR, fontsize=11)
+    ax.set_ylabel(ylabel, color=TEXT_COLOR, fontsize=11)
+    ax.tick_params(colors=TICK_COLOR, labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_color(SPINE_COLOR)
+    ax.xaxis.set_major_formatter(FuncFormatter(freq_formatter))
+    ticks = preferred_frequency_ticks(*ax.get_xlim())
+    if ticks:
+        ax.set_xticks(ticks)
+    for freq in log_grid_lines(*ax.get_xlim()):
+        major = any(np.isclose(freq, tick, rtol=1.0e-6, atol=1.0e-6) for tick in ticks)
+        ax.axvline(
+            freq,
+            color=GRID_COLOR,
+            alpha=PRIMARY_GRID_ALPHA if major else SECONDARY_GRID_ALPHA,
+            linewidth=0.7 if major else 0.5,
+            zorder=0,
+        )
+    ax.grid(True, axis="y", alpha=SECONDARY_GRID_ALPHA, color=GRID_COLOR, linewidth=0.5)
+
+
+def _save_directivity_power_plot(
+    path: Path,
+    freqs: np.ndarray,
+    metrics: dict[str, Any],
+    *,
+    title: str,
+    mesh_valid_hz: float | None,
+    mesh_valid_radiating_hz: float | None,
+) -> None:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from hornlab_plots.style import (  # noqa: PLC0415
+        AXES_BG,
+        FIGURE_BG,
+        RESPONSE_COLORS,
+        SPINE_COLOR,
+        TEXT_COLOR,
+        TICK_COLOR,
+    )
+
+    fig, ax = plt.subplots(figsize=(10.0, 4.8))
+    fig.patch.set_facecolor(FIGURE_BG)
+    freqs = np.asarray(freqs, dtype=np.float64)
+    ax.semilogx(
+        freqs,
+        metrics["directivity_index_db"],
+        color=RESPONSE_COLORS["combined"],
+        linewidth=2.2,
+        label="DI",
+    )
+    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
+    _apply_mesh_valid_markers(
+        ax,
+        freqs,
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    _style_line_axes(
+        ax,
+        title=title,
+        xlabel="Frequency [Hz]",
+        ylabel="Directivity index [dB]",
+    )
+    ax2 = ax.twinx()
+    ax2.semilogx(
+        freqs,
+        metrics["power_response_db"],
+        color=RESPONSE_COLORS["mf"],
+        linewidth=1.6,
+        linestyle="--",
+        alpha=0.82,
+        label="Power response",
+    )
+    ax2.set_ylabel("Power response [dB SPL avg]", color=TEXT_COLOR, fontsize=10)
+    ax2.tick_params(colors=TICK_COLOR, labelsize=8)
+    ax2.set_facecolor(AXES_BG)
+    ax2.spines["right"].set_color(SPINE_COLOR)
+    lines = [*ax.get_lines(), *ax2.get_lines()]
+    labels = [line.get_label() for line in lines]
+    legend = ax.legend(
+        lines,
+        labels,
+        loc="best",
+        fontsize=9,
+        facecolor=AXES_BG,
+        edgecolor=SPINE_COLOR,
+        labelcolor=TEXT_COLOR,
+    )
+    legend.get_frame().set_alpha(0.92)
+    fig.text(
+        0.5,
+        0.01,
+        POLAR_POWER_APPROXIMATION_NOTE,
+        ha="center",
+        va="bottom",
+        color=TEXT_COLOR,
+        fontsize=8,
+        alpha=0.78,
+    )
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0), pad=1.5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+
+
+def _save_beamwidth_plot(
+    path: Path,
+    freqs: np.ndarray,
+    beamwidths: dict[str, np.ndarray],
+    *,
+    title: str,
+    mesh_valid_hz: float | None,
+    mesh_valid_radiating_hz: float | None,
+) -> None:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from hornlab_plots.style import AXES_BG, FIGURE_BG, RESPONSE_COLORS, SPINE_COLOR, TEXT_COLOR  # noqa: PLC0415
+
+    fig, ax = plt.subplots(figsize=(10.0, 4.5))
+    fig.patch.set_facecolor(FIGURE_BG)
+    freqs = np.asarray(freqs, dtype=np.float64)
+    colors = [RESPONSE_COLORS["combined"], RESPONSE_COLORS["mf"], RESPONSE_COLORS["hf"]]
+    for index, (plane, values) in enumerate(beamwidths.items()):
+        ax.semilogx(
+            freqs,
+            values,
+            linewidth=2.0,
+            color=colors[index % len(colors)],
+            label=plane,
+        )
+    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
+    ax.set_ylim(0.0, 360.0)
+    _apply_mesh_valid_markers(
+        ax,
+        freqs,
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    _style_line_axes(
+        ax,
+        title=title,
+        xlabel="Frequency [Hz]",
+        ylabel="-6 dB beamwidth [deg]",
+    )
+    legend = ax.legend(
+        loc="best",
+        fontsize=9,
+        facecolor=AXES_BG,
+        edgecolor=SPINE_COLOR,
+        labelcolor=TEXT_COLOR,
+    )
+    legend.get_frame().set_alpha(0.92)
+    fig.tight_layout(pad=1.5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+
+
+def _save_group_delay_plot(
+    path: Path,
+    freqs: np.ndarray,
+    group_delay_s: np.ndarray,
+    *,
+    title: str,
+    mesh_valid_hz: float | None,
+    mesh_valid_radiating_hz: float | None,
+) -> None:
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from hornlab_plots.style import FIGURE_BG, RESPONSE_COLORS  # noqa: PLC0415
+
+    fig, ax = plt.subplots(figsize=(10.0, 4.5))
+    fig.patch.set_facecolor(FIGURE_BG)
+    freqs = np.asarray(freqs, dtype=np.float64)
+    ax.semilogx(
+        freqs,
+        np.asarray(group_delay_s, dtype=np.float64) * 1000.0,
+        color=RESPONSE_COLORS["combined"],
+        linewidth=2.0,
+    )
+    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
+    _apply_mesh_valid_markers(
+        ax,
+        freqs,
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    _style_line_axes(
+        ax,
+        title=title,
+        xlabel="Frequency [Hz]",
+        ylabel="Group delay [ms]",
+    )
+    fig.tight_layout(pad=1.5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+
+
+def _write_pressure_grid_derived_artifacts(
+    out_dir: Path,
+    stem: str,
+    *,
+    label: str,
+    frequencies_hz: np.ndarray,
+    angles_deg: np.ndarray,
+    planes: np.ndarray,
+    pressure_complex: np.ndarray,
+    polar_distance_m: float,
+    mesh_valid_hz: float | None,
+    mesh_valid_radiating_hz: float | None,
+) -> dict[str, str]:
+    safe_stem = _safe_stem(stem)
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    plane_names = np.asarray(planes, dtype=str)
+    pressure = np.asarray(pressure_complex, dtype=np.complex128)
+
+    directivity_png = out_dir / f"{safe_stem}_directivity_index_power_response.png"
+    directivity_csv = out_dir / f"{safe_stem}_directivity_index_power_response.csv"
+    directivity_json = out_dir / f"{safe_stem}_directivity_index_power_response.json"
+    metrics = _directivity_power_metrics_from_pressure(
+        pressure,
+        angles,
+        polar_distance_m=polar_distance_m,
+    )
+    _save_directivity_power_plot(
+        directivity_png,
+        freqs,
+        metrics,
+        title=f"{label} Directivity Index and Power Response",
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    _write_csv(
+        directivity_csv,
+        [
+            "frequency_hz",
+            "directivity_index_db",
+            "power_response_db_spl_avg",
+            "acoustic_power_w",
+            "on_axis_spl_db",
+            "spatial_average_intensity_w_m2",
+        ],
+        [
+            [
+                float(freq),
+                float(di),
+                float(power_db),
+                float(power_w),
+                float(on_axis),
+                float(avg_i),
+            ]
+            for freq, di, power_db, power_w, on_axis, avg_i in zip(
+                freqs,
+                metrics["directivity_index_db"],
+                metrics["power_response_db"],
+                metrics["acoustic_power_w"],
+                metrics["on_axis_spl_db"],
+                metrics["spatial_average_intensity_w_m2"],
+                strict=True,
+            )
+        ],
+    )
+    _write_json(
+        directivity_json,
+        {
+            "label": label,
+            "frequencies_hz": freqs,
+            "directivity_index_db": metrics["directivity_index_db"],
+            "power_response_db_spl_avg": metrics["power_response_db"],
+            "acoustic_power_w": metrics["acoustic_power_w"],
+            "on_axis_spl_db": metrics["on_axis_spl_db"],
+            "spatial_average_intensity_w_m2": metrics[
+                "spatial_average_intensity_w_m2"
+            ],
+            "polar_distance_m": float(polar_distance_m),
+            "solid_angle_sum_sr": metrics["solid_angle_sum_sr"],
+            "solid_angle_coverage_fraction": metrics[
+                "solid_angle_coverage_fraction"
+            ],
+            "polar_angles_deg": metrics["polar_angles_deg"],
+            "polar_weights_sr": metrics["polar_weights_sr"],
+            "approximation": metrics["approximation"],
+        },
+    )
+
+    beamwidth_png = out_dir / f"{safe_stem}_beamwidth.png"
+    beamwidth_csv = out_dir / f"{safe_stem}_beamwidth.csv"
+    beamwidth_json = out_dir / f"{safe_stem}_beamwidth.json"
+    beamwidths, beamwidth_limited = _beamwidth_minus6_db_by_plane(
+        pressure,
+        angles,
+        plane_names,
+    )
+    _save_beamwidth_plot(
+        beamwidth_png,
+        freqs,
+        beamwidths,
+        title=f"{label} -6 dB Beamwidth",
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    beam_header = ["frequency_hz"]
+    for plane in beamwidths:
+        beam_header.append(f"{_safe_stem(plane)}_beamwidth_deg")
+        beam_header.append(f"{_safe_stem(plane)}_limited_by_grid")
+    beam_rows: list[list[float | str | None]] = []
+    for freq_index, freq in enumerate(freqs):
+        row: list[float | str | None] = [float(freq)]
+        for plane in beamwidths:
+            row.append(float(beamwidths[plane][freq_index]))
+            row.append("true" if bool(beamwidth_limited[plane][freq_index]) else "false")
+        beam_rows.append(row)
+    _write_csv(beamwidth_csv, beam_header, beam_rows)
+    _write_json(
+        beamwidth_json,
+        {
+            "label": label,
+            "frequencies_hz": freqs,
+            "beamwidth_deg": beamwidths,
+            "limited_by_grid": beamwidth_limited,
+            "threshold_db": -6.0,
+        },
+    )
+
+    group_delay_png = out_dir / f"{safe_stem}_group_delay.png"
+    group_delay_csv = out_dir / f"{safe_stem}_group_delay.csv"
+    group_delay_json = out_dir / f"{safe_stem}_group_delay.json"
+    on_axis_idx = int(np.argmin(np.abs(angles)))
+    on_axis_pressure = pressure[:, 0, on_axis_idx]
+    group_delay_s, phase_rad = _group_delay_from_pressure(freqs, on_axis_pressure)
+    _save_group_delay_plot(
+        group_delay_png,
+        freqs,
+        group_delay_s,
+        title=f"{label} On-Axis Group Delay",
+        mesh_valid_hz=mesh_valid_hz,
+        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+    )
+    _write_csv(
+        group_delay_csv,
+        ["frequency_hz", "group_delay_ms", "unwrapped_phase_deg"],
+        [
+            [float(freq), float(delay_s * 1000.0), float(np.degrees(phase))]
+            for freq, delay_s, phase in zip(freqs, group_delay_s, phase_rad, strict=True)
+        ],
+    )
+    _write_json(
+        group_delay_json,
+        {
+            "label": label,
+            "frequencies_hz": freqs,
+            "group_delay_s": group_delay_s,
+            "group_delay_ms": group_delay_s * 1000.0,
+            "unwrapped_phase_deg": np.degrees(phase_rad),
+            "phase_convention": PRESSURE_NPZ_PHASE_CONVENTION,
+            "formula": "-d(unwrap(angle(p_engineering)))/d(omega)",
+        },
+    )
+    return {
+        "directivity_power_png": str(directivity_png),
+        "directivity_power_csv": str(directivity_csv),
+        "directivity_power_json": str(directivity_json),
+        "beamwidth_png": str(beamwidth_png),
+        "beamwidth_csv": str(beamwidth_csv),
+        "beamwidth_json": str(beamwidth_json),
+        "group_delay_png": str(group_delay_png),
+        "group_delay_csv": str(group_delay_csv),
+        "group_delay_json": str(group_delay_json),
+    }
 
 
 def _directivity_payload_from_arrays(
@@ -3017,6 +3813,14 @@ def _apply_driver_lem_coupling(
             ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
             mesh_valid_hz=source_result.get("mesh_valid_freq_max_hz"),
             mesh_valid_radiating_hz=source_result.get("aperture_valid_freq_max_hz"),
+            phase_curves=[
+                (
+                    basis.frequencies_hz,
+                    _phase_deg_from_pressure(pressure[:, 0, on_axis_idx]),
+                    matching_name,
+                    _source_role(matching_name),
+                )
+            ],
         )
         _write_zma(
             impedance_zma,
@@ -3377,6 +4181,26 @@ def _solve_passive_cardioid_mf(
         ],
         title="MF Passive Cardioid Combine",
         ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+        phase_curves=[
+            (
+                mf_basis.frequencies_hz,
+                _phase_deg_from_pressure(mf_basis.pressure_complex[:, 0, on_axis_idx]),
+                mf_name,
+                "mf",
+            ),
+            (
+                mf_basis.frequencies_hz,
+                _phase_deg_from_pressure(port_pressure[:, 0, on_axis_idx]),
+                f"{port_name} weighted",
+                "other",
+            ),
+            (
+                mf_basis.frequencies_hz,
+                _phase_deg_from_pressure(total_pressure[:, 0, on_axis_idx]),
+                "MF passive cardioid",
+                "combined",
+            ),
+        ],
     )
 
     payload = {
@@ -3553,6 +4377,16 @@ def _solve_passive_cardioid_mf(
                 ],
                 title="MF Passive Cardioid Coupled Response",
                 ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+                phase_curves=[
+                    (
+                        mf_basis.frequencies_hz,
+                        _phase_deg_from_pressure(
+                            coupled_pressure[:, 0, on_axis_idx]
+                        ),
+                        "MF passive cardioid coupled",
+                        "combined",
+                    )
+                ],
             )
             _write_zma(
                 impedance_zma,
@@ -3790,6 +4624,10 @@ def _write_one_source_outputs(
     heatmap_png = out_dir / f"{safe_name}_directivity_heatmap.png"
     response_png = out_dir / f"{safe_name}_frequency_response.png"
     on_axis_spl_db = _on_axis_spl_db(result)
+    on_axis_idx = int(np.argmin(np.abs(result.observation_angles_deg)))
+    pressure_engineering = np.conjugate(
+        np.asarray(result.pressure_complex, dtype=np.complex128)
+    )
     payload = _result_payload(result, source_name=source_name, source_tag=source_tag)
     _write_json(result_json, payload)
     source_area_m2 = None
@@ -3827,6 +4665,14 @@ def _write_one_source_outputs(
         ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        phase_curves=[
+            (
+                result.frequencies_hz,
+                _phase_deg_from_pressure(pressure_engineering[:, 0, on_axis_idx]),
+                source_name,
+                _source_role(source_name),
+            )
+        ],
     )
     return {
         "name": source_name,
@@ -3934,6 +4780,16 @@ def _write_one_source_derived_outputs_from_basis(
         ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        phase_curves=[
+            (
+                basis.frequencies_hz,
+                _phase_deg_from_pressure(
+                    basis.pressure_complex[:, 0, on_axis_idx]
+                ),
+                source_name,
+                _source_role(source_name),
+            )
+        ],
     )
     return {
         "name": source_name,
@@ -4087,6 +4943,37 @@ def _apply_post_solve_derived_outputs(
                 manifest["outputs"].setdefault("driver_lem_active_pressure_npzs", {})[
                     source_name
                 ] = outputs["active_pressure_npz"]
+
+    active_bases_by_name: dict[str, PressureBasis] = {}
+    for source in source_results:
+        source_name = str(source["name"])
+        basis = _load_pressure_basis(_source_active_basis_path(source))
+        active_bases_by_name[source_name] = basis
+        derived_outputs = _write_pressure_grid_derived_artifacts(
+            out_dir,
+            _safe_stem(source_name),
+            label=source_name,
+            frequencies_hz=basis.frequencies_hz,
+            angles_deg=basis.observation_angles_deg,
+            planes=basis.observation_planes,
+            pressure_complex=basis.pressure_complex,
+            polar_distance_m=float(args.polar_distance_m),
+            mesh_valid_hz=source.get("mesh_valid_freq_max_hz"),
+            mesh_valid_radiating_hz=source.get("aperture_valid_freq_max_hz"),
+        )
+        source.update(
+            {
+                "directivity_power_png": derived_outputs["directivity_power_png"],
+                "directivity_power_csv": derived_outputs["directivity_power_csv"],
+                "directivity_power_json": derived_outputs["directivity_power_json"],
+                "beamwidth_png": derived_outputs["beamwidth_png"],
+                "beamwidth_csv": derived_outputs["beamwidth_csv"],
+                "beamwidth_json": derived_outputs["beamwidth_json"],
+                "group_delay_png": derived_outputs["group_delay_png"],
+                "group_delay_csv": derived_outputs["group_delay_csv"],
+                "group_delay_json": derived_outputs["group_delay_json"],
+            }
+        )
     response_curves = [
         FrequencyResponseCurve(
             frequencies=source_result["frequencies_hz"],
@@ -4110,6 +4997,21 @@ def _apply_post_solve_derived_outputs(
         ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
         mesh_valid_hz=combined_mesh_valid_hz,
         mesh_valid_radiating_hz=combined_aperture_valid_hz,
+        phase_curves=[
+            (
+                basis.frequencies_hz,
+                _phase_deg_from_pressure(
+                    basis.pressure_complex[
+                        :,
+                        0,
+                        int(np.argmin(np.abs(basis.observation_angles_deg))),
+                    ]
+                ),
+                name,
+                _source_role(name),
+            )
+            for name, basis in active_bases_by_name.items()
+        ],
     )
     manifest["sources"] = source_results
     manifest["outputs"]["combined_frequency_response_png"] = str(response_png)
@@ -4118,6 +5020,33 @@ def _apply_post_solve_derived_outputs(
     }
     manifest["outputs"]["source_pressure_basis_npzs"] = {
         source["name"]: source["pressure_basis_npz"] for source in source_results
+    }
+    manifest["outputs"]["source_directivity_power_pngs"] = {
+        source["name"]: source["directivity_power_png"] for source in source_results
+    }
+    manifest["outputs"]["source_directivity_power_csvs"] = {
+        source["name"]: source["directivity_power_csv"] for source in source_results
+    }
+    manifest["outputs"]["source_directivity_power_jsons"] = {
+        source["name"]: source["directivity_power_json"] for source in source_results
+    }
+    manifest["outputs"]["source_beamwidth_pngs"] = {
+        source["name"]: source["beamwidth_png"] for source in source_results
+    }
+    manifest["outputs"]["source_beamwidth_csvs"] = {
+        source["name"]: source["beamwidth_csv"] for source in source_results
+    }
+    manifest["outputs"]["source_beamwidth_jsons"] = {
+        source["name"]: source["beamwidth_json"] for source in source_results
+    }
+    manifest["outputs"]["source_group_delay_pngs"] = {
+        source["name"]: source["group_delay_png"] for source in source_results
+    }
+    manifest["outputs"]["source_group_delay_csvs"] = {
+        source["name"]: source["group_delay_csv"] for source in source_results
+    }
+    manifest["outputs"]["source_group_delay_jsons"] = {
+        source["name"]: source["group_delay_json"] for source in source_results
     }
     active_basis_npzs = {
         source["name"]: source["active_pressure_basis_npz"]

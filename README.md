@@ -14,8 +14,10 @@ meshing and solves run:
 3. `scripts/solve_fusion_wg_metal.py` — per-source Metal BEM solves, crossover
    alignment, passive-cardioid combine, plots, VituixCAD FRD/ZMA export
 
-Full pipeline, dialog, and output documentation:
-[fusion-addins/WGMetalPipeline/README.md](fusion-addins/WGMetalPipeline/README.md).
+## Docs
+
+- [User guide](docs/USER-GUIDE.md)
+- [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)
 
 ## Install
 

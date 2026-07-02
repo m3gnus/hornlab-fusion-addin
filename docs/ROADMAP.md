@@ -4,8 +4,8 @@ Prioritized improvement plan for the WGMetalPipeline add-in and pipeline.
 Ordered by leverage-per-complexity; the add-in should stay small, so each
 item states what it *removes* or reuses, not just what it adds.
 
-Status 2026-07-02: item 1 DONE (commit 96081c0). Item 2 design accepted —
-see [plans/per-driver-lem-coupling.md](plans/per-driver-lem-coupling.md).
+Status 2026-07-02: items 1 and 2 DONE. Item 2 followed the accepted plan in
+[plans/per-driver-lem-coupling.md](plans/per-driver-lem-coupling.md).
 Item 3's N-driver table is DEFERRED by owner decision (three fixed slots are
 enough for now); its T/S + Hornresp-import half moved into item 2.
 
@@ -28,29 +28,37 @@ Remove the mode entirely:
 plot markers, the live Estimate readout): manual-mm depends on it. Only the
 frequency-driven *sizing* goes. Estimated net: ~150–200 lines deleted.
 
-## 2. Per-driver LEM coupling: T/S parameters, ZMA, and true levels
+## 2. Per-driver LEM coupling: T/S parameters, ZMA, and true levels — DONE
 
-The highest-leverage feature. Today only the passive-cardioid MF path has a
-voltage-driven Thiele/Small driver model; direct BEM drivers are
-unit-cone-velocity sources, so their exported FRDs need manual per-driver
-level scaling and have no impedance — which is exactly what blocks passive
+The highest-leverage feature. Before this work only the passive-cardioid MF
+path had a voltage-driven Thiele/Small driver model; direct BEM drivers were
+unit-normal-acceleration sources, so their exported FRDs needed manual
+per-driver level scaling and had no impedance — exactly what blocked passive
 crossover design in VituixCAD.
 
-Generalize the existing `Couple driver LEM` machinery
-(`hornlab_sim.methods.driver_coupling`) to *any* driver:
+Implemented by generalizing the existing `Couple driver LEM` machinery
+(`hornlab_sim.methods.driver_coupling`) to direct drivers:
 
 - per-driver T/S parameters (Sd, Bl, Re, Le, Mmd/Mms, Cms/Vas/Fs, Qms/Rms)
 - voltage-driven SPL at the chosen drive level → correct *relative* driver
   levels in the crossover sum and absolute SPL/2.83 V curves
 - per-driver electrical impedance → one `.zma` per driver in the VituixCAD
   export (the cardioid MF already does this; extend to LF/MF/HF)
-- per-driver excursion and (where ports exist) port-velocity curves
+- per-driver excursion curves with Xmax markers where supplied
 
 With FRDs (magnitude + phase, off-axis, shared timing reference — already
 exported) plus per-driver ZMA, VituixCAD can do full **passive** crossover
 design natively. Simulating the passive network inside the add-in stays out
 of scope: VituixCAD is the better network simulator; the add-in's job is to
 feed it complete data.
+
+Completed in stages:
+
+- per-source `--driver-lem` specs and Hornresp driver-file parsing
+- per-source rear chamber values plus shared drive voltage and generator Rg
+- voltage-driven direct-source FRDs, crossover input, excursion PNGs, and ZMAs
+- VituixCAD export copies for coupled direct drivers and coupled cardioid MF
+- settings v12 dialog migration with a compact `Driver LEM (optional)` group
 
 ## 3. N drivers instead of fixed LF/MF/HF slots — DEFERRED (owner decision)
 
@@ -86,8 +94,8 @@ Per-driver complex pressure over the full angle grid is already stored in
   numerics, big diagnostic value; plot alongside the existing heatmaps
 - **Group delay** (d phase/d f of the exported complex pressure), per driver
   and for the aligned sum
-- **Excursion / port-velocity plots** for coupled drivers (the coupled NPZ
-  already stores excursion; it just isn't plotted) with an Xmax marker
+- **Port-velocity plots** for coupled ported/cardioid paths with an excursion
+  companion where needed. Per-driver direct excursion plots shipped with item 2.
 - **Phase overlay** on the response plots (phase is already in the FRDs;
   show it in the PNGs too)
 

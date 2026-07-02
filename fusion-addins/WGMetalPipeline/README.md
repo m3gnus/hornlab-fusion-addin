@@ -45,13 +45,11 @@ The add-in is designed to not fail on configuration drift:
   tagged `PORT_EXIT` mesh area. `Rear-wave polarity` defaults on; flip it only
   if the null appears on the wrong side. Use a `-180..180 deg` polar sweep when
   you want the rear null visible; narrower requested windows are preserved.
-  **Coupled mode:** `Couple driver LEM` adds a voltage-driven
-  Thiele/Small driver on the MF diaphragm. The dialog exposes `Sd`, `Bl`,
-  `Re`, `Le`, `Mms`, `Cms`/`Vas`/`Fs`, `Qms`, RMS drive voltage, and generator
-  `Rg`; fill exactly one of `Cms`, `Vas`, or `Fs`. The Mms dialog path applies
-  the documented free-air radiation-mass correction before the BEM load is
-  applied; Mmd, LR-2, Rms, and driver count remain command-line-only controls.
-  Coupled mode also writes `MF_passive_cardioid_coupled_results.npz`,
+  **Coupled mode:** `Couple driver LEM` makes the passive-cardioid branch use
+  the `MF driver T/S` entry from the separate `Driver LEM (optional)` group.
+  MF is then owned by the MF+port coupled network, so the generic per-driver
+  MF coupling is skipped rather than applied twice. Coupled mode also writes
+  `MF_passive_cardioid_coupled_results.npz`,
   `MF_passive_cardioid_coupled_frequency_response.png`, and
   `MF_passive_cardioid_impedance.zma`, and the summary JSON gains a
   `coupled` block with the driver echo, excursion, impedance, and area
@@ -64,12 +62,28 @@ The add-in is designed to not fail on configuration drift:
   4 kPa*s/m^3 gives ~2.8 kHz). The summary's `diagnostics` block reports
   `rc_corner_hz` and the in-band `|Q_port/Q_mf|` range, and the solve log
   warns when the port is too weak to form a null. **Model limits:** with
-  coupling off, the MF cone is a fixed velocity source (the rear load does not
-  react back on it), so the radiation *pattern* per frequency is trustworthy
-  but the absolute response shape is approximate; with coupling on, the
-  response and ZMA are voltage-driven by the coupled driver/LEM/BEM load. The
-  chamber is still a lumped, undamped compliance, valid below its first
-  internal mode (~c/(2*max_dim), often mid-band), which real stuffing softens.
+  coupling off, the MF cone is a fixed acceleration source (the rear load does
+  not react back on it), so the radiation *pattern* per frequency is
+  trustworthy but the absolute response shape is approximate; with coupling
+  on, the response and ZMA are voltage-driven by the coupled driver/LEM/BEM
+  load. The chamber is still a lumped, undamped compliance, valid below its
+  first internal mode (~c/(2*max_dim), often mid-band), which real stuffing
+  softens.
+- **Driver LEM coupling is optional per direct source.** The `Driver LEM
+  (optional)` group accepts one `LF/MF/HF driver T/S` string per source. Each
+  string may be pasted Hornresp-style `Key=Value` text or a path to a Hornresp
+  driver `.txt` file. Units follow Hornresp: `Sd` cm2, `Mmd`/`Mms` g, `Cms`
+  m/N, `Rms` kg/s, `Le`/`Le2` mH, `Re`/`Re2` ohm, `Xmax` mm, optional `N`
+  driver count. `Leb`, `Ke`, `Rss`, and `Vrc*` system keys are ignored with a
+  warning. Shared `Drive voltage V RMS` and `Generator Rg ohm` set the voltage
+  drive. For each coupled direct source the solver derives the BEM radiation
+  self-load from that source's surface-average pressure and patch area, runs
+  `hornlab_sim.methods.driver_coupling.coupled_direct_radiator_response`, and
+  scales the pressure basis for response plots, crossover input, and VituixCAD
+  export. Outputs include `<NAME>_impedance.zma`, `<NAME>_excursion.png`, and a
+  manifest `driver_lem` block with normalized parameter echo, Mmd/Mms provenance,
+  self-impedance provenance, excursion maximum, impedance range, and the explicit
+  note that driver-driver mutual coupling is neglected.
 - **Elements use explicit millimetre sizing.** Source patches use their source
   mesh mm values, rigid/shadow surfaces use `Rigid body mesh mm`, and the
   near-field baffle grades from each source's own size out to the background
@@ -166,8 +180,16 @@ The output folder contains:
   crossover/alignment, passive-cardioid, and FRD artifacts generated before
   the 2026-07-02 convention fix were computed conjugate-wrong; re-run the
   pipeline to regenerate them (the raw bases themselves were always valid).
+  New bases also embed `surface_pressure_avg`, the source patch area, and
+  `source_normalization=unit_normal_acceleration` for postprocess-only
+  per-driver coupling.
 - one `<source>_directivity_heatmap.png` per solved source
 - one `<source>_frequency_response.png` per solved source
+- `<NAME>_driver_lem_results.npz`, `<NAME>_driver_lem_pressure.npz`,
+  `<NAME>_impedance.zma`, and `<NAME>_excursion.png` for each direct source
+  with a Driver LEM T/S spec. The manifest's per-source `driver_lem` block
+  records normalized parameters, self-impedance provenance, excursion maximum,
+  electrical impedance range, and the self-coupling-only assumption.
 - `port_exit_radiation_impedance_matrix.npz` and
   `port_exit_radiation_impedance_matrix.summary.json` when port-exit source
   tags are solved
@@ -208,15 +230,15 @@ The output folder contains:
   already carries every inter-driver path/delay difference; keep driver
   X/Y/Z offsets at 0. Phase follows the measurement convention (a later
   arrival falls with frequency), with the common time of flight removed.
-  Direct BEM driver levels are unit-source-drive SPL (arbitrary per-driver
-  scale; the solver drives sources at unit normal acceleration); no ZMA is
-  exported for those drivers because BEM has no electrical side (use
-  measured/datasheet impedance for passive crossover work). The
+  Uncoupled direct BEM drivers remain unit-source-drive SPL (arbitrary
+  per-driver scale; the solver drives sources at unit normal acceleration) and
+  have no electrical side. Coupled direct drivers export voltage-driven FRDs
+  and their `<NAME>_impedance.zma` is copied into the VituixCAD folder. The
   passive-cardioid combined MF exports as `MF_cardioid`; with coupled mode
-  enabled its FRDs use the voltage-driven coupled field and
-  `MF_passive_cardioid_impedance.zma` is copied into the VituixCAD folder
-  for that driver. Raise `Number of frequencies` (120-200) for
-  crossover-design resolution.
+  enabled its FRDs use the voltage-driven MF+port field and
+  `MF_passive_cardioid_impedance.zma` is copied into the VituixCAD folder for
+  that driver. Raise `Number of frequencies` (120-200) for crossover-design
+  resolution.
 - `manifest.json`
 - `fusion_wg_pipeline_manifest.json`
 - `final_summary_manifest.json`
@@ -228,12 +250,13 @@ The output folder contains:
 
 Inputs are grouped: **Sources and mesh** (per-source resolutions, rigid body
 resolution, transition distance), **Mesh sizing** (refine overrides and the live
-Estimate readout), **Solve** (frequency band and polar grid, mesh-only toggle, mesh-valid
-clamp, mesh-valid plot-marker toggle), **Passive cardioid MF** (optional
-MF plus `PORT_EXIT` postprocess combine, with optional coupled driver LEM),
-**Output** (output root, open folder), and **Advanced** (mirror plane
-override, Python interpreter, Waveguide Generator folder, launch WG). Typical
-3-way values:
+Estimate readout), **Solve** (frequency band and polar grid, mesh-only toggle,
+mesh-valid clamp, mesh-valid plot-marker toggle), **Passive cardioid MF**
+(optional MF plus `PORT_EXIT` postprocess combine), **Driver LEM (optional)**
+(per-source T/S text or Hornresp driver-file path, rear volumes, shared drive
+voltage and source resistance), **Output** (output root, open folder), and
+**Advanced** (mirror plane override, Python interpreter, Waveguide Generator
+folder, launch WG). Typical 3-way values:
 
 ```text
 LF source mesh mm: 20
@@ -250,15 +273,13 @@ Passive cardioid MF:
   Foam resistance Pa s/m3: 0
   Rear-wave polarity: on
   Couple driver LEM: off
-  Driver Sd cm2:
-  Driver Bl Tm:
-  Driver Re ohm:
-  Driver Le mH: 0
-  Driver Mms g:
-  Driver Cms mm/N:
-  Driver Vas L:
-  Driver Fs Hz:
-  Driver Qms:
+Driver LEM (optional):
+  LF driver T/S:
+  LF rear chamber L:
+  MF driver T/S:
+  MF rear chamber L:
+  HF driver T/S:
+  HF rear chamber L:
   Drive voltage V RMS: 2.83
   Generator Rg ohm: 0
 ```

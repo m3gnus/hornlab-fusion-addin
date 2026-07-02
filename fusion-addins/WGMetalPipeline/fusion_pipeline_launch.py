@@ -471,6 +471,7 @@ def build_pipeline_command(
     mesh_only: bool,
     open_wg: bool,
     open_output: bool,
+    plot_theme: str = "hornlab",
     crossover_lf_mf_hz: str | None = None,
     crossover_mf_hf_hz: str | None = None,
     symmetry_planes: str = "auto",
@@ -512,6 +513,7 @@ def build_pipeline_command(
     drive_voltage: str | None = None,
     rg_ohm: str | None = None,
 ) -> list[str]:
+    plot_theme_value = str(plot_theme or "").strip() or "hornlab"
     cmd = [
         str(python_path),
         str(pipeline_script),
@@ -545,6 +547,8 @@ def build_pipeline_command(
         freq_count,
         "--freq-spacing",
         freq_spacing,
+        "--plot-theme",
+        plot_theme_value,
         "--polar-distance-m",
         polar_distance_m,
         "--polar-angle-min-deg",

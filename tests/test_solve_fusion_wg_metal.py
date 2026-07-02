@@ -70,6 +70,10 @@ def _write_fake_solver_imports(workspace_root: Path, *, origin: str) -> None:
                 "    return None",
                 "def save_frequency_response_plot(*args, **kwargs):",
                 "    return None",
+                "def get_theme(*args, **kwargs):",
+                "    return None",
+                "def set_theme(*args, **kwargs):",
+                "    return None",
             ]
         )
         + "\n",
@@ -424,6 +428,50 @@ def test_source_mesh_valid_and_aperture_overlays_parse_independently(tmp_path):
     )
     assert module._parse_source_freq_max(args.source_mesh_valid_hz) == {"HF": 3642.0}
     assert module._parse_source_freq_max(args.source_aperture_valid_hz) == {"HF": 11352.0}
+
+
+def test_plot_theme_parser_and_manifest_config(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "tagged_sources.msh"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:4",
+            "--plot-theme",
+            "dark",
+            "--dry-run",
+        ]
+    )
+    assert args.plot_theme == "dark"
+
+    mesh_path = tmp_path / "tagged_sources.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    try:
+        rc = module.main(
+            [
+                "--mesh",
+                str(mesh_path),
+                "--out",
+                str(tmp_path / "out"),
+                "--source",
+                "HF:4",
+                "--plot-theme",
+                "dark",
+                "--dry-run",
+            ]
+        )
+        assert rc == 0
+        manifest = json.loads(
+            (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert manifest["config"]["plot_theme"] == "dark"
+    finally:
+        module.set_theme("hornlab")
 
 
 def test_port_exit_apertures_are_detected_from_sources():

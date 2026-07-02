@@ -561,6 +561,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--freq-count", type=int, default=60)
     parser.add_argument("--freq-spacing", choices=("log", "linear"), default="log")
     parser.add_argument(
+        "--plot-theme",
+        default="hornlab",
+        help="hornlab-plots theme to forward to the direct solve.",
+    )
+    parser.add_argument(
         "--crossover-lf-mf-hz",
         type=float,
         default=None,
@@ -1205,6 +1210,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             str(args.freq_count),
             "--freq-spacing",
             str(args.freq_spacing),
+            "--plot-theme",
+            str(args.plot_theme),
             "--polar-distance-m",
             str(args.polar_distance_m),
             "--polar-angle-min-deg",

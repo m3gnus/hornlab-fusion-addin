@@ -66,8 +66,10 @@ from fusion_pipeline_launch import (  # noqa: E402
 )
 from hornlab_plots import (  # noqa: E402
     FrequencyResponseCurve,
+    get_theme,
     save_directivity_plot,
     save_frequency_response_plot as _save_frequency_response_plot,
+    set_theme,
 )
 from hornlab_metal_bem import (  # noqa: E402
     ObservationConfig,
@@ -135,24 +137,25 @@ def save_frequency_response_plot(
         _build_frequency_response_figure,
         _response_curve_style,
     )
-    from hornlab_plots.style import (  # noqa: PLC0415
-        AXES_BG,
-        SPINE_COLOR,
-        TEXT_COLOR,
-        TICK_COLOR,
-    )
+    from hornlab_plots.style import apply_theme_overrides  # noqa: PLC0415
 
+    theme_obj = apply_theme_overrides(
+        kwargs.get("theme"),
+        colors=kwargs.get("colors"),
+        line_colors=kwargs.get("line_colors"),
+        response_colors=kwargs.get("response_colors"),
+    )
     fig = _build_frequency_response_figure(curves, **kwargs)
     if fig is None:
         return None
     ax = fig.axes[0]
     phase_ax = ax.twinx()
-    phase_ax.set_ylabel("Phase [deg]", color=TEXT_COLOR, fontsize=10)
+    phase_ax.set_ylabel("Phase [deg]", color=theme_obj.text_color, fontsize=10)
     phase_ax.set_ylim(-180.0, 180.0)
     phase_ax.set_yticks([-180.0, -90.0, 0.0, 90.0, 180.0])
-    phase_ax.tick_params(colors=TICK_COLOR, labelsize=8)
-    phase_ax.set_facecolor(AXES_BG)
-    phase_ax.spines["right"].set_color(SPINE_COLOR)
+    phase_ax.tick_params(colors=theme_obj.tick_color, labelsize=8)
+    phase_ax.set_facecolor(theme_obj.axes_bg)
+    phase_ax.spines["right"].set_color(theme_obj.spine_color)
     for spine_name in ("left", "top", "bottom"):
         phase_ax.spines[spine_name].set_visible(False)
 
@@ -173,7 +176,8 @@ def save_frequency_response_plot(
                 label=label,
                 role=role,
                 crossover=crossover,
-            )
+            ),
+            theme=theme_obj,
         )
         phase_ax.semilogx(
             freqs[finite],
@@ -191,7 +195,7 @@ def save_frequency_response_plot(
         transform=phase_ax.transAxes,
         ha="right",
         va="bottom",
-        color=TEXT_COLOR,
+        color=theme_obj.text_color,
         fontsize=8,
         alpha=0.68,
     )
@@ -1048,8 +1052,8 @@ def _save_interference_heatmap(
     """
     import matplotlib.pyplot as plt
     from hornlab_plots import prepare_heatmap_data, render_single_heatmap
-    from hornlab_plots.style import FIGURE_BG, TEXT_COLOR
 
+    theme_obj = get_theme()
     coherent = np.abs(sum(aligned_grids[name] for name in members))
     incoherent = sum(np.abs(aligned_grids[name]) for name in members)
     ratio_db = 20.0 * np.log10(
@@ -1062,7 +1066,7 @@ def _save_interference_heatmap(
     )
     if len(plane_names) == 1:
         axes = [axes]
-    fig.patch.set_facecolor(FIGURE_BG)
+    fig.patch.set_facecolor(theme_obj.figure_bg)
     for plane_index, (ax, plane) in enumerate(zip(axes, plane_names)):
         values = ratio_db[:, plane_index, :].T  # (n_angle, n_freq)
         angles_p, freqs_p, values_p = prepare_heatmap_data(
@@ -1079,13 +1083,14 @@ def _save_interference_heatmap(
             reference_level=-6.0,
             mesh_valid_hz=mesh_valid_hz,
             mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+            theme=theme_obj,
         )
         # Point straight at the bands that matter: cancellation lives where
         # two drivers carry comparable level, around each crossover.
         for xo in crossovers_hz or []:
             ax.axvline(
                 float(xo),
-                color=TEXT_COLOR,
+                color=theme_obj.text_color,
                 linestyle=":",
                 linewidth=1.2,
                 alpha=0.8,
@@ -1096,7 +1101,7 @@ def _save_interference_heatmap(
                 xy=(float(xo), angles_p[-1]),
                 xytext=(3, -12),
                 textcoords="offset points",
-                color=TEXT_COLOR,
+                color=theme_obj.text_color,
                 fontsize=8,
                 alpha=0.9,
             )
@@ -2560,23 +2565,15 @@ def _apply_mesh_valid_markers(
 def _style_line_axes(ax: Any, *, title: str, xlabel: str, ylabel: str) -> None:
     from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
     from hornlab_plots._grid import freq_formatter, log_grid_lines, preferred_frequency_ticks  # noqa: PLC0415
-    from hornlab_plots.style import (  # noqa: PLC0415
-        AXES_BG,
-        GRID_COLOR,
-        PRIMARY_GRID_ALPHA,
-        SECONDARY_GRID_ALPHA,
-        SPINE_COLOR,
-        TEXT_COLOR,
-        TICK_COLOR,
-    )
 
-    ax.set_facecolor(AXES_BG)
-    ax.set_title(title, color=TEXT_COLOR, fontsize=13, fontweight="600", pad=8)
-    ax.set_xlabel(xlabel, color=TEXT_COLOR, fontsize=11)
-    ax.set_ylabel(ylabel, color=TEXT_COLOR, fontsize=11)
-    ax.tick_params(colors=TICK_COLOR, labelsize=9)
+    theme_obj = get_theme()
+    ax.set_facecolor(theme_obj.axes_bg)
+    ax.set_title(title, color=theme_obj.text_color, fontsize=13, fontweight="600", pad=8)
+    ax.set_xlabel(xlabel, color=theme_obj.text_color, fontsize=11)
+    ax.set_ylabel(ylabel, color=theme_obj.text_color, fontsize=11)
+    ax.tick_params(colors=theme_obj.tick_color, labelsize=9)
     for spine in ax.spines.values():
-        spine.set_color(SPINE_COLOR)
+        spine.set_color(theme_obj.spine_color)
     ax.xaxis.set_major_formatter(FuncFormatter(freq_formatter))
     ticks = preferred_frequency_ticks(*ax.get_xlim())
     if ticks:
@@ -2585,12 +2582,12 @@ def _style_line_axes(ax: Any, *, title: str, xlabel: str, ylabel: str) -> None:
         major = any(np.isclose(freq, tick, rtol=1.0e-6, atol=1.0e-6) for tick in ticks)
         ax.axvline(
             freq,
-            color=GRID_COLOR,
-            alpha=PRIMARY_GRID_ALPHA if major else SECONDARY_GRID_ALPHA,
+            color=theme_obj.grid_color,
+            alpha=theme_obj.primary_grid_alpha if major else theme_obj.secondary_grid_alpha,
             linewidth=0.7 if major else 0.5,
             zorder=0,
         )
-    ax.grid(True, axis="y", alpha=SECONDARY_GRID_ALPHA, color=GRID_COLOR, linewidth=0.5)
+    ax.grid(True, axis="y", alpha=theme_obj.secondary_grid_alpha, color=theme_obj.grid_color, linewidth=0.5)
 
 
 def _save_directivity_power_plot(
@@ -2603,22 +2600,15 @@ def _save_directivity_power_plot(
     mesh_valid_radiating_hz: float | None,
 ) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    from hornlab_plots.style import (  # noqa: PLC0415
-        AXES_BG,
-        FIGURE_BG,
-        RESPONSE_COLORS,
-        SPINE_COLOR,
-        TEXT_COLOR,
-        TICK_COLOR,
-    )
 
+    theme_obj = get_theme()
     fig, ax = plt.subplots(figsize=(10.0, 4.8))
-    fig.patch.set_facecolor(FIGURE_BG)
+    fig.patch.set_facecolor(theme_obj.figure_bg)
     freqs = np.asarray(freqs, dtype=np.float64)
     ax.semilogx(
         freqs,
         metrics["directivity_index_db"],
-        color=RESPONSE_COLORS["combined"],
+        color=theme_obj.response_colors["combined"],
         linewidth=2.2,
         label="DI",
     )
@@ -2639,16 +2629,16 @@ def _save_directivity_power_plot(
     ax2.semilogx(
         freqs,
         metrics["power_response_db"],
-        color=RESPONSE_COLORS["mf"],
+        color=theme_obj.response_colors["mf"],
         linewidth=1.6,
         linestyle="--",
         alpha=0.82,
         label="Power response",
     )
-    ax2.set_ylabel("Power response [dB SPL avg]", color=TEXT_COLOR, fontsize=10)
-    ax2.tick_params(colors=TICK_COLOR, labelsize=8)
-    ax2.set_facecolor(AXES_BG)
-    ax2.spines["right"].set_color(SPINE_COLOR)
+    ax2.set_ylabel("Power response [dB SPL avg]", color=theme_obj.text_color, fontsize=10)
+    ax2.tick_params(colors=theme_obj.tick_color, labelsize=8)
+    ax2.set_facecolor(theme_obj.axes_bg)
+    ax2.spines["right"].set_color(theme_obj.spine_color)
     lines = [*ax.get_lines(), *ax2.get_lines()]
     labels = [line.get_label() for line in lines]
     legend = ax.legend(
@@ -2656,9 +2646,9 @@ def _save_directivity_power_plot(
         labels,
         loc="best",
         fontsize=9,
-        facecolor=AXES_BG,
-        edgecolor=SPINE_COLOR,
-        labelcolor=TEXT_COLOR,
+        facecolor=theme_obj.axes_bg,
+        edgecolor=theme_obj.spine_color,
+        labelcolor=theme_obj.text_color,
     )
     legend.get_frame().set_alpha(0.92)
     fig.text(
@@ -2667,7 +2657,7 @@ def _save_directivity_power_plot(
         POLAR_POWER_APPROXIMATION_NOTE,
         ha="center",
         va="bottom",
-        color=TEXT_COLOR,
+        color=theme_obj.text_color,
         fontsize=8,
         alpha=0.78,
     )
@@ -2688,12 +2678,16 @@ def _save_beamwidth_plot(
     assumed_symmetric_from_one_sided_grid: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    from hornlab_plots.style import AXES_BG, FIGURE_BG, RESPONSE_COLORS, SPINE_COLOR, TEXT_COLOR  # noqa: PLC0415
 
+    theme_obj = get_theme()
     fig, ax = plt.subplots(figsize=(10.0, 4.5))
-    fig.patch.set_facecolor(FIGURE_BG)
+    fig.patch.set_facecolor(theme_obj.figure_bg)
     freqs = np.asarray(freqs, dtype=np.float64)
-    colors = [RESPONSE_COLORS["combined"], RESPONSE_COLORS["mf"], RESPONSE_COLORS["hf"]]
+    colors = [
+        theme_obj.response_colors["combined"],
+        theme_obj.response_colors["mf"],
+        theme_obj.response_colors["hf"],
+    ]
     for index, (plane, values) in enumerate(beamwidths.items()):
         ax.semilogx(
             freqs,
@@ -2719,9 +2713,9 @@ def _save_beamwidth_plot(
     legend = ax.legend(
         loc="best",
         fontsize=9,
-        facecolor=AXES_BG,
-        edgecolor=SPINE_COLOR,
-        labelcolor=TEXT_COLOR,
+        facecolor=theme_obj.axes_bg,
+        edgecolor=theme_obj.spine_color,
+        labelcolor=theme_obj.text_color,
     )
     legend.get_frame().set_alpha(0.92)
     if assumed_symmetric_from_one_sided_grid:
@@ -2731,7 +2725,7 @@ def _save_beamwidth_plot(
             BEAMWIDTH_SYMMETRY_NOTE,
             ha="center",
             va="bottom",
-            color=TEXT_COLOR,
+            color=theme_obj.text_color,
             fontsize=8,
             alpha=0.78,
         )
@@ -2753,15 +2747,15 @@ def _save_group_delay_plot(
     mesh_valid_radiating_hz: float | None,
 ) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415
-    from hornlab_plots.style import FIGURE_BG, RESPONSE_COLORS  # noqa: PLC0415
 
+    theme_obj = get_theme()
     fig, ax = plt.subplots(figsize=(10.0, 4.5))
-    fig.patch.set_facecolor(FIGURE_BG)
+    fig.patch.set_facecolor(theme_obj.figure_bg)
     freqs = np.asarray(freqs, dtype=np.float64)
     ax.semilogx(
         freqs,
         np.asarray(group_delay_s, dtype=np.float64) * 1000.0,
-        color=RESPONSE_COLORS["combined"],
+        color=theme_obj.response_colors["combined"],
         linewidth=2.0,
     )
     ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
@@ -3690,20 +3684,40 @@ def _write_excursion_plot(
 ) -> None:
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
+    theme_obj = get_theme()
     fig, ax = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
+    fig.patch.set_facecolor(theme_obj.figure_bg)
     ax.semilogx(
         freqs,
         np.asarray(excursion_m, dtype=np.float64) * 1.0e3,
+        color=theme_obj.response_colors["combined"],
+        linewidth=2.0,
         label=source_name,
     )
     if xmax_m is not None:
-        ax.axhline(float(xmax_m) * 1.0e3, color="tab:red", linestyle="--", label="Xmax")
-    ax.set_title(f"{source_name} Cone Excursion")
-    ax.set_xlabel("Frequency [Hz]")
-    ax.set_ylabel("Excursion [mm RMS]")
-    ax.grid(True, which="both", alpha=0.25)
-    ax.legend(loc="best")
-    fig.savefig(path, dpi=160)
+        ax.axhline(
+            float(xmax_m) * 1.0e3,
+            color=theme_obj.mesh_limit_color,
+            linestyle="--",
+            label="Xmax",
+        )
+    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
+    _style_line_axes(
+        ax,
+        title=f"{source_name} Cone Excursion",
+        xlabel="Frequency [Hz]",
+        ylabel="Excursion [mm RMS]",
+    )
+    legend = ax.legend(
+        loc="best",
+        fontsize=9,
+        facecolor=theme_obj.axes_bg,
+        edgecolor=theme_obj.spine_color,
+        labelcolor=theme_obj.text_color,
+    )
+    legend.get_frame().set_alpha(0.92)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=160, facecolor=fig.get_facecolor(), edgecolor="none")
     plt.close(fig)
 
 
@@ -5539,6 +5553,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--freq-count", type=int, default=60)
     parser.add_argument("--freq-spacing", choices=("log", "linear"), default="log")
     parser.add_argument(
+        "--plot-theme",
+        default="hornlab",
+        help="hornlab-plots theme name or custom installed theme. Defaults to hornlab.",
+    )
+    parser.add_argument(
         "--crossover-lf-mf-hz",
         type=float,
         default=None,
@@ -5700,6 +5719,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    set_theme(args.plot_theme)
     mesh_path = args.mesh.expanduser().resolve()
     out_dir = args.out.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -5794,6 +5814,7 @@ def main(argv: list[str] | None = None) -> int:
             "freq_max_hz": args.freq_max_hz,
             "freq_count": args.freq_count,
             "freq_spacing": args.freq_spacing,
+            "plot_theme": args.plot_theme,
             "crossover": {
                 "lf_mf_hz": args.crossover_lf_mf_hz,
                 "mf_hf_hz": args.crossover_mf_hf_hz,

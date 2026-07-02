@@ -107,6 +107,7 @@ DEFAULT_SETTINGS = {
     "export_vituixcad": False,
     "clamp_to_mesh_limit": False,
     "show_mesh_valid_markers": True,
+    "plot_theme": "hornlab",
     "passive_cardioid_enabled": False,
     "passive_cardioid_rear_volume_l": "",
     "passive_cardioid_port_length_mm": "0",
@@ -734,6 +735,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             advanced.addBoolValueInput("browse_python_path", "Browse Python", False, "", False)
             advanced.addStringValueInput("wg_dir", "WG folder", _setting_str(settings, "wg_dir"))
             advanced.addBoolValueInput("browse_wg_dir", "Browse WG folder", False, "", False)
+            advanced.addStringValueInput("plot_theme", "Plot theme", _setting_str(settings, "plot_theme"))
             advanced.addBoolValueInput("open_wg", "Launch WG", True, "", _setting_bool(settings, "open_wg"))
 
             input_changed_handler = CommandInputChangedHandler()
@@ -985,6 +987,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             quadrants = quadrants_for_symmetry_planes(symmetry_planes)
             python_path = Path(str(_input_value(inputs, "python_path"))).expanduser()
             wg_dir = Path(str(_input_value(inputs, "wg_dir"))).expanduser()
+            plot_theme = str(_input_value(inputs, "plot_theme") or "hornlab").strip() or "hornlab"
             mesh_only = bool(_input_value(inputs, "mesh_only"))
             clamp_to_mesh_limit = bool(_input_value(inputs, "clamp_to_mesh_limit"))
             show_mesh_valid_markers = bool(_input_value(inputs, "show_mesh_valid_markers"))
@@ -1106,6 +1109,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "mirror_plane": mirror_plane,
                 "python_path": str(python_path),
                 "wg_dir": str(wg_dir),
+                "plot_theme": plot_theme,
                 "mesh_only": mesh_only,
                 "open_wg": open_wg,
                 "open_output": open_output,
@@ -1167,6 +1171,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 mesh_only=mesh_only,
                 open_wg=open_wg,
                 open_output=open_output,
+                plot_theme=plot_theme,
                 underresolved_solve_policy=underresolved_solve_policy,
                 show_mesh_valid_markers=show_mesh_valid_markers,
                 export_vituixcad=export_vituixcad,

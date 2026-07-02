@@ -86,6 +86,7 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
     cmd = _helper_command(helper, **_coupled_helper_overrides())
     args = pipeline.parse_args(cmd[2:])
 
+    assert args.plot_theme == "hornlab"
     assert args.passive_cardioid_coupled is True
     assert args.driver_lem == [
         "MF:Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=29.4,Cms=0.000252,Qms=4.1,N=1"
@@ -287,6 +288,7 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--quadrants" not in cmd
     assert "--mirror-axes" not in cmd
     assert cmd[cmd.index("--polar-angle-count") + 1] == "37"
+    assert cmd[cmd.index("--plot-theme") + 1] == "hornlab"
     assert cmd[cmd.index("--bem-formulation") + 1] == "complex_k"
     assert cmd[cmd.index("--complex-k-shift") + 1] == "0.005"
     assert cmd[cmd.index("--underresolved-solve-policy") + 1] == "warn"
@@ -297,6 +299,17 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--open-output-folder" in cmd
     assert "--open-wg" not in cmd
     assert "--allow-underresolved-solve" not in cmd
+
+
+def test_build_pipeline_command_can_request_plot_theme():
+    helper = _load_helper()
+    pipeline = _load_pipeline()
+
+    cmd = _helper_command(helper, plot_theme="dark")
+    args = pipeline.parse_args(cmd[2:])
+
+    assert cmd[cmd.index("--plot-theme") + 1] == "dark"
+    assert args.plot_theme == "dark"
 
 
 def test_build_pipeline_command_can_request_passive_cardioid_combine():
@@ -914,6 +927,53 @@ def test_pipeline_orders_direct_solve_sources_hf_mf_lf(tmp_path, monkeypatch):
         "LF:20:2",
         "PORT_EXIT:8:10",
     ]
+
+
+def test_pipeline_forwards_plot_theme_to_direct_solve(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "wg_source_meshes_m": {},
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {
+            "status": "valid",
+            "requested_max_frequency_hz": 2000.0,
+            "max_valid_frequency_hz": 3000.0,
+            "per_source": {
+                "HF": {"max_valid_frequency_hz": 3000.0, "status": "valid"},
+            },
+            "warnings": [],
+        },
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(calls, prep_manifest_payload=prep_manifest),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--freq-max-hz",
+            "2000",
+            "--plot-theme",
+            "dark",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 0
+    solve_cmd = calls[-1][1]
+    assert solve_cmd[solve_cmd.index("--plot-theme") + 1] == "dark"
 
 
 def test_pipeline_writes_solving_manifest_before_direct_solve_returns(

@@ -1340,6 +1340,32 @@ def test_passive_cardioid_coupled_args_validate_driver_requirements(tmp_path):
         )
 
 
+def test_deprecated_passive_cardioid_driver_alias_conflict_warns_deterministically(
+    tmp_path,
+    capsys,
+):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "fake.msh"),
+            "--out", str(tmp_path),
+            "--source", "MF:3",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l", "10",
+            "--passive-cardioid-port-length-mm", "20",
+            "--passive-cardioid-coupled",
+            "--driver-lem",
+            "MF:Sd=210,Bl=9,Re=6,Mmd=19,Cms=5e-4,Rms=2.5",
+        ]
+        + _passive_cardioid_driver_cli()
+    )
+
+    module._validate_passive_cardioid_args(args)
+
+    assert args.driver_lem_specs["MF"].params["sd_m2"] == pytest.approx(0.021)
+    assert "ignored because --driver-lem MF" in capsys.readouterr().out
+
+
 def test_passive_cardioid_coupled_skips_matrix_without_mf_aperture(tmp_path, monkeypatch):
     module = _load_script()
     fixture = _write_passive_cardioid_fixture(tmp_path, include_mf_matrix=False)
@@ -1393,6 +1419,168 @@ def test_per_driver_lem_skips_mf_when_passive_cardioid_coupled_owns_it(tmp_path)
 
     assert payload["sources"]["MF"]["status"] == "skipped"
     assert "passive-cardioid coupled mode owns" in payload["sources"]["MF"]["reason"]
+
+
+def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    freqs = np.array([100.0, 250.0], dtype=np.float64)
+    angles = np.array([0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    basis_npz = tmp_path / "LF_pressure_basis.npz"
+    _write_synthetic_basis(
+        basis_npz,
+        name="LF",
+        tag=2,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128),
+    )
+    p_avg_solver = np.array([1.0 + 2.0j, -0.25 + 0.5j], dtype=np.complex128)
+    previous_result_json = tmp_path / "LF_previous_results.json"
+    module._write_json(
+        previous_result_json,
+        {"surface_pressure_avg": {"2": p_avg_solver}},
+    )
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "missing-postprocess-mesh.msh"),
+            "--out", str(tmp_path),
+            "--source", "LF:2",
+            "--driver-lem",
+            "LF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3,Xmax=4.5",
+            "--drive-voltage", "4",
+            "--rg-ohm", "0.2",
+        ]
+    )
+    module._normalize_driver_lem_args(args)
+    source_result = module._write_one_source_derived_outputs_from_basis(
+        basis_npz,
+        tmp_path,
+        args,
+        source_name="LF",
+        source_tag=2,
+        previous_result_json=previous_result_json,
+    )
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.02)
+    captured: dict[str, np.ndarray] = {}
+    electrical = np.array([5.0 + 5.0j, 3.0 - 4.0j], dtype=np.complex128)
+
+    def fake_coupled_direct_radiator_response(_frequencies_hz, **kwargs):
+        captured["z_self"] = np.asarray(kwargs["z_self"], dtype=np.complex128)
+        return SimpleNamespace(
+            cone_volume_velocity=np.array([0.01 + 0.0j, 0.02 + 0.0j]),
+            acoustic_load=np.asarray(kwargs["z_self"], dtype=np.complex128),
+            electrical_input_impedance=electrical,
+            cone_excursion_m=np.array([0.001, 0.002]),
+            mmd_correction_kg=0.0,
+            diagnostics={
+                "mmd_source": "Mmd",
+                "mmd_eff_kg": 0.018,
+                "sd_eff_m2": 0.02,
+            },
+        )
+
+    monkeypatch.setattr(
+        module.driver_coupling,
+        "coupled_direct_radiator_response",
+        fake_coupled_direct_radiator_response,
+    )
+    import matplotlib.axes
+
+    axhline_calls = []
+    original_axhline = matplotlib.axes.Axes.axhline
+
+    def spy_axhline(self, y=0, *plot_args, **plot_kwargs):
+        axhline_calls.append((y, plot_kwargs.get("label")))
+        return original_axhline(self, y, *plot_args, **plot_kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "axhline", spy_axhline)
+
+    payload = module._apply_driver_lem_coupling(
+        tmp_path / "missing-postprocess-mesh.msh",
+        tmp_path,
+        args,
+        source_results=[source_result],
+    )
+
+    assert payload["sources"]["LF"]["status"] == "complete"
+    omega = 2.0 * np.pi * freqs
+    expected_z_self = np.conjugate(1j * omega * p_avg_solver) / 0.02
+    np.testing.assert_allclose(captured["z_self"], expected_z_self)
+    rows = [
+        line.split()
+        for line in (tmp_path / "LF_impedance.zma")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line and not line.startswith("*")
+    ]
+    zma = np.asarray(rows, dtype=np.float64)
+    np.testing.assert_allclose(zma[:, 0], freqs)
+    np.testing.assert_allclose(zma[:, 1], np.abs(electrical), rtol=1.0e-6)
+    np.testing.assert_allclose(
+        zma[:, 2],
+        np.degrees(np.angle(electrical)),
+        atol=1.0e-6,
+    )
+    assert any(
+        label == "Xmax" and y == pytest.approx(4.5)
+        for y, label in axhline_calls
+    )
+    assert not (tmp_path / "vituixcad" / "LF_impedance.zma").exists()
+
+
+def test_driver_lem_missing_surface_avg_skips_instead_of_crashing(
+    tmp_path,
+    capsys,
+):
+    module = _load_script()
+    freqs = np.array([100.0, 250.0], dtype=np.float64)
+    angles = np.array([0.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    basis_npz = tmp_path / "LF_pressure_basis.npz"
+    _write_synthetic_basis(
+        basis_npz,
+        name="LF",
+        tag=2,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128),
+    )
+    result_json = tmp_path / "LF_results.json"
+    module._write_json(result_json, {"surface_pressure_avg": {}})
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "fake.msh"),
+            "--out", str(tmp_path),
+            "--source", "LF:2",
+            "--driver-lem",
+            "LF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+        ]
+    )
+    module._normalize_driver_lem_args(args)
+
+    payload = module._apply_driver_lem_coupling(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_results=[
+            {
+                "name": "LF",
+                "tag": 2,
+                "pressure_basis_npz": str(basis_npz),
+                "results_json": str(result_json),
+            }
+        ],
+    )
+
+    assert payload["sources"]["LF"]["status"] == "skipped"
+    assert "no surface_pressure_avg" in payload["sources"]["LF"]["reason"]
+    assert "DRIVER LEM WARNING: LF" in capsys.readouterr().out
 
 
 def test_passive_cardioid_skips_when_required_sources_were_skipped(tmp_path):
@@ -1709,6 +1897,92 @@ def test_two_way_crossover_combine_writes_outputs(tmp_path):
     report = Path(outputs["driver_time_alignment_txt"]).read_text(encoding="utf-8")
     assert "MF -> HF (2-way)" in report
     assert "MF/HF: LR4 at 1000.000 Hz" in report
+
+
+def test_crossover_combine_uses_active_driver_lem_basis_and_reports_trim(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 25)
+    angles = np.array([0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    unit_lf_npz = tmp_path / "LF_pressure_basis.npz"
+    active_lf_npz = tmp_path / "LF_driver_lem_pressure.npz"
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    _write_synthetic_basis(
+        unit_lf_npz,
+        name="LF",
+        tag=2,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=np.full((freqs.size, 1, angles.size), 0.01, dtype=np.complex128),
+    )
+    np.savez_compressed(
+        active_lf_npz,
+        source_name=np.asarray("LF"),
+        source_tag=np.asarray(2, dtype=np.int32),
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=np.full(
+            (freqs.size, 1, angles.size),
+            0.04,
+            dtype=np.complex128,
+        ),
+        phase_convention=np.asarray(module.PRESSURE_NPZ_PHASE_CONVENTION),
+        source_normalization=np.asarray("voltage_driven_driver_lem"),
+    )
+    _write_synthetic_basis(
+        mf_npz,
+        name="MF",
+        tag=3,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=np.full((freqs.size, 1, angles.size), 0.02, dtype=np.complex128),
+    )
+
+    lf_result = _synthetic_source_result(unit_lf_npz, "LF", 2)
+    lf_result["active_pressure_basis_npz"] = str(active_lf_npz)
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            lf_result,
+            _synthetic_source_result(mf_npz, "MF", 3),
+        ],
+        lf_mf_hz=500.0,
+        mf_hf_hz=None,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["level_match"]["gains_db"]["LF"] < 0.0
+    assert payload["level_match"]["gains_db"]["MF"] > 0.0
+    weights = module._crossover_weights(freqs, ["LF", "MF"], [500.0])
+    lf_band = freqs <= 500.0
+    mf_band = freqs >= 500.0
+    lf_median = float(
+        np.median(module._spl_db_from_pressure(0.04 * weights["LF"])[lf_band])
+    )
+    mf_median = float(
+        np.median(module._spl_db_from_pressure(0.02 * weights["MF"])[mf_band])
+    )
+    expected_lf_gain = float(np.median([lf_median, mf_median]) - lf_median)
+    unit_lf_median = float(
+        np.median(module._spl_db_from_pressure(0.01 * weights["LF"])[lf_band])
+    )
+    unit_lf_gain = float(np.median([unit_lf_median, mf_median]) - unit_lf_median)
+    assert payload["level_match"]["gains_db"]["LF"] == pytest.approx(
+        expected_lf_gain,
+        abs=1.0e-9,
+    )
+    assert unit_lf_gain > 0.0
+    report = Path(payload["outputs"]["driver_time_alignment_txt"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Applied gain (dB)" in report
+    assert "LF" in report and "MF" in report
 
 
 def test_three_way_combine_interpolates_clamped_lf_grid(tmp_path):
@@ -2652,6 +2926,62 @@ def test_vituixcad_export_includes_coupled_passive_cardioid_zma(tmp_path):
     readme = (export_dir / "README.txt").read_text(encoding="utf-8")
     assert "MF_passive_cardioid_impedance.zma" in readme
     assert "No ZMA is exported" not in readme
+
+
+def test_vituixcad_export_copies_direct_driver_lem_zma_only_during_export(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 2000.0, 10)
+    angles = np.array([0.0, 90.0, 180.0])
+    planes = np.array(["horizontal"], dtype=str)
+    active_npz = tmp_path / "LF_driver_lem_pressure.npz"
+    np.savez_compressed(
+        active_npz,
+        source_name=np.asarray("LF"),
+        source_tag=np.asarray(2, dtype=np.int32),
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=_delayed_pressure(
+            freqs,
+            planes,
+            angles,
+            arrival_s=0.0,
+            amplitude=0.04,
+        ),
+        phase_convention=np.asarray(module.PRESSURE_NPZ_PHASE_CONVENTION),
+        source_normalization=np.asarray("voltage_driven_driver_lem"),
+    )
+    zma = tmp_path / "LF_impedance.zma"
+    zma.write_text(
+        "* synthetic\n100.0\t5.5\t0.0\n200.0\t6.0\t10.0\n",
+        encoding="utf-8",
+    )
+    source_result = {
+        "name": "LF",
+        "tag": 2,
+        "pressure_basis_npz": str(tmp_path / "LF_pressure_basis.npz"),
+        "active_pressure_basis_npz": str(active_npz),
+        "driver_lem": {
+            "status": "complete",
+            "outputs": {"impedance_zma": str(zma)},
+        },
+    }
+
+    assert not (tmp_path / "vituixcad" / "LF_impedance.zma").exists()
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [source_result],
+        polar_distance_m=2.0,
+    )
+
+    export_dir = Path(payload["export_dir"])
+    assert (export_dir / "LF_impedance.zma").exists()
+    assert payload["outputs"]["vituixcad_driver_zmas"]["LF"].endswith(
+        "LF_impedance.zma"
+    )
+    assert "LF_impedance.zma" in (export_dir / "README.txt").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_regenerate_driver_recovers_reference_style_solve_command(tmp_path):

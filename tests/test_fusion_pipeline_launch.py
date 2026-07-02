@@ -1045,6 +1045,14 @@ def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, mo
             "--passive-cardioid-foam-resistance-pa-s-m3",
             "600",
             "--no-passive-cardioid-invert-port",
+            "--driver-lem",
+            "MF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+            "--driver-rear-volume-l",
+            "MF:4.5",
+            "--drive-voltage",
+            "4.0",
+            "--rg-ohm",
+            "0.2",
         ]
     )
 
@@ -1055,6 +1063,12 @@ def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, mo
     assert solve_cmd[solve_cmd.index("--passive-cardioid-port-length-mm") + 1] == "22.0"
     assert solve_cmd[solve_cmd.index("--passive-cardioid-foam-resistance-pa-s-m3") + 1] == "600.0"
     assert "--no-passive-cardioid-invert-port" in solve_cmd
+    assert solve_cmd[solve_cmd.index("--driver-lem") + 1] == (
+        "MF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3"
+    )
+    assert solve_cmd[solve_cmd.index("--driver-rear-volume-l") + 1] == "MF:4.5"
+    assert solve_cmd[solve_cmd.index("--drive-voltage") + 1] == "4.0"
+    assert solve_cmd[solve_cmd.index("--rg-ohm") + 1] == "0.2"
 
 
 def test_pipeline_default_warns_and_solves_underresolved_sources(tmp_path, monkeypatch):

@@ -2931,13 +2931,26 @@ def _apply_driver_lem_coupling(
             source_result["driver_lem"] = source_payload
             continue
 
-        basis = _load_pressure_basis(_source_unit_basis_path(source_result))
-        z_self, z_self_payload = _basis_self_impedance(
-            mesh_path,
-            args,
-            source_result,
-            basis,
-        )
+        try:
+            basis = _load_pressure_basis(_source_unit_basis_path(source_result))
+            z_self, z_self_payload = _basis_self_impedance(
+                mesh_path,
+                args,
+                source_result,
+                basis,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            source_payload = {
+                "status": "skipped",
+                "reason": str(exc),
+            }
+            print(
+                f"DRIVER LEM WARNING: {matching_name}: {source_payload['reason']}",
+                flush=True,
+            )
+            payload["sources"][matching_name] = source_payload
+            source_result["driver_lem"] = source_payload
+            continue
         coupled = driver_coupling.coupled_direct_radiator_response(
             basis.frequencies_hz,
             driver=_driver_lem_spec_driver(spec),

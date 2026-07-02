@@ -49,6 +49,7 @@ class _Input:
         self.value = value
         self.selectedItem = selected
         self.children = children
+        self.isEnabled = True
 
 
 class _Selected:
@@ -138,37 +139,34 @@ def test_passive_cardioid_sync_preserves_requested_polar_window():
     assert addin._input_by_id(top, "passive_cardioid_rear_volume_l").isEnabled is True
 
 
-def test_passive_cardioid_coupled_defaults_present():
+def test_driver_lem_defaults_present():
     addin = _load_addin_with_fake_adsk()
 
+    assert addin.SETTINGS_VERSION == 12
     assert addin.DEFAULT_SETTINGS["passive_cardioid_coupled"] is False
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_sd_cm2"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_bl_tm"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_re_ohm"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_le_mh"] == "0"
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_mms_g"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_cms_mm_per_n"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_vas_l"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_fs_hz"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_driver_qms"] == ""
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_drive_voltage"] == "2.83"
-    assert addin.DEFAULT_SETTINGS["passive_cardioid_rg_ohm"] == "0"
+    assert addin.DEFAULT_SETTINGS["lf_driver_lem"] == ""
+    assert addin.DEFAULT_SETTINGS["mf_driver_lem"] == ""
+    assert addin.DEFAULT_SETTINGS["hf_driver_lem"] == ""
+    assert addin.DEFAULT_SETTINGS["lf_driver_rear_volume_l"] == ""
+    assert addin.DEFAULT_SETTINGS["mf_driver_rear_volume_l"] == ""
+    assert addin.DEFAULT_SETTINGS["hf_driver_rear_volume_l"] == ""
+    assert addin.DEFAULT_SETTINGS["drive_voltage"] == "2.83"
+    assert addin.DEFAULT_SETTINGS["rg_ohm"] == "0"
+    assert "passive_cardioid_driver_sd_cm2" not in addin.DEFAULT_SETTINGS
+    assert "passive_cardioid_drive_voltage" not in addin.DEFAULT_SETTINGS
 
 
-def test_passive_cardioid_sync_gates_coupled_driver_fields():
+def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
     addin = _load_addin_with_fake_adsk()
     driver_ids = [
-        "passive_cardioid_driver_sd_cm2",
-        "passive_cardioid_driver_bl_tm",
-        "passive_cardioid_driver_re_ohm",
-        "passive_cardioid_driver_le_mh",
-        "passive_cardioid_driver_mms_g",
-        "passive_cardioid_driver_cms_mm_per_n",
-        "passive_cardioid_driver_vas_l",
-        "passive_cardioid_driver_fs_hz",
-        "passive_cardioid_driver_qms",
-        "passive_cardioid_drive_voltage",
-        "passive_cardioid_rg_ohm",
+        "lf_driver_lem",
+        "mf_driver_lem",
+        "hf_driver_lem",
+        "lf_driver_rear_volume_l",
+        "mf_driver_rear_volume_l",
+        "hf_driver_rear_volume_l",
+        "drive_voltage",
+        "rg_ohm",
     ]
     top = _Inputs(
         [
@@ -187,7 +185,7 @@ def test_passive_cardioid_sync_gates_coupled_driver_fields():
 
     assert addin._input_by_id(top, "passive_cardioid_coupled").isEnabled is False
     for input_id in driver_ids:
-        assert addin._input_by_id(top, input_id).isEnabled is False
+        assert addin._input_by_id(top, input_id).isEnabled is True
 
     addin._input_by_id(top, "passive_cardioid_enabled").value = True
     addin._input_by_id(top, "passive_cardioid_coupled").value = False
@@ -195,7 +193,7 @@ def test_passive_cardioid_sync_gates_coupled_driver_fields():
 
     assert addin._input_by_id(top, "passive_cardioid_coupled").isEnabled is True
     for input_id in driver_ids:
-        assert addin._input_by_id(top, input_id).isEnabled is False
+        assert addin._input_by_id(top, input_id).isEnabled is True
 
     addin._input_by_id(top, "passive_cardioid_coupled").value = True
     addin._sync_passive_cardioid_ui(top)
@@ -232,6 +230,45 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
     assert "throat_epw" not in settings
     assert settings["mirror_plane"] == "Front/Back"
     assert settings["clamp_to_mesh_limit"] is True
+
+    # A v11 file drops the removed passive-cardioid driver controls at v12.
+    settings_path.write_text(
+        json.dumps(
+            {
+                "settings_version": 11,
+                "passive_cardioid_driver_sd_cm2": "320",
+                "passive_cardioid_driver_bl_tm": "11.6",
+                "passive_cardioid_driver_re_ohm": "5.2",
+                "passive_cardioid_driver_le_mh": "0.8",
+                "passive_cardioid_driver_mms_g": "29.4",
+                "passive_cardioid_driver_cms_mm_per_n": "0.252",
+                "passive_cardioid_driver_vas_l": "33",
+                "passive_cardioid_driver_fs_hz": "55",
+                "passive_cardioid_driver_qms": "4.1",
+                "passive_cardioid_drive_voltage": "4",
+                "passive_cardioid_rg_ohm": "0.2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = addin._load_settings()
+    for stale_key in (
+        "passive_cardioid_driver_sd_cm2",
+        "passive_cardioid_driver_bl_tm",
+        "passive_cardioid_driver_re_ohm",
+        "passive_cardioid_driver_le_mh",
+        "passive_cardioid_driver_mms_g",
+        "passive_cardioid_driver_cms_mm_per_n",
+        "passive_cardioid_driver_vas_l",
+        "passive_cardioid_driver_fs_hz",
+        "passive_cardioid_driver_qms",
+        "passive_cardioid_drive_voltage",
+        "passive_cardioid_rg_ohm",
+    ):
+        assert stale_key not in settings
+    assert settings["mf_driver_lem"] == ""
+    assert settings["drive_voltage"] == "2.83"
+    assert settings["rg_ohm"] == "0"
 
     # A pre-v9 file drops the whole stale set.
     settings_path.write_text(

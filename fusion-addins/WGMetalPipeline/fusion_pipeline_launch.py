@@ -503,6 +503,14 @@ def build_pipeline_command(
     passive_cardioid_driver_qms: str | None = None,
     passive_cardioid_drive_voltage: str | None = None,
     passive_cardioid_rg_ohm: str | None = None,
+    lf_driver_lem: str | None = None,
+    mf_driver_lem: str | None = None,
+    hf_driver_lem: str | None = None,
+    lf_driver_rear_volume_l: str | None = None,
+    mf_driver_rear_volume_l: str | None = None,
+    hf_driver_rear_volume_l: str | None = None,
+    drive_voltage: str | None = None,
+    rg_ohm: str | None = None,
 ) -> list[str]:
     cmd = [
         str(python_path),
@@ -574,6 +582,23 @@ def build_pipeline_command(
         cmd.append("--no-mesh-valid-markers")
     if export_vituixcad:
         cmd.append("--export-vituixcad")
+    for name, raw_payload in (
+        ("LF", lf_driver_lem),
+        ("MF", mf_driver_lem),
+        ("HF", hf_driver_lem),
+    ):
+        entry = build_driver_lem_cli_entry(name, raw_payload)
+        if entry is not None:
+            cmd.extend(["--driver-lem", entry])
+    for name, raw_volume in (
+        ("LF", lf_driver_rear_volume_l),
+        ("MF", mf_driver_rear_volume_l),
+        ("HF", hf_driver_rear_volume_l),
+    ):
+        if raw_volume and str(raw_volume).strip():
+            cmd.extend(["--driver-rear-volume-l", f"{name}:{str(raw_volume).strip()}"])
+    _append_optional_cli_value(cmd, "--drive-voltage", drive_voltage)
+    _append_optional_cli_value(cmd, "--rg-ohm", rg_ohm)
     if passive_cardioid_enabled:
         cmd.append("--passive-cardioid-mf")
         if passive_cardioid_rear_volume_l and str(passive_cardioid_rear_volume_l).strip():

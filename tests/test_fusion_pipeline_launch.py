@@ -68,15 +68,12 @@ def _coupled_helper_overrides():
         passive_cardioid_foam_resistance_pa_s_m3="2000",
         passive_cardioid_invert_port=True,
         passive_cardioid_coupled=True,
-        passive_cardioid_driver_sd_cm2="320",
-        passive_cardioid_driver_bl_tm="11.6",
-        passive_cardioid_driver_re_ohm="5.2",
-        passive_cardioid_driver_le_mh="0.8",
-        passive_cardioid_driver_mms_g="29.4",
-        passive_cardioid_driver_cms_mm_per_n="0.252",
-        passive_cardioid_driver_qms="4.1",
-        passive_cardioid_drive_voltage="2.83",
-        passive_cardioid_rg_ohm="0.1",
+        mf_driver_lem=(
+            "Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=29.4,"
+            "Cms=0.000252,Qms=4.1"
+        ),
+        drive_voltage="2.83",
+        rg_ohm="0.1",
     )
 
 
@@ -90,12 +87,13 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
     args = pipeline.parse_args(cmd[2:])
 
     assert args.passive_cardioid_coupled is True
-    assert args.passive_cardioid_driver_sd_cm2 == pytest.approx(320.0)
-    assert args.passive_cardioid_driver_cms_mm_per_n == pytest.approx(0.252)
-    assert args.passive_cardioid_drive_voltage == pytest.approx(2.83)
-    assert args.passive_cardioid_rg_ohm == pytest.approx(0.1)
-    assert args.drive_voltage is None
-    assert args.rg_ohm is None
+    assert args.driver_lem == [
+        "MF:Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=29.4,Cms=0.000252,Qms=4.1,N=1"
+    ]
+    assert args.drive_voltage == pytest.approx(2.83)
+    assert args.rg_ohm == pytest.approx(0.1)
+    assert args.passive_cardioid_drive_voltage is None
+    assert args.passive_cardioid_rg_ohm is None
 
     forwarded = {
         option
@@ -108,6 +106,15 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
         or token in ("--passive-cardioid-drive-voltage", "--passive-cardioid-rg-ohm")
     }
     assert emitted <= forwarded
+    emitted_driver_lem = {
+        token
+        for token in cmd
+        if token in ("--driver-lem", "--driver-rear-volume-l", "--drive-voltage", "--rg-ohm")
+    }
+    driver_lem_forwarded = {
+        option for option, _attr in pipeline.DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS
+    } | {option for option, _attr in pipeline.DRIVER_LEM_VALUE_FORWARD_OPTIONS}
+    assert emitted_driver_lem <= driver_lem_forwarded
 
 
 def test_driver_lem_parser_accepts_hornresp_file_and_normalizes_units(tmp_path):
@@ -311,6 +318,31 @@ def test_build_pipeline_command_can_request_passive_cardioid_combine():
     assert cmd[cmd.index("--passive-cardioid-port-area-cm2") + 1] == "100"
     assert cmd[cmd.index("--passive-cardioid-foam-resistance-pa-s-m3") + 1] == "420"
     assert "--no-passive-cardioid-invert-port" in cmd
+
+
+def test_build_pipeline_command_maps_driver_lem_inputs():
+    helper = _load_helper()
+
+    cmd = _helper_command(
+        helper,
+        lf_driver_lem=(
+            "Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mmd=26.2,"
+            "Cms=0.000252,Rms=3.18,Xmax=5.5"
+        ),
+        lf_driver_rear_volume_l="4.5",
+        drive_voltage="4.0",
+        rg_ohm="0.2",
+    )
+
+    driver_entries = [
+        cmd[index + 1] for index, token in enumerate(cmd) if token == "--driver-lem"
+    ]
+    assert driver_entries == [
+        "LF:Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mmd=26.2,Cms=0.000252,Rms=3.18,Xmax=5.5,N=1"
+    ]
+    assert cmd[cmd.index("--driver-rear-volume-l") + 1] == "LF:4.5"
+    assert cmd[cmd.index("--drive-voltage") + 1] == "4.0"
+    assert cmd[cmd.index("--rg-ohm") + 1] == "0.2"
 
 
 def test_build_pipeline_command_maps_passive_cardioid_coupled_driver_flags():

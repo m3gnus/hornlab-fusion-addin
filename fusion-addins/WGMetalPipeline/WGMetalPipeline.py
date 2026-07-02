@@ -77,7 +77,7 @@ SETTINGS_PATH = (
     / "WGMetalPipeline"
     / "settings.json"
 )
-SETTINGS_VERSION = 11
+SETTINGS_VERSION = 12
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
     "output_root": str(DEFAULT_OUTPUT_ROOT),
@@ -114,17 +114,14 @@ DEFAULT_SETTINGS = {
     "passive_cardioid_foam_resistance_pa_s_m3": "0",
     "passive_cardioid_invert_port": True,
     "passive_cardioid_coupled": False,
-    "passive_cardioid_driver_sd_cm2": "",
-    "passive_cardioid_driver_bl_tm": "",
-    "passive_cardioid_driver_re_ohm": "",
-    "passive_cardioid_driver_le_mh": "0",
-    "passive_cardioid_driver_mms_g": "",
-    "passive_cardioid_driver_cms_mm_per_n": "",
-    "passive_cardioid_driver_vas_l": "",
-    "passive_cardioid_driver_fs_hz": "",
-    "passive_cardioid_driver_qms": "",
-    "passive_cardioid_drive_voltage": "2.83",
-    "passive_cardioid_rg_ohm": "0",
+    "lf_driver_lem": "",
+    "mf_driver_lem": "",
+    "hf_driver_lem": "",
+    "lf_driver_rear_volume_l": "",
+    "mf_driver_rear_volume_l": "",
+    "hf_driver_rear_volume_l": "",
+    "drive_voltage": "2.83",
+    "rg_ohm": "0",
 }
 # Keys removed or redefined at a given settings version, mapped to the version
 # that made them stale. A stored key is dropped on load only when the file
@@ -141,6 +138,17 @@ _STALE_SETTINGS_KEY_VERSIONS = {
     "radiating_epw": 11,
     "shadow_epw": 11,
     "throat_epw": 11,
+    "passive_cardioid_driver_sd_cm2": 12,
+    "passive_cardioid_driver_bl_tm": 12,
+    "passive_cardioid_driver_re_ohm": 12,
+    "passive_cardioid_driver_le_mh": 12,
+    "passive_cardioid_driver_mms_g": 12,
+    "passive_cardioid_driver_cms_mm_per_n": 12,
+    "passive_cardioid_driver_vas_l": 12,
+    "passive_cardioid_driver_fs_hz": 12,
+    "passive_cardioid_driver_qms": 12,
+    "passive_cardioid_drive_voltage": 12,
+    "passive_cardioid_rg_ohm": 12,
 }
 
 _handlers = []
@@ -420,23 +428,6 @@ def _sync_passive_cardioid_ui(inputs) -> None:
         item = _input_by_id(inputs, input_id)
         if item is not None:
             item.isEnabled = enabled
-    coupled = enabled and bool(_input_value(inputs, "passive_cardioid_coupled"))
-    for input_id in (
-        "passive_cardioid_driver_sd_cm2",
-        "passive_cardioid_driver_bl_tm",
-        "passive_cardioid_driver_re_ohm",
-        "passive_cardioid_driver_le_mh",
-        "passive_cardioid_driver_mms_g",
-        "passive_cardioid_driver_cms_mm_per_n",
-        "passive_cardioid_driver_vas_l",
-        "passive_cardioid_driver_fs_hz",
-        "passive_cardioid_driver_qms",
-        "passive_cardioid_drive_voltage",
-        "passive_cardioid_rg_ohm",
-    ):
-        item = _input_by_id(inputs, input_id)
-        if item is not None:
-            item.isEnabled = coupled
 
 
 class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
@@ -601,65 +592,40 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 "Use the MF BEM radiation load with a voltage-driven "
                 "Thiele/Small driver model."
             )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_sd_cm2",
-                "Driver Sd cm2",
-                _setting_str(settings, "passive_cardioid_driver_sd_cm2"),
+            driver_group = inputs.addGroupCommandInput(
+                "grp_driver_lem",
+                "Driver LEM (optional)",
             )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_bl_tm",
-                "Driver Bl Tm",
-                _setting_str(settings, "passive_cardioid_driver_bl_tm"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_re_ohm",
-                "Driver Re ohm",
-                _setting_str(settings, "passive_cardioid_driver_re_ohm"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_le_mh",
-                "Driver Le mH",
-                _setting_str(settings, "passive_cardioid_driver_le_mh"),
-            )
-            mms_input = cardioid.addStringValueInput(
-                "passive_cardioid_driver_mms_g",
-                "Driver Mms g",
-                _setting_str(settings, "passive_cardioid_driver_mms_g"),
-            )
-            mms_input.tooltip = (
-                "Dialog path uses Mms; the coupled solver subtracts the "
-                "free-air radiation-mass convention before applying the "
-                "BEM load."
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_cms_mm_per_n",
-                "Driver Cms mm/N",
-                _setting_str(settings, "passive_cardioid_driver_cms_mm_per_n"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_vas_l",
-                "Driver Vas L",
-                _setting_str(settings, "passive_cardioid_driver_vas_l"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_fs_hz",
-                "Driver Fs Hz",
-                _setting_str(settings, "passive_cardioid_driver_fs_hz"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_driver_qms",
-                "Driver Qms",
-                _setting_str(settings, "passive_cardioid_driver_qms"),
-            )
-            cardioid.addStringValueInput(
-                "passive_cardioid_drive_voltage",
+            driver_group.isExpanded = False
+            driver_lem = driver_group.children
+            for source_name, ts_id, volume_id in (
+                ("LF", "lf_driver_lem", "lf_driver_rear_volume_l"),
+                ("MF", "mf_driver_lem", "mf_driver_rear_volume_l"),
+                ("HF", "hf_driver_lem", "hf_driver_rear_volume_l"),
+            ):
+                ts_input = driver_lem.addStringValueInput(
+                    ts_id,
+                    f"{source_name} driver T/S",
+                    _setting_str(settings, ts_id),
+                )
+                ts_input.tooltip = (
+                    "Paste Hornresp Key=Value text or enter a path to a Hornresp "
+                    "driver file. Blank leaves this source uncoupled."
+                )
+                driver_lem.addStringValueInput(
+                    volume_id,
+                    f"{source_name} rear chamber L",
+                    _setting_str(settings, volume_id),
+                )
+            driver_lem.addStringValueInput(
+                "drive_voltage",
                 "Drive voltage V RMS",
-                _setting_str(settings, "passive_cardioid_drive_voltage"),
+                _setting_str(settings, "drive_voltage"),
             )
-            cardioid.addStringValueInput(
-                "passive_cardioid_rg_ohm",
+            driver_lem.addStringValueInput(
+                "rg_ohm",
                 "Generator Rg ohm",
-                _setting_str(settings, "passive_cardioid_rg_ohm"),
+                _setting_str(settings, "rg_ohm"),
             )
 
             output_group = inputs.addGroupCommandInput("grp_output", "Output")
@@ -976,39 +942,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 _input_value(inputs, "passive_cardioid_invert_port")
             )
             passive_cardioid_coupled = bool(_input_value(inputs, "passive_cardioid_coupled"))
-            passive_cardioid_driver_sd_cm2 = str(
-                _input_value(inputs, "passive_cardioid_driver_sd_cm2") or ""
+            lf_driver_lem = str(_input_value(inputs, "lf_driver_lem") or "").strip()
+            mf_driver_lem = str(_input_value(inputs, "mf_driver_lem") or "").strip()
+            hf_driver_lem = str(_input_value(inputs, "hf_driver_lem") or "").strip()
+            lf_driver_rear_volume_l = str(
+                _input_value(inputs, "lf_driver_rear_volume_l") or ""
             ).strip()
-            passive_cardioid_driver_bl_tm = str(
-                _input_value(inputs, "passive_cardioid_driver_bl_tm") or ""
+            mf_driver_rear_volume_l = str(
+                _input_value(inputs, "mf_driver_rear_volume_l") or ""
             ).strip()
-            passive_cardioid_driver_re_ohm = str(
-                _input_value(inputs, "passive_cardioid_driver_re_ohm") or ""
+            hf_driver_rear_volume_l = str(
+                _input_value(inputs, "hf_driver_rear_volume_l") or ""
             ).strip()
-            passive_cardioid_driver_le_mh = str(
-                _input_value(inputs, "passive_cardioid_driver_le_mh") or ""
-            ).strip()
-            passive_cardioid_driver_mms_g = str(
-                _input_value(inputs, "passive_cardioid_driver_mms_g") or ""
-            ).strip()
-            passive_cardioid_driver_cms_mm_per_n = str(
-                _input_value(inputs, "passive_cardioid_driver_cms_mm_per_n") or ""
-            ).strip()
-            passive_cardioid_driver_vas_l = str(
-                _input_value(inputs, "passive_cardioid_driver_vas_l") or ""
-            ).strip()
-            passive_cardioid_driver_fs_hz = str(
-                _input_value(inputs, "passive_cardioid_driver_fs_hz") or ""
-            ).strip()
-            passive_cardioid_driver_qms = str(
-                _input_value(inputs, "passive_cardioid_driver_qms") or ""
-            ).strip()
-            passive_cardioid_drive_voltage = str(
-                _input_value(inputs, "passive_cardioid_drive_voltage") or ""
-            ).strip()
-            passive_cardioid_rg_ohm = str(
-                _input_value(inputs, "passive_cardioid_rg_ohm") or ""
-            ).strip()
+            drive_voltage = str(_input_value(inputs, "drive_voltage") or "").strip()
+            rg_ohm = str(_input_value(inputs, "rg_ohm") or "").strip()
             underresolved_solve_policy = (
                 "clamp-per-source" if clamp_to_mesh_limit else "warn"
             )
@@ -1044,6 +991,21 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     passive_cardioid_foam_resistance_pa_s_m3,
                     "Passive cardioid foam resistance",
                 )
+            if passive_cardioid_enabled and passive_cardioid_coupled and not mf_driver_lem:
+                raise RuntimeError(
+                    "Passive cardioid coupled mode requires MF driver T/S in Driver LEM."
+                )
+            for label, raw in (
+                ("LF rear chamber L", lf_driver_rear_volume_l),
+                ("MF rear chamber L", mf_driver_rear_volume_l),
+                ("HF rear chamber L", hf_driver_rear_volume_l),
+            ):
+                if raw:
+                    _parse_required_positive_float(raw, label)
+            if drive_voltage:
+                _parse_required_positive_float(drive_voltage, "Drive voltage V RMS")
+            if rg_ohm:
+                _parse_required_nonnegative_float(rg_ohm, "Generator Rg ohm")
             lf_mf_xo = (
                 _parse_required_positive_float(crossover_lf_mf_hz, "LF/MF XO Hz")
                 if crossover_lf_mf_hz
@@ -1095,19 +1057,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 ),
                 "passive_cardioid_invert_port": passive_cardioid_invert_port,
                 "passive_cardioid_coupled": passive_cardioid_coupled,
-                "passive_cardioid_driver_sd_cm2": passive_cardioid_driver_sd_cm2,
-                "passive_cardioid_driver_bl_tm": passive_cardioid_driver_bl_tm,
-                "passive_cardioid_driver_re_ohm": passive_cardioid_driver_re_ohm,
-                "passive_cardioid_driver_le_mh": passive_cardioid_driver_le_mh,
-                "passive_cardioid_driver_mms_g": passive_cardioid_driver_mms_g,
-                "passive_cardioid_driver_cms_mm_per_n": (
-                    passive_cardioid_driver_cms_mm_per_n
-                ),
-                "passive_cardioid_driver_vas_l": passive_cardioid_driver_vas_l,
-                "passive_cardioid_driver_fs_hz": passive_cardioid_driver_fs_hz,
-                "passive_cardioid_driver_qms": passive_cardioid_driver_qms,
-                "passive_cardioid_drive_voltage": passive_cardioid_drive_voltage,
-                "passive_cardioid_rg_ohm": passive_cardioid_rg_ohm,
+                "lf_driver_lem": lf_driver_lem,
+                "mf_driver_lem": mf_driver_lem,
+                "hf_driver_lem": hf_driver_lem,
+                "lf_driver_rear_volume_l": lf_driver_rear_volume_l,
+                "mf_driver_rear_volume_l": mf_driver_rear_volume_l,
+                "hf_driver_rear_volume_l": hf_driver_rear_volume_l,
+                "drive_voltage": drive_voltage,
+                "rg_ohm": rg_ohm,
             })
 
             stamp = _datetime.datetime.now().strftime("%y%m%d-%H%M%S")
@@ -1158,19 +1115,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 ),
                 passive_cardioid_invert_port=passive_cardioid_invert_port,
                 passive_cardioid_coupled=passive_cardioid_coupled,
-                passive_cardioid_driver_sd_cm2=passive_cardioid_driver_sd_cm2,
-                passive_cardioid_driver_bl_tm=passive_cardioid_driver_bl_tm,
-                passive_cardioid_driver_re_ohm=passive_cardioid_driver_re_ohm,
-                passive_cardioid_driver_le_mh=passive_cardioid_driver_le_mh,
-                passive_cardioid_driver_mms_g=passive_cardioid_driver_mms_g,
-                passive_cardioid_driver_cms_mm_per_n=(
-                    passive_cardioid_driver_cms_mm_per_n
-                ),
-                passive_cardioid_driver_vas_l=passive_cardioid_driver_vas_l,
-                passive_cardioid_driver_fs_hz=passive_cardioid_driver_fs_hz,
-                passive_cardioid_driver_qms=passive_cardioid_driver_qms,
-                passive_cardioid_drive_voltage=passive_cardioid_drive_voltage,
-                passive_cardioid_rg_ohm=passive_cardioid_rg_ohm,
+                lf_driver_lem=lf_driver_lem,
+                mf_driver_lem=mf_driver_lem,
+                hf_driver_lem=hf_driver_lem,
+                lf_driver_rear_volume_l=lf_driver_rear_volume_l,
+                mf_driver_rear_volume_l=mf_driver_rear_volume_l,
+                hf_driver_rear_volume_l=hf_driver_rear_volume_l,
+                drive_voltage=drive_voltage,
+                rg_ohm=rg_ohm,
             )
             pid = _launch_pipeline_background(
                 cmd,

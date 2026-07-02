@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "9f6ffbd0-e206-4f0e-9eb6-c5f04a9b1a87",
+  "author": "HornLab",
+  "description": {
+    "": "Export the active Fusion design to STEP, prepare tagged WG Metal BEM meshes, run orientation diagnostics, and open Waveguide Generator."
+  },
+  "version": "0.1.0",
+  "runOnStartup": true,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}

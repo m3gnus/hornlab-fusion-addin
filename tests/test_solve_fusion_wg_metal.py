@@ -1,0 +1,2610 @@
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "solve_fusion_wg_metal.py"
+REGEN_SCRIPT = ROOT / "scripts" / "regenerate_fusion_derived_artifacts.py"
+SMOKE_MESH = (
+    ROOT
+    / "runs"
+    / "scratch"
+    / "260609-fusion-addin-normalized-sources-smoke"
+    / "tagged_sources.msh"
+)
+
+
+def _load_script():
+    spec = importlib.util.spec_from_file_location("solve_fusion_wg_metal", SCRIPT)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_regen_driver():
+    spec = importlib.util.spec_from_file_location(
+        "regenerate_fusion_derived_artifacts",
+        REGEN_SCRIPT,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_dry_run_writes_manifest_for_current_smoke_mesh(tmp_path):
+    if not SMOKE_MESH.exists():
+        pytest.skip(f"smoke mesh not available: {SMOKE_MESH}")
+    module = _load_script()
+    rc = module.main(
+        [
+            "--mesh",
+            str(SMOKE_MESH),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "LF:20:2",
+            "--source",
+            "HF:5:4",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    manifest = (tmp_path / "direct_solve_manifest.json").read_text(encoding="utf-8")
+    assert '"native_symmetry_plane": "yz+xz"' in manifest
+    assert '"native_check_open_edges": true' in manifest
+    assert '"bem_formulation": "complex_k"' in manifest
+    assert '"complex_k_shift": 0.005' in manifest
+    assert '"tag": 2' in manifest
+    assert '"tag": 4' in manifest
+
+
+def test_dry_run_orders_canonical_sources_hf_mf_lf(tmp_path):
+    module = _load_script()
+    mesh_path = tmp_path / "dummy.msh"
+    mesh_path.write_text("", encoding="utf-8")
+
+    rc = module.main(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "LF:2",
+            "--source",
+            "PORT_EXIT:10",
+            "--source",
+            "MF:3",
+            "--source",
+            "HF:4",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads(
+        (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [source["name"] for source in manifest["sources"]] == [
+        "HF",
+        "MF",
+        "LF",
+        "PORT_EXIT",
+    ]
+
+
+def test_explicit_bigmeh_frame_is_orthonormal():
+    if not SMOKE_MESH.exists():
+        pytest.skip(f"smoke mesh not available: {SMOKE_MESH}")
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(SMOKE_MESH),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "LF:2",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    assert np.allclose(frame.axis, [0.0, 0.0, 1.0])
+    assert np.allclose(frame.origin, [0.0, 0.0, 0.31])
+    assert np.allclose(frame.u, [1.0, 0.0, 0.0])
+    assert np.allclose(frame.v, [0.0, 1.0, 0.0])
+    assert np.isclose(np.dot(frame.axis, frame.u), 0.0)
+    assert np.isclose(np.dot(frame.axis, frame.v), 0.0)
+
+
+def test_source_freq_max_overrides_band_for_that_source_only():
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "LF:2",
+            "--source",
+            "HF:4",
+            "--source-freq-max",
+            "LF:1475.5",
+            "--freq-max-hz",
+            "20000",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    limits = module._parse_source_freq_max(args.source_freq_max)
+
+    assert limits == {"LF": 1475.5}
+    lf_cfg = module._build_config(
+        args, source_tag=2, frame=frame, freq_max_hz=limits.get("LF")
+    )
+    hf_cfg = module._build_config(
+        args, source_tag=4, frame=frame, freq_max_hz=limits.get("HF")
+    )
+    assert lf_cfg.freq_max_hz == 1475.5
+    assert hf_cfg.freq_max_hz == 20000.0
+
+
+def test_source_mesh_valid_hz_is_overlay_only_not_a_band_clamp(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "HF:4",
+            "--source-mesh-valid-hz",
+            "HF:11352",
+            "--freq-max-hz",
+            "20000",
+            "--dry-run",
+        ]
+    )
+    overlay = module._parse_source_freq_max(args.source_mesh_valid_hz)
+    assert overlay == {"HF": 11352.0}
+    # The overlay must not narrow the solved band.
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame, freq_max_hz=None)
+    assert cfg.freq_max_hz == 20000.0
+
+
+def test_source_mesh_valid_and_aperture_overlays_parse_independently(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "HF:4",
+            "--source-mesh-valid-hz",
+            "HF:3642",
+            "--source-aperture-valid-hz",
+            "HF:11352",
+            "--dry-run",
+        ]
+    )
+    assert module._parse_source_freq_max(args.source_mesh_valid_hz) == {"HF": 3642.0}
+    assert module._parse_source_freq_max(args.source_aperture_valid_hz) == {"HF": 11352.0}
+
+
+def test_port_exit_apertures_are_detected_from_sources():
+    module = _load_script()
+
+    sources = module._split_sources(
+        ["LF:2,PORT_EXIT_L:10", "port_exit_r:20:11", "HF:4"]
+    )
+
+    assert module._port_exit_apertures(sources) == [
+        ("PORT_EXIT_L", 10),
+        ("port_exit_r", 11),
+    ]
+
+
+def test_source_freq_max_for_unknown_source_is_rejected(tmp_path):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="not in --source list"):
+        module.main(
+            [
+                "--mesh",
+                str(mesh_path),
+                "--out",
+                str(tmp_path / "out"),
+                "--source",
+                "HF:4",
+                "--source-freq-max",
+                "LF:1000",
+                "--dry-run",
+            ]
+        )
+
+
+def test_solver_is_canonical_hornlab_metal_bem():
+    module = _load_script()
+
+    assert module.solve.__module__.startswith("hornlab_metal_bem")
+    assert module.SolveConfig.__module__.startswith("hornlab_metal_bem")
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "HF:4",
+            "--native-symmetry-plane",
+            "xy",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+    assert cfg.native_symmetry_plane == "xy"
+    assert cfg.velocity_sources == {4: 1.0}
+    assert cfg.formulation == "complex_k"
+    assert cfg.complex_k_shift == 0.005
+    # Default keeps the strict cut-plane open-edge guard.
+    assert cfg.native_check_open_edges is True
+
+
+def test_standard_bem_formulation_override_is_forwarded():
+    module = _load_script()
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "HF:4",
+            "--bem-formulation",
+            "standard",
+            "--complex-k-shift",
+            "0.0125",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+
+    assert cfg.formulation == "standard"
+    assert cfg.complex_k_shift == 0.0125
+
+
+def test_complex_k_dash_alias_is_normalized():
+    module = _load_script()
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "HF:4",
+            "--bem-formulation",
+            "complex-k",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+
+    assert args.bem_formulation == "complex_k"
+    assert cfg.formulation == "complex_k"
+
+
+def test_no_native_check_open_edges_relaxes_guard_for_open_mouth_mesh():
+    module = _load_script()
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "HF:4",
+            "--native-symmetry-plane",
+            "yz+xz",
+            "--no-native-check-open-edges",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+    assert cfg.native_check_open_edges is False
+
+
+def test_port_exit_radiation_impedance_matrix_writes_conjugated_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    solver_matrix = np.array(
+        [
+            [
+                [10.0 - 2.0j, 3.0 - 5.0j],
+                [3.0 - 5.0j, 11.0 - 1.0j],
+            ]
+        ],
+        dtype=np.complex128,
+    )
+    fake_result = module.radiation_impedance.RadiationImpedanceResult(
+        frequencies_hz=np.array([250.0]),
+        aperture_names=["PORT_EXIT_L", "PORT_EXIT_R"],
+        aperture_area_m2={"PORT_EXIT_L": 0.001, "PORT_EXIT_R": 0.002},
+        impedance_matrix=solver_matrix,
+        solver_logs=[],
+    )
+    fake_diagnostics = module.radiation_impedance.RadiationMatrixDiagnostics(
+        reciprocity_max_abs=np.array([0.0]),
+        reciprocity_max_rel=np.array([0.0]),
+        passivity_min_eig=np.array([7.0]),
+        passivity_ok=np.array([True]),
+        low_ka_self_impedance={},
+        low_ka_self_impedance_rel_error={},
+    )
+    captured = {}
+
+    def fake_solve_aperture_matrix(mesh, aperture_tags, frequencies_hz, config):
+        captured["mesh"] = mesh
+        captured["aperture_tags"] = aperture_tags
+        captured["frequencies_hz"] = frequencies_hz
+        captured["config"] = config
+        return fake_result
+
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "solve_aperture_matrix",
+        fake_solve_aperture_matrix,
+    )
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "matrix_diagnostics",
+        lambda result: fake_diagnostics,
+    )
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "PORT_EXIT_L:10",
+            "--source",
+            "PORT_EXIT_R:11",
+            "--freq-min-hz",
+            "250",
+            "--freq-max-hz",
+            "1000",
+            "--freq-count",
+            "1",
+            "--source-freq-max",
+            "PORT_EXIT_R:500",
+        ]
+    )
+    frame = module._build_frame(args)
+
+    payload = module._solve_port_exit_radiation_impedance_matrix(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        apertures=[("PORT_EXIT_L", 10), ("PORT_EXIT_R", 11)],
+        frame=frame,
+        source_freq_max={"PORT_EXIT_R": 500.0},
+    )
+
+    assert captured["aperture_tags"] == {"PORT_EXIT_L": [10], "PORT_EXIT_R": [11]}
+    assert captured["config"].velocity_sources == {10: 1.0}
+    np.testing.assert_allclose(captured["frequencies_hz"], [250.0])
+    assert payload["convention"]["engineering_matrix"].startswith("conj(Z_solver)")
+    np.testing.assert_allclose(
+        payload["in_phase_termination_load"]["PORT_EXIT_L"],
+        [13.0 + 7.0j],
+    )
+    np.testing.assert_allclose(
+        payload["in_phase_termination_load"]["PORT_EXIT_R"],
+        [14.0 + 6.0j],
+    )
+
+    matrix_npz = np.load(tmp_path / "port_exit_radiation_impedance_matrix.npz")
+    np.testing.assert_allclose(
+        matrix_npz["engineering_impedance_matrix"],
+        np.conjugate(solver_matrix),
+    )
+    assert (tmp_path / "port_exit_radiation_impedance_matrix.summary.json").exists()
+
+
+def test_native_symmetry_none_maps_to_solver_none():
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(ROOT / "runs" / "scratch" / "unused.msh"),
+            "--out",
+            str(ROOT / "runs" / "scratch" / "unused"),
+            "--source",
+            "HF:4",
+            "--native-symmetry-plane",
+            "none",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+    assert cfg.native_symmetry_plane is None
+
+
+def test_native_symmetry_xy_maps_to_solver_and_manifest(tmp_path):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+
+    rc = module.main(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:4",
+            "--native-symmetry-plane",
+            "xy",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    manifest = (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+        encoding="utf-8"
+    )
+    assert '"native_symmetry_plane": "xy"' in manifest
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(tmp_path / "out2"),
+            "--source",
+            "HF:4",
+            "--native-symmetry-plane",
+            "xy",
+            "--dry-run",
+        ]
+    )
+    frame = module._build_frame(args)
+    cfg = module._build_config(args, source_tag=4, frame=frame)
+    assert cfg.native_symmetry_plane == "xy"
+
+
+def test_solve_one_source_writes_per_source_frequency_response(tmp_path, monkeypatch):
+    module = _load_script()
+
+    class FakeResult:
+        frequencies_hz = np.geomspace(100.0, 1000.0, 4)
+        observation_angles_deg = np.asarray([0.0, 30.0])
+        observation_planes = ["horizontal", "vertical"]
+        # Solver-convention phasor with a non-trivial phase: the stored basis
+        # must be the engineering-convention conjugate.
+        pressure_complex = np.full(
+            (4, 2, 2), 0.02 * np.exp(1j * 0.7), dtype=np.complex128
+        )
+        directivity_db = np.full((4, 2, 2), 0.0, dtype=np.float64)
+        impedance = {}
+        surface_pressure_avg = {}
+        timings = {}
+        solver_log = []
+        mesh_info = {}
+
+    monkeypatch.setattr(module, "solve", lambda _mesh, _config: FakeResult())
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "HF:4",
+        ]
+    )
+    frame = module._build_frame(args)
+
+    result = module._solve_one_source(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_name="HF",
+        source_tag=4,
+        frame=frame,
+    )
+
+    response_png = tmp_path / "HF_frequency_response.png"
+    assert result["frequency_response_png"] == str(response_png)
+    assert response_png.exists()
+    assert response_png.stat().st_size > 500
+    basis_npz = tmp_path / "HF_pressure_basis.npz"
+    assert result["pressure_basis_npz"] == str(basis_npz)
+    assert basis_npz.exists()
+    with np.load(basis_npz) as basis:
+        assert basis["source_name"].item() == "HF"
+        assert int(basis["source_tag"]) == 4
+        assert basis["pressure_complex"].shape == (4, 2, 2)
+        assert (
+            str(basis["phase_convention"].item())
+            == module.PRESSURE_NPZ_PHASE_CONVENTION
+        )
+        np.testing.assert_allclose(
+            basis["pressure_complex"],
+            np.conjugate(FakeResult.pressure_complex),
+        )
+    loaded = module._load_pressure_basis(basis_npz)
+    np.testing.assert_allclose(
+        loaded.pressure_complex,
+        np.conjugate(FakeResult.pressure_complex),
+    )
+
+
+def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    captured = {}
+
+    class FakeResult:
+        frequencies_hz = np.geomspace(100.0, 1000.0, 4)
+        observation_angles_deg = np.asarray([0.0, 30.0])
+        observation_planes = ["horizontal", "vertical"]
+        pressure_complex = np.full((4, 2, 2), 0.02 + 0.0j, dtype=np.complex128)
+        directivity_db = np.full((4, 2, 2), 0.0, dtype=np.float64)
+        impedance = {}
+        surface_pressure_avg = {}
+        timings = {}
+        solver_log = []
+        mesh_info = {}
+
+    def fake_solve(_mesh, _config):
+        manifest = json.loads(
+            (out_dir / "direct_solve_manifest.json").read_text(encoding="utf-8")
+        )
+        captured["status"] = manifest["status"]
+        captured["current_phase"] = manifest["current_phase"]
+        captured["current_source"] = manifest["current_source"]
+        captured["sources"] = manifest["sources"]
+        return FakeResult()
+
+    monkeypatch.setenv(
+        "HORNLAB_FUSION_DIRECT_SOLVE_LOCK",
+        str(tmp_path / "direct-solve.lock"),
+    )
+    monkeypatch.setattr(module, "solve", fake_solve)
+
+    rc = module.main(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(out_dir),
+            "--source",
+            "HF:4",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["status"] == "running"
+    assert captured["current_phase"] == "solving_source"
+    assert captured["current_source"] == {"name": "HF", "tag": 4}
+    assert captured["sources"][0]["status"] == "running"
+    final_manifest = json.loads(
+        (out_dir / "direct_solve_manifest.json").read_text(encoding="utf-8")
+    )
+    assert final_manifest["status"] == "complete"
+
+
+def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    freqs = np.geomspace(100.0, 1000.0, 4)
+    angles = np.array([0.0, 45.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+
+    class FakeResult:
+        def __init__(self, tag):
+            self.frequencies_hz = freqs
+            self.observation_angles_deg = angles
+            self.observation_planes = planes
+            amplitude = {3: 0.018, 4: 0.02, 10: 0.006}[tag]
+            phase = {3: 0.1, 4: 0.4, 10: -0.2}[tag]
+            self.pressure_complex = np.full(
+                (freqs.size, planes.size, angles.size),
+                amplitude * np.exp(1j * phase),
+                dtype=np.complex128,
+            )
+            self.directivity_db = np.zeros(
+                (freqs.size, planes.size, angles.size),
+                dtype=np.float64,
+            )
+            self.impedance = {}
+            self.surface_pressure_avg = {}
+            self.timings = {}
+            self.solver_log = []
+            self.mesh_info = {}
+
+    def fake_solve_multi_source(_mesh, velocity_sources, _config):
+        return [
+            FakeResult(next(iter(velocity_source)))
+            for velocity_source in velocity_sources
+        ]
+
+    def fake_solve_aperture_matrix(_mesh, aperture_tags, frequencies_hz, _config):
+        names = list(aperture_tags)
+        matrix = np.zeros((len(frequencies_hz), len(names), len(names)), dtype=np.complex128)
+        matrix[:, 0, 0] = 80.0 - 8.0j
+        return module.radiation_impedance.RadiationImpedanceResult(
+            frequencies_hz=np.asarray(frequencies_hz, dtype=np.float64),
+            aperture_names=names,
+            aperture_area_m2={name: 0.01 for name in names},
+            impedance_matrix=matrix,
+            solver_logs=[],
+        )
+
+    def fake_matrix_diagnostics(result):
+        nfreq = result.frequencies_hz.size
+        return module.radiation_impedance.RadiationMatrixDiagnostics(
+            reciprocity_max_abs=np.zeros(nfreq),
+            reciprocity_max_rel=np.zeros(nfreq),
+            passivity_min_eig=np.ones(nfreq),
+            passivity_ok=np.ones(nfreq, dtype=bool),
+            low_ka_self_impedance={},
+            low_ka_self_impedance_rel_error={},
+        )
+
+    monkeypatch.setenv(
+        "HORNLAB_FUSION_DIRECT_SOLVE_LOCK",
+        str(tmp_path / "direct-solve.lock"),
+    )
+    monkeypatch.setattr(module, "solve_multi_source", fake_solve_multi_source)
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "solve_aperture_matrix",
+        fake_solve_aperture_matrix,
+    )
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "matrix_diagnostics",
+        fake_matrix_diagnostics,
+    )
+
+    argv = [
+        "--mesh", str(mesh_path),
+        "--out", str(out_dir),
+        "--source", "MF:3",
+        "--source", "HF:4",
+        "--source", "PORT_EXIT:10",
+        "--freq-min-hz", "100",
+        "--freq-max-hz", "1000",
+        "--freq-count", "4",
+        "--crossover-mf-hf-hz", "500",
+        "--export-vituixcad",
+    ]
+    assert module.main(argv) == 0
+    npz_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in out_dir.glob("*.npz")
+    }
+    assert set(npz_hashes) == {
+        "HF_pressure_basis.npz",
+        "MF_pressure_basis.npz",
+        "PORT_EXIT_pressure_basis.npz",
+        "port_exit_radiation_impedance_matrix.npz",
+    }
+
+    for path in (
+        out_dir / "MF_frequency_response.png",
+        out_dir / "combined_frequency_response_time_aligned.png",
+        out_dir / "driver_time_alignment.txt",
+        out_dir / "vituixcad" / "hor" / "MF 0.frd",
+    ):
+        path.unlink()
+
+    monkeypatch.setattr(
+        module,
+        "solve_multi_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postprocess-only must not solve sources")
+        ),
+    )
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "solve_aperture_matrix",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postprocess-only must not solve radiation matrix")
+        ),
+    )
+
+    assert module.main([*argv, "--postprocess-only"]) == 0
+    for path in (
+        out_dir / "MF_frequency_response.png",
+        out_dir / "combined_frequency_response_time_aligned.png",
+        out_dir / "driver_time_alignment.txt",
+        out_dir / "vituixcad" / "hor" / "MF 0.frd",
+    ):
+        assert path.exists()
+        assert path.stat().st_size > 0
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in out_dir.glob("*.npz")
+        if path.name in npz_hashes
+    } == npz_hashes
+    manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
+    assert manifest["postprocess_only"] is True
+    assert manifest["status"] == "complete"
+
+
+def test_postprocess_only_without_port_exit_mirrors_original_cardioid_skip(
+    tmp_path,
+    monkeypatch,
+):
+    """Cardioid flags without a PORT_EXIT source never produced a radiation
+    matrix — the combine skipped. postprocess-only must reproduce that skip
+    instead of demanding a matrix file the original run never wrote."""
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    freqs = np.geomspace(100.0, 1000.0, 4)
+    angles = np.array([0.0, 45.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+
+    class FakeResult:
+        def __init__(self, tag):
+            self.frequencies_hz = freqs
+            self.observation_angles_deg = angles
+            self.observation_planes = planes
+            amplitude = {3: 0.018, 4: 0.02}[tag]
+            self.pressure_complex = np.full(
+                (freqs.size, planes.size, angles.size),
+                amplitude + 0.0j,
+                dtype=np.complex128,
+            )
+            self.directivity_db = np.zeros(
+                (freqs.size, planes.size, angles.size),
+                dtype=np.float64,
+            )
+            self.impedance = {}
+            self.surface_pressure_avg = {}
+            self.timings = {}
+            self.solver_log = []
+            self.mesh_info = {}
+
+    monkeypatch.setenv(
+        "HORNLAB_FUSION_DIRECT_SOLVE_LOCK",
+        str(tmp_path / "direct-solve.lock"),
+    )
+    monkeypatch.setattr(
+        module,
+        "solve_multi_source",
+        lambda _mesh, velocity_sources, _config: [
+            FakeResult(next(iter(velocity_source)))
+            for velocity_source in velocity_sources
+        ],
+    )
+
+    argv = [
+        "--mesh", str(mesh_path),
+        "--out", str(out_dir),
+        "--source", "MF:3",
+        "--source", "HF:4",
+        "--freq-min-hz", "100",
+        "--freq-max-hz", "1000",
+        "--freq-count", "4",
+        "--passive-cardioid-mf",
+        "--passive-cardioid-rear-volume-l", "10",
+        "--passive-cardioid-port-length-mm", "20",
+    ]
+    assert module.main(argv) == 0
+    assert not (out_dir / "port_exit_radiation_impedance_matrix.npz").exists()
+
+    monkeypatch.setattr(
+        module,
+        "solve_multi_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postprocess-only must not solve sources")
+        ),
+    )
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "solve_aperture_matrix",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("postprocess-only must not solve radiation matrix")
+        ),
+    )
+    assert module.main([*argv, "--postprocess-only"]) == 0
+    manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
+    assert manifest["status"] == "complete"
+    combine = manifest["passive_cardioid"]
+    assert combine["status"] == "skipped"
+    assert "PORT_EXIT" in combine["reason"]
+
+
+def test_postprocess_only_keyless_bases_use_corrected_phase_for_alignment_and_cardioid(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    freqs = np.geomspace(200.0, 2000.0, 30)
+    planes = np.array(["horizontal"], dtype=str)
+
+    align_dir = tmp_path / "align"
+    align_dir.mkdir()
+    angles = np.array([0.0, 45.0], dtype=np.float64)
+    for name, tag, arrival_s in (("MF", 3, 0.0), ("HF", 4, 0.3e-3)):
+        _write_synthetic_basis(
+            align_dir / f"{name}_pressure_basis.npz",
+            name=name,
+            tag=tag,
+            freqs=freqs,
+            angles=angles,
+            planes=planes,
+            pressure=_delayed_pressure(freqs, planes, angles, arrival_s=arrival_s),
+        )
+    (align_dir / "direct_solve_manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "MF",
+                        "tag": 3,
+                        "pressure_basis_npz": str(align_dir / "MF_pressure_basis.npz"),
+                    },
+                    {
+                        "name": "HF",
+                        "tag": 4,
+                        "pressure_basis_npz": str(align_dir / "HF_pressure_basis.npz"),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert module.main(
+        [
+            "--mesh", str(align_dir / "unused.msh"),
+            "--out", str(align_dir),
+            "--source", "MF:3",
+            "--source", "HF:4",
+            "--freq-min-hz", "200",
+            "--freq-max-hz", "2000",
+            "--crossover-mf-hf-hz", "1000",
+            "--postprocess-only",
+        ]
+    ) == 0
+    manifest = json.loads((align_dir / "direct_solve_manifest.json").read_text())
+    assert manifest["crossover_alignment"]["delays_ms"]["MF"] == pytest.approx(
+        0.3,
+        abs=1.0e-6,
+    )
+    assert manifest["crossover_alignment"]["delays_ms"]["HF"] == pytest.approx(
+        0.0,
+        abs=1.0e-9,
+    )
+
+    cardioid_dir = tmp_path / "cardioid"
+    cardioid_dir.mkdir()
+    mesh_path = cardioid_dir / "tagged_sources.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    c = module.SPEED_OF_SOUND_M_S
+    d = 0.1
+    tau = d / c
+    cardioid_freqs = np.array([200.0, 400.0, 800.0], dtype=np.float64)
+    cardioid_angles = np.array([0.0, 90.0, 180.0], dtype=np.float64)
+    k = 2.0 * np.pi * cardioid_freqs / c
+    mf_pressure = np.ones((cardioid_freqs.size, 1, cardioid_angles.size), dtype=np.complex128)
+    port_pressure = np.exp(
+        1j
+        * k[:, None, None]
+        * d
+        * np.cos(np.radians(cardioid_angles))[None, None, :]
+    )
+    _write_synthetic_basis(
+        cardioid_dir / "MF_pressure_basis.npz",
+        name="MF",
+        tag=3,
+        freqs=cardioid_freqs,
+        angles=cardioid_angles,
+        planes=planes,
+        pressure=mf_pressure,
+    )
+    _write_synthetic_basis(
+        cardioid_dir / "PORT_EXIT_pressure_basis.npz",
+        name="PORT_EXIT",
+        tag=10,
+        freqs=cardioid_freqs,
+        angles=cardioid_angles,
+        planes=planes,
+        pressure=port_pressure,
+    )
+    matrix_npz = cardioid_dir / "port_exit_radiation_impedance_matrix.npz"
+    np.savez_compressed(
+        matrix_npz,
+        frequencies_hz=cardioid_freqs,
+        aperture_names=np.asarray(["PORT_EXIT"]),
+        aperture_area_m2=np.asarray([0.01], dtype=np.float64),
+        solver_impedance_matrix=np.full((cardioid_freqs.size, 1, 1), 100.0 - 10.0j),
+    )
+    (cardioid_dir / "direct_solve_manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "MF",
+                        "tag": 3,
+                        "pressure_basis_npz": str(cardioid_dir / "MF_pressure_basis.npz"),
+                    },
+                    {
+                        "name": "PORT_EXIT",
+                        "tag": 10,
+                        "pressure_basis_npz": str(
+                            cardioid_dir / "PORT_EXIT_pressure_basis.npz"
+                        ),
+                    },
+                ],
+                "radiation_impedance": {
+                    "status": "complete",
+                    "outputs": {"npz": str(matrix_npz)},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.01)
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "terminated_chamber_port_branch",
+        lambda frequencies_hz, termination_load, **_kwargs: SimpleNamespace(
+            frequencies_hz=frequencies_hz,
+            termination_load=termination_load,
+            input_impedance=np.ones(cardioid_freqs.size, dtype=np.complex128),
+            exit_to_input_volume_velocity_ratio=np.exp(
+                -1j * 2.0 * np.pi * frequencies_hz * tau
+            ),
+        ),
+    )
+    assert module.main(
+        [
+            "--mesh", str(mesh_path),
+            "--out", str(cardioid_dir),
+            "--source", "MF:3",
+            "--source", "PORT_EXIT:10",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l", "10",
+            "--passive-cardioid-port-length-mm", "20",
+            "--postprocess-only",
+        ]
+    ) == 0
+    with np.load(cardioid_dir / "MF_passive_cardioid_results.npz") as result:
+        total = result["pressure_complex"]
+        rear = int(np.argmin(np.abs(cardioid_angles - 180.0)))
+        front = int(np.argmin(np.abs(cardioid_angles)))
+        assert np.max(np.abs(total[:, :, rear])) < 1.0e-9
+        assert np.min(np.abs(total[:, :, front])) > 0.5
+
+
+def test_passive_cardioid_mf_combine_writes_complex_sum(tmp_path, monkeypatch):
+    module = _load_script()
+    freqs = np.array([100.0, 200.0], dtype=np.float64)
+    angles = np.array([-90.0, 0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    mf_pressure = np.full((2, 2, 3), 0.010 + 0.0j, dtype=np.complex128)
+    port_pressure = np.full((2, 2, 3), 0.002 + 0.0j, dtype=np.complex128)
+
+    mf_basis = tmp_path / "MF_pressure_basis.npz"
+    port_basis = tmp_path / "PORT_EXIT_pressure_basis.npz"
+    np.savez_compressed(
+        mf_basis,
+        source_name=np.asarray("MF"),
+        source_tag=np.asarray(3, dtype=np.int32),
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=mf_pressure,
+    )
+    np.savez_compressed(
+        port_basis,
+        source_name=np.asarray("PORT_EXIT"),
+        source_tag=np.asarray(10, dtype=np.int32),
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=port_pressure,
+    )
+
+    matrix_npz = tmp_path / "port_exit_radiation_impedance_matrix.npz"
+    solver_matrix = np.array([[[100.0 - 10.0j]], [[120.0 - 12.0j]]], dtype=np.complex128)
+    np.savez_compressed(
+        matrix_npz,
+        frequencies_hz=freqs,
+        aperture_names=np.asarray(["PORT_EXIT"]),
+        aperture_area_m2=np.asarray([0.01], dtype=np.float64),
+        solver_impedance_matrix=solver_matrix,
+    )
+    monkeypatch.setattr(
+        module,
+        "_mesh_tag_area_m2",
+        lambda _mesh, _tag, mesh_scale: 0.02,
+    )
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "MF:3",
+            "--source",
+            "PORT_EXIT:10",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l",
+            "10",
+            "--passive-cardioid-port-length-mm",
+            "20",
+            "--passive-cardioid-foam-resistance-pa-s-m3",
+            "50",
+        ]
+    )
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_results=[
+            {
+                "name": "MF",
+                "tag": 3,
+                "pressure_basis_npz": str(mf_basis),
+                "mesh_valid_freq_max_hz": None,
+                "aperture_valid_freq_max_hz": None,
+            },
+            {
+                "name": "PORT_EXIT",
+                "tag": 10,
+                "pressure_basis_npz": str(port_basis),
+                "mesh_valid_freq_max_hz": None,
+                "aperture_valid_freq_max_hz": None,
+            },
+        ],
+        radiation_payload={"outputs": {"npz": str(matrix_npz)}},
+    )
+
+    assert payload["status"] == "complete"
+    assert (tmp_path / "MF_passive_cardioid_results.npz").exists()
+    assert (tmp_path / "MF_passive_cardioid_summary.json").exists()
+    assert (tmp_path / "MF_passive_cardioid_frequency_response.png").stat().st_size > 500
+    assert (tmp_path / "MF_passive_cardioid_directivity_heatmap.png").stat().st_size > 500
+
+    termination_load = module.radiation_impedance.termination_load_from_solver_matrix(
+        solver_matrix,
+        receiver_index=0,
+    )
+    branch = module.radiation_impedance.terminated_chamber_port_branch(
+        freqs,
+        termination_load,
+        chamber_volume_m3=0.010,
+        port_area_m2=0.01,
+        port_length_m=0.020,
+        series_resistance_pa_s_m3=50.0,
+    )
+    expected_weight = -1.0 * (0.02 / 0.01) * branch.exit_to_input_volume_velocity_ratio
+    with np.load(tmp_path / "MF_passive_cardioid_results.npz") as result:
+        np.testing.assert_allclose(result["port_velocity_weight"], expected_weight)
+        np.testing.assert_allclose(
+            result["pressure_complex"],
+            mf_pressure + expected_weight[:, None, None] * port_pressure,
+        )
+
+
+def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatch):
+    module = _load_script()
+    fixture = _write_passive_cardioid_fixture(tmp_path)
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.02)
+    off_dir = tmp_path / "off"
+    on_dir = tmp_path / "on"
+    off_dir.mkdir()
+    on_dir.mkdir()
+
+    off_payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        off_dir,
+        _passive_cardioid_args(module, tmp_path, off_dir, coupled=False),
+        source_results=fixture["source_results"],
+        radiation_payload={"outputs": {"npz": str(fixture["matrix_npz"])}},
+    )
+    on_payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        on_dir,
+        _passive_cardioid_args(module, tmp_path, on_dir, coupled=True),
+        source_results=fixture["source_results"],
+        radiation_payload={"outputs": {"npz": str(fixture["matrix_npz"])}},
+    )
+
+    assert off_payload["status"] == "complete"
+    assert on_payload["status"] == "complete"
+    assert on_payload["coupled"]["status"] == "complete"
+    assert on_payload["coupled"]["coupled_ratio_check"] == "passed"
+    assert (on_dir / "MF_passive_cardioid_coupled_results.npz").exists()
+    assert (on_dir / "MF_passive_cardioid_coupled_frequency_response.png").stat().st_size > 500
+    assert (on_dir / "MF_passive_cardioid_impedance.zma").exists()
+    assert not (on_dir / "MF_passive_cardioid_coupled_directivity_heatmap.png").exists()
+
+    with np.load(off_dir / "MF_passive_cardioid_results.npz") as off:
+        with np.load(on_dir / "MF_passive_cardioid_results.npz") as on:
+            assert set(on.files) == set(off.files)
+            for key in off.files:
+                if off[key].dtype.kind in {"U", "S"}:
+                    np.testing.assert_array_equal(on[key], off[key])
+                else:
+                    np.testing.assert_allclose(on[key], off[key])
+            fixed_directivity = off["directivity_db"]
+            fixed_pressure = off["pressure_complex"]
+
+    with np.load(on_dir / "MF_passive_cardioid_coupled_results.npz") as coupled:
+        assert "pressure_complex" in coupled.files
+        assert "electrical_input_impedance" in coupled.files
+        np.testing.assert_allclose(
+            coupled["directivity_db"],
+            fixed_directivity,
+            atol=1.0e-9,
+        )
+        normalized = module._directivity_from_pressure_array(
+            coupled["pressure_complex"],
+            coupled["observation_angles_deg"],
+        )
+        np.testing.assert_allclose(normalized, fixed_directivity, atol=1.0e-9)
+        assert not np.allclose(coupled["pressure_complex"], fixed_pressure)
+
+    summary = json.loads(
+        (on_dir / "MF_passive_cardioid_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["coupled"]["driver"]["mmd_eff_g"] == pytest.approx(18.0)
+    assert summary["coupled"]["drive_voltage_v"] == pytest.approx(2.83)
+    assert summary["outputs"]["coupled_results_npz"].endswith(
+        "MF_passive_cardioid_coupled_results.npz"
+    )
+
+    rows = [
+        line.split()
+        for line in (on_dir / "MF_passive_cardioid_impedance.zma")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line and not line.startswith("*")
+    ]
+    zma = np.asarray(rows, dtype=np.float64)
+    assert zma.shape == (fixture["freqs"].size, 3)
+    assert np.all(zma[:, 1] > 0.0)
+    impedance = zma[:, 1] * np.exp(1j * np.radians(zma[:, 2]))
+    assert np.all(impedance.real >= 5.5 - 1.0e-9)
+
+
+def test_passive_cardioid_coupled_args_validate_driver_requirements(tmp_path):
+    module = _load_script()
+    base = [
+        "--mesh", str(tmp_path / "fake.msh"),
+        "--out", str(tmp_path),
+        "--source", "MF:3",
+        "--source", "PORT_EXIT:10",
+        "--passive-cardioid-mf",
+        "--passive-cardioid-rear-volume-l", "10",
+        "--passive-cardioid-port-length-mm", "20",
+        "--passive-cardioid-coupled",
+    ]
+    with pytest.raises(SystemExit):
+        module._validate_passive_cardioid_args(module.parse_args(base))
+
+    with pytest.raises(SystemExit):
+        module._validate_passive_cardioid_args(
+            module.parse_args(
+                base
+                + _passive_cardioid_driver_cli()
+                + ["--passive-cardioid-driver-mms-g", "20"]
+            )
+        )
+
+    no_compliance = [
+        item
+        for item in _passive_cardioid_driver_cli()
+        if item not in {"--passive-cardioid-driver-cms-mm-per-n", "0.6"}
+    ]
+    with pytest.raises(SystemExit):
+        module._validate_passive_cardioid_args(
+            module.parse_args(base + no_compliance)
+        )
+
+
+def test_passive_cardioid_coupled_skips_matrix_without_mf_aperture(tmp_path, monkeypatch):
+    module = _load_script()
+    fixture = _write_passive_cardioid_fixture(tmp_path, include_mf_matrix=False)
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.02)
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        tmp_path,
+        _passive_cardioid_args(module, tmp_path, tmp_path, coupled=True),
+        source_results=fixture["source_results"],
+        radiation_payload={"outputs": {"npz": str(fixture["matrix_npz"])}},
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["coupled"]["status"] == "skipped"
+    assert "predates the MF-aperture extension" in payload["coupled"]["reason"]
+    assert (tmp_path / "MF_passive_cardioid_results.npz").exists()
+    assert not (tmp_path / "MF_passive_cardioid_coupled_results.npz").exists()
+
+
+def test_passive_cardioid_skips_when_required_sources_were_skipped(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "HF:4",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l",
+            "10",
+            "--passive-cardioid-port-length-mm",
+            "20",
+        ]
+    )
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_results=[{"name": "HF", "tag": 4}],
+        radiation_payload=None,
+    )
+
+    assert payload["status"] == "skipped"
+    assert "requires solved source 'MF'" in payload["reason"]
+    assert payload["available_sources"] == ["HF"]
+
+
+def test_passive_cardioid_dry_run_preserves_requested_polar_window(tmp_path):
+    module = _load_script()
+    mesh_path = tmp_path / "dummy.msh"
+    mesh_path.write_text("", encoding="utf-8")
+
+    rc = module.main(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "MF:3",
+            "--source",
+            "PORT_EXIT:10",
+            "--polar-angle-min-deg",
+            "0",
+            "--polar-angle-max-deg",
+            "90",
+            "--polar-angle-count",
+            "19",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l",
+            "10",
+            "--passive-cardioid-port-length-mm",
+            "25",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    manifest = (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"polar_angle_min_deg": 0.0' in manifest
+    assert '"polar_angle_max_deg": 90.0' in manifest
+    assert '"polar_angle_count": 19' in manifest
+    assert '"enabled": true' in manifest
+
+
+def _write_synthetic_basis(
+    path,
+    *,
+    name,
+    tag,
+    freqs,
+    angles,
+    planes,
+    pressure,
+):
+    np.savez_compressed(
+        path,
+        source_name=np.asarray(name),
+        source_tag=np.asarray(tag, dtype=np.int32),
+        frequencies_hz=np.asarray(freqs, dtype=np.float64),
+        observation_angles_deg=np.asarray(angles, dtype=np.float64),
+        observation_planes=np.asarray(planes, dtype=str),
+        pressure_complex=np.asarray(pressure, dtype=np.complex128),
+    )
+
+
+def _synthetic_source_result(path, name, tag):
+    return {
+        "name": name,
+        "tag": tag,
+        "pressure_basis_npz": str(path),
+        "mesh_valid_freq_max_hz": None,
+        "aperture_valid_freq_max_hz": None,
+    }
+
+
+def _passive_cardioid_driver_cli():
+    return [
+        "--passive-cardioid-driver-sd-cm2", "200",
+        "--passive-cardioid-driver-bl-tm", "8",
+        "--passive-cardioid-driver-re-ohm", "5.5",
+        "--passive-cardioid-driver-le-mh", "0.1",
+        "--passive-cardioid-driver-mmd-g", "18",
+        "--passive-cardioid-driver-cms-mm-per-n", "0.6",
+        "--passive-cardioid-driver-qms", "5",
+        "--passive-cardioid-drive-voltage", "2.83",
+    ]
+
+
+def _write_passive_cardioid_fixture(tmp_path, *, include_mf_matrix=True):
+    freqs = np.array([100.0, 200.0, 400.0], dtype=np.float64)
+    angles = np.array([-90.0, 0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    angle_shape = np.array([0.7, 1.0, 0.8], dtype=np.float64)
+    mf_pressure = (
+        0.010
+        * angle_shape[None, None, :]
+        * np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128)
+    )
+    port_pressure = (
+        (0.002 + 0.0004j)
+        * np.array([1.0, 0.9, 0.6], dtype=np.float64)[None, None, :]
+        * np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128)
+    )
+    mf_basis = tmp_path / "MF_pressure_basis.npz"
+    port_basis = tmp_path / "PORT_EXIT_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_basis,
+        name="MF",
+        tag=3,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=mf_pressure,
+    )
+    _write_synthetic_basis(
+        port_basis,
+        name="PORT_EXIT",
+        tag=10,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=port_pressure,
+    )
+    matrix_npz = tmp_path / "port_exit_radiation_impedance_matrix.npz"
+    if include_mf_matrix:
+        solver_matrix = np.zeros((freqs.size, 2, 2), dtype=np.complex128)
+        solver_matrix[:, 0, 0] = np.array([100.0 - 10.0j, 120.0 - 12.0j, 140.0 - 14.0j])
+        solver_matrix[:, 0, 1] = np.array([6.0 - 0.6j, 7.0 - 0.7j, 8.0 - 0.8j])
+        solver_matrix[:, 1, 0] = np.array([6.0 - 0.6j, 7.0 - 0.7j, 8.0 - 0.8j])
+        solver_matrix[:, 1, 1] = np.array([320.0 - 20.0j, 340.0 - 22.0j, 360.0 - 24.0j])
+        np.savez_compressed(
+            matrix_npz,
+            frequencies_hz=freqs,
+            aperture_names=np.asarray(["PORT_EXIT", "MF"]),
+            aperture_area_m2=np.asarray([0.01, 0.02], dtype=np.float64),
+            solver_impedance_matrix=solver_matrix,
+            in_phase_aperture_names=np.asarray(["PORT_EXIT"]),
+        )
+    else:
+        solver_matrix = np.array(
+            [[[100.0 - 10.0j]], [[120.0 - 12.0j]], [[140.0 - 14.0j]]],
+            dtype=np.complex128,
+        )
+        np.savez_compressed(
+            matrix_npz,
+            frequencies_hz=freqs,
+            aperture_names=np.asarray(["PORT_EXIT"]),
+            aperture_area_m2=np.asarray([0.01], dtype=np.float64),
+            solver_impedance_matrix=solver_matrix,
+        )
+    source_results = [
+        _synthetic_source_result(mf_basis, "MF", 3),
+        _synthetic_source_result(port_basis, "PORT_EXIT", 10),
+    ]
+    return {
+        "freqs": freqs,
+        "angles": angles,
+        "planes": planes,
+        "mf_pressure": mf_pressure,
+        "port_pressure": port_pressure,
+        "matrix_npz": matrix_npz,
+        "source_results": source_results,
+    }
+
+
+def _passive_cardioid_args(module, tmp_path, out_dir, *, coupled=False):
+    argv = [
+        "--mesh", str(tmp_path / "fake.msh"),
+        "--out", str(out_dir),
+        "--source", "MF:3",
+        "--source", "PORT_EXIT:10",
+        "--passive-cardioid-mf",
+        "--passive-cardioid-rear-volume-l", "10",
+        "--passive-cardioid-port-length-mm", "20",
+        "--passive-cardioid-foam-resistance-pa-s-m3", "50",
+    ]
+    if coupled:
+        argv.append("--passive-cardioid-coupled")
+        argv.extend(_passive_cardioid_driver_cli())
+    return module.parse_args(argv)
+
+
+def test_crossover_chain_three_way_needs_both_fields():
+    module = _load_script()
+    chain, reason = module._crossover_chain(
+        ["LF", "MF", "HF"], lf_mf_hz=130.0, mf_hf_hz=None
+    )
+    assert chain is None
+    assert "both" in str(reason)
+    chain, xos = module._crossover_chain(
+        ["LF", "MF", "HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
+    )
+    assert chain == ["LF", "MF", "HF"]
+    assert xos == [130.0, 1000.0]
+
+
+def test_crossover_chain_two_way_uses_natural_or_single_field():
+    module = _load_script()
+    # Natural field for the pair wins.
+    chain, xos = module._crossover_chain(
+        ["MF", "HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
+    )
+    assert chain == ["MF", "HF"]
+    assert xos == [1000.0]
+    # A single filled field is used even if it is not the pair's natural one.
+    chain, xos = module._crossover_chain(
+        ["MF", "HF"], lf_mf_hz=800.0, mf_hf_hz=None
+    )
+    assert chain == ["MF", "HF"]
+    assert xos == [800.0]
+    # LF+HF with both fields filled is ambiguous.
+    chain, reason = module._crossover_chain(
+        ["LF", "HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
+    )
+    assert chain is None
+    assert "ambiguous" in str(reason)
+    # Fewer than two drivers cannot form a crossover sum.
+    chain, reason = module._crossover_chain(
+        ["HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
+    )
+    assert chain is None
+
+
+def test_crossover_weights_lr4_pair_is_allpass():
+    module = _load_script()
+    freqs = np.geomspace(20.0, 20000.0, 200)
+    weights = module._crossover_weights(freqs, ["MF", "HF"], [1000.0])
+    total = weights["MF"] + weights["HF"]
+    np.testing.assert_allclose(np.abs(total), 1.0, atol=1.0e-9)
+
+
+def test_two_way_crossover_combine_writes_outputs(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 25)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    pressure = np.full(
+        (freqs.size, planes.size, angles.size), 0.02 + 0.0j, dtype=np.complex128
+    )
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["members"] == ["MF", "HF"]
+    assert payload["crossovers_hz"] == [1000.0]
+    # Identical coincident sources need no alignment delay, and the LR4
+    # LP+HP pair is allpass, so the aligned sum equals one source's SPL.
+    for delay_ms in payload["delays_ms"].values():
+        assert abs(delay_ms) < 1.0e-6
+    outputs = payload["outputs"]
+    for key in (
+        "combined_time_aligned_frequency_response_png",
+        "combined_time_aligned_directivity_heatmap_png",
+        "combined_interference_heatmap_png",
+        "driver_time_alignment_txt",
+    ):
+        assert Path(outputs[key]).exists(), key
+        assert Path(outputs[key]).stat().st_size > 500
+    off_axis = outputs["combined_off_axis_frequency_response_pngs"]
+    assert set(off_axis) == {"horizontal", "vertical"}
+    for png in off_axis.values():
+        assert Path(png).exists()
+    report = Path(outputs["driver_time_alignment_txt"]).read_text(encoding="utf-8")
+    assert "MF -> HF (2-way)" in report
+    assert "MF/HF: LR4 at 1000.000 Hz" in report
+
+
+def test_three_way_combine_interpolates_clamped_lf_grid(tmp_path):
+    module = _load_script()
+    full = np.geomspace(100.0, 10000.0, 25)
+    clamped = np.geomspace(100.0, 800.0, 25)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+
+    def _grid(freqs):
+        return np.full(
+            (freqs.size, planes.size, angles.size), 0.02 + 0.0j, dtype=np.complex128
+        )
+
+    lf_npz = tmp_path / "LF_pressure_basis.npz"
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        lf_npz, name="LF", tag=2, freqs=clamped, angles=angles, planes=planes,
+        pressure=_grid(clamped),
+    )
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=full, angles=angles, planes=planes,
+        pressure=_grid(full),
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=full, angles=angles, planes=planes,
+        pressure=_grid(full),
+    )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(lf_npz, "LF", 2),
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=300.0,
+        mf_hf_hz=2000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["members"] == ["LF", "MF", "HF"]
+    assert payload["source_solved_freq_max_hz"]["LF"] == pytest.approx(800.0)
+    assert payload["source_solved_freq_max_hz"]["HF"] == pytest.approx(10000.0)
+    report = Path(payload["outputs"]["driver_time_alignment_txt"]).read_text(
+        encoding="utf-8"
+    )
+    assert "Clamped solve bands" in report
+    assert "LF 800 Hz" in report
+
+
+def test_harmonize_bases_zeroes_clamped_source_above_its_band():
+    module = _load_script()
+    full = np.geomspace(100.0, 10000.0, 25)
+    clamped = np.geomspace(100.0, 800.0, 25)
+    angles = np.array([0.0, 90.0])
+    planes = np.array(["horizontal"], dtype=str)
+    make = lambda freqs: module.PressureBasis(
+        source_name="X",
+        source_tag=1,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=np.full(
+            (freqs.size, 1, angles.size), 0.02 + 0.0j, dtype=np.complex128
+        ),
+    )
+    freqs, grids, solved_top = module._harmonize_bases(
+        {"LF": make(clamped), "HF": make(full)}
+    )
+    np.testing.assert_allclose(freqs, full)
+    assert solved_top == {"LF": pytest.approx(800.0), "HF": pytest.approx(10000.0)}
+    above = freqs > 800.0 * (1.0 + 1.0e-6)
+    assert np.all(grids["LF"][above] == 0.0)
+    assert np.all(np.abs(grids["LF"][~above]) > 0.0)
+    np.testing.assert_allclose(np.abs(grids["HF"]), 0.02)
+
+
+def test_crossover_combine_skips_single_source_gracefully(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 10)
+    angles = np.array([0.0, 90.0])
+    planes = np.array(["horizontal"], dtype=str)
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=np.full((freqs.size, 1, angles.size), 0.02, dtype=np.complex128),
+    )
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [_synthetic_source_result(hf_npz, "HF", 4)],
+        lf_mf_hz=None,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+    assert payload["status"] == "skipped"
+    assert "two" in payload["reason"]
+
+
+def _delayed_pressure(freqs, planes, angles, *, arrival_s, amplitude=0.02):
+    """Uniform radiator whose wave arrives ``arrival_s`` after t=0.
+
+    Built in the SOLVER ``e^{-i omega t}`` convention (a delay of tau
+    multiplies the phasor by ``e^{+i omega tau}``), exactly as
+    ``hornlab_metal_bem`` produces ``pressure_complex``. Written to a legacy
+    (keyless) NPZ, the loader conjugates this into the engineering
+    convention that the combine/export math assumes.
+    """
+    phase = np.exp(1j * 2.0 * np.pi * np.asarray(freqs) * arrival_s)
+    return amplitude * phase[:, None, None] * np.ones(
+        (len(freqs), len(planes), len(angles)), dtype=np.complex128
+    )
+
+
+def test_two_way_combine_recovers_known_arrival_offset(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 60)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal"], dtype=str)
+    # HF arrives 0.3 ms after MF (e.g. deeper horn throat): MF must be
+    # delayed by 0.3 ms to align.
+    offset_s = 0.3e-3
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=0.0),
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=offset_s),
+    )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["delays_ms"]["MF"] == pytest.approx(0.3, abs=1.0e-6)
+    assert payload["delays_ms"]["HF"] == pytest.approx(0.0, abs=1.0e-9)
+    assert payload["arrival_offsets_ms"]["HF"] == pytest.approx(0.3, abs=1.0e-6)
+
+
+def test_two_way_combine_is_coherent_across_band_not_only_at_fc(tmp_path):
+    """Solver-convention delayed bases must align coherently through fc±20%.
+
+    Two identical radiators offset by a pure arrival delay sum to an allpass
+    (LR4 LP+HP) once aligned — |sum| equals the driver amplitude at EVERY
+    frequency, not just the crossover. Getting the delay complement-wrong
+    (T-dt instead of dt) is coherent exactly at fc but rips through the rest
+    of the band, which is what this pins down.
+    """
+    module = _load_script()
+    freqs = np.geomspace(200.0, 5000.0, 400)
+    angles = np.array([0.0, 30.0])
+    planes = np.array(["horizontal"], dtype=str)
+    fc = 1000.0
+    offset_s = 0.3e-3
+    amplitude = 0.02
+    arrivals = {"MF": 0.0, "HF": offset_s}
+    paths = {}
+    for name, tag in (("MF", 3), ("HF", 4)):
+        paths[name] = tmp_path / f"{name}_pressure_basis.npz"
+        _write_synthetic_basis(
+            paths[name], name=name, tag=tag, freqs=freqs, angles=angles,
+            planes=planes,
+            pressure=_delayed_pressure(
+                freqs, planes, angles, arrival_s=arrivals[name],
+                amplitude=amplitude,
+            ),
+        )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(paths["MF"], "MF", 3),
+            _synthetic_source_result(paths["HF"], "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=fc,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["delays_ms"]["MF"] == pytest.approx(0.3, abs=1.0e-6)
+    # Rebuild the aligned sum in the engineering convention from the REPORTED
+    # delays and gains: if they are physical, the sum is allpass-flat.
+    weights = module._crossover_weights(freqs, ["MF", "HF"], [fc])
+    total = np.zeros(freqs.size, dtype=np.complex128)
+    for name in ("MF", "HF"):
+        engineering = amplitude * np.exp(
+            -1j * 2.0 * np.pi * freqs * arrivals[name]
+        )
+        gain = 10.0 ** (payload["level_match"]["gains_db"][name] / 20.0)
+        delay = np.exp(
+            -1j * 2.0 * np.pi * freqs * payload["delays_ms"][name] * 1.0e-3
+        )
+        total += engineering * weights[name] * gain * delay
+    band = (freqs >= 0.8 * fc) & (freqs <= 1.2 * fc)
+    np.testing.assert_allclose(np.abs(total[band]), amplitude, rtol=1.0e-6)
+    # The pure-delay pair stays coherent over the full solved band too.
+    np.testing.assert_allclose(np.abs(total), amplitude, rtol=1.0e-6)
+
+
+def test_three_way_combine_recovers_chained_arrival_offsets(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(50.0, 10000.0, 80)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal"], dtype=str)
+    # Arrivals: LF first, MF +0.2 ms, HF +0.5 ms. The alignment zeroes the
+    # TOTAL phase difference (driver arrival + filter phase) at each
+    # crossover — a band-pass branch carries extra phase from its other
+    # filter tail, so the added delays exceed the raw arrival offsets. The
+    # invariant to pin is coherence: aligned phase ~0 at both crossovers,
+    # delays ordered LF > MF > HF = 0.
+    arrivals = {"LF": 0.0, "MF": 0.2e-3, "HF": 0.5e-3}
+    paths = {}
+    for name, tag in (("LF", 2), ("MF", 3), ("HF", 4)):
+        paths[name] = tmp_path / f"{name}_pressure_basis.npz"
+        _write_synthetic_basis(
+            paths[name], name=name, tag=tag, freqs=freqs, angles=angles,
+            planes=planes,
+            pressure=_delayed_pressure(freqs, planes, angles, arrival_s=arrivals[name]),
+        )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(paths["LF"], "LF", 2),
+            _synthetic_source_result(paths["MF"], "MF", 3),
+            _synthetic_source_result(paths["HF"], "HF", 4),
+        ],
+        lf_mf_hz=300.0,
+        mf_hf_hz=2000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["delays_ms"]["HF"] == pytest.approx(0.0, abs=1.0e-9)
+    assert payload["delays_ms"]["MF"] > 0.2
+    assert payload["delays_ms"]["LF"] > payload["delays_ms"]["MF"]
+    for row in payload["phase_checks"]:
+        assert abs(row["raw_phase_deg"]) > 1.0  # non-trivial input
+        assert abs(row["aligned_phase_deg"]) < 1.0e-3  # coherent at the XO
+
+
+def test_crossover_above_clamped_band_measures_alignment_at_band_top(tmp_path):
+    module = _load_script()
+    full = np.geomspace(100.0, 10000.0, 60)
+    clamped = np.geomspace(100.0, 1500.0, 60)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal"], dtype=str)
+    offset_s = 0.3e-3
+    # MF clamped to 1.5 kHz but the MF/HF crossover requested at 2 kHz: the
+    # pair phase must be measured at the clamped top, not on the zero-filled
+    # region (which would silently produce a 0 ms delay).
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=clamped, angles=angles, planes=planes,
+        pressure=_delayed_pressure(clamped, planes, angles, arrival_s=0.0),
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=full, angles=angles, planes=planes,
+        pressure=_delayed_pressure(full, planes, angles, arrival_s=offset_s),
+    )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=2000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    # Evaluation snaps to the highest master-grid sample inside both solved
+    # bands (just below the 1.5 kHz clamp), never onto the zero-filled region.
+    eval_hz = payload["pair_alignment_eval_hz"]["MF-HF"]
+    assert 1300.0 < eval_hz <= 1500.0
+    assert payload["delays_ms"]["MF"] == pytest.approx(0.3, abs=1.0e-4)
+    assert payload["alignment_warnings"]
+    assert "measured at" in payload["alignment_warnings"][0]
+    report = Path(payload["outputs"]["driver_time_alignment_txt"]).read_text(
+        encoding="utf-8"
+    )
+    assert "WARNING" in report
+
+
+def test_crossover_combine_uses_passive_cardioid_mf_override(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 30)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal"], dtype=str)
+    direct = _delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.02)
+    combined = _delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.05)
+
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=direct,
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=direct,
+    )
+    override_npz = tmp_path / "MF_passive_cardioid_results.npz"
+    np.savez_compressed(
+        override_npz,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=combined,
+    )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+        mf_override_npz=override_npz,
+        mf_override_kind="passive_cardioid_combined",
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["mf_basis"] == "passive_cardioid_combined"
+    # The MF channel is ~8 dB hotter than the direct basis, so the level
+    # match must trim MF relative to HF — proof the override grid was used.
+    assert payload["level_match"]["gains_db"]["MF"] == pytest.approx(
+        -0.5 * 20.0 * np.log10(0.05 / 0.02), abs=0.2
+    )
+    report = Path(payload["outputs"]["driver_time_alignment_txt"]).read_text(
+        encoding="utf-8"
+    )
+    assert "passive_cardioid_combined" in report
+
+
+def test_crossover_combine_uses_coupled_passive_cardioid_override(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 30)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal"], dtype=str)
+    direct = _delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.02)
+    fixed = _delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.03)
+    coupled = _delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.06)
+
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=direct,
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=direct,
+    )
+    fixed_npz = tmp_path / "MF_passive_cardioid_results.npz"
+    coupled_npz = tmp_path / "MF_passive_cardioid_coupled_results.npz"
+    for path, pressure in ((fixed_npz, fixed), (coupled_npz, coupled)):
+        np.savez_compressed(
+            path,
+            frequencies_hz=freqs,
+            observation_angles_deg=angles,
+            observation_planes=planes,
+            pressure_complex=pressure,
+            phase_convention=np.asarray(module.PRESSURE_NPZ_PHASE_CONVENTION),
+        )
+
+    override, kind = module._preferred_passive_cardioid_results(
+        {
+            "status": "complete",
+            "outputs": {"results_npz": str(fixed_npz)},
+            "coupled": {
+                "status": "complete",
+                "outputs": {"results_npz": str(coupled_npz)},
+            },
+        }
+    )
+    assert override == coupled_npz
+    assert kind == "passive_cardioid_coupled"
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=None,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+        mf_override_npz=override,
+        mf_override_kind=kind,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["mf_basis"] == "passive_cardioid_coupled"
+    assert payload["level_match"]["gains_db"]["MF"] == pytest.approx(
+        -0.5 * 20.0 * np.log10(0.06 / 0.02), abs=0.2
+    )
+
+
+def test_passive_cardioid_exterior_drive_uses_port_mf_mutual_term(tmp_path, monkeypatch):
+    module = _load_script()
+    freqs = np.array([100.0, 200.0], dtype=np.float64)
+    angles = np.array([-90.0, 0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    mf_pressure = np.full((2, 2, 3), 0.010 + 0.0j, dtype=np.complex128)
+    port_pressure = np.full((2, 2, 3), 0.002 + 0.0j, dtype=np.complex128)
+
+    mf_basis = tmp_path / "MF_pressure_basis.npz"
+    port_basis = tmp_path / "PORT_EXIT_pressure_basis.npz"
+    for path, name, tag, pressure in (
+        (mf_basis, "MF", 3, mf_pressure),
+        (port_basis, "PORT_EXIT", 10, port_pressure),
+    ):
+        np.savez_compressed(
+            path,
+            source_name=np.asarray(name),
+            source_tag=np.asarray(tag, dtype=np.int32),
+            frequencies_hz=freqs,
+            observation_angles_deg=angles,
+            observation_planes=planes,
+            pressure_complex=pressure,
+        )
+
+    # 2x2 solver matrix over (PORT_EXIT, MF): the mutual column drives the
+    # exterior term; the engineering convention is conj(solver).
+    z_pp = np.array([100.0 - 10.0j, 120.0 - 12.0j], dtype=np.complex128)
+    z_pm = np.array([40.0 - 4.0j, 50.0 - 5.0j], dtype=np.complex128)
+    solver_matrix = np.zeros((2, 2, 2), dtype=np.complex128)
+    solver_matrix[:, 0, 0] = z_pp
+    solver_matrix[:, 0, 1] = z_pm
+    solver_matrix[:, 1, 0] = z_pm
+    solver_matrix[:, 1, 1] = np.array([500.0 - 50.0j, 520.0 - 52.0j])
+    matrix_npz = tmp_path / "port_exit_radiation_impedance_matrix.npz"
+    np.savez_compressed(
+        matrix_npz,
+        frequencies_hz=freqs,
+        aperture_names=np.asarray(["PORT_EXIT", "MF"]),
+        aperture_area_m2=np.asarray([0.01, 0.02], dtype=np.float64),
+        solver_impedance_matrix=solver_matrix,
+    )
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.02)
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "fake.msh"),
+            "--out", str(tmp_path),
+            "--source", "MF:3",
+            "--source", "PORT_EXIT:10",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l", "10",
+            "--passive-cardioid-port-length-mm", "20",
+            "--passive-cardioid-foam-resistance-pa-s-m3", "50",
+        ]
+    )
+    source_results = [
+        {
+            "name": "MF", "tag": 3, "pressure_basis_npz": str(mf_basis),
+            "mesh_valid_freq_max_hz": None, "aperture_valid_freq_max_hz": None,
+        },
+        {
+            "name": "PORT_EXIT", "tag": 10, "pressure_basis_npz": str(port_basis),
+            "mesh_valid_freq_max_hz": None, "aperture_valid_freq_max_hz": None,
+        },
+    ]
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh", tmp_path, args,
+        source_results=source_results,
+        radiation_payload={"outputs": {"npz": str(matrix_npz)}},
+    )
+
+    assert payload["status"] == "complete"
+    diag = payload["diagnostics"]
+    assert diag["exterior_drive_included"] is True
+    rho_c2 = module.radiation_impedance.RHO_AIR * module.radiation_impedance.C_AIR**2
+    compliance = 0.010 / rho_c2
+    assert diag["chamber_compliance_m3_per_pa"] == pytest.approx(compliance)
+    assert diag["rc_corner_hz"] == pytest.approx(1.0 / (2.0 * np.pi * 50.0 * compliance))
+
+    # Hand-compute the expected weight: conj() converts the solver mutual to
+    # the engineering convention, and the exterior term multiplies the same
+    # branch ratio as the interior rear drive.
+    termination = module.radiation_impedance.termination_load_from_solver_matrix(
+        solver_matrix, receiver_index=0,
+    )
+    branch = module.radiation_impedance.terminated_chamber_port_branch(
+        freqs, termination,
+        chamber_volume_m3=0.010, port_area_m2=0.01, port_length_m=0.020,
+        series_resistance_pa_s_m3=50.0,
+    )
+    omega = 2.0 * np.pi * freqs
+    exterior = -1j * omega * compliance * np.conjugate(z_pm)
+    expected_weight = (
+        (0.02 / 0.01)
+        * branch.exit_to_input_volume_velocity_ratio
+        * (-1.0 + exterior)
+    )
+    with np.load(tmp_path / "MF_passive_cardioid_results.npz") as result:
+        np.testing.assert_allclose(result["port_velocity_weight"], expected_weight)
+        np.testing.assert_allclose(result["exterior_drive"], exterior)
+    # The mutual term must actually change the result vs interior-only.
+    interior_only = (0.02 / 0.01) * branch.exit_to_input_volume_velocity_ratio * -1.0
+    assert not np.allclose(expected_weight, interior_only)
+
+
+def test_passive_cardioid_monopole_pair_nulls_at_rear(tmp_path, monkeypatch):
+    """Textbook cardioid: rear source inverted and delayed by its own spacing.
+
+    MF sits at the origin, the port exit a distance d behind it. With the
+    port driven at ``-e^{-j w d/c} * Q_mf`` the pair nulls at 180 deg at
+    every frequency: path lead and drive delay cancel exactly. Bases are
+    written through ``_write_pressure_basis_npz`` from solver-convention
+    fields, so this pins the write-conjugate + branch-multiply chain end to
+    end; conjugate-wrong port phase flips the null to the FRONT.
+    """
+    module = _load_script()
+    c = module.SPEED_OF_SOUND_M_S
+    d = 0.1
+    tau = d / c
+    freqs = np.array([200.0, 400.0, 800.0], dtype=np.float64)
+    angles = np.array([0.0, 90.0, 180.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    k = 2.0 * np.pi * freqs / c
+    # Solver-convention (e^{+ikr}) far fields with the common radius dropped:
+    # the port sits d*cos(theta) farther from the observer at angle theta.
+    mf_pressure = np.ones((freqs.size, 1, angles.size), dtype=np.complex128)
+    port_pressure = np.exp(
+        1j * k[:, None, None] * d * np.cos(np.radians(angles))[None, None, :]
+    )
+
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    port_npz = tmp_path / "PORT_EXIT_pressure_basis.npz"
+    for path, name, tag, pressure in (
+        (mf_npz, "MF", 3, mf_pressure),
+        (port_npz, "PORT_EXIT", 10, port_pressure),
+    ):
+        module._write_pressure_basis_npz(
+            path,
+            SimpleNamespace(
+                frequencies_hz=freqs,
+                observation_angles_deg=angles,
+                observation_planes=planes,
+                pressure_complex=pressure,
+            ),
+            source_name=name,
+            source_tag=tag,
+        )
+
+    matrix_npz = tmp_path / "port_exit_radiation_impedance_matrix.npz"
+    np.savez_compressed(
+        matrix_npz,
+        frequencies_hz=freqs,
+        aperture_names=np.asarray(["PORT_EXIT"]),
+        aperture_area_m2=np.asarray([0.01], dtype=np.float64),
+        solver_impedance_matrix=np.full((3, 1, 1), 100.0 - 10.0j),
+    )
+    monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.01)
+    # Idealize the branch to a pure engineering-convention delay of d/c so
+    # the combine's weight is exactly the textbook -e^{-j w tau}.
+    monkeypatch.setattr(
+        module.radiation_impedance,
+        "terminated_chamber_port_branch",
+        lambda frequencies_hz, termination_load, **_kwargs: SimpleNamespace(
+            frequencies_hz=frequencies_hz,
+            termination_load=termination_load,
+            input_impedance=np.ones(freqs.size, dtype=np.complex128),
+            exit_to_input_volume_velocity_ratio=np.exp(
+                -1j * 2.0 * np.pi * frequencies_hz * tau
+            ),
+        ),
+    )
+    args = module.parse_args(
+        [
+            "--mesh", str(tmp_path / "fake.msh"),
+            "--out", str(tmp_path),
+            "--source", "MF:3",
+            "--source", "PORT_EXIT:10",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l", "10",
+            "--passive-cardioid-port-length-mm", "20",
+        ]
+    )
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh", tmp_path, args,
+        source_results=[
+            {
+                "name": "MF", "tag": 3, "pressure_basis_npz": str(mf_npz),
+                "mesh_valid_freq_max_hz": None, "aperture_valid_freq_max_hz": None,
+            },
+            {
+                "name": "PORT_EXIT", "tag": 10, "pressure_basis_npz": str(port_npz),
+                "mesh_valid_freq_max_hz": None, "aperture_valid_freq_max_hz": None,
+            },
+        ],
+        radiation_payload={"outputs": {"npz": str(matrix_npz)}},
+    )
+
+    assert payload["status"] == "complete"
+    with np.load(tmp_path / "MF_passive_cardioid_results.npz") as result:
+        np.testing.assert_allclose(
+            result["port_velocity_weight"],
+            -np.exp(-1j * 2.0 * np.pi * freqs * tau),
+        )
+        total = result["pressure_complex"]
+        expected = 1.0 - np.exp(
+            -1j
+            * (
+                2.0 * np.pi * freqs[:, None, None] * tau
+                + k[:, None, None] * d * np.cos(np.radians(angles))[None, None, :]
+            )
+        )
+        np.testing.assert_allclose(total, expected, atol=1.0e-12)
+        rear = int(np.argmin(np.abs(angles - 180.0)))
+        front = int(np.argmin(np.abs(angles)))
+        # Perfect rear null at every frequency; the front must stay live
+        # (a conjugate-wrong port basis would null the front instead).
+        assert np.max(np.abs(total[:, :, rear])) < 1.0e-9
+        assert np.min(np.abs(total[:, :, front])) > 0.5
+
+
+def test_vituixcad_export_writes_frd_sets_with_shared_timing(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 20)
+    angles = np.arange(0.0, 181.0, 45.0)  # 0,45,90,135,180
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    distance_m = 2.0
+    # MF: pure time-of-flight arrival at the observation distance -> after
+    # the common ToF removal its exported phase must be ~0 at every
+    # frequency. HF: extra 0.2 ms -> exported phase -360*f*0.0002 deg.
+    tof_s = distance_m / module.SPEED_OF_SOUND_M_S
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=tof_s),
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=tof_s + 0.2e-3),
+    )
+
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        polar_distance_m=distance_m,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["drivers"] == ["MF", "HF"]
+    export_dir = Path(payload["export_dir"])
+    assert (export_dir / "README.txt").exists()
+    # 5 solved angles + mirrored -45/-90/-135 => 8 files per driver per plane.
+    hor_mf = sorted((export_dir / "hor").glob("MF *.frd"))
+    assert len(hor_mf) == 8
+    assert (export_dir / "hor" / "MF -45.frd").exists()
+    assert (export_dir / "ver" / "HF 90.frd").exists()
+
+    def _read_frd(path):
+        rows = [
+            line.split()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("*")
+        ]
+        data = np.asarray(rows, dtype=np.float64)
+        return data[:, 0], data[:, 1], data[:, 2]
+
+    f_mf, _spl, phase_mf = _read_frd(export_dir / "hor" / "MF 0.frd")
+    np.testing.assert_allclose(f_mf, freqs, rtol=1.0e-6)
+    # Common ToF removed -> MF phase flat at ~0 deg.
+    assert np.max(np.abs(phase_mf)) < 1.0e-3
+    _f, _spl, phase_hf = _read_frd(export_dir / "hor" / "HF 0.frd")
+    expected = np.angle(np.exp(-1j * 2.0 * np.pi * freqs * 0.2e-3), deg=True)
+    np.testing.assert_allclose(phase_hf, expected, atol=1.0e-3)
+
+
+def test_vituixcad_export_writes_active_lr4_vxp_when_alignment_is_available(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 20)
+    angles = np.array([0.0, 45.0, 90.0])
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    distance_m = 2.0
+    tof_s = distance_m / module.SPEED_OF_SOUND_M_S
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz,
+        name="MF",
+        tag=3,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=tof_s),
+    )
+    _write_synthetic_basis(
+        hf_npz,
+        name="HF",
+        tag=4,
+        freqs=freqs,
+        angles=angles,
+        planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=tof_s),
+    )
+
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [
+            _synthetic_source_result(mf_npz, "MF", 3),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        polar_distance_m=distance_m,
+        active_crossover_payload={
+            "status": "complete",
+            "type": "lr4_time_aligned_on_axis_sum",
+            "members": ["MF", "HF"],
+            "crossovers_hz": [1000.0],
+            "mf_basis": "direct",
+            "level_match": {"gains_db": {"MF": -2.0, "HF": 1.5}},
+            "delays_ms": {"MF": 0.25, "HF": 0.0},
+        },
+    )
+
+    vxp_path = Path(payload["outputs"]["vituixcad_active_lr4_vxp"])
+    assert vxp_path.name == "HornLab_active_lr4.vxp"
+    root = ET.parse(vxp_path).getroot()
+
+    assert [node.findtext("Model") for node in root.findall("DRIVER")] == ["MF", "HF"]
+    filenames = [node.findtext("FileName") for node in root.findall(".//RESPONSE")]
+    assert "hor/MF -45.frd" in filenames
+    assert "ver/HF 90.frd" in filenames
+
+    parts = root.findall("./CROSSOVER/PART")
+    filters = [part for part in parts if (part.findtext("Type") or "").startswith("Active")]
+    assert sorted(part.findtext("Type") for part in filters) == [
+        "Active High pass",
+        "Active Low pass",
+    ]
+    assert {part.findtext("PARAM/Value") for part in filters} == {"1000"}
+
+    buffers = [part for part in parts if part.findtext("Type") == "Buffer"]
+    buffer_params = {
+        part.findtext("PartID"): {
+            param.findtext("Name"): param.findtext("Value")
+            for param in part.findall("PARAM")
+        }
+        for part in buffers
+    }
+    assert {"A": "1.5", "dt": "0"} in buffer_params.values()
+    assert {"A": "-2", "dt": "250"} in buffer_params.values()
+    readme = (vxp_path.parent / "README.txt").read_text(encoding="utf-8")
+    assert "HornLab_active_lr4.vxp contains the computed active LR4" in readme
+
+
+def test_vituixcad_export_phase_slope_is_negative_for_delayed_arrival(tmp_path):
+    """A later arrival must export measurement-convention falling phase.
+
+    Solver-convention input carries e^{+i omega tau} for a delay; exporting
+    its angle unconverted would rise with frequency, and the e^{+jkd} ToF
+    factor would then DOUBLE the propagation phase instead of removing it.
+    """
+    module = _load_script()
+    # Dense linear grid so the unwrapped slope is unambiguous.
+    freqs = np.linspace(500.0, 3000.0, 201)
+    angles = np.array([0.0])
+    planes = np.array(["horizontal"], dtype=str)
+    distance_m = 2.0
+    tof_s = distance_m / module.SPEED_OF_SOUND_M_S
+    extra_s = 0.3e-3
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(
+            freqs, planes, angles, arrival_s=tof_s + extra_s
+        ),
+    )
+
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [_synthetic_source_result(mf_npz, "MF", 3)],
+        polar_distance_m=distance_m,
+    )
+
+    assert payload["status"] == "complete"
+    rows = [
+        line.split()
+        for line in (Path(payload["export_dir"]) / "hor" / "MF 0.frd")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line and not line.startswith("*")
+    ]
+    data = np.asarray(rows, dtype=np.float64)
+    unwrapped_rad = np.unwrap(np.radians(data[:, 2]))
+    assert np.all(np.diff(unwrapped_rad) < 0.0)
+    np.testing.assert_allclose(
+        unwrapped_rad[-1] - unwrapped_rad[0],
+        -2.0 * np.pi * extra_s * (freqs[-1] - freqs[0]),
+        rtol=1.0e-6,
+    )
+
+
+def test_vituixcad_export_includes_passive_cardioid_combined_mf(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 2000.0, 10)
+    angles = np.array([0.0, 90.0, 180.0])
+    planes = np.array(["horizontal"], dtype=str)
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=0.0),
+    )
+    combined_npz = tmp_path / "MF_passive_cardioid_results.npz"
+    np.savez_compressed(
+        combined_npz,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=_delayed_pressure(freqs, planes, angles, arrival_s=0.0, amplitude=0.05),
+    )
+
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [_synthetic_source_result(mf_npz, "MF", 3)],
+        polar_distance_m=2.0,
+        passive_payload={
+            "status": "complete",
+            "outputs": {"results_npz": str(combined_npz)},
+        },
+    )
+
+    assert payload["drivers"] == ["MF", "MF_cardioid"]
+    assert (Path(payload["export_dir"]) / "hor" / "MF_cardioid 0.frd").exists()
+
+
+def test_vituixcad_export_includes_coupled_passive_cardioid_zma(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 2000.0, 10)
+    angles = np.array([0.0, 90.0, 180.0])
+    planes = np.array(["horizontal"], dtype=str)
+    mf_npz = tmp_path / "MF_pressure_basis.npz"
+    _write_synthetic_basis(
+        mf_npz, name="MF", tag=3, freqs=freqs, angles=angles, planes=planes,
+        pressure=_delayed_pressure(freqs, planes, angles, arrival_s=0.0),
+    )
+    fixed_npz = tmp_path / "MF_passive_cardioid_results.npz"
+    coupled_npz = tmp_path / "MF_passive_cardioid_coupled_results.npz"
+    np.savez_compressed(
+        fixed_npz,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=_delayed_pressure(
+            freqs, planes, angles, arrival_s=0.0, amplitude=0.03
+        ),
+        phase_convention=np.asarray(module.PRESSURE_NPZ_PHASE_CONVENTION),
+    )
+    np.savez_compressed(
+        coupled_npz,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=_delayed_pressure(
+            freqs, planes, angles, arrival_s=0.0, amplitude=0.05
+        ),
+        phase_convention=np.asarray(module.PRESSURE_NPZ_PHASE_CONVENTION),
+    )
+    zma = tmp_path / "MF_passive_cardioid_impedance.zma"
+    zma.write_text(
+        "* synthetic\n100.0\t5.5\t0.0\n200.0\t6.0\t10.0\n",
+        encoding="utf-8",
+    )
+
+    payload = module._write_vituixcad_export(
+        tmp_path,
+        [_synthetic_source_result(mf_npz, "MF", 3)],
+        polar_distance_m=2.0,
+        passive_payload={
+            "status": "complete",
+            "outputs": {"results_npz": str(fixed_npz)},
+            "coupled": {
+                "status": "complete",
+                "outputs": {
+                    "results_npz": str(coupled_npz),
+                    "impedance_zma": str(zma),
+                },
+            },
+        },
+    )
+
+    export_dir = Path(payload["export_dir"])
+    assert payload["drivers"] == ["MF", "MF_cardioid"]
+    assert (export_dir / "MF_passive_cardioid_impedance.zma").exists()
+    assert payload["outputs"]["vituixcad_mf_cardioid_zma"].endswith(
+        "MF_passive_cardioid_impedance.zma"
+    )
+    rows = [
+        line.split()
+        for line in (export_dir / "hor" / "MF_cardioid 0.frd")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line and not line.startswith("*")
+    ]
+    data = np.asarray(rows, dtype=np.float64)
+    assert data[0, 1] == pytest.approx(20.0 * np.log10(0.05 / module.P_REF), abs=1.0e-4)
+    readme = (export_dir / "README.txt").read_text(encoding="utf-8")
+    assert "MF_passive_cardioid_impedance.zma" in readme
+    assert "No ZMA is exported" not in readme
+
+
+def test_regenerate_driver_recovers_reference_style_solve_command(tmp_path):
+    driver = _load_regen_driver()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "tagged_sources.msh").write_text("$MeshFormat\n", encoding="utf-8")
+    launch = {
+        "command": [
+            "/venv/bin/python",
+            str(ROOT / "scripts" / "fusion_step_to_wg_pipeline.py"),
+            "--step",
+            str(run_dir / "model.step"),
+            "--out",
+            str(run_dir),
+            "--run-solves",
+        ],
+    }
+    solve_cmd = [
+        "/venv/bin/python",
+        str(SCRIPT),
+        "--mesh",
+        "/old/location/tagged_sources.msh",
+        "--out",
+        "/old/location",
+        "--source",
+        "HF:4",
+        "--freq-count",
+        "8",
+        "--dry-run",
+    ]
+    (run_dir / "fusion_addin_launch.json").write_text(
+        json.dumps(launch),
+        encoding="utf-8",
+    )
+    (run_dir / "final_summary_manifest.json").write_text(
+        json.dumps({"commands": {"solve": solve_cmd}}),
+        encoding="utf-8",
+    )
+
+    command, reason = driver._recover_postprocess_command(run_dir)
+
+    assert reason is None
+    assert command[0] == sys.executable
+    assert command[1] == str(SCRIPT)
+    assert "--postprocess-only" in command
+    assert "--dry-run" not in command
+    assert command[command.index("--out") + 1] == str(run_dir)
+    assert command[command.index("--mesh") + 1] == str(run_dir / "tagged_sources.msh")
+    assert command[command.index("--source") + 1] == "HF:4"
+
+
+def test_regenerate_driver_reports_skip_without_recoverable_launch(
+    tmp_path,
+    capsys,
+):
+    driver = _load_regen_driver()
+    recoverable = tmp_path / "missing-launch-with-manifest"
+    recoverable.mkdir()
+    (recoverable / "final_summary_manifest.json").write_text(
+        json.dumps({"commands": {"solve": ["python", str(SCRIPT)]}}),
+        encoding="utf-8",
+    )
+    unrecoverable = tmp_path / "missing-everything"
+    unrecoverable.mkdir()
+
+    rc = driver.main([str(recoverable), str(unrecoverable), "--dry-run"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Manifest commands are recoverable without the launch json.
+    assert f"DRY-RUN {recoverable}" in captured.out
+    assert f"SKIPPED {unrecoverable}" in captured.out
+    assert "no recoverable solve_fusion_wg_metal.py command" in captured.out

@@ -41,6 +41,33 @@ CANONICAL_SOLVE_SOURCE_PRIORITY = {
     "MF": 1,
     "LF": 2,
 }
+# Coupled driver-LEM options forwarded verbatim to the direct solve when
+# --passive-cardioid-coupled is set. Kept as a table so tests can assert the
+# add-in dialog never emits a coupled flag this pipeline fails to forward.
+PASSIVE_CARDIOID_COUPLED_FORWARD_OPTIONS = (
+    ("--passive-cardioid-driver-sd-cm2", "passive_cardioid_driver_sd_cm2"),
+    ("--passive-cardioid-driver-bl-tm", "passive_cardioid_driver_bl_tm"),
+    ("--passive-cardioid-driver-re-ohm", "passive_cardioid_driver_re_ohm"),
+    ("--passive-cardioid-driver-le-mh", "passive_cardioid_driver_le_mh"),
+    ("--passive-cardioid-driver-le2-mh", "passive_cardioid_driver_le2_mh"),
+    ("--passive-cardioid-driver-re2-ohm", "passive_cardioid_driver_re2_ohm"),
+    ("--passive-cardioid-driver-mmd-g", "passive_cardioid_driver_mmd_g"),
+    ("--passive-cardioid-driver-mms-g", "passive_cardioid_driver_mms_g"),
+    (
+        "--passive-cardioid-driver-cms-mm-per-n",
+        "passive_cardioid_driver_cms_mm_per_n",
+    ),
+    ("--passive-cardioid-driver-vas-l", "passive_cardioid_driver_vas_l"),
+    ("--passive-cardioid-driver-fs-hz", "passive_cardioid_driver_fs_hz"),
+    (
+        "--passive-cardioid-driver-rms-kg-per-s",
+        "passive_cardioid_driver_rms_kg_per_s",
+    ),
+    ("--passive-cardioid-driver-qms", "passive_cardioid_driver_qms"),
+    ("--passive-cardioid-driver-count", "passive_cardioid_driver_count"),
+    ("--passive-cardioid-drive-voltage", "passive_cardioid_drive_voltage"),
+    ("--passive-cardioid-rg-ohm", "passive_cardioid_rg_ohm"),
+)
 SYMMETRY_PLANE_ALIASES = {
     "": (),
     "none": (),
@@ -623,6 +650,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--passive-cardioid-coupled", action="store_true")
+    # Coupled driver-LEM parameters, forwarded verbatim to the direct solve
+    # (None = let the solve script's own default apply).
+    parser.add_argument("--passive-cardioid-driver-sd-cm2", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-bl-tm", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-re-ohm", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-le-mh", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-le2-mh", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-re2-ohm", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-mmd-g", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-mms-g", type=float, default=None)
+    parser.add_argument(
+        "--passive-cardioid-driver-cms-mm-per-n",
+        type=float,
+        default=None,
+    )
+    parser.add_argument("--passive-cardioid-driver-vas-l", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-fs-hz", type=float, default=None)
+    parser.add_argument(
+        "--passive-cardioid-driver-rms-kg-per-s",
+        type=float,
+        default=None,
+    )
+    parser.add_argument("--passive-cardioid-driver-qms", type=float, default=None)
+    parser.add_argument("--passive-cardioid-driver-count", type=int, default=None)
+    parser.add_argument("--passive-cardioid-drive-voltage", type=float, default=None)
+    parser.add_argument("--passive-cardioid-rg-ohm", type=float, default=None)
     return parser.parse_args(argv)
 
 
@@ -1190,6 +1244,12 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 if args.passive_cardioid_invert_port
                 else "--no-passive-cardioid-invert-port"
             )
+            if args.passive_cardioid_coupled:
+                solve_cmd.append("--passive-cardioid-coupled")
+                for option, attr in PASSIVE_CARDIOID_COUPLED_FORWARD_OPTIONS:
+                    value = getattr(args, attr)
+                    if value is not None:
+                        solve_cmd.extend([option, str(value)])
         for source in solve_sources:
             solve_cmd.extend(["--source", source])
         for name, freq_max_hz in solve_source_freq_max.items():

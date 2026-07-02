@@ -3,9 +3,12 @@
 
 This script is intentionally independent of Waveguide Generator. It consumes
 the tagged multi-source mesh from ``prepare_step_for_wg_metal.py`` and solves
-one unit-velocity source at a time with an explicit observation frame using
-the canonical ``hornlab_metal_bem`` native Metal solver (dense Accelerate
-``cgesv`` solve, no iterative fallback).
+one source at a time with an explicit observation frame using the canonical
+``hornlab_metal_bem`` native Metal solver (dense Accelerate ``cgesv`` solve,
+no iterative fallback). Sources are driven at unit normal ACCELERATION (the
+``SolveConfig`` default), so per-driver levels are arbitrary-scale; only the
+coupled driver-LEM path converts a basis to absolute voltage-driven pressure
+(see ``_voltage_drive_pressure``).
 
 Phase convention: the native solver returns ``e^{-i omega t}`` phasors
 (Green kernel ``e^{+ikr}``; a time delay of tau multiplies the phasor by
@@ -449,6 +452,7 @@ def _write_pressure_basis_npz(path: Path, result, *, source_name: str, source_ta
             np.asarray(result.pressure_complex, dtype=np.complex128)
         ),
         phase_convention=np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
+        source_normalization=np.asarray("unit_normal_acceleration"),
     )
 
 
@@ -1486,8 +1490,9 @@ def _write_vituixcad_export(
     offsets stay 0, exactly like a measurement session with a fixed mic and
     a shared timing reference. The common time-of-flight to the observation
     distance is removed equally from every file (cosmetic: less phase wrap,
-    no relative change). Levels are unit-cone-velocity SPL except for a
-    coupled MF_cardioid export, which is voltage-driven. No ZMA is exported
+    no relative change). Levels are unit-source-drive SPL (unit normal
+    acceleration; arbitrary per-driver scale) except for a coupled
+    MF_cardioid export, which is voltage-driven. No ZMA is exported
     for direct BEM drivers; coupled MF_cardioid carries its calculated ZMA.
     """
     by_name = {str(result["name"]).strip().upper(): result for result in source_results}
@@ -1565,7 +1570,7 @@ def _write_vituixcad_export(
                         pressure,
                         comment=(
                             f"{name} {plane} {label} deg - HornLab WG Metal BEM, "
-                            f"unit cone velocity, common ToF {polar_distance_m:g} m "
+                            f"unit source drive, common ToF {polar_distance_m:g} m "
                             "removed, shared timing reference (set X/Y/Z=0)"
                         ),
                     )
@@ -1611,7 +1616,7 @@ def _write_vituixcad_export(
                 "- The common time of flight to the observation distance was",
                 "  removed identically from every file; relative data is",
                 "  untouched.",
-                "- Levels are unit-cone-velocity SPL, not per-volt sensitivity.",
+                "- Levels are unit-source-drive SPL, not per-volt sensitivity.",
                 "  Scale each driver's level to taste (or to measured",
                 "  sensitivity) before reading absolute SPL off the charts.",
                 *zma_lines,
@@ -2137,6 +2142,33 @@ def _load_mf_self_and_port_mutual(
         source_indices=port_indices,
     )
     return z_mm, z_mf_from_port
+
+
+def _voltage_drive_pressure(
+    cone_volume_velocity: np.ndarray,
+    *,
+    frequencies_hz: np.ndarray,
+    diaphragm_area_m2: float,
+    basis_pressure: np.ndarray,
+) -> np.ndarray:
+    """Scale a per-unit-acceleration pressure basis to voltage-driven pressure.
+
+    Direct source bases are solved at unit normal ACCELERATION (the
+    ``SolveConfig`` default; ``bie.py`` converts ``v_n = weight/(j omega)``),
+    so an absolute field for a coupled driver is the basis times the cone
+    acceleration ``a = j*omega*U/S`` in the engineering ``e^{+j omega t}``
+    convention — NOT the cone velocity ``U/S`` alone.
+    """
+    omega = 2.0 * np.pi * np.asarray(frequencies_hz, dtype=np.float64)
+    acceleration = (
+        1j
+        * omega
+        * np.asarray(cone_volume_velocity, dtype=np.complex128)
+        / float(diaphragm_area_m2)
+    )
+    return acceleration[:, None, None] * np.asarray(
+        basis_pressure, dtype=np.complex128
+    )
 
 
 def _source_result_by_name(source_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -2780,9 +2812,12 @@ def _solve_passive_cardioid_mf(
                     flush=True,
                 )
 
-            coupled_pressure = (
-                coupled.cone_volume_velocity / mf_area_m2
-            )[:, None, None] * total_pressure
+            coupled_pressure = _voltage_drive_pressure(
+                coupled.cone_volume_velocity,
+                frequencies_hz=mf_basis.frequencies_hz,
+                diaphragm_area_m2=mf_area_m2,
+                basis_pressure=total_pressure,
+            )
             coupled_directivity_db = _directivity_from_pressure_array(
                 coupled_pressure,
                 mf_basis.observation_angles_deg,

@@ -208,8 +208,9 @@ The output folder contains:
   already carries every inter-driver path/delay difference; keep driver
   X/Y/Z offsets at 0. Phase follows the measurement convention (a later
   arrival falls with frequency), with the common time of flight removed.
-  Direct BEM driver levels are unit-cone-velocity SPL (scale per driver); no
-  ZMA is exported for those drivers because BEM has no electrical side (use
+  Direct BEM driver levels are unit-source-drive SPL (arbitrary per-driver
+  scale; the solver drives sources at unit normal acceleration); no ZMA is
+  exported for those drivers because BEM has no electrical side (use
   measured/datasheet impedance for passive crossover work). The
   passive-cardioid combined MF exports as `MF_cardioid`; with coupled mode
   enabled its FRDs use the voltage-driven coupled field and

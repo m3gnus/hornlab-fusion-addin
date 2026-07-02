@@ -59,6 +59,55 @@ def _helper_command(helper, **overrides):
     return helper.build_pipeline_command(**kwargs)
 
 
+def _coupled_helper_overrides():
+    return dict(
+        passive_cardioid_enabled=True,
+        passive_cardioid_rear_volume_l="4",
+        passive_cardioid_port_length_mm="30",
+        passive_cardioid_port_area_cm2="120",
+        passive_cardioid_foam_resistance_pa_s_m3="2000",
+        passive_cardioid_invert_port=True,
+        passive_cardioid_coupled=True,
+        passive_cardioid_driver_sd_cm2="320",
+        passive_cardioid_driver_bl_tm="11.6",
+        passive_cardioid_driver_re_ohm="5.2",
+        passive_cardioid_driver_le_mh="0.8",
+        passive_cardioid_driver_mms_g="29.4",
+        passive_cardioid_driver_cms_mm_per_n="0.252",
+        passive_cardioid_driver_qms="4.1",
+        passive_cardioid_drive_voltage="2.83",
+        passive_cardioid_rg_ohm="0.1",
+    )
+
+
+def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
+    """Dialog-launched coupled runs must not die at the pipeline argparse,
+    and every coupled option the dialog emits must be in the forward table."""
+    helper = _load_helper()
+    pipeline = _load_pipeline()
+
+    cmd = _helper_command(helper, **_coupled_helper_overrides())
+    args = pipeline.parse_args(cmd[2:])
+
+    assert args.passive_cardioid_coupled is True
+    assert args.passive_cardioid_driver_sd_cm2 == pytest.approx(320.0)
+    assert args.passive_cardioid_driver_cms_mm_per_n == pytest.approx(0.252)
+    assert args.passive_cardioid_drive_voltage == pytest.approx(2.83)
+    assert args.passive_cardioid_rg_ohm == pytest.approx(0.1)
+
+    forwarded = {
+        option
+        for option, _attr in pipeline.PASSIVE_CARDIOID_COUPLED_FORWARD_OPTIONS
+    }
+    emitted = {
+        token
+        for token in cmd
+        if token.startswith("--passive-cardioid-driver-")
+        or token in ("--passive-cardioid-drive-voltage", "--passive-cardioid-rg-ohm")
+    }
+    assert emitted <= forwarded
+
+
 def test_estimate_clamped_solve_band_flags_shadow_limited_sources():
     helper = _load_helper()
 

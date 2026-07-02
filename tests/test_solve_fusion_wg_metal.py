@@ -33,6 +33,36 @@ def _load_script():
     return module
 
 
+def test_voltage_drive_pressure_scales_by_cone_acceleration():
+    """Bases are unit-normal-ACCELERATION solves: p_V = (j w U / S) * basis.
+
+    Constant volume velocity must give +6 dB/oct with +90 deg phase; a
+    mass-controlled velocity U = 1/(j w) must give a flat, real field.
+    """
+    module = _load_script()
+    freqs = np.array([100.0, 200.0])
+    basis = np.ones((2, 1, 1), dtype=np.complex128)
+
+    constant_u = module._voltage_drive_pressure(
+        np.array([1.0 + 0.0j, 1.0 + 0.0j]),
+        frequencies_hz=freqs,
+        diaphragm_area_m2=2.0,
+        basis_pressure=basis,
+    )
+    assert np.abs(constant_u[1, 0, 0]) == pytest.approx(2.0 * np.abs(constant_u[0, 0, 0]))
+    assert np.angle(constant_u[0, 0, 0]) == pytest.approx(np.pi / 2)
+    assert np.abs(constant_u[0, 0, 0]) == pytest.approx(2.0 * np.pi * 100.0 / 2.0)
+
+    omega = 2.0 * np.pi * freqs
+    mass_controlled = module._voltage_drive_pressure(
+        1.0 / (1j * omega),
+        frequencies_hz=freqs,
+        diaphragm_area_m2=1.0,
+        basis_pressure=basis,
+    )
+    np.testing.assert_allclose(mass_controlled, np.ones_like(mass_controlled))
+
+
 def _load_regen_driver():
     spec = importlib.util.spec_from_file_location(
         "regenerate_fusion_derived_artifacts",

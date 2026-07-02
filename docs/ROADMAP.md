@@ -4,7 +4,12 @@ Prioritized improvement plan for the WGMetalPipeline add-in and pipeline.
 Ordered by leverage-per-complexity; the add-in should stay small, so each
 item states what it *removes* or reuses, not just what it adds.
 
-## 1. Remove the `frequency-role` sizing mode (simplification)
+Status 2026-07-02: item 1 DONE (commit 96081c0). Item 2 design accepted —
+see [plans/per-driver-lem-coupling.md](plans/per-driver-lem-coupling.md).
+Item 3's N-driver table is DEFERRED by owner decision (three fixed slots are
+enough for now); its T/S + Hornresp-import half moved into item 2.
+
+## 1. Remove the `frequency-role` sizing mode (simplification) — DONE
 
 `manual-mm` has been the default and the recommended mode since settings
 v10; `frequency-role` sizes every radiating surface for the single band top
@@ -47,7 +52,7 @@ design natively. Simulating the passive network inside the add-in stays out
 of scope: VituixCAD is the better network simulator; the add-in's job is to
 feed it complete data.
 
-## 3. N drivers instead of fixed LF/MF/HF slots
+## 3. N drivers instead of fixed LF/MF/HF slots — DEFERRED (owner decision)
 
 Replace the three fixed source rows with a driver table: add/remove/duplicate
 entries, each with a name (`LF`, `MF`, `MF2`, `HF`…), mesh resolution, a

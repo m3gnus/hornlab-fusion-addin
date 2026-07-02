@@ -8,15 +8,9 @@ the live size/cost readout while the dials change.
 
 Two ideas drive it:
 
-* **Size by acoustic role at a frequency-derived target.** A boundary element
-  carries the field accurately when it is small against the wavelength. The
-  per-role element size is ``min(mm_knob, c / (epw_role * f_max))``: the mm knob
-  is an explicit hand ceiling, and the frequency term is the physical floor for
-  the requested band top. Radiating surfaces (the waveguide flare and the
-  source itself) get the finest target, shadowed rear/outer/far-cabinet
-  surfaces ride near Nyquist, and the baffle/near-field is left to the smooth
-  distance-graded fallback rather than coarsened to shadow level. Ported from
-  ``hornlab_mesher.geometry.MeshDensity`` (commits ce254e6 + fe45d37).
+* **Use explicit millimetre mesh sizes.** Source patches use their source mm
+  dials, rigid/shadow surfaces use the rigid body mm dial, and the near-field
+  baffle is distance-graded between those explicit sizes.
 
 * **Predict mesh size and solve cost before meshing.** ``N_triangles ~= 2.3 *
   sum_region(A_region / h_region^2)`` (validated constant 2.33 +/- 0.15, ~4%
@@ -34,15 +28,6 @@ from typing import Iterable, Sequence
 
 SPEED_OF_SOUND_M_S = 343.0
 
-# Elements-per-wavelength targets per acoustic role. The throat patch area is
-# tiny so a finer target there is nearly free; the radiating flare is the large
-# accuracy/size lever; shadowed surfaces sit near the 2 e/w Nyquist floor.
-DEFAULT_RADIATING_EPW = 6.0
-DEFAULT_THROAT_EPW = 8.0
-DEFAULT_SHADOW_EPW = 2.5
-# Near-field/baffle is graded by distance from the source, not pinned to a
-# role ceiling; this is the e/w used only when reporting its valid band.
-DEFAULT_NEARFIELD_EPW = DEFAULT_RADIATING_EPW
 # Conservative e/w used to report the validated band of an existing mesh from
 # its measured max edge (matches hornlab_mesher.config_builder._mesh_report and
 # the historical prepare-step global check).
@@ -78,23 +63,6 @@ RAM_WARN_GB = 24.0
 RAM_INFEASIBLE_GB = 40.0
 
 
-def frequency_ceiling_mm(
-    epw: float,
-    f_max_hz: float | None,
-    *,
-    speed_of_sound_m_s: float = SPEED_OF_SOUND_M_S,
-) -> float | None:
-    """Largest element (mm) that resolves ``f_max_hz`` at ``epw`` elements/wave.
-
-    Returns ``None`` when no band top is requested (``f_max_hz`` falsy/<=0), so
-    callers fall back to the mm knob alone.
-    """
-    if not f_max_hz or f_max_hz <= 0.0:
-        return None
-    epw = max(float(epw), 1.0)
-    return (float(speed_of_sound_m_s) * 1000.0) / (epw * float(f_max_hz))
-
-
 def valid_f_max_hz(
     size_mm: float,
     *,
@@ -108,54 +76,14 @@ def valid_f_max_hz(
     return (float(speed_of_sound_m_s) * 1000.0) / (epw * float(size_mm))
 
 
-def role_epw(
-    role: str,
-    *,
-    radiating_epw: float = DEFAULT_RADIATING_EPW,
-    shadow_epw: float = DEFAULT_SHADOW_EPW,
-    throat_epw: float | None = None,
-    nearfield_epw: float | None = None,
-) -> float:
-    """Elements-per-wavelength target for an acoustic role."""
-    if role in (ROLE_THROAT,):
-        return float(throat_epw) if throat_epw is not None else max(radiating_epw, DEFAULT_THROAT_EPW)
-    if role in (ROLE_RADIATING, ROLE_SOURCE):
-        return float(radiating_epw)
-    if role == ROLE_SHADOW:
-        return float(shadow_epw)
-    if role == ROLE_NEAR_FIELD:
-        return float(nearfield_epw) if nearfield_epw is not None else float(radiating_epw)
-    return float(radiating_epw)
-
-
 def role_size_mm(
     role: str,
     *,
-    f_max_hz: float | None,
     mm_knob_mm: float,
-    radiating_epw: float = DEFAULT_RADIATING_EPW,
-    shadow_epw: float = DEFAULT_SHADOW_EPW,
-    throat_epw: float | None = None,
-    nearfield_epw: float | None = None,
-    speed_of_sound_m_s: float = SPEED_OF_SOUND_M_S,
 ) -> float:
-    """Planned element size (mm) for a role: ``min(mm_knob, freq ceiling)``.
-
-    The mm knob is always an upper bound, so a coarse hand setting can never be
-    overridden into a finer mesh by the frequency term; the frequency term only
-    refines where the band requires it.
-    """
-    epw = role_epw(
-        role,
-        radiating_epw=radiating_epw,
-        shadow_epw=shadow_epw,
-        throat_epw=throat_epw,
-        nearfield_epw=nearfield_epw,
-    )
-    ceiling = frequency_ceiling_mm(epw, f_max_hz, speed_of_sound_m_s=speed_of_sound_m_s)
-    if ceiling is None:
-        return float(mm_knob_mm)
-    return min(float(mm_knob_mm), float(ceiling))
+    """Planned element size (mm) for a role under manual-mm sizing."""
+    _ = role
+    return float(mm_knob_mm)
 
 
 def graded_size_mm(

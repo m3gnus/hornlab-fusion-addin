@@ -36,7 +36,6 @@ estimate_clamped_solve_band = _fusion_pipeline_launch.estimate_clamped_solve_ban
 estimate_design_mesh_cost = _fusion_pipeline_launch.estimate_design_mesh_cost
 format_mesh_cost_summary = _fusion_pipeline_launch.format_mesh_cost_summary
 expected_pipeline_paths = _fusion_pipeline_launch.expected_pipeline_paths
-normalize_mesh_sizing_mode = _fusion_pipeline_launch.normalize_mesh_sizing_mode
 mirror_axes_for_symmetry_planes = _fusion_pipeline_launch.mirror_axes_for_symmetry_planes
 quadrants_for_symmetry_planes = _fusion_pipeline_launch.quadrants_for_symmetry_planes
 symmetry_planes_for_mirror_plane = _fusion_pipeline_launch.symmetry_planes_for_mirror_plane
@@ -78,7 +77,7 @@ SETTINGS_PATH = (
     / "WGMetalPipeline"
     / "settings.json"
 )
-SETTINGS_VERSION = 10
+SETTINGS_VERSION = 11
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
     "output_root": str(DEFAULT_OUTPUT_ROOT),
@@ -87,10 +86,6 @@ DEFAULT_SETTINGS = {
     "hf_mesh_mm": "5",
     "port_exit_mesh_mm": "",
     "rigid_res_mm": "20",
-    "mesh_sizing_mode": "manual-mm",
-    "radiating_epw": "6",
-    "shadow_epw": "2.5",
-    "throat_epw": "8",
     "refine": "",
     "freq_min_hz": "50",
     "freq_max_hz": "20000",
@@ -133,9 +128,7 @@ DEFAULT_SETTINGS = {
 }
 # Keys removed or redefined at a given settings version, mapped to the version
 # that made them stale. A stored key is dropped on load only when the file
-# predates that version, so a bump for one key no longer wipes the others
-# (e.g. a v10 bump for mesh_sizing_mode must not reset a v9 user's saved
-# mirror_plane or clamp_to_mesh_limit).
+# predates that version, so a bump for one key no longer wipes the others.
 _STALE_SETTINGS_KEY_VERSIONS = {
     "mirror_plane": 9,
     "quadrants": 9,
@@ -144,9 +137,10 @@ _STALE_SETTINGS_KEY_VERSIONS = {
     "allow_underresolved_solve": 9,
     "underresolved_solve_policy": 9,
     "clamp_to_mesh_limit": 9,
-    # The manual-mm default landed in v10; older files carry the old
-    # frequency-role default as a stored value, not a choice.
-    "mesh_sizing_mode": 10,
+    "mesh_sizing_mode": 11,
+    "radiating_epw": 11,
+    "shadow_epw": 11,
+    "throat_epw": 11,
 }
 
 _handlers = []
@@ -377,7 +371,6 @@ def _update_size_prediction(inputs) -> None:
         return str(item.value) if item and item.value is not None else ""
 
     try:
-        mode = normalize_mesh_sizing_mode(_selected_dropdown_name(inputs, "mesh_sizing_mode"))
         design = adsk.fusion.Design.cast(adsk.core.Application.get().activeProduct)
         if design is None:
             box.text = "estimate unavailable (no active design)"
@@ -405,39 +398,13 @@ def _update_size_prediction(inputs) -> None:
         estimate = estimate_design_mesh_cost(
             faces,
             source_res_mm=source_res,
-            f_max_hz=float(_val("freq_max_hz") or 20000.0),
-            radiating_epw=float(_val("radiating_epw") or 6.0),
-            shadow_epw=float(_val("shadow_epw") or 2.5),
             transition_mm=float(_val("transition_mm") or 200.0),
             rigid_res_mm=rigid_mm,
             freq_count=int(float(_val("freq_count") or 60.0)),
-            mesh_sizing_mode=mode,
         )
         box.text = format_mesh_cost_summary(estimate) + "\n(approx; exact in prepare manifest)"
     except Exception:
         box.text = "estimate unavailable (computed exactly during prepare)"
-
-
-def _sync_mesh_mode_ui(inputs) -> None:
-    mode = normalize_mesh_sizing_mode(_selected_dropdown_name(inputs, "mesh_sizing_mode"))
-    role_enabled = mode == "frequency-role"
-    for input_id in ("radiating_epw", "shadow_epw", "throat_epw"):
-        item = _input_by_id(inputs, input_id)
-        if item is not None:
-            item.isEnabled = role_enabled
-    summary = _input_by_id(inputs, "mesh_mode_summary")
-    if summary is None:
-        return
-    if role_enabled:
-        summary.text = (
-            "Frequency-targeted: source and rigid mm are maximum caps; "
-            "role e/w dials refine the mesh to the requested band top."
-        )
-    else:
-        summary.text = (
-            "Manual mm: source and rigid mm set mesh sizes directly; "
-            "the run still reports mesh-valid frequency limits."
-        )
 
 
 def _sync_passive_cardioid_ui(inputs) -> None:
@@ -493,54 +460,15 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             sources.addStringValueInput("rigid_res_mm", "Rigid body mesh mm", _setting_str(settings, "rigid_res_mm"))
             sources.addStringValueInput("transition_mm", "Transition mm", _setting_str(settings, "transition_mm"))
 
-            sizing_group = inputs.addGroupCommandInput("grp_sizing", "Acoustic-role sizing")
+            sizing_group = inputs.addGroupCommandInput("grp_sizing", "Mesh sizing")
             sizing_group.isExpanded = True
             szc = sizing_group.children
-            mesh_mode = szc.addDropDownCommandInput(
-                "mesh_sizing_mode",
-                "Mesh sizing mode",
-                adsk.core.DropDownStyles.TextListDropDownStyle,
-            )
-            selected_mesh_mode = normalize_mesh_sizing_mode(_setting_str(settings, "mesh_sizing_mode"))
-            mesh_mode.listItems.add("manual-mm", selected_mesh_mode == "manual-mm")
-            mesh_mode.listItems.add("frequency-role", selected_mesh_mode == "frequency-role")
-            mode_summary = szc.addTextBoxCommandInput(
-                "mesh_mode_summary",
-                "Mode",
-                "",
-                2,
-                True,
-            )
-            mode_summary.isFullWidth = True
-            rad_input = szc.addStringValueInput(
-                "radiating_epw", "Radiating elements/wave", _setting_str(settings, "radiating_epw")
-            )
-            rad_input.tooltip = (
-                "Elements per wavelength on radiating surfaces (waveguide flare + "
-                "source) at the band top. The main accuracy/size lever; default 6."
-            )
-            shadow_input = szc.addStringValueInput(
-                "shadow_epw", "Shadow elements/wave", _setting_str(settings, "shadow_epw")
-            )
-            shadow_input.tooltip = (
-                "Elements per wavelength on shadowed rear/outer/far surfaces; near "
-                "the 2 e/w Nyquist floor (default 2.5) to minimise elements where "
-                "the field is weak."
-            )
-            throat_input = szc.addStringValueInput(
-                "throat_epw", "Throat elements/wave", _setting_str(settings, "throat_epw")
-            )
-            throat_input.tooltip = (
-                "Elements per wavelength for throat/refine surfaces; default 8. "
-                "Only active in frequency-role mode."
-            )
             refine_input = szc.addStringValueInput(
                 "refine", "Refine overrides", _setting_str(settings, "refine")
             )
             refine_input.tooltip = (
-                "Optional per-appearance overrides, comma-separated: NAME:EPW, "
-                "NAME:<num>mm, or NAME:ROLE (radiating/shadow/throat). Painted faces "
-                "stay rigid. Example: Rear:shadow, Baffle:4"
+                "Optional per-appearance overrides, comma-separated: NAME:<num>mm. "
+                "Painted faces stay rigid. Example: Rim:8mm"
             )
             prediction = szc.addTextBoxCommandInput(
                 "size_prediction", "Estimate", "estimate updates as dials change", 4, True
@@ -786,7 +714,6 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             command.execute.add(execute_handler)
             _handlers.append(execute_handler)
 
-            _sync_mesh_mode_ui(inputs)
             _sync_passive_cardioid_ui(inputs)
             _update_size_prediction(inputs)
         except Exception:
@@ -801,11 +728,7 @@ _PREDICTION_INPUT_IDS = frozenset(
         "hf_mesh_mm",
         "port_exit_mesh_mm",
         "rigid_res_mm",
-        "mesh_sizing_mode",
         "transition_mm",
-        "radiating_epw",
-        "shadow_epw",
-        "throat_epw",
         "freq_max_hz",
         "freq_count",
     }
@@ -827,9 +750,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             elif input_id == "browse_python_path":
                 _choose_file(inputs, "python_path", "Select Python executable")
                 changed.value = False
-            elif input_id == "mesh_sizing_mode":
-                _sync_mesh_mode_ui(inputs)
-                _update_size_prediction(inputs)
             elif input_id in {"passive_cardioid_enabled", "passive_cardioid_coupled"}:
                 _sync_passive_cardioid_ui(inputs)
             elif input_id in _PREDICTION_INPUT_IDS:
@@ -1027,12 +947,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             polar_angle_count = str(_input_value(inputs, "polar_angle_count") or "37").strip()
             transition_mm = str(_input_value(inputs, "transition_mm") or "200").strip()
             rigid_res_mm = str(_input_value(inputs, "rigid_res_mm") or "").strip()
-            mesh_sizing_mode = normalize_mesh_sizing_mode(
-                _selected_dropdown_name(inputs, "mesh_sizing_mode")
-            )
-            radiating_epw = str(_input_value(inputs, "radiating_epw") or "").strip()
-            shadow_epw = str(_input_value(inputs, "shadow_epw") or "").strip()
-            throat_epw = str(_input_value(inputs, "throat_epw") or "").strip()
             refine_raw = str(_input_value(inputs, "refine") or "").strip()
             refine = [entry.strip() for entry in refine_raw.split(",") if entry.strip()]
             mirror_plane = _selected_dropdown_name(inputs, "mirror_plane") or "Auto detect"
@@ -1151,10 +1065,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "hf_mesh_mm": hf_mesh_mm,
                 "port_exit_mesh_mm": port_exit_mesh_mm,
                 "rigid_res_mm": rigid_res_mm,
-                "mesh_sizing_mode": mesh_sizing_mode,
-                "radiating_epw": radiating_epw,
-                "shadow_epw": shadow_epw,
-                "throat_epw": throat_epw,
                 "refine": refine_raw,
                 "freq_min_hz": freq_min_hz,
                 "freq_max_hz": freq_max_hz,
@@ -1218,11 +1128,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 sources=sources,
                 transition_mm=transition_mm,
                 rigid_res_mm=rigid_res_mm,
-                radiating_epw=radiating_epw,
-                shadow_epw=shadow_epw,
-                throat_epw=throat_epw,
                 refine=refine,
-                mesh_sizing_mode=mesh_sizing_mode,
                 quadrants=quadrants,
                 mirror_axes=mirror_axes,
                 symmetry_planes=symmetry_planes,
@@ -1294,9 +1200,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     sources=sources,
                     rigid_res_mm=rigid_res_mm,
                     freq_max_hz=freq_max_hz,
-                    radiating_epw=radiating_epw or "6",
-                    shadow_epw=shadow_epw or "2.5",
-                    mesh_sizing_mode=mesh_sizing_mode,
                 )
                 if clamp_estimate:
                     bands = ", ".join(
@@ -1304,13 +1207,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                         for name, hz in sorted(clamp_estimate.items())
                     )
                     if clamp_to_mesh_limit:
-                        mode_prefix = (
-                            "manual-mm mesh" if mesh_sizing_mode == "manual-mm"
-                            else "frequency-role mesh"
-                        )
                         note = (
                             f"NOTE: the requested solve maximum of {freq_max_hz} Hz "
-                            f"exceeds what the {mode_prefix} resolves. The solve clamps "
+                            "exceeds what the manual-mm mesh resolves. The solve clamps "
                             f"{bands} (conservative limit at "
                             "6 elements per wavelength; the exact limits come from "
                             "the prepared mesh). Refine 'Rigid body mesh mm' and "
@@ -1319,13 +1218,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             "band anyway."
                         )
                     else:
-                        mode_prefix = (
-                            "manual-mm mesh" if mesh_sizing_mode == "manual-mm"
-                            else "frequency-role mesh"
-                        )
                         note = (
                             f"NOTE: the full band up to {freq_max_hz} Hz is solved, "
-                            f"but the {mode_prefix} only resolves {bands} (conservative "
+                            f"but the manual-mm mesh only resolves {bands} (conservative "
                             "limit at 6 elements per wavelength). Results above "
                             "those limits are increasingly inaccurate. Refine "
                             "'Rigid body mesh mm' and the source mesh mm values "

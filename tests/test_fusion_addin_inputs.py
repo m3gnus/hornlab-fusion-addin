@@ -76,13 +76,13 @@ def test_addin_input_lookup_finds_nested_group_children():
     nested = _Inputs(
         [
             _Input("python_path", "/venv/bin/python"),
-            _Input("mesh_sizing_mode", selected=_Selected("manual-mm")),
+            _Input("mirror_plane", selected=_Selected("Auto detect")),
         ]
     )
     top = _Inputs([_Input("grp_advanced", children=nested)])
 
     assert addin._input_value(top, "python_path") == "/venv/bin/python"
-    assert addin._selected_dropdown_name(top, "mesh_sizing_mode") == "manual-mm"
+    assert addin._selected_dropdown_name(top, "mirror_plane") == "Auto detect"
 
 
 def test_fusion_archive_export_uses_native_archive_options(tmp_path):
@@ -209,13 +209,16 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
     settings_path = tmp_path / "settings.json"
     monkeypatch.setattr(addin, "SETTINGS_PATH", settings_path)
 
-    # A v9 file keeps its live choices; only mesh_sizing_mode (stale at v10)
-    # is reset to the new manual-mm default.
+    # A v10 file keeps its live choices; removed mesh sizing controls are
+    # dropped at v11.
     settings_path.write_text(
         json.dumps(
             {
-                "settings_version": 9,
+                "settings_version": 10,
                 "mesh_sizing_mode": "frequency-role",
+                "radiating_epw": "6",
+                "shadow_epw": "2.5",
+                "throat_epw": "8",
                 "mirror_plane": "Front/Back",
                 "clamp_to_mesh_limit": True,
             }
@@ -223,7 +226,10 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     settings = addin._load_settings()
-    assert settings["mesh_sizing_mode"] == "manual-mm"
+    assert "mesh_sizing_mode" not in settings
+    assert "radiating_epw" not in settings
+    assert "shadow_epw" not in settings
+    assert "throat_epw" not in settings
     assert settings["mirror_plane"] == "Front/Back"
     assert settings["clamp_to_mesh_limit"] is True
 
@@ -240,23 +246,21 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     settings = addin._load_settings()
-    assert settings["mesh_sizing_mode"] == "manual-mm"
+    assert "mesh_sizing_mode" not in settings
     assert settings["mirror_plane"] == "Auto detect"
     assert settings["clamp_to_mesh_limit"] is False
 
-    # A current-version file is untouched.
+    # A current-version file keeps live settings.
     settings_path.write_text(
         json.dumps(
             {
                 "settings_version": addin.SETTINGS_VERSION,
-                "mesh_sizing_mode": "frequency-role",
                 "mirror_plane": "Front/Back",
             }
         ),
         encoding="utf-8",
     )
     settings = addin._load_settings()
-    assert settings["mesh_sizing_mode"] == "frequency-role"
     assert settings["mirror_plane"] == "Front/Back"
 
 

@@ -461,39 +461,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--mesh-sizing-mode",
-        choices=("frequency-role", "manual-mm"),
-        default="manual-mm",
-        help=(
-            "manual-mm (default) uses explicit millimetre caps for sizing "
-            "while still validating against the requested band; "
-            "frequency-role sizes by source/rigid mm caps plus role EPW at "
-            "the requested band top."
-        ),
-    )
-    parser.add_argument(
-        "--radiating-epw",
-        type=float,
-        default=None,
-        help="Elements per wavelength on radiating surfaces (forwarded to prepare).",
-    )
-    parser.add_argument(
-        "--shadow-epw",
-        type=float,
-        default=None,
-        help="Elements per wavelength on shadowed surfaces (forwarded to prepare).",
-    )
-    parser.add_argument(
-        "--throat-epw",
-        type=float,
-        default=None,
-        help="Elements per wavelength at the throat (forwarded to prepare).",
-    )
-    parser.add_argument(
         "--refine",
         action="append",
         default=[],
-        help="Per-face refine override NAME:EPW|RES_MMmm|ROLE (forwarded to prepare).",
+        help="Per-face refine override NAME:RES_MMmm (forwarded to prepare).",
     )
     parser.add_argument("--quadrants", type=int, default=1, choices=(1, 12, 14, 1234))
     parser.add_argument(
@@ -830,17 +801,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         str(args.topology_tol),
         "--requested-max-frequency-hz",
         str(args.freq_max_hz),
-        "--mesh-sizing-mode",
-        args.mesh_sizing_mode,
     ]
     if args.rigid_res_mm is not None:
         prep_cmd.extend(["--rigid-res-mm", str(args.rigid_res_mm)])
-    if args.radiating_epw is not None:
-        prep_cmd.extend(["--radiating-epw", str(args.radiating_epw)])
-    if args.shadow_epw is not None:
-        prep_cmd.extend(["--shadow-epw", str(args.shadow_epw)])
-    if args.throat_epw is not None:
-        prep_cmd.extend(["--throat-epw", str(args.throat_epw)])
     for refine in args.refine:
         prep_cmd.extend(["--refine", refine])
     if args.allow_leaks:

@@ -47,12 +47,6 @@ DEFAULT_TOPOLOGY_TOL = 1e-5
 GENERIC_PORT_EXIT_SOURCE = "PORT_EXIT"
 LEGACY_PORT_EXIT_SOURCES = frozenset({"PORT_EXIT_L", "PORT_EXIT_R"})
 
-# Acoustic-role element-per-wavelength defaults (see wg_mesh_sizing). The
-# radiating flare/source is the main accuracy/size lever; shadowed rear/outer
-# surfaces ride near Nyquist; the near-field baffle is graded by distance.
-DEFAULT_RADIATING_EPW = sizing.DEFAULT_RADIATING_EPW
-DEFAULT_SHADOW_EPW = sizing.DEFAULT_SHADOW_EPW
-DEFAULT_THROAT_EPW = sizing.DEFAULT_THROAT_EPW
 WELD_TOLERANCE_MM = 5.0e-3  # 5 micrometres; closes near-duplicate OCC patch nodes
 DEGENERATE_MIN_QUALITY = 1.0e-4  # drops needle slivers that make dense solves singular
 
@@ -82,83 +76,37 @@ def _parse_source_spec(raw: str, index: int) -> SourceSpec:
     return SourceSpec(name=parts[0], resolution_mm=resolution, tag=tag)
 
 
-# Role keyword -> the acoustic role its refine group adopts.
-_REFINE_ROLE_KEYWORDS = {
-    "radiating": sizing.ROLE_RADIATING,
-    "flare": sizing.ROLE_RADIATING,
-    "mouth": sizing.ROLE_RADIATING,
-    "throat": sizing.ROLE_THROAT,
-    "shadow": sizing.ROLE_SHADOW,
-    "rear": sizing.ROLE_SHADOW,
-    "near": sizing.ROLE_NEAR_FIELD,
-    "nearfield": sizing.ROLE_NEAR_FIELD,
-    "baffle": sizing.ROLE_NEAR_FIELD,
-}
-
-
 @dataclass(frozen=True)
 class RefineSpec:
     """Per-face mesh-size override painted via a Fusion appearance/shell name.
 
     A refine group stays physically rigid (tag 1); it only restricts the local
-    mesh size. The size is either an explicit ``RES_MM`` ceiling or an
-    elements-per-wavelength target resolved against the band top at mesh time.
+    mesh size to an explicit millimetre value.
     """
 
     name: str
-    epw: float | None
-    size_mm: float | None
-    role: str
-
-    def size_for_band(self, f_max_hz: float | None, *, fallback_mm: float) -> float:
-        if self.size_mm is not None:
-            return float(self.size_mm)
-        ceiling = sizing.frequency_ceiling_mm(self.epw or DEFAULT_RADIATING_EPW, f_max_hz)
-        return float(ceiling) if ceiling is not None else float(fallback_mm)
+    size_mm: float
+    role: str = "custom"
 
 
-def _parse_refine_spec(
-    raw: str,
-    *,
-    radiating_epw: float,
-    shadow_epw: float,
-    throat_epw: float,
-) -> RefineSpec:
+def _parse_refine_spec(raw: str) -> RefineSpec:
     """Parse ``--refine NAME:VALUE``.
 
-    ``VALUE`` is one of: a role keyword (``radiating``/``shadow``/``throat``/
-    ``near``) which adopts that role's elements-per-wavelength; ``<num>mm`` for
-    an explicit size ceiling in millimetres; or a bare ``<num>`` read as
-    elements-per-wavelength (the primary size lever).
+    ``VALUE`` is ``<num>mm`` for an explicit size ceiling in millimetres.
     """
     parts = [part.strip() for part in raw.split(":")]
     if len(parts) != 2 or not parts[0]:
-        raise argparse.ArgumentTypeError("--refine expects NAME:EPW, NAME:RES_MMmm, or NAME:ROLE")
+        raise argparse.ArgumentTypeError("--refine expects NAME:RES_MMmm")
     name, value = parts[0], parts[1].lower()
-    if value in _REFINE_ROLE_KEYWORDS:
-        role = _REFINE_ROLE_KEYWORDS[value]
-        epw = {
-            sizing.ROLE_RADIATING: radiating_epw,
-            sizing.ROLE_THROAT: throat_epw,
-            sizing.ROLE_SHADOW: shadow_epw,
-            sizing.ROLE_NEAR_FIELD: radiating_epw,
-        }[role]
-        return RefineSpec(name=name, epw=float(epw), size_mm=None, role=role)
-    if value.endswith("mm"):
-        try:
-            size_mm = float(value[:-2])
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(f"invalid --refine size: {raw!r}") from exc
-        if size_mm <= 0.0:
-            raise argparse.ArgumentTypeError(f"--refine size must be positive: {raw!r}")
-        return RefineSpec(name=name, epw=None, size_mm=size_mm, role="custom")
+    if not value.endswith("mm"):
+        raise argparse.ArgumentTypeError("--refine expects NAME:RES_MMmm")
     try:
-        epw = float(value)
+        size_mm = float(value[:-2])
     except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid --refine value: {raw!r}") from exc
-    if epw <= 0.0:
-        raise argparse.ArgumentTypeError(f"--refine elements-per-wavelength must be positive: {raw!r}")
-    return RefineSpec(name=name, epw=epw, size_mm=None, role="custom")
+        raise argparse.ArgumentTypeError(f"invalid --refine size: {raw!r}") from exc
+    if size_mm <= 0.0:
+        raise argparse.ArgumentTypeError(f"--refine size must be positive: {raw!r}")
+    return RefineSpec(name=name, size_mm=size_mm)
 
 
 def _auto_radiating_surfaces(
@@ -1335,44 +1283,31 @@ def _surface_diagnostics(surface_tags: list[int]) -> list[dict]:
     return rows
 
 
-def _source_size_min_mm(spec: SourceSpec, *, f_max_hz: float | None, radiating_epw: float) -> float:
+def _source_size_min_mm(spec: SourceSpec) -> float:
     """Radiating size of a source patch and the wall grading start around it.
 
-    ``min(mm_knob, c/(radiating_epw*f_max))``: the source patch is a radiating
-    surface, so it is refined to the band top, and the near-field/flare grades
-    out from this same size. Sizing the patch at the surrounding wall
-    resolution avoids a size discontinuity at the patch boundary; a coarse
-    woofer patch cannot survive a finer baffle anyway, because the field is the
-    minimum of all size fields.
+    The source patch is a radiating surface, but manual-mm sizing uses the
+    source's explicit millimetre dial directly.
     """
     return sizing.role_size_mm(
         sizing.ROLE_RADIATING,
-        f_max_hz=f_max_hz,
         mm_knob_mm=spec.resolution_mm,
-        radiating_epw=radiating_epw,
     )
 
 
-def _shadow_size_mm(*, rigid_res_mm: float, f_max_hz: float | None, shadow_epw: float) -> float:
-    """Coarse background size for far/shadow surfaces: ``min(rigid_res, ceiling)``."""
+def _shadow_size_mm(*, rigid_res_mm: float) -> float:
+    """Coarse background size for far/shadow surfaces."""
     return sizing.role_size_mm(
         sizing.ROLE_SHADOW,
-        f_max_hz=f_max_hz,
         mm_knob_mm=rigid_res_mm,
-        shadow_epw=shadow_epw,
     )
 
 
 def _density_configuration(
     source_specs: list[SourceSpec],
     *,
-    mesh_sizing_mode: str = "manual-mm",
     rigid_res_mm: float,
     transition_mm: float,
-    f_max_hz: float | None = None,
-    radiating_epw: float = DEFAULT_RADIATING_EPW,
-    shadow_epw: float = DEFAULT_SHADOW_EPW,
-    throat_epw: float = DEFAULT_THROAT_EPW,
     refine_specs: list[RefineSpec] | None = None,
     refine_surfaces: dict[str, list[int]] | None = None,
     curvature_segments: int = 0,
@@ -1380,32 +1315,24 @@ def _density_configuration(
     """Describe the planned size field by acoustic role.
 
     The near-field/baffle is graded by distance from each source patch, from
-    the source's (band-refined) radiating size up to the shadow background
-    size, so the baffle stays medium rather than being coarsened to shadow.
+    the source's explicit radiating size up to the shadow background size, so
+    the baffle stays medium rather than being coarsened to shadow.
     Far surfaces relax to the shadow background (``Mesh.MeshSizeMax``).
     Painted refine groups pin a constant size on named faces while keeping
     them rigid.
     """
     refine_specs = refine_specs or []
     refine_surfaces = refine_surfaces or {}
-    radiating_res = sizing.frequency_ceiling_mm(radiating_epw, f_max_hz)
-    throat_res = sizing.frequency_ceiling_mm(throat_epw, f_max_hz)
-    shadow_res = _shadow_size_mm(rigid_res_mm=rigid_res_mm, f_max_hz=f_max_hz, shadow_epw=shadow_epw)
+    shadow_res = _shadow_size_mm(rigid_res_mm=rigid_res_mm)
     config: dict[str, object] = {
         "groups": ["rigid", *[spec.name for spec in source_specs]],
         "mesh_size_extend_from_boundary": 0,
         "mesh_size_from_curvature": int(curvature_segments),
         "mesh_size_from_points": 0,
         "mesh_algorithm": 6,
-        "mesh_sizing_mode": mesh_sizing_mode,
+        "mesh_sizing_mode": "manual-mm",
         "rigid_res_mm": float(rigid_res_mm),
         "transition_mm": float(transition_mm),
-        "f_max_hz": None if not f_max_hz else float(f_max_hz),
-        "radiating_epw": float(radiating_epw),
-        "shadow_epw": float(shadow_epw),
-        "throat_epw": float(throat_epw),
-        "radiating_res_mm": None if radiating_res is None else float(radiating_res),
-        "throat_res_mm": None if throat_res is None else float(throat_res),
         "shadow_res_mm": float(shadow_res),
         "source_fields": {
             spec.name: {
@@ -1415,14 +1342,8 @@ def _density_configuration(
                 "role": sizing.ROLE_RADIATING,
                 "dist_min_mm": 0.0,
                 "dist_max_mm": float(transition_mm),
-                # The patch is radiating: refined to the band top, and the
-                # near-field/flare grades out from this same size.
-                "patch_size_mm": _source_size_min_mm(
-                    spec, f_max_hz=f_max_hz, radiating_epw=radiating_epw
-                ),
-                "size_min_mm": _source_size_min_mm(
-                    spec, f_max_hz=f_max_hz, radiating_epw=radiating_epw
-                ),
+                "patch_size_mm": _source_size_min_mm(spec),
+                "size_min_mm": _source_size_min_mm(spec),
                 "size_max_mm": float(shadow_res),
             }
             for spec in source_specs
@@ -1431,8 +1352,7 @@ def _density_configuration(
             spec.name: {
                 "field": "Restrict",
                 "role": spec.role,
-                "size_mm": spec.size_for_band(f_max_hz, fallback_mm=rigid_res_mm),
-                "epw": spec.epw,
+                "size_mm": spec.size_mm,
                 "surfaces": refine_surfaces.get(spec.name, []),
             }
             for spec in refine_specs
@@ -1446,26 +1366,21 @@ def _predict_mesh_size_cost(
     *,
     source_surfaces: dict[str, list[int]],
     rigid_surfaces: list[int],
-    auto_radiating: set[int],
     refine_surfaces: dict[str, list[int]],
     refine_specs: list[RefineSpec],
     active_source_specs: list[SourceSpec],
     density: dict[str, object],
-    f_max_hz: float | None,
     transition_mm: float,
-    radiating_ceiling: float | None,
     shadow_res: float,
-    radiating_epw: float,
     symmetry_planes: tuple[str, ...] | str,
 ) -> dict[str, object]:
     """Predict triangles/RAM/solve cost from OCC face areas before meshing.
 
     Each surface is assigned its planned element size by acoustic role (the
-    same field the mesher applies): radiating surfaces at the radiating
-    ceiling, painted refine groups at their size, and the near-field/baffle at
-    the distance-graded size evaluated at the face centroid. ``N ~= 2.3 *
-    sum(area / size^2)`` over the quarter model (the symmetry-reduced solve
-    matrix dimension).
+    same field the mesher applies): source patches at their explicit mm size,
+    painted refine groups at their explicit mm size, and the near-field/baffle
+    at the distance-graded size evaluated at the face centroid. ``N ~= 2.3 *
+    sum(area / size^2)`` over the quarter model.
     """
     refine_by_name = {spec.name: spec for spec in refine_specs}
     refine_surface_to_size: dict[int, tuple[str, float]] = {}
@@ -1473,7 +1388,7 @@ def _predict_mesh_size_cost(
         spec = refine_by_name.get(name)
         if spec is None:
             continue
-        size_mm = spec.size_for_band(f_max_hz, fallback_mm=float(density["rigid_res_mm"]))
+        size_mm = spec.size_mm
         role = spec.role if spec.role in (sizing.ROLE_RADIATING, sizing.ROLE_SHADOW, sizing.ROLE_THROAT) else f"refine:{name}"
         for surface in surfaces:
             refine_surface_to_size[surface] = (role, size_mm)
@@ -1595,7 +1510,6 @@ def _predict_mesh_size_cost(
         area = sum(float(gmsh.model.occ.getMass(2, s)) for s in source_surfaces[spec.name])
         regions.append(sizing.Region(area_mm2=area, size_mm=size_mm, label=sizing.ROLE_RADIATING, role=sizing.ROLE_RADIATING))
 
-    radiating_size = float(radiating_ceiling) if radiating_ceiling is not None else finest_source_size
     # Near-field triangle counts are accumulated from per-face graded sampling,
     # so they are added as a pre-summed pseudo-region with the coarsest planned
     # size (shadow) driving the reported near-field valid band.
@@ -1607,10 +1521,6 @@ def _predict_mesh_size_cost(
         if surface in refine_surface_to_size:
             role, size_mm = refine_surface_to_size[surface]
             regions.append(sizing.Region(area_mm2=area, size_mm=size_mm, label=role, role=role))
-        elif surface in auto_radiating:
-            regions.append(
-                sizing.Region(area_mm2=area, size_mm=radiating_size, label=sizing.ROLE_RADIATING, role=sizing.ROLE_RADIATING)
-            )
         else:
             near_field_triangles += _graded_triangles(surface, area)
     if near_field_triangles > 0.0:
@@ -1686,47 +1596,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Band top in Hz. Drives both the frequency-derived element sizing "
-            "(size = min(mm_knob, c/(epw_role * f_max))) and the conservative "
-            "mesh frequency validation. When omitted, sizing falls back to the "
-            "mm knobs only."
+            "Band top in Hz used for conservative mesh frequency validation. "
+            "Mesh sizing itself uses the explicit millimetre values."
         ),
-    )
-    parser.add_argument(
-        "--mesh-sizing-mode",
-        choices=("frequency-role", "manual-mm"),
-        default="manual-mm",
-        help=(
-            "manual-mm (default) uses explicit millimetre caps for sizing "
-            "while still validating the finished mesh against the requested "
-            "max frequency; frequency-role refines source/radiating/shadow "
-            "roles from the requested band top."
-        ),
-    )
-    parser.add_argument(
-        "--radiating-epw",
-        type=float,
-        default=DEFAULT_RADIATING_EPW,
-        help=(
-            "Elements per wavelength on radiating surfaces (waveguide flare and "
-            "source patches). The main accuracy/size lever; default 6."
-        ),
-    )
-    parser.add_argument(
-        "--shadow-epw",
-        type=float,
-        default=DEFAULT_SHADOW_EPW,
-        help=(
-            "Elements per wavelength on shadowed rear/outer/far surfaces; rides "
-            "near the 2 e/w Nyquist floor (default 2.5) to minimise elements "
-            "where the field is weak."
-        ),
-    )
-    parser.add_argument(
-        "--throat-epw",
-        type=float,
-        default=DEFAULT_THROAT_EPW,
-        help="Elements per wavelength at the throat (tiny area, cheap to refine; default 8).",
     )
     parser.add_argument(
         "--refine",
@@ -1734,9 +1606,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help=(
             "Per-face mesh-size override on a painted appearance/shell name, "
-            "kept physically rigid. NAME:EPW (elements/wavelength), NAME:<num>mm "
-            "(explicit size), or NAME:ROLE (radiating/shadow/throat/near). "
-            "Repeat per group."
+            "kept physically rigid. Use NAME:<num>mm. Repeat per group."
         ),
     )
     parser.add_argument(
@@ -1787,30 +1657,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--mesh-frequency-elements-per-wavelength must be positive")
     if args.speed_of_sound_m_s <= 0.0:
         raise SystemExit("--speed-of-sound-m-s must be positive")
-    for epw_name, epw_value in (
-        ("--radiating-epw", args.radiating_epw),
-        ("--shadow-epw", args.shadow_epw),
-        ("--throat-epw", args.throat_epw),
-    ):
-        if epw_value <= 0.0:
-            raise SystemExit(f"{epw_name} must be positive")
     if args.curvature_segments < 0.0:
         raise SystemExit("--curvature-segments must be >= 0")
-    f_max_hz = (
-        args.requested_max_frequency_hz
-        if args.mesh_sizing_mode == "frequency-role"
-        else None
-    )
     try:
-        refine_specs = [
-            _parse_refine_spec(
-                raw,
-                radiating_epw=args.radiating_epw,
-                shadow_epw=args.shadow_epw,
-                throat_epw=args.throat_epw,
-            )
-            for raw in args.refine
-        ]
+        refine_specs = [_parse_refine_spec(raw) for raw in args.refine]
     except argparse.ArgumentTypeError as exc:
         raise SystemExit(str(exc)) from exc
     symmetry_auto = (
@@ -1889,19 +1739,13 @@ def main(argv: list[str] | None = None) -> int:
 
         density = _density_configuration(
             active_source_specs,
-            mesh_sizing_mode=args.mesh_sizing_mode,
             rigid_res_mm=rigid_res,
             transition_mm=args.transition_mm,
-            f_max_hz=f_max_hz,
-            radiating_epw=args.radiating_epw,
-            shadow_epw=args.shadow_epw,
-            throat_epw=args.throat_epw,
             refine_specs=refine_specs,
             refine_surfaces=refine_surfaces,
             curvature_segments=args.curvature_segments,
         )
 
-        radiating_ceiling = sizing.frequency_ceiling_mm(args.radiating_epw, f_max_hz)
         shadow_res = float(density["shadow_res_mm"])
         # Finest planned size pins MeshSizeMin; the shadow background caps
         # everything not pulled finer by a field.
@@ -1909,7 +1753,6 @@ def main(argv: list[str] | None = None) -> int:
             [float(field["patch_size_mm"]) for field in density["source_fields"].values()]
             + [float(field["size_min_mm"]) for field in density["source_fields"].values()]
             + [float(f["size_mm"]) for f in density["refine_fields"].values()]
-            + ([float(radiating_ceiling)] if (radiating_ceiling and auto_radiating) else [])
         ) if density["source_fields"] or density["refine_fields"] else rigid_res
         gmsh.option.setNumber("Mesh.MeshSizeMin", max(planned_min, 0.0))
         gmsh.option.setNumber("Mesh.MeshSizeMax", shadow_res)
@@ -1964,19 +1807,12 @@ def main(argv: list[str] | None = None) -> int:
             # would otherwise drift coarser than the dialled size.
             fields.append(_add_restrict_field(patch_size, source_surfaces[spec.name]))
 
-        # Radiating flare auto-classified from the body/shell structure: pin the
-        # radiating size regardless of distance so the mouth (far from the
-        # throat but the primary radiator) stays fine.
-        if auto_radiating and radiating_ceiling is not None:
-            fields.append(_add_restrict_field(float(radiating_ceiling), sorted(auto_radiating)))
-
         # Painted refine overrides.
         for spec in refine_specs:
             surfaces = refine_surfaces.get(spec.name)
             if not surfaces:
                 continue
-            size_mm = spec.size_for_band(f_max_hz, fallback_mm=rigid_res)
-            fields.append(_add_restrict_field(size_mm, surfaces))
+            fields.append(_add_restrict_field(spec.size_mm, surfaces))
 
         if len(fields) == 1:
             gmsh.model.mesh.field.setAsBackgroundMesh(fields[0])
@@ -1990,16 +1826,12 @@ def main(argv: list[str] | None = None) -> int:
         mesh_size_prediction = _predict_mesh_size_cost(
             source_surfaces=source_surfaces,
             rigid_surfaces=rigid_surfaces,
-            auto_radiating=auto_radiating,
             refine_surfaces=refine_surfaces,
             refine_specs=refine_specs,
             active_source_specs=active_source_specs,
             density=density,
-            f_max_hz=f_max_hz,
             transition_mm=args.transition_mm,
-            radiating_ceiling=radiating_ceiling,
             shadow_res=shadow_res,
-            radiating_epw=args.radiating_epw,
             symmetry_planes=symmetry_planes,
         )
 
@@ -2027,8 +1859,7 @@ def main(argv: list[str] | None = None) -> int:
         refine_diag = {
             spec.name: {
                 "role": spec.role,
-                "epw": spec.epw,
-                "size_mm": spec.size_for_band(f_max_hz, fallback_mm=rigid_res),
+                "size_mm": spec.size_mm,
                 "classification_origin": refine_origins.get(spec.name, "unmatched"),
                 "matched": spec.name in refine_surfaces,
                 "surfaces": refine_surfaces.get(spec.name, []),

@@ -70,21 +70,12 @@ The add-in is designed to not fail on configuration drift:
   response and ZMA are voltage-driven by the coupled driver/LEM/BEM load. The
   chamber is still a lumped, undamped compliance, valid below its first
   internal mode (~c/(2*max_dim), often mid-band), which real stuffing softens.
-- **Elements have an explicit sizing mode.** `manual-mm` (default) uses the
-  source/rigid millimetre caps directly, while still validating and reporting
-  the mesh-valid solve band. `frequency-role` sizes each element at
-  `min(mm_knob, c/(epw_role * f_max))`: radiating surfaces (the waveguide
-  flare and source patches) get `Radiating elements/wave` (default 6) at the
-  band top; throat/refine surfaces get `Throat elements/wave` (default 8);
-  shadowed rear/outer/far-cabinet surfaces ride near the Nyquist floor at
-  `Shadow elements/wave` (default 2.5). Beware that `frequency-role` sizes all
-  radiating surfaces for the single band top (20 kHz -> ~2.9 mm everywhere),
-  which is usually far denser than needed. In both modes the near-field
-  baffle grades from each source's own size out to the background over
-  `Transition mm`. A source-bearing STEP body's other faces are auto-classified
-  as radiating; painted appearances can override per face with
-  `Refine overrides` (`NAME:EPW`, `NAME:<num>mm`, or `NAME:ROLE`), kept
-  physically rigid. In `manual-mm`, prefer explicit `NAME:<num>mm` overrides.
+- **Elements use explicit millimetre sizing.** Source patches use their source
+  mesh mm values, rigid/shadow surfaces use `Rigid body mesh mm`, and the
+  near-field baffle grades from each source's own size out to the background
+  over `Transition mm`. The run still validates and reports the mesh-valid
+  solve band from the prepared mesh. Painted appearances can override per face
+  with `Refine overrides` (`NAME:<num>mm`), kept physically rigid.
 - **Mesh size and solve cost are predicted before meshing.** The dialog's
   `Estimate` readout shows the predicted triangle count (per role), the dense
   BEM matrix RAM (`N^2 * 16` bytes) with a feasibility flag, the solve time,
@@ -235,9 +226,8 @@ The output folder contains:
 ## Dialog
 
 Inputs are grouped: **Sources and mesh** (per-source resolutions, rigid body
-resolution, transition distance), **Acoustic-role sizing** (mesh sizing mode,
-radiating/shadow/throat elements-per-wave, refine overrides, and the live Estimate
-readout), **Solve** (frequency band and polar grid, mesh-only toggle, mesh-valid
+resolution, transition distance), **Mesh sizing** (refine overrides and the live
+Estimate readout), **Solve** (frequency band and polar grid, mesh-only toggle, mesh-valid
 clamp, mesh-valid plot-marker toggle), **Passive cardioid MF** (optional
 MF plus `PORT_EXIT` postprocess combine, with optional coupled driver LEM),
 **Output** (output root, open folder), and **Advanced** (mirror plane
@@ -250,10 +240,6 @@ MF source mesh mm: 10
 HF source mesh mm: 5
 Port exit mesh mm:
 Rigid body mesh mm: 20
-Mesh sizing mode: manual-mm
-Radiating elements/wave: 6
-Shadow elements/wave: 2.5
-Throat elements/wave: 8
 Refine overrides:
 Passive cardioid MF:
   Combine MF + port exit: off
@@ -300,16 +286,14 @@ Mirror plane override values map to cut planes as before:
 | `Top/Bottom` | `z=0` | Native half-domain solve (`xy`) |
 | `Full model` | none | Full-domain solve |
 
-Source resolution is the per-source mesh-size knob. In `frequency-role` mode,
-the radiating role refines it to the band top; `Rigid body mesh mm` is the
-coarse hand ceiling for rigid surfaces, refined to the shadow target for the
-band. In `manual-mm` mode, those same millimetre values are used directly. If
-`Rigid body mesh mm` is blank, the pipeline falls back to the coarsest declared
-source resolution. The STEP mesher pins radiating surfaces at the chosen size
-and applies source-local Distance/Threshold fields so the near-field grades
-from the source size to the background over the transition distance. `Refine
-overrides` paint specific appearance/shell names at a chosen size or role
-without changing their physical (rigid) tag.
+Source resolution is the per-source mesh-size knob. `Rigid body mesh mm` is the
+background size for rigid surfaces away from source refinement. If `Rigid body
+mesh mm` is blank, the pipeline falls back to the coarsest declared source
+resolution. The STEP mesher pins source patches at their chosen size and
+applies source-local Distance/Threshold fields so the near-field grades from
+the source size to the background over the transition distance. `Refine
+overrides` paint specific appearance/shell names at a chosen explicit
+millimetre size without changing their physical (rigid) tag.
 
 The dialog remembers the last values used after a run. Settings are stored in:
 

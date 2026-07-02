@@ -23,12 +23,6 @@ MIRROR_PLANE_SYMMETRY_PLANES = {
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
-MESH_SIZING_MODE_FREQUENCY_ROLE = "frequency-role"
-MESH_SIZING_MODE_MANUAL_MM = "manual-mm"
-MESH_SIZING_MODES = {
-    MESH_SIZING_MODE_FREQUENCY_ROLE,
-    MESH_SIZING_MODE_MANUAL_MM,
-}
 
 
 def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> None:
@@ -36,46 +30,25 @@ def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> 
         cmd.extend([flag, str(value).strip()])
 
 
-def normalize_mesh_sizing_mode(value: str | None) -> str:
-    mode = str(value or "").strip().lower().replace("_", "-")
-    aliases = {
-        "frequency": MESH_SIZING_MODE_FREQUENCY_ROLE,
-        "role": MESH_SIZING_MODE_FREQUENCY_ROLE,
-        "role-based": MESH_SIZING_MODE_FREQUENCY_ROLE,
-        "frequency-role": MESH_SIZING_MODE_FREQUENCY_ROLE,
-        "frequency-targeted": MESH_SIZING_MODE_FREQUENCY_ROLE,
-        "manual": MESH_SIZING_MODE_MANUAL_MM,
-        "manual-mm": MESH_SIZING_MODE_MANUAL_MM,
-        "mm": MESH_SIZING_MODE_MANUAL_MM,
-    }
-    return aliases.get(mode, MESH_SIZING_MODE_MANUAL_MM)
-
-
 def estimate_clamped_solve_band(
     *,
     sources: str,
     rigid_res_mm: str,
     freq_max_hz: str,
-    radiating_epw: str | float = 6.0,
-    shadow_epw: str | float = 2.5,
-    mesh_sizing_mode: str | None = MESH_SIZING_MODE_MANUAL_MM,
 ) -> dict[str, float] | None:
     """Predict per-source solve ceilings for the clamp-per-source policy.
 
-    Mirrors the reworked role-based sizing: the pipeline limits each source to
-    ``c / (validation_epw * max_edge)`` over the source patch and the rigid
-    walls within the refinement transition. With role grading the patch sits at
-    the radiating size and the near-field grades out to the shadow background
-    ``min(rigid_res, c/(shadow_epw*f_max))`` (not the full rigid knob), so the
-    effective ceiling is ``c/(validation_epw * max(patch_size, shadow_size))``.
+    The pipeline limits each source to ``c / (validation_epw * max_edge)`` over
+    the source patch and the rigid walls within the refinement transition. In
+    manual-mm sizing the source patch and shadow background are their explicit
+    millimetre values, so the effective ceiling is based on the coarser of the
+    source patch and rigid background.
     Returns ``{source_name: ceiling_hz}`` for sources expected to clamp below
     the requested maximum, or None when nothing clamps (or inputs do not parse;
     the pipeline validates the actual mesh authoritatively).
     """
     try:
         requested_hz = float(freq_max_hz)
-        radiating_epw_f = float(radiating_epw)
-        shadow_epw_f = float(shadow_epw)
         resolutions = {}
         for spec in sources.split(","):
             parts = [part.strip() for part in spec.split(":")]
@@ -90,19 +63,16 @@ def estimate_clamped_solve_band(
         return None
     if requested_hz <= 0.0 or rigid_mm <= 0.0 or any(res <= 0.0 for res in resolutions.values()):
         return None
-    sizing_f_max_hz = (
-        requested_hz
-        if normalize_mesh_sizing_mode(mesh_sizing_mode) == MESH_SIZING_MODE_FREQUENCY_ROLE
-        else None
-    )
     sizing = _load_sizing()
     shadow_size = sizing.role_size_mm(
-        sizing.ROLE_SHADOW, f_max_hz=sizing_f_max_hz, mm_knob_mm=rigid_mm, shadow_epw=shadow_epw_f
+        sizing.ROLE_SHADOW,
+        mm_knob_mm=rigid_mm,
     )
     clamped: dict[str, float] = {}
     for name, res_mm in resolutions.items():
         patch_size = sizing.role_size_mm(
-            sizing.ROLE_RADIATING, f_max_hz=sizing_f_max_hz, mm_knob_mm=res_mm, radiating_epw=radiating_epw_f
+            sizing.ROLE_RADIATING,
+            mm_knob_mm=res_mm,
         )
         # The wave a source launches traverses near-walls coarsening to the
         # shadow background, so the effective limit is the coarser of the two.
@@ -126,31 +96,23 @@ def estimate_design_mesh_cost(
     faces: list[dict[str, Any]],
     *,
     source_res_mm: dict[str, float],
-    f_max_hz: float | None,
-    radiating_epw: float,
-    shadow_epw: float,
     transition_mm: float,
     rigid_res_mm: float,
     freq_count: int = 1,
-    mesh_sizing_mode: str | None = MESH_SIZING_MODE_MANUAL_MM,
 ) -> dict[str, Any]:
     """Predict triangles/RAM/solve cost for the dialog from sampled BRep faces.
 
     ``faces`` is a list of ``{"area_mm2", "centroid": (x, y, z), "source_name"}``
-    sampled from the active (quarter) design. Mirrors the prepare-step role
-    sizing: source patches at the radiating size from their per-source dial,
-    the near-field graded from the radiating ceiling to the shadow background.
+    sampled from the active (quarter) design. Mirrors the prepare-step sizing:
+    source patches at their per-source mm dial, with the near-field graded from
+    that source size to the rigid shadow background.
     This is an approximate live preview; the prepare-step manifest holds the
     authoritative prediction.
     """
     sizing = _load_sizing()
-    sizing_f_max_hz = (
-        f_max_hz
-        if normalize_mesh_sizing_mode(mesh_sizing_mode) == MESH_SIZING_MODE_FREQUENCY_ROLE
-        else None
-    )
     shadow_res = sizing.role_size_mm(
-        sizing.ROLE_SHADOW, f_max_hz=sizing_f_max_hz, mm_knob_mm=rigid_res_mm, shadow_epw=shadow_epw
+        sizing.ROLE_SHADOW,
+        mm_knob_mm=rigid_res_mm,
     )
     # One grading site per source face: the mesher grades each source's
     # Distance/Threshold field from that source's own patch size, combined by
@@ -163,7 +125,8 @@ def estimate_design_mesh_cost(
             continue
         knob = float(source_res_mm.get(name, rigid_res_mm))
         patch_size = sizing.role_size_mm(
-            sizing.ROLE_RADIATING, f_max_hz=sizing_f_max_hz, mm_knob_mm=knob, radiating_epw=radiating_epw
+            sizing.ROLE_RADIATING,
+            mm_knob_mm=knob,
         )
         source_sites.append((tuple(face["centroid"]), float(patch_size)))
 
@@ -176,7 +139,8 @@ def estimate_design_mesh_cost(
         if name:
             knob = float(source_res_mm.get(name, rigid_res_mm))
             size = sizing.role_size_mm(
-                sizing.ROLE_RADIATING, f_max_hz=sizing_f_max_hz, mm_knob_mm=knob, radiating_epw=radiating_epw
+                sizing.ROLE_RADIATING,
+                mm_knob_mm=knob,
             )
             regions.append(sizing.Region(area_mm2=area, size_mm=size, label=sizing.ROLE_RADIATING))
             continue
@@ -275,13 +239,9 @@ def build_pipeline_command(
     open_output: bool,
     crossover_lf_mf_hz: str | None = None,
     crossover_mf_hf_hz: str | None = None,
-    mesh_sizing_mode: str | None = MESH_SIZING_MODE_MANUAL_MM,
     symmetry_planes: str = "auto",
     quadrants: str | None = None,
     mirror_axes: str | None = None,
-    radiating_epw: str | None = None,
-    shadow_epw: str | None = None,
-    throat_epw: str | None = None,
     refine: list[str] | None = None,
     skip_missing_sources: bool = True,
     allow_underresolved_solve: bool = False,
@@ -324,14 +284,6 @@ def build_pipeline_command(
     ]
     if rigid_res_mm and rigid_res_mm.strip():
         cmd.extend(["--rigid-res-mm", rigid_res_mm.strip()])
-    mode = normalize_mesh_sizing_mode(mesh_sizing_mode)
-    cmd.extend(["--mesh-sizing-mode", mode])
-    if mode == MESH_SIZING_MODE_FREQUENCY_ROLE and radiating_epw and str(radiating_epw).strip():
-        cmd.extend(["--radiating-epw", str(radiating_epw).strip()])
-    if mode == MESH_SIZING_MODE_FREQUENCY_ROLE and shadow_epw and str(shadow_epw).strip():
-        cmd.extend(["--shadow-epw", str(shadow_epw).strip()])
-    if mode == MESH_SIZING_MODE_FREQUENCY_ROLE and throat_epw and str(throat_epw).strip():
-        cmd.extend(["--throat-epw", str(throat_epw).strip()])
     for entry in refine or []:
         entry = str(entry).strip()
         if entry:

@@ -66,37 +66,25 @@ def test_estimate_clamped_solve_band_flags_shadow_limited_sources():
         sources="LF:30,MF:15,HF:5",
         rigid_res_mm="30",
         freq_max_hz="20000",
-        radiating_epw="6",
-        shadow_epw="2.5",
-        mesh_sizing_mode="frequency-role",
     )
 
     assert clamped is not None
     assert set(clamped) == {"LF", "MF", "HF"}
-    # With role grading the near-walls coarsen to the shadow background
-    # min(30, 343000/(2.5*20000)=6.86) = 6.86 mm, not the 30 mm rigid knob:
-    # 343 / (6 * 0.00686) ~= 8333 Hz.
-    shadow_mm = 343000.0 / (2.5 * 20000.0)
-    expected = 343.0 / (6.0 * shadow_mm / 1000.0)
+    expected = 343000.0 / (6.0 * 30.0)
     for ceiling_hz in clamped.values():
         assert abs(ceiling_hz - expected) < 1.0
 
 
-def test_estimate_clamped_solve_band_tracks_reworked_pipeline_cap():
+def test_estimate_clamped_solve_band_tracks_manual_background_cap():
     helper = _load_helper()
-    # Mirrors the 3waymeh validation (rigid 30, shadow_epw 2.5, f_max 10k): the
-    # add-in NOTE must land near the pipeline's measured ~3.6 kHz HF cap, not
-    # the stale 30 mm rigid estimate (~1.9 kHz).
+
     clamped = helper.estimate_clamped_solve_band(
         sources="LF:20,HF:5",
         rigid_res_mm="30",
         freq_max_hz="10000",
-        radiating_epw="6",
-        shadow_epw="2.5",
-        mesh_sizing_mode="frequency-role",
     )
     assert clamped is not None
-    assert 3500.0 < clamped["HF"] < 4500.0
+    assert clamped["HF"] == pytest.approx(343000.0 / (6.0 * 30.0), rel=1e-3)
 
 
 def test_estimate_clamped_solve_band_none_when_request_fits():
@@ -118,14 +106,10 @@ def test_estimate_clamped_solve_band_defaults_rigid_to_coarsest_source():
         sources="LF:20,HF:5",
         rigid_res_mm="",
         freq_max_hz="20000",
-        mesh_sizing_mode="frequency-role",
     )
 
     assert clamped is not None
-    # Implied rigid 20 mm refines to the shadow background
-    # min(20, 343000/(2.5*20000)=6.86) = 6.86 mm at 20 kHz.
-    shadow_mm = 343000.0 / (2.5 * 20000.0)
-    expected = 343.0 / (6.0 * shadow_mm / 1000.0)
+    expected = 343000.0 / (6.0 * 20.0)
     for ceiling_hz in clamped.values():
         assert abs(ceiling_hz - expected) < 1.0
 
@@ -159,7 +143,7 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
         "/out/run",
     ]
     assert cmd[cmd.index("--sources") + 1] == "LF:20,MF:10,HF:5"
-    assert cmd[cmd.index("--mesh-sizing-mode") + 1] == "manual-mm"
+    assert "--mesh-sizing-mode" not in cmd
     assert cmd[cmd.index("--symmetry-planes") + 1] == "auto"
     assert "--quadrants" not in cmd
     assert "--mirror-axes" not in cmd
@@ -304,15 +288,6 @@ def test_build_pipeline_command_forwards_single_crossover_for_two_way():
     assert cmd[cmd.index("--crossover-mf-hf-hz") + 1] == "1000"
 
 
-def test_normalize_mesh_sizing_mode_defaults_to_manual_mm():
-    helper = _load_helper()
-
-    assert helper.normalize_mesh_sizing_mode("") == "manual-mm"
-    assert helper.normalize_mesh_sizing_mode(None) == "manual-mm"
-    assert helper.normalize_mesh_sizing_mode("frequency-role") == "frequency-role"
-    assert helper.normalize_mesh_sizing_mode("manual") == "manual-mm"
-
-
 def test_build_pipeline_command_can_request_clamped_solve_policy():
     helper = _load_helper()
 
@@ -392,51 +367,33 @@ def test_build_pipeline_command_omits_blank_rigid_resolution():
     assert "--rigid-res-mm" not in cmd
 
 
-def test_build_pipeline_command_forwards_role_dials_and_refine():
+def test_build_pipeline_command_forwards_refine():
     helper = _load_helper()
 
     cmd = _helper_command(
         helper,
-        mesh_sizing_mode="frequency-role",
-        radiating_epw="6",
-        shadow_epw="2.5",
-        throat_epw="8",
-        refine=["Rear:shadow", "Flare:radiating", " "],
+        refine=["Rear:8mm", "Flare:4mm", " "],
     )
 
-    assert cmd[cmd.index("--radiating-epw") + 1] == "6"
-    assert cmd[cmd.index("--shadow-epw") + 1] == "2.5"
-    assert cmd[cmd.index("--throat-epw") + 1] == "8"
+    assert "--mesh-sizing-mode" not in cmd
+    assert "--radiating-epw" not in cmd
+    assert "--shadow-epw" not in cmd
+    assert "--throat-epw" not in cmd
     assert "--refine" in cmd
     refine_values = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--refine"]
-    assert refine_values == ["Rear:shadow", "Flare:radiating"]
+    assert refine_values == ["Rear:8mm", "Flare:4mm"]
 
 
-def test_build_pipeline_command_omits_role_dials_when_unset():
+def test_build_pipeline_command_omits_removed_role_dials_and_refine_when_unset():
     helper = _load_helper()
 
     cmd = _helper_command(helper)
 
-    assert "--radiating-epw" not in cmd
-    assert "--shadow-epw" not in cmd
-    assert "--refine" not in cmd
-
-
-def test_build_pipeline_command_manual_mm_mode_disables_role_dials():
-    helper = _load_helper()
-
-    cmd = _helper_command(
-        helper,
-        mesh_sizing_mode="manual-mm",
-        radiating_epw="6",
-        shadow_epw="2.5",
-        throat_epw="8",
-    )
-
-    assert cmd[cmd.index("--mesh-sizing-mode") + 1] == "manual-mm"
+    assert "--mesh-sizing-mode" not in cmd
     assert "--radiating-epw" not in cmd
     assert "--shadow-epw" not in cmd
     assert "--throat-epw" not in cmd
+    assert "--refine" not in cmd
 
 
 def test_manual_mm_clamp_estimate_uses_explicit_mm_caps():
@@ -446,7 +403,6 @@ def test_manual_mm_clamp_estimate_uses_explicit_mm_caps():
         sources="HF:5",
         rigid_res_mm="30",
         freq_max_hz="20000",
-        mesh_sizing_mode="manual-mm",
     )
 
     assert clamped is not None
@@ -467,9 +423,6 @@ def test_estimate_design_mesh_cost_sizes_by_role():
     estimate = helper.estimate_design_mesh_cost(
         faces,
         source_res_mm={"HF": 5.0},
-        f_max_hz=10000.0,
-        radiating_epw=6.0,
-        shadow_epw=2.5,
         transition_mm=200.0,
         rigid_res_mm=30.0,
         freq_count=60,
@@ -477,7 +430,7 @@ def test_estimate_design_mesh_cost_sizes_by_role():
     assert estimate["n_triangles"] > 0
     assert "radiating" in estimate["per_role_triangles"]
     assert "near_field" in estimate["per_role_triangles"]
-    # radiating reaches ~10 kHz; matrix RAM and a feasibility flag are reported
+    # radiating validity, matrix RAM, and a feasibility flag are reported
     assert estimate["per_role_valid_f_max_hz"]["radiating"] >= 10000.0 - 200.0
     assert estimate["ram_gb"] > 0.0
     summary = helper.format_mesh_cost_summary(estimate)
@@ -972,7 +925,7 @@ def test_pipeline_default_warns_and_solves_underresolved_sources(tmp_path, monke
         "solve_fusion_wg_metal.py",
     ]
     prep_cmd = calls[0][1]
-    assert prep_cmd[prep_cmd.index("--mesh-sizing-mode") + 1] == "manual-mm"
+    assert "--mesh-sizing-mode" not in prep_cmd
     solve_cmd = calls[-1][1]
     assert solve_cmd[solve_cmd.index("--freq-max-hz") + 1] == "20000.0"
     assert solve_cmd[solve_cmd.index("--bem-formulation") + 1] == "complex_k"
@@ -1123,15 +1076,13 @@ def test_pipeline_forwards_manual_mm_mode_to_prepare(tmp_path, monkeypatch):
             str(tmp_path / "out"),
             "--source",
             "HF:5",
-            "--mesh-sizing-mode",
-            "manual-mm",
             "--run-solves",
         ]
     )
 
     assert rc == 0
     prep_cmd = calls[0][1]
-    assert prep_cmd[prep_cmd.index("--mesh-sizing-mode") + 1] == "manual-mm"
+    assert "--mesh-sizing-mode" not in prep_cmd
 
 
 def test_pipeline_clamp_policy_clamps_each_underresolved_source_separately(

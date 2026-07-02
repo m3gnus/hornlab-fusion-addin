@@ -507,7 +507,7 @@ def test_density_configuration_uses_canonical_boundary_extension_and_gradual_fie
     assert density["source_fields"]["HF"]["dist_max_mm"] == 200.0
 
 
-def test_density_configuration_sizes_by_role_at_band_top():
+def test_density_configuration_records_explicit_manual_mm_sizes():
     module = _load_script()
     specs = [module.SourceSpec("LF", 20.0, 2), module.SourceSpec("HF", 5.0, 4)]
 
@@ -515,59 +515,26 @@ def test_density_configuration_sizes_by_role_at_band_top():
         specs,
         rigid_res_mm=30.0,
         transition_mm=200.0,
-        f_max_hz=10_000.0,
-        radiating_epw=6.0,
-        shadow_epw=2.5,
-    )
-
-    # shadow background refines the rigid knob to the 2.5 e/w ceiling
-    assert density["shadow_res_mm"] == pytest.approx(13.72, rel=1e-3)
-    # radiating ceiling at 6 e/w
-    assert density["radiating_res_mm"] == pytest.approx(5.7166, rel=1e-3)
-    # LF patch (20 mm knob) refined to the radiating ceiling; HF (5 mm) stays 5
-    assert density["source_fields"]["LF"]["patch_size_mm"] == pytest.approx(5.7166, rel=1e-3)
-    assert density["source_fields"]["HF"]["patch_size_mm"] == pytest.approx(5.0)
-    # near-field grades from the radiating size up to the shadow background
-    assert density["source_fields"]["LF"]["size_max_mm"] == pytest.approx(13.72, rel=1e-3)
-
-
-def test_density_configuration_manual_mm_mode_records_explicit_sizes():
-    module = _load_script()
-    specs = [module.SourceSpec("LF", 20.0, 2), module.SourceSpec("HF", 5.0, 4)]
-
-    density = module._density_configuration(
-        specs,
-        mesh_sizing_mode="manual-mm",
-        rigid_res_mm=30.0,
-        transition_mm=200.0,
-        f_max_hz=None,
-        radiating_epw=6.0,
-        shadow_epw=2.5,
     )
 
     assert density["mesh_sizing_mode"] == "manual-mm"
     assert density["shadow_res_mm"] == pytest.approx(30.0)
-    assert density["radiating_res_mm"] is None
     assert density["source_fields"]["LF"]["patch_size_mm"] == pytest.approx(20.0)
     assert density["source_fields"]["HF"]["patch_size_mm"] == pytest.approx(5.0)
 
 
-def test_parse_refine_spec_epw_mm_and_role_keywords():
+def test_parse_refine_spec_accepts_explicit_mm_only():
     module = _load_script()
-    epw_spec = module._parse_refine_spec("Baffle:3", radiating_epw=6.0, shadow_epw=2.5, throat_epw=8.0)
-    assert epw_spec.epw == 3.0 and epw_spec.size_mm is None
-    assert epw_spec.size_for_band(10_000.0, fallback_mm=30.0) == pytest.approx(343000 / (3 * 10000), rel=1e-6)
-
-    mm_spec = module._parse_refine_spec("Rim:8mm", radiating_epw=6.0, shadow_epw=2.5, throat_epw=8.0)
-    assert mm_spec.size_mm == 8.0 and mm_spec.epw is None
-    assert mm_spec.size_for_band(10_000.0, fallback_mm=30.0) == 8.0
-
-    shadow_spec = module._parse_refine_spec("Rear:shadow", radiating_epw=6.0, shadow_epw=2.5, throat_epw=8.0)
-    assert shadow_spec.role == module.sizing.ROLE_SHADOW
-    assert shadow_spec.epw == 2.5
+    mm_spec = module._parse_refine_spec("Rim:8mm")
+    assert mm_spec.size_mm == 8.0
+    assert mm_spec.role == "custom"
 
     with pytest.raises(Exception):
-        module._parse_refine_spec("bad", radiating_epw=6.0, shadow_epw=2.5, throat_epw=8.0)
+        module._parse_refine_spec("Baffle:3")
+    with pytest.raises(Exception):
+        module._parse_refine_spec("Rear:shadow")
+    with pytest.raises(Exception):
+        module._parse_refine_spec("bad")
 
 
 def test_auto_radiating_promotes_source_bearing_shell_only_when_multibody():

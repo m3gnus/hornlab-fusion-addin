@@ -23,36 +23,10 @@ def _load():
 M = _load()
 
 
-def test_frequency_ceiling_matches_canonical_formula():
-    # 343000 / (6 * 10000) = 5.716...
-    assert M.frequency_ceiling_mm(6.0, 10_000.0) == pytest.approx(5.7166, rel=1e-3)
-    # shadow at 2.5 e/w is coarser
-    assert M.frequency_ceiling_mm(2.5, 10_000.0) == pytest.approx(13.72, rel=1e-3)
-    # no band top -> no ceiling
-    assert M.frequency_ceiling_mm(6.0, None) is None
-    assert M.frequency_ceiling_mm(6.0, 0.0) is None
-
-
-def test_role_size_takes_min_of_mm_knob_and_freq_ceiling():
-    # mm knob 30 is coarser than the 10 kHz radiating ceiling -> ceiling wins
-    radiating = M.role_size_mm(
-        M.ROLE_RADIATING, f_max_hz=10_000.0, mm_knob_mm=30.0
-    )
-    assert radiating == pytest.approx(5.7166, rel=1e-3)
-    # a hand-set fine mm knob is never coarsened by the frequency term
-    fine = M.role_size_mm(M.ROLE_RADIATING, f_max_hz=10_000.0, mm_knob_mm=2.0)
-    assert fine == pytest.approx(2.0)
-    # shadow rides near Nyquist -> coarser than radiating
-    shadow = M.role_size_mm(M.ROLE_SHADOW, f_max_hz=10_000.0, mm_knob_mm=30.0)
-    assert shadow == pytest.approx(13.72, rel=1e-3)
-    assert shadow > radiating
-    # throat goes finer than radiating (default 8 e/w)
-    throat = M.role_size_mm(M.ROLE_THROAT, f_max_hz=10_000.0, mm_knob_mm=30.0)
-    assert throat < radiating
-
-
-def test_role_size_without_band_top_uses_mm_knob():
-    assert M.role_size_mm(M.ROLE_RADIATING, f_max_hz=None, mm_knob_mm=12.0) == 12.0
+def test_role_size_uses_explicit_mm_knob():
+    assert M.role_size_mm(M.ROLE_RADIATING, mm_knob_mm=30.0) == 30.0
+    assert M.role_size_mm(M.ROLE_SHADOW, mm_knob_mm=12.0) == 12.0
+    assert M.role_size_mm(M.ROLE_THROAT, mm_knob_mm=2.0) == 2.0
 
 
 def test_valid_f_max_inverts_the_size_formula():

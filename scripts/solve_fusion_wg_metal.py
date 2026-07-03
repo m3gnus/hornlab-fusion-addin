@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import time
 from typing import Any
@@ -42,6 +43,7 @@ import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
 # Workspace checkouts win over installed packages when present. The HornLab
 # helper packages may be checked out as top-level siblings or inside a sibling
 # HornLab repo; elsewhere imports resolve from the active environment.
@@ -93,6 +95,85 @@ CANONICAL_SOLVE_SOURCE_PRIORITY = {
     "LF": 2,
 }
 DEFAULT_DIRECT_SOLVE_LOCK_PATH = Path("/tmp/hornlab-fusion-direct-solve.lock")
+SOLVER_LAYOUT_VERSION = 2
+
+
+class SolverOutputLayout:
+    def __init__(self, root: Path, *, layout_version: int) -> None:
+        self.root = root
+        self.layout_version = int(layout_version)
+        if self.layout_version >= 2:
+            self.sources_dir = root / "sources"
+            self.combined_dir = root / "combined"
+            self.cardioid_dir = root / "cardioid"
+            self.driver_lem_dir = root / "driver-lem"
+            self.derived_dir = root / "derived"
+        else:
+            self.sources_dir = root
+            self.combined_dir = root
+            self.cardioid_dir = root
+            self.driver_lem_dir = root
+            self.derived_dir = root
+        self.vituixcad_dir = root / "vituixcad"
+        self.logs_dir = root / "logs"
+
+    def ensure_dirs(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        for path in (
+            self.sources_dir,
+            self.combined_dir,
+            self.cardioid_dir,
+            self.driver_lem_dir,
+            self.derived_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+    def manifest_payload(self) -> dict[str, Any]:
+        return {
+            "version": self.layout_version,
+            "sources_dir": str(self.sources_dir),
+            "combined_dir": str(self.combined_dir),
+            "cardioid_dir": str(self.cardioid_dir),
+            "driver_lem_dir": str(self.driver_lem_dir),
+            "derived_dir": str(self.derived_dir),
+            "vituixcad_dir": str(self.vituixcad_dir),
+            "logs_dir": str(self.logs_dir),
+        }
+
+
+def _layout_version_for_run(
+    *,
+    postprocess_only: bool,
+    previous_direct_manifest: dict[str, Any],
+    previous_final_manifest: dict[str, Any],
+) -> int:
+    if not postprocess_only:
+        return SOLVER_LAYOUT_VERSION
+    candidates = [
+        previous_direct_manifest.get("layout_version"),
+        previous_final_manifest.get("direct_solve", {}).get("layout_version"),
+    ]
+    for raw in candidates:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value >= 2:
+            return SOLVER_LAYOUT_VERSION
+    return 1
+
+
+def _render_run_report(out_dir: Path) -> dict[str, Any] | None:
+    if not REPORT_SCRIPT.exists():
+        return None
+    cmd = [sys.executable, str(REPORT_SCRIPT), str(out_dir)]
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), text=True, check=False)
+    return {
+        "path": str(out_dir / "report.html"),
+        "returncode": int(result.returncode),
+        "status": "complete" if result.returncode == 0 else "failed",
+        "command": cmd,
+    }
 
 
 def _coerce_phase_overlay_curve(curve: Any) -> tuple[np.ndarray, np.ndarray, str, str, bool]:
@@ -627,6 +708,31 @@ def _write_pressure_basis_npz(
     np.savez_compressed(path, **arrays)
 
 
+def _pressure_basis_from_result(
+    result,
+    *,
+    source_name: str,
+    source_tag: int,
+    source_area_m2: float | None = None,
+) -> PressureBasis:
+    return PressureBasis(
+        source_name=source_name,
+        source_tag=source_tag,
+        frequencies_hz=np.asarray(result.frequencies_hz, dtype=np.float64),
+        observation_angles_deg=np.asarray(
+            result.observation_angles_deg,
+            dtype=np.float64,
+        ),
+        observation_planes=np.asarray(result.observation_planes, dtype=str),
+        pressure_complex=np.conjugate(
+            np.asarray(result.pressure_complex, dtype=np.complex128)
+        ),
+        source_normalization="unit_normal_acceleration",
+        surface_pressure_avg_solver=_surface_pressure_avg_for_tag(result, source_tag),
+        source_area_m2=source_area_m2,
+    )
+
+
 def _write_active_pressure_npz(
     path: Path,
     basis: PressureBasis,
@@ -652,6 +758,26 @@ def _write_active_pressure_npz(
     if area is not None:
         arrays["source_area_m2"] = np.asarray(float(area), dtype=np.float64)
     np.savez_compressed(path, **arrays)
+
+
+def _active_pressure_basis(
+    basis: PressureBasis,
+    pressure_complex: np.ndarray,
+    *,
+    source_normalization: str,
+    source_area_m2: float | None = None,
+) -> PressureBasis:
+    return PressureBasis(
+        source_name=basis.source_name,
+        source_tag=basis.source_tag,
+        frequencies_hz=basis.frequencies_hz,
+        observation_angles_deg=basis.observation_angles_deg,
+        observation_planes=basis.observation_planes,
+        pressure_complex=np.asarray(pressure_complex, dtype=np.complex128),
+        source_normalization=source_normalization,
+        surface_pressure_avg_solver=basis.surface_pressure_avg_solver,
+        source_area_m2=source_area_m2 if source_area_m2 is not None else basis.source_area_m2,
+    )
 
 
 def _load_pressure_basis(path: Path) -> PressureBasis:
@@ -1734,7 +1860,7 @@ def _write_vituixcad_export(
     """
     by_name = {str(result["name"]).strip().upper(): result for result in source_results}
     export_bases: list[tuple[str, PressureBasis]] = [
-        (name, _load_pressure_basis(_source_active_basis_path(by_name[name])))
+        (name, _source_active_basis(by_name[name]))
         for name in _VITUIXCAD_DRIVER_NAMES
         if name in by_name
     ]
@@ -1924,6 +2050,9 @@ def _write_vituixcad_export(
     return payload
 
 
+_DEFAULT_DERIVED_DIR = object()
+
+
 def _write_crossover_alignment_outputs(
     out_dir: Path,
     source_results: list[dict[str, Any]],
@@ -1935,6 +2064,7 @@ def _write_crossover_alignment_outputs(
     mesh_valid_radiating_hz: float | None,
     mf_override_npz: Path | None = None,
     mf_override_kind: str = "direct",
+    derived_dir: Path | None | object = _DEFAULT_DERIVED_DIR,
 ) -> dict[str, Any] | None:
     if lf_mf_hz is None and mf_hf_hz is None:
         return None
@@ -1948,10 +2078,7 @@ def _write_crossover_alignment_outputs(
         return {"status": "skipped", "reason": str(chain_or_reason)}
     members, crossovers_hz = chain, list(chain_or_reason)
 
-    bases = {
-        name: _load_pressure_basis(_source_active_basis_path(by_name[name]))
-        for name in members
-    }
+    bases = {name: _source_active_basis(by_name[name]) for name in members}
     mf_basis_kind = "direct"
     if mf_override_npz is not None and "MF" in bases:
         with np.load(mf_override_npz, allow_pickle=False) as data:
@@ -2129,18 +2256,21 @@ def _write_crossover_alignment_outputs(
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
     )
 
-    derived_outputs = _write_pressure_grid_derived_artifacts(
-        out_dir,
-        "combined_time_aligned",
-        label="Combined time-aligned sum",
-        frequencies_hz=freqs,
-        angles_deg=angles_deg,
-        planes=planes,
-        pressure_complex=combined_pressure_grid,
-        polar_distance_m=polar_distance_m,
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
+    derived_outputs = None
+    derived_output_dir = out_dir if derived_dir is _DEFAULT_DERIVED_DIR else derived_dir
+    if derived_output_dir is not None:
+        derived_outputs = _write_pressure_grid_derived_artifacts(
+            Path(derived_output_dir),
+            "combined_time_aligned",
+            label="Combined time-aligned sum",
+            frequencies_hz=freqs,
+            angles_deg=angles_deg,
+            planes=planes,
+            pressure_complex=combined_pressure_grid,
+            polar_distance_m=polar_distance_m,
+            mesh_valid_hz=mesh_valid_hz,
+            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        )
 
     interference_png = out_dir / "combined_interference_heatmap_time_aligned.png"
     _save_interference_heatmap(
@@ -2221,7 +2351,7 @@ def _write_crossover_alignment_outputs(
             },
         },
     )
-    return {
+    payload = {
         "status": "complete",
         "type": "lr4_time_aligned_on_axis_sum",
         "members": members,
@@ -2235,23 +2365,6 @@ def _write_crossover_alignment_outputs(
         "outputs": {
             "combined_time_aligned_frequency_response_png": str(output_png),
             "combined_time_aligned_directivity_heatmap_png": str(heatmap_png),
-            "combined_time_aligned_directivity_power_png": derived_outputs[
-                "directivity_power_png"
-            ],
-            "combined_time_aligned_directivity_power_csv": derived_outputs[
-                "directivity_power_csv"
-            ],
-            "combined_time_aligned_directivity_power_json": derived_outputs[
-                "directivity_power_json"
-            ],
-            "combined_time_aligned_beamwidth_png": derived_outputs["beamwidth_png"],
-            "combined_time_aligned_beamwidth_csv": derived_outputs["beamwidth_csv"],
-            "combined_time_aligned_beamwidth_json": derived_outputs["beamwidth_json"],
-            "combined_time_aligned_group_delay_png": derived_outputs["group_delay_png"],
-            "combined_time_aligned_group_delay_csv": derived_outputs["group_delay_csv"],
-            "combined_time_aligned_group_delay_json": derived_outputs[
-                "group_delay_json"
-            ],
             "combined_interference_heatmap_png": str(interference_png),
             "combined_off_axis_frequency_response_pngs": off_axis_pngs,
             "driver_time_alignment_txt": str(report_txt),
@@ -2268,6 +2381,33 @@ def _write_crossover_alignment_outputs(
         },
         "phase_checks": phase_rows,
     }
+    if derived_outputs is not None:
+        payload["outputs"].update(
+            {
+                "combined_time_aligned_directivity_power_png": derived_outputs[
+                    "directivity_power_png"
+                ],
+                "combined_time_aligned_directivity_power_csv": derived_outputs[
+                    "directivity_power_csv"
+                ],
+                "combined_time_aligned_directivity_power_json": derived_outputs[
+                    "directivity_power_json"
+                ],
+                "combined_time_aligned_beamwidth_png": derived_outputs["beamwidth_png"],
+                "combined_time_aligned_beamwidth_csv": derived_outputs["beamwidth_csv"],
+                "combined_time_aligned_beamwidth_json": derived_outputs["beamwidth_json"],
+                "combined_time_aligned_group_delay_png": derived_outputs[
+                    "group_delay_png"
+                ],
+                "combined_time_aligned_group_delay_csv": derived_outputs[
+                    "group_delay_csv"
+                ],
+                "combined_time_aligned_group_delay_json": derived_outputs[
+                    "group_delay_json"
+                ],
+            }
+        )
+    return payload
 
 
 def _assert_matching_basis_grid(a: PressureBasis, b: PressureBasis) -> None:
@@ -3175,13 +3315,47 @@ def _source_result_by_name(source_results: list[dict[str, Any]]) -> dict[str, di
 
 
 def _source_unit_basis_path(source_result: dict[str, Any]) -> Path:
-    return Path(str(source_result["pressure_basis_npz"]))
+    value = source_result.get("pressure_basis_npz")
+    if not value:
+        raise RuntimeError(f"{source_result['name']} has no saved pressure basis")
+    return Path(str(value))
 
 
 def _source_active_basis_path(source_result: dict[str, Any]) -> Path:
-    return Path(
-        str(source_result.get("active_pressure_basis_npz") or source_result["pressure_basis_npz"])
+    value = source_result.get("active_pressure_basis_npz") or source_result.get(
+        "pressure_basis_npz"
     )
+    if not value:
+        raise RuntimeError(f"{source_result['name']} has no saved active pressure basis")
+    return Path(str(value))
+
+
+def _source_unit_basis(source_result: dict[str, Any]) -> PressureBasis:
+    basis = source_result.get("_pressure_basis")
+    if isinstance(basis, PressureBasis):
+        return basis
+    return _load_pressure_basis(_source_unit_basis_path(source_result))
+
+
+def _source_active_basis(source_result: dict[str, Any]) -> PressureBasis:
+    basis = source_result.get("_active_pressure_basis")
+    if isinstance(basis, PressureBasis):
+        return basis
+    basis = source_result.get("_pressure_basis")
+    if (
+        isinstance(basis, PressureBasis)
+        and not source_result.get("active_pressure_basis_npz")
+    ):
+        return basis
+    return _load_pressure_basis(_source_active_basis_path(source_result))
+
+
+def _public_source_result(source_result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in source_result.items()
+        if not str(key).startswith("_")
+    }
 
 
 def _auto_port_source_name(source_results: list[dict[str, Any]]) -> str | None:
@@ -3745,6 +3919,20 @@ def _source_owned_by_passive_cardioid(args: argparse.Namespace, source_name: str
     )
 
 
+def _pressure_basis_required_for_selected_outputs(args: argparse.Namespace) -> bool:
+    return (
+        bool(getattr(args, "driver_lem_specs", {}))
+        or bool(args.export_vituixcad)
+        or not bool(args.skip_derived_acoustics)
+        or not bool(args.skip_combined_set)
+        or (bool(args.passive_cardioid_mf) and not bool(args.skip_passive_cardioid_set))
+    )
+
+
+def _write_pressure_basis_for_run(args: argparse.Namespace) -> bool:
+    return not bool(args.skip_pressure_bases)
+
+
 def _basis_self_impedance(
     mesh_path: Path,
     args: argparse.Namespace,
@@ -3827,7 +4015,7 @@ def _apply_driver_lem_coupling(
             continue
 
         try:
-            basis = _load_pressure_basis(_source_unit_basis_path(source_result))
+            basis = _source_unit_basis(source_result)
             z_self, z_self_payload = _basis_self_impedance(
                 mesh_path,
                 args,
@@ -3867,13 +4055,20 @@ def _apply_driver_lem_coupling(
         response_png = out_dir / f"{safe_name}_frequency_response.png"
         impedance_zma = out_dir / f"{safe_name}_impedance.zma"
         excursion_png = out_dir / f"{safe_name}_excursion.png"
-        _write_active_pressure_npz(
-            active_npz,
+        active_basis = _active_pressure_basis(
             basis,
             pressure,
             source_normalization="voltage_driven_driver_lem",
             source_area_m2=source_area_m2,
         )
+        if not args.skip_driver_lem_artifacts:
+            _write_active_pressure_npz(
+                active_npz,
+                basis,
+                pressure,
+                source_normalization="voltage_driven_driver_lem",
+                source_area_m2=source_area_m2,
+            )
         directivity_db = _directivity_from_pressure_array(
             pressure,
             basis.observation_angles_deg,
@@ -3897,47 +4092,50 @@ def _apply_driver_lem_coupling(
             drive_voltage_v=np.asarray(float(args.drive_voltage), dtype=np.float64),
             rg_ohm=np.asarray(float(args.rg_ohm), dtype=np.float64),
             mmd_correction_kg=np.asarray(coupled.mmd_correction_kg, dtype=np.float64),
-        )
-        save_frequency_response_plot(
-            response_png,
-            [
-                FrequencyResponseCurve(
-                    frequencies=basis.frequencies_hz,
-                    spl_db=on_axis_spl_db,
-                    label=f"{matching_name} {args.drive_voltage:g} V",
-                    role=_source_role(matching_name),
-                )
-            ],
-            title=f"{matching_name} Frequency Response",
-            ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
-            mesh_valid_hz=source_result.get("mesh_valid_freq_max_hz"),
-            mesh_valid_radiating_hz=source_result.get("aperture_valid_freq_max_hz"),
-            phase_curves=[
-                (
-                    basis.frequencies_hz,
-                    _phase_deg_from_pressure(pressure[:, 0, on_axis_idx]),
-                    matching_name,
-                    _source_role(matching_name),
-                )
-            ],
-        )
-        _write_zma(
-            impedance_zma,
-            basis.frequencies_hz,
-            coupled.electrical_input_impedance,
-            comment=(
-                f"{matching_name} driver LEM electrical input impedance "
-                f"at {args.drive_voltage:g} V RMS"
-            ),
-        )
+        ) if not args.skip_driver_lem_artifacts else None
+        if not args.skip_per_driver_plots:
+            save_frequency_response_plot(
+                response_png,
+                [
+                    FrequencyResponseCurve(
+                        frequencies=basis.frequencies_hz,
+                        spl_db=on_axis_spl_db,
+                        label=f"{matching_name} {args.drive_voltage:g} V",
+                        role=_source_role(matching_name),
+                    )
+                ],
+                title=f"{matching_name} Frequency Response",
+                ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+                mesh_valid_hz=source_result.get("mesh_valid_freq_max_hz"),
+                mesh_valid_radiating_hz=source_result.get("aperture_valid_freq_max_hz"),
+                phase_curves=[
+                    (
+                        basis.frequencies_hz,
+                        _phase_deg_from_pressure(pressure[:, 0, on_axis_idx]),
+                        matching_name,
+                        _source_role(matching_name),
+                    )
+                ],
+            )
+        if not args.skip_driver_lem_artifacts:
+            _write_zma(
+                impedance_zma,
+                basis.frequencies_hz,
+                coupled.electrical_input_impedance,
+                comment=(
+                    f"{matching_name} driver LEM electrical input impedance "
+                    f"at {args.drive_voltage:g} V RMS"
+                ),
+            )
         xmax_m = float(spec.params["xmax_m"]) if "xmax_m" in spec.params else None
-        _write_excursion_plot(
-            excursion_png,
-            basis.frequencies_hz,
-            coupled.cone_excursion_m,
-            source_name=matching_name,
-            xmax_m=xmax_m,
-        )
+        if not args.skip_driver_lem_artifacts:
+            _write_excursion_plot(
+                excursion_png,
+                basis.frequencies_hz,
+                coupled.cone_excursion_m,
+                source_name=matching_name,
+                xmax_m=xmax_m,
+            )
         excursion_max_idx = int(np.argmax(coupled.cone_excursion_m))
         z_abs = np.abs(coupled.electrical_input_impedance)
         warnings = list(spec.warnings)
@@ -3974,22 +4172,37 @@ def _apply_driver_lem_coupling(
                 "its own BEM self-impedance only"
             ),
             "outputs": {
-                "active_pressure_npz": str(active_npz),
-                "results_npz": str(results_npz),
-                "frequency_response_png": str(response_png),
-                "impedance_zma": str(impedance_zma),
-                "excursion_png": str(excursion_png),
+                **(
+                    {
+                        "active_pressure_npz": str(active_npz),
+                        "results_npz": str(results_npz),
+                        "impedance_zma": str(impedance_zma),
+                        "excursion_png": str(excursion_png),
+                    }
+                    if not args.skip_driver_lem_artifacts
+                    else {}
+                ),
+                **(
+                    {"frequency_response_png": str(response_png)}
+                    if not args.skip_per_driver_plots
+                    else {}
+                ),
             },
         }
         payload["sources"][matching_name] = source_payload
-        source_result["unit_pressure_basis_npz"] = source_result["pressure_basis_npz"]
-        source_result["active_pressure_basis_npz"] = str(active_npz)
-        source_result["frequency_response_png"] = str(response_png)
+        if source_result.get("pressure_basis_npz"):
+            source_result["unit_pressure_basis_npz"] = source_result["pressure_basis_npz"]
+        source_result["_active_pressure_basis"] = active_basis
+        if not args.skip_driver_lem_artifacts:
+            source_result["active_pressure_basis_npz"] = str(active_npz)
+        if not args.skip_per_driver_plots:
+            source_result["frequency_response_png"] = str(response_png)
         source_result["on_axis_spl_db"] = on_axis_spl_db
         source_result["driver_lem"] = source_payload
-        source_result["driver_lem_results_npz"] = str(results_npz)
-        source_result["driver_lem_impedance_zma"] = str(impedance_zma)
-        source_result["driver_lem_excursion_png"] = str(excursion_png)
+        if not args.skip_driver_lem_artifacts:
+            source_result["driver_lem_results_npz"] = str(results_npz)
+            source_result["driver_lem_impedance_zma"] = str(impedance_zma)
+            source_result["driver_lem_excursion_png"] = str(excursion_png)
     return payload
 
 
@@ -4053,8 +4266,8 @@ def _solve_passive_cardioid_mf(
             "available_sources": [str(result["name"]) for result in source_results],
         }
 
-    mf_basis = _load_pressure_basis(_source_unit_basis_path(by_name[mf_name]))
-    port_basis = _load_pressure_basis(_source_unit_basis_path(by_name[port_name]))
+    mf_basis = _source_unit_basis(by_name[mf_name])
+    port_basis = _source_unit_basis(by_name[port_name])
     try:
         _assert_matching_basis_grid(mf_basis, port_basis)
     except ValueError as exc:
@@ -4736,50 +4949,64 @@ def _write_one_source_outputs(
             source_tag,
             mesh_scale=float(args.mesh_scale),
         )
-    _write_pressure_basis_npz(
-        basis_npz,
+    pressure_basis = _pressure_basis_from_result(
         result,
         source_name=source_name,
         source_tag=source_tag,
         source_area_m2=source_area_m2,
     )
-    save_directivity_plot(
-        heatmap_png,
-        result.frequencies_hz,
-        _result_directivity_payload(result),
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
-    save_frequency_response_plot(
-        response_png,
-        [
-            FrequencyResponseCurve(
-                frequencies=result.frequencies_hz,
-                spl_db=on_axis_spl_db,
-                label=source_name,
-                role=_source_role(source_name),
-            )
-        ],
-        title=f"{source_name} Frequency Response",
-        ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-        phase_curves=[
-            (
-                result.frequencies_hz,
-                _phase_deg_from_pressure(pressure_engineering[:, 0, on_axis_idx]),
-                source_name,
-                _source_role(source_name),
-            )
-        ],
-    )
+    if _write_pressure_basis_for_run(args):
+        _write_pressure_basis_npz(
+            basis_npz,
+            result,
+            source_name=source_name,
+            source_tag=source_tag,
+            source_area_m2=source_area_m2,
+        )
+    else:
+        basis_npz = None
+    if not args.skip_per_driver_plots:
+        save_directivity_plot(
+            heatmap_png,
+            result.frequencies_hz,
+            _result_directivity_payload(result),
+            mesh_valid_hz=mesh_valid_hz,
+            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        )
+        save_frequency_response_plot(
+            response_png,
+            [
+                FrequencyResponseCurve(
+                    frequencies=result.frequencies_hz,
+                    spl_db=on_axis_spl_db,
+                    label=source_name,
+                    role=_source_role(source_name),
+                )
+            ],
+            title=f"{source_name} Frequency Response",
+            ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+            mesh_valid_hz=mesh_valid_hz,
+            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+            phase_curves=[
+                (
+                    result.frequencies_hz,
+                    _phase_deg_from_pressure(pressure_engineering[:, 0, on_axis_idx]),
+                    source_name,
+                    _source_role(source_name),
+                )
+            ],
+        )
     return {
         "name": source_name,
         "tag": source_tag,
         "results_json": str(result_json),
-        "pressure_basis_npz": str(basis_npz),
-        "directivity_heatmap_png": str(heatmap_png),
-        "frequency_response_png": str(response_png),
+        "pressure_basis_npz": str(basis_npz) if basis_npz is not None else None,
+        "directivity_heatmap_png": (
+            str(heatmap_png) if not args.skip_per_driver_plots else None
+        ),
+        "frequency_response_png": (
+            str(response_png) if not args.skip_per_driver_plots else None
+        ),
         "freq_max_hz": float(args.freq_max_hz if freq_max_hz is None else freq_max_hz),
         "mesh_valid_freq_max_hz": None if mesh_valid_hz is None else float(mesh_valid_hz),
         "aperture_valid_freq_max_hz": (
@@ -4789,6 +5016,7 @@ def _write_one_source_outputs(
         "on_axis_spl_db": on_axis_spl_db,
         "timings": result.timings,
         "source_area_m2": source_area_m2,
+        "_pressure_basis": pressure_basis,
     }
 
 
@@ -4854,49 +5082,54 @@ def _write_one_source_derived_outputs_from_basis(
             "postprocess_only_regenerated": True,
         },
     )
-    save_directivity_plot(
-        heatmap_png,
-        basis.frequencies_hz,
-        _directivity_payload_from_arrays(
-            basis.observation_angles_deg,
-            basis.observation_planes,
-            directivity_db,
-        ),
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
-    save_frequency_response_plot(
-        response_png,
-        [
-            FrequencyResponseCurve(
-                frequencies=basis.frequencies_hz,
-                spl_db=on_axis_spl_db,
-                label=source_name,
-                role=_source_role(source_name),
-            )
-        ],
-        title=f"{source_name} Frequency Response",
-        ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-        phase_curves=[
-            (
-                basis.frequencies_hz,
-                _phase_deg_from_pressure(
-                    basis.pressure_complex[:, 0, on_axis_idx]
-                ),
-                source_name,
-                _source_role(source_name),
-            )
-        ],
-    )
+    if not args.skip_per_driver_plots:
+        save_directivity_plot(
+            heatmap_png,
+            basis.frequencies_hz,
+            _directivity_payload_from_arrays(
+                basis.observation_angles_deg,
+                basis.observation_planes,
+                directivity_db,
+            ),
+            mesh_valid_hz=mesh_valid_hz,
+            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        )
+        save_frequency_response_plot(
+            response_png,
+            [
+                FrequencyResponseCurve(
+                    frequencies=basis.frequencies_hz,
+                    spl_db=on_axis_spl_db,
+                    label=source_name,
+                    role=_source_role(source_name),
+                )
+            ],
+            title=f"{source_name} Frequency Response",
+            ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+            mesh_valid_hz=mesh_valid_hz,
+            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+            phase_curves=[
+                (
+                    basis.frequencies_hz,
+                    _phase_deg_from_pressure(
+                        basis.pressure_complex[:, 0, on_axis_idx]
+                    ),
+                    source_name,
+                    _source_role(source_name),
+                )
+            ],
+        )
     return {
         "name": source_name,
         "tag": source_tag,
         "results_json": str(result_json),
         "pressure_basis_npz": str(basis_path),
-        "directivity_heatmap_png": str(heatmap_png),
-        "frequency_response_png": str(response_png),
+        "directivity_heatmap_png": (
+            str(heatmap_png) if not args.skip_per_driver_plots else None
+        ),
+        "frequency_response_png": (
+            str(response_png) if not args.skip_per_driver_plots else None
+        ),
         "freq_max_hz": float(basis.frequencies_hz[-1]),
         "mesh_valid_freq_max_hz": None if mesh_valid_hz is None else float(mesh_valid_hz),
         "aperture_valid_freq_max_hz": (
@@ -4907,6 +5140,7 @@ def _write_one_source_derived_outputs_from_basis(
         "timings": previous_payload.get("timings", {}),
         "source_area_m2": basis.source_area_m2,
         "postprocess_only": True,
+        "_pressure_basis": basis,
     }
 
 
@@ -4994,6 +5228,7 @@ _RADIATION_PAYLOAD_FROM_SOLVER = object()
 def _apply_post_solve_derived_outputs(
     mesh_path: Path,
     out_dir: Path,
+    layout: SolverOutputLayout,
     args: argparse.Namespace,
     *,
     manifest: dict[str, Any],
@@ -5012,7 +5247,7 @@ def _apply_post_solve_derived_outputs(
     source_results.sort(key=lambda entry: source_index_by_name.get(entry["name"], 9999))
     driver_lem_payload = _apply_driver_lem_coupling(
         mesh_path,
-        out_dir,
+        layout.driver_lem_dir,
         args,
         source_results=source_results,
     )
@@ -5044,35 +5279,38 @@ def _apply_post_solve_derived_outputs(
                 ] = outputs["active_pressure_npz"]
 
     active_bases_by_name: dict[str, PressureBasis] = {}
-    for source in source_results:
-        source_name = str(source["name"])
-        basis = _load_pressure_basis(_source_active_basis_path(source))
-        active_bases_by_name[source_name] = basis
-        derived_outputs = _write_pressure_grid_derived_artifacts(
-            out_dir,
-            _safe_stem(source_name),
-            label=source_name,
-            frequencies_hz=basis.frequencies_hz,
-            angles_deg=basis.observation_angles_deg,
-            planes=basis.observation_planes,
-            pressure_complex=basis.pressure_complex,
-            polar_distance_m=float(args.polar_distance_m),
-            mesh_valid_hz=source.get("mesh_valid_freq_max_hz"),
-            mesh_valid_radiating_hz=source.get("aperture_valid_freq_max_hz"),
-        )
-        source.update(
-            {
-                "directivity_power_png": derived_outputs["directivity_power_png"],
-                "directivity_power_csv": derived_outputs["directivity_power_csv"],
-                "directivity_power_json": derived_outputs["directivity_power_json"],
-                "beamwidth_png": derived_outputs["beamwidth_png"],
-                "beamwidth_csv": derived_outputs["beamwidth_csv"],
-                "beamwidth_json": derived_outputs["beamwidth_json"],
-                "group_delay_png": derived_outputs["group_delay_png"],
-                "group_delay_csv": derived_outputs["group_delay_csv"],
-                "group_delay_json": derived_outputs["group_delay_json"],
-            }
-        )
+    basis_required = _pressure_basis_required_for_selected_outputs(args)
+    if basis_required:
+        for source in source_results:
+            source_name = str(source["name"])
+            basis = _source_active_basis(source)
+            active_bases_by_name[source_name] = basis
+            if not args.skip_derived_acoustics:
+                derived_outputs = _write_pressure_grid_derived_artifacts(
+                    layout.derived_dir,
+                    _safe_stem(source_name),
+                    label=source_name,
+                    frequencies_hz=basis.frequencies_hz,
+                    angles_deg=basis.observation_angles_deg,
+                    planes=basis.observation_planes,
+                    pressure_complex=basis.pressure_complex,
+                    polar_distance_m=float(args.polar_distance_m),
+                    mesh_valid_hz=source.get("mesh_valid_freq_max_hz"),
+                    mesh_valid_radiating_hz=source.get("aperture_valid_freq_max_hz"),
+                )
+                source.update(
+                    {
+                        "directivity_power_png": derived_outputs["directivity_power_png"],
+                        "directivity_power_csv": derived_outputs["directivity_power_csv"],
+                        "directivity_power_json": derived_outputs["directivity_power_json"],
+                        "beamwidth_png": derived_outputs["beamwidth_png"],
+                        "beamwidth_csv": derived_outputs["beamwidth_csv"],
+                        "beamwidth_json": derived_outputs["beamwidth_json"],
+                        "group_delay_png": derived_outputs["group_delay_png"],
+                        "group_delay_csv": derived_outputs["group_delay_csv"],
+                        "group_delay_json": derived_outputs["group_delay_json"],
+                    }
+                )
     response_curves = [
         FrequencyResponseCurve(
             frequencies=source_result["frequencies_hz"],
@@ -5088,65 +5326,74 @@ def _apply_post_solve_derived_outputs(
     combined_aperture_valid_hz = (
         min(source_aperture_valid.values()) if source_aperture_valid else None
     )
-    response_png = out_dir / "combined_frequency_response.png"
-    save_frequency_response_plot(
-        response_png,
-        response_curves,
-        title="Fusion WG Metal Direct Source Responses",
-        ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
-        mesh_valid_hz=combined_mesh_valid_hz,
-        mesh_valid_radiating_hz=combined_aperture_valid_hz,
-        phase_curves=[
-            (
-                basis.frequencies_hz,
-                _phase_deg_from_pressure(
-                    basis.pressure_complex[
-                        :,
-                        0,
-                        int(np.argmin(np.abs(basis.observation_angles_deg))),
-                    ]
-                ),
-                name,
-                _source_role(name),
-            )
-            for name, basis in active_bases_by_name.items()
-        ],
-    )
-    manifest["sources"] = source_results
-    manifest["outputs"]["combined_frequency_response_png"] = str(response_png)
+    response_png = layout.combined_dir / "combined_frequency_response.png"
+    if not args.skip_combined_set:
+        save_frequency_response_plot(
+            response_png,
+            response_curves,
+            title="Fusion WG Metal Direct Source Responses",
+            ylabel=f"On-axis SPL at {args.polar_distance_m:g} m [dB]",
+            mesh_valid_hz=combined_mesh_valid_hz,
+            mesh_valid_radiating_hz=combined_aperture_valid_hz,
+            phase_curves=[
+                (
+                    basis.frequencies_hz,
+                    _phase_deg_from_pressure(
+                        basis.pressure_complex[
+                            :,
+                            0,
+                            int(np.argmin(np.abs(basis.observation_angles_deg))),
+                        ]
+                    ),
+                    name,
+                    _source_role(name),
+                )
+                for name, basis in active_bases_by_name.items()
+            ],
+        )
+    manifest["sources"] = [
+        _public_source_result(source_result) for source_result in source_results
+    ]
+    if not args.skip_combined_set:
+        manifest["outputs"]["combined_frequency_response_png"] = str(response_png)
     manifest["outputs"]["source_frequency_response_pngs"] = {
-        source["name"]: source["frequency_response_png"] for source in source_results
+        source["name"]: source["frequency_response_png"]
+        for source in source_results
+        if source.get("frequency_response_png")
     }
     manifest["outputs"]["source_pressure_basis_npzs"] = {
-        source["name"]: source["pressure_basis_npz"] for source in source_results
+        source["name"]: source["pressure_basis_npz"]
+        for source in source_results
+        if source.get("pressure_basis_npz")
     }
-    manifest["outputs"]["source_directivity_power_pngs"] = {
-        source["name"]: source["directivity_power_png"] for source in source_results
-    }
-    manifest["outputs"]["source_directivity_power_csvs"] = {
-        source["name"]: source["directivity_power_csv"] for source in source_results
-    }
-    manifest["outputs"]["source_directivity_power_jsons"] = {
-        source["name"]: source["directivity_power_json"] for source in source_results
-    }
-    manifest["outputs"]["source_beamwidth_pngs"] = {
-        source["name"]: source["beamwidth_png"] for source in source_results
-    }
-    manifest["outputs"]["source_beamwidth_csvs"] = {
-        source["name"]: source["beamwidth_csv"] for source in source_results
-    }
-    manifest["outputs"]["source_beamwidth_jsons"] = {
-        source["name"]: source["beamwidth_json"] for source in source_results
-    }
-    manifest["outputs"]["source_group_delay_pngs"] = {
-        source["name"]: source["group_delay_png"] for source in source_results
-    }
-    manifest["outputs"]["source_group_delay_csvs"] = {
-        source["name"]: source["group_delay_csv"] for source in source_results
-    }
-    manifest["outputs"]["source_group_delay_jsons"] = {
-        source["name"]: source["group_delay_json"] for source in source_results
-    }
+    if not args.skip_derived_acoustics:
+        manifest["outputs"]["source_directivity_power_pngs"] = {
+            source["name"]: source["directivity_power_png"] for source in source_results
+        }
+        manifest["outputs"]["source_directivity_power_csvs"] = {
+            source["name"]: source["directivity_power_csv"] for source in source_results
+        }
+        manifest["outputs"]["source_directivity_power_jsons"] = {
+            source["name"]: source["directivity_power_json"] for source in source_results
+        }
+        manifest["outputs"]["source_beamwidth_pngs"] = {
+            source["name"]: source["beamwidth_png"] for source in source_results
+        }
+        manifest["outputs"]["source_beamwidth_csvs"] = {
+            source["name"]: source["beamwidth_csv"] for source in source_results
+        }
+        manifest["outputs"]["source_beamwidth_jsons"] = {
+            source["name"]: source["beamwidth_json"] for source in source_results
+        }
+        manifest["outputs"]["source_group_delay_pngs"] = {
+            source["name"]: source["group_delay_png"] for source in source_results
+        }
+        manifest["outputs"]["source_group_delay_csvs"] = {
+            source["name"]: source["group_delay_csv"] for source in source_results
+        }
+        manifest["outputs"]["source_group_delay_jsons"] = {
+            source["name"]: source["group_delay_json"] for source in source_results
+        }
     active_basis_npzs = {
         source["name"]: source["active_pressure_basis_npz"]
         for source in source_results
@@ -5160,7 +5407,7 @@ def _apply_post_solve_derived_outputs(
         mf_override_kind: str,
     ) -> dict[str, Any] | None:
         crossover_payload = _write_crossover_alignment_outputs(
-            out_dir,
+            layout.combined_dir,
             source_results,
             lf_mf_hz=args.crossover_lf_mf_hz,
             mf_hf_hz=args.crossover_mf_hf_hz,
@@ -5169,6 +5416,7 @@ def _apply_post_solve_derived_outputs(
             mesh_valid_radiating_hz=combined_aperture_valid_hz,
             mf_override_npz=mf_override_npz,
             mf_override_kind=mf_override_kind,
+            derived_dir=None if args.skip_derived_acoustics else layout.derived_dir,
         )
         if crossover_payload is not None:
             manifest["crossover_alignment"] = crossover_payload
@@ -5177,7 +5425,9 @@ def _apply_post_solve_derived_outputs(
                 manifest["outputs"].update(outputs)
         return crossover_payload
 
-    active_crossover_payload = _run_crossover_sum(None, "direct")
+    active_crossover_payload = None
+    if not args.skip_combined_set:
+        active_crossover_payload = _run_crossover_sum(None, "direct")
     _update_manifest(
         manifest_path,
         manifest,
@@ -5194,10 +5444,17 @@ def _apply_post_solve_derived_outputs(
             for name, tag in sources
             if name.strip().upper() == wanted_mf
         ]
-    if radiation_payload_override is _RADIATION_PAYLOAD_FROM_SOLVER:
+    if args.skip_radiation_impedance:
+        radiation_payload = None
+        if port_exit_apertures:
+            manifest["radiation_impedance"] = {
+                "status": "skipped",
+                "reason": "disabled by --skip-radiation-impedance",
+            }
+    elif radiation_payload_override is _RADIATION_PAYLOAD_FROM_SOLVER:
         radiation_payload = _solve_port_exit_radiation_impedance_matrix(
             mesh_path,
-            out_dir,
+            layout.sources_dir,
             args,
             apertures=port_exit_apertures,
             frame=frame,
@@ -5215,13 +5472,21 @@ def _apply_post_solve_derived_outputs(
             manifest["outputs"]["port_exit_radiation_impedance_summary_json"] = (
                 outputs["summary_json"]
             )
-    passive_payload = _solve_passive_cardioid_mf(
-        mesh_path,
-        out_dir,
-        args,
-        source_results=source_results,
-        radiation_payload=radiation_payload,
-    )
+    passive_payload = None
+    if args.skip_passive_cardioid_set:
+        if args.passive_cardioid_mf:
+            passive_payload = {
+                "status": "skipped",
+                "reason": "disabled by --skip-passive-cardioid-set",
+            }
+    else:
+        passive_payload = _solve_passive_cardioid_mf(
+            mesh_path,
+            layout.cardioid_dir,
+            args,
+            source_results=source_results,
+            radiation_payload=radiation_payload,
+        )
     if passive_payload is not None:
         manifest["passive_cardioid"] = passive_payload
         outputs = passive_payload.get("outputs", {})
@@ -5257,7 +5522,11 @@ def _apply_post_solve_derived_outputs(
     ):
         override = _preferred_passive_cardioid_results(passive_payload)
         if override is not None:
-            override_payload = _run_crossover_sum(*override)
+            override_payload = (
+                _run_crossover_sum(*override)
+                if not args.skip_combined_set
+                else None
+            )
             if (
                 isinstance(override_payload, dict)
                 and override_payload.get("status") == "complete"
@@ -5289,13 +5558,18 @@ def _manifest_path_in_run(
     fallback_name: str,
 ) -> Path:
     candidates: list[Path] = []
+    category_dirs = ("sources", "combined", "cardioid", "driver-lem", "derived")
     if value:
         path = Path(str(value))
         candidates.append(path)
         if not path.is_absolute():
             candidates.append(out_dir / path)
         candidates.append(out_dir / path.name)
+        for dirname in category_dirs:
+            candidates.append(out_dir / dirname / path.name)
     candidates.append(out_dir / fallback_name)
+    for dirname in category_dirs:
+        candidates.append(out_dir / dirname / fallback_name)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -5371,8 +5645,12 @@ def _load_existing_radiation_payload(
                 )
             rebuilt["outputs"] = rebuilt_outputs
             return rebuilt
-    summary_path = out_dir / "port_exit_radiation_impedance_matrix.summary.json"
-    if summary_path.exists():
+    for summary_path in (
+        out_dir / "port_exit_radiation_impedance_matrix.summary.json",
+        out_dir / "sources" / "port_exit_radiation_impedance_matrix.summary.json",
+    ):
+        if not summary_path.exists():
+            continue
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
         outputs = payload.setdefault("outputs", {})
         outputs["npz"] = str(
@@ -5385,16 +5663,19 @@ def _load_existing_radiation_payload(
         outputs["summary_json"] = str(summary_path)
         if Path(outputs["npz"]).exists():
             return payload
-    npz_path = out_dir / "port_exit_radiation_impedance_matrix.npz"
-    if npz_path.exists():
-        return {
-            "status": "complete",
-            "type": "port_exit_radiation_impedance_matrix",
-            "outputs": {
-                "npz": str(npz_path),
-                "summary_json": str(summary_path),
-            },
-        }
+    for npz_path in (
+        out_dir / "port_exit_radiation_impedance_matrix.npz",
+        out_dir / "sources" / "port_exit_radiation_impedance_matrix.npz",
+    ):
+        if npz_path.exists():
+            return {
+                "status": "complete",
+                "type": "port_exit_radiation_impedance_matrix",
+                "outputs": {
+                    "npz": str(npz_path),
+                    "summary_json": str(npz_path.with_suffix(".summary.json")),
+                },
+            }
     if required:
         raise RuntimeError(
             "postprocess-only requires existing "
@@ -5421,9 +5702,29 @@ def _update_pipeline_summary_manifests(out_dir: Path, direct_manifest: dict[str,
             _write_json(path, payload)
 
 
+def _finalize_run_report(
+    out_dir: Path,
+    args: argparse.Namespace,
+    *,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+) -> None:
+    if args.no_run_report or manifest.get("status") != "complete":
+        return
+    report_path = out_dir / "report.html"
+    manifest.setdefault("outputs", {})["report_html"] = str(report_path)
+    _write_json(manifest_path, manifest)
+    report_payload = _render_run_report(out_dir)
+    if report_payload is not None:
+        manifest["report"] = report_payload
+        manifest.setdefault("outputs", {})["report_html"] = str(report_path)
+        _write_json(manifest_path, manifest)
+
+
 def _run_postprocess_only(
     mesh_path: Path,
     out_dir: Path,
+    layout: SolverOutputLayout,
     args: argparse.Namespace,
     *,
     manifest: dict[str, Any],
@@ -5462,7 +5763,7 @@ def _run_postprocess_only(
         source_results.append(
             _write_one_source_derived_outputs_from_basis(
                 basis_path,
-                out_dir,
+                layout.sources_dir,
                 args,
                 source_name=source_name,
                 source_tag=source_tag,
@@ -5484,15 +5785,20 @@ def _run_postprocess_only(
     # combine skipped instead), so postprocess-only must mirror that skip
     # rather than demand a file the original run never wrote.
     radiation_required = bool(port_exit_apertures)
-    radiation_payload = _load_existing_radiation_payload(
-        out_dir,
-        direct_manifest=direct_manifest,
-        final_manifest=final_manifest,
-        required=radiation_required,
-    )
+    if args.skip_radiation_impedance:
+        radiation_required = False
+    radiation_payload = None
+    if not args.skip_radiation_impedance:
+        radiation_payload = _load_existing_radiation_payload(
+            out_dir,
+            direct_manifest=direct_manifest,
+            final_manifest=final_manifest,
+            required=radiation_required,
+        )
     _apply_post_solve_derived_outputs(
         mesh_path,
         out_dir,
+        layout,
         args,
         manifest=manifest,
         manifest_path=manifest_path,
@@ -5593,6 +5899,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "passive-cardioid combined MF when that combine runs."
         ),
     )
+    parser.add_argument("--skip-per-driver-plots", action="store_true")
+    parser.add_argument("--skip-combined-set", action="store_true")
+    parser.add_argument("--skip-passive-cardioid-set", action="store_true")
+    parser.add_argument("--skip-driver-lem-artifacts", action="store_true")
+    parser.add_argument("--skip-derived-acoustics", action="store_true")
+    parser.add_argument("--skip-radiation-impedance", action="store_true")
+    parser.add_argument("--skip-pressure-bases", action="store_true")
+    parser.add_argument("--no-run-report", action="store_true")
     parser.add_argument("--mesh-scale", type=float, default=0.001)
     parser.add_argument(
         "--native-symmetry-plane",
@@ -5727,6 +6041,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"mesh not found: {mesh_path}")
     previous_direct_manifest = _read_json_if_exists(out_dir / "direct_solve_manifest.json")
     previous_final_manifest = _read_json_if_exists(out_dir / "final_summary_manifest.json")
+    layout = SolverOutputLayout(
+        out_dir,
+        layout_version=_layout_version_for_run(
+            postprocess_only=bool(args.postprocess_only),
+            previous_direct_manifest=previous_direct_manifest,
+            previous_final_manifest=previous_final_manifest,
+        ),
+    )
+    layout.ensure_dirs()
     sources = _split_sources(args.source)
     if args.postprocess_only and not sources:
         sources = _sources_from_previous_manifests(
@@ -5799,6 +6122,8 @@ def main(argv: list[str] | None = None) -> int:
         "started_at": started_at,
         "mesh": str(mesh_path),
         "output_dir": str(out_dir),
+        "layout_version": layout.layout_version,
+        "layout": layout.manifest_payload(),
         "dry_run": bool(args.dry_run),
         "postprocess_only": bool(args.postprocess_only),
         "frame": {
@@ -5850,6 +6175,18 @@ def main(argv: list[str] | None = None) -> int:
                     name: value
                     for name, value in args.driver_rear_volume_l_by_name.items()
                 },
+            },
+            "outputs": {
+                "per_driver_plots": not bool(args.skip_per_driver_plots),
+                "combined_set": not bool(args.skip_combined_set),
+                "passive_cardioid_set": not bool(args.skip_passive_cardioid_set),
+                "driver_lem_artifacts": not bool(args.skip_driver_lem_artifacts),
+                "derived_acoustics": not bool(args.skip_derived_acoustics),
+                "vituixcad_export": bool(args.export_vituixcad),
+                "radiation_impedance": not bool(args.skip_radiation_impedance),
+                "pressure_bases": _write_pressure_basis_for_run(args),
+                "pressure_bases_requested": not bool(args.skip_pressure_bases),
+                "run_report": not bool(args.no_run_report),
             },
             "passive_cardioid": {
                 "enabled": bool(args.passive_cardioid_mf),
@@ -5908,6 +6245,7 @@ def main(argv: list[str] | None = None) -> int:
             _run_postprocess_only(
                 mesh_path,
                 out_dir,
+                layout,
                 args,
                 manifest=manifest,
                 manifest_path=manifest_path,
@@ -5931,6 +6269,12 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
             _write_json(manifest_path, manifest)
+            _finalize_run_report(
+                out_dir,
+                args,
+                manifest=manifest,
+                manifest_path=manifest_path,
+            )
             if manifest.get("status") == "complete":
                 _update_pipeline_summary_manifests(out_dir, manifest)
         print(json.dumps(_jsonable(manifest), indent=2, sort_keys=True))
@@ -5995,7 +6339,7 @@ def main(argv: list[str] | None = None) -> int:
                 group_results = [
                     _solve_one_source(
                         mesh_path,
-                        out_dir,
+                        layout.sources_dir,
                         args,
                         source_name=source_name,
                         source_tag=source_tag,
@@ -6013,7 +6357,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 group_results = _solve_source_group(
                     mesh_path,
-                    out_dir,
+                    layout.sources_dir,
                     args,
                     group=group,
                     frame=frame,
@@ -6060,6 +6404,7 @@ def main(argv: list[str] | None = None) -> int:
         _apply_post_solve_derived_outputs(
             mesh_path,
             out_dir,
+            layout,
             args,
             manifest=manifest,
             manifest_path=manifest_path,
@@ -6085,6 +6430,12 @@ def main(argv: list[str] | None = None) -> int:
             lock_file.close()
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _write_json(manifest_path, manifest)
+        _finalize_run_report(
+            out_dir,
+            args,
+            manifest=manifest,
+            manifest_path=manifest_path,
+        )
 
     print(json.dumps(_jsonable(manifest), indent=2, sort_keys=True))
     return returncode

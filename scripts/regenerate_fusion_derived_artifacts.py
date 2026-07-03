@@ -42,16 +42,20 @@ def _is_keyless_pressure_basis(path: Path) -> bool:
 
 
 def _has_keyless_pressure_basis(run_dir: Path) -> bool:
-    return any(_is_keyless_pressure_basis(path) for path in run_dir.glob("*_pressure_basis.npz"))
+    return any(_is_keyless_pressure_basis(path) for path in run_dir.rglob("*_pressure_basis.npz"))
 
 
 def _has_derived_artifacts(run_dir: Path) -> bool:
     if any((run_dir / name).exists() for name in DERIVED_MARKERS):
         return True
+    for folder in ("combined", "cardioid", "derived"):
+        if any((run_dir / folder / name).exists() for name in DERIVED_MARKERS):
+            return True
     if (run_dir / "vituixcad").is_dir():
         return True
-    return any(run_dir.glob("*_frequency_response.png")) or any(
-        run_dir.glob("*_directivity_heatmap.png")
+    return (
+        any(run_dir.rglob("*_frequency_response.png"))
+        or any(run_dir.rglob("*_directivity_heatmap.png"))
     )
 
 

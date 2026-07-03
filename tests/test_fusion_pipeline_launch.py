@@ -297,8 +297,60 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--skip-missing-sources" in cmd
     assert "--notify" in cmd
     assert "--open-output-folder" in cmd
+    assert "--open-report" not in cmd
     assert "--open-wg" not in cmd
     assert "--allow-underresolved-solve" not in cmd
+    assert "--skip-per-driver-plots" not in cmd
+    assert "--skip-combined-set" not in cmd
+    assert "--skip-passive-cardioid-set" not in cmd
+    assert "--skip-driver-lem-artifacts" not in cmd
+    assert "--skip-derived-acoustics" not in cmd
+    assert "--skip-radiation-impedance" not in cmd
+    assert "--skip-pressure-bases" not in cmd
+    assert "--no-run-report" not in cmd
+
+
+def test_build_pipeline_command_forwards_output_skip_flags():
+    helper = _load_helper()
+    pipeline = _load_pipeline()
+
+    cmd = _helper_command(
+        helper,
+        open_report=True,
+        output_per_driver_plots=False,
+        output_combined_set=False,
+        output_passive_cardioid_set=False,
+        output_driver_lem_artifacts=False,
+        output_derived_acoustics=False,
+        output_radiation_impedance=False,
+        output_pressure_bases=False,
+        output_run_report=False,
+    )
+    args = pipeline.parse_args(cmd[2:])
+
+    assert "--open-report" in cmd
+    expected = {
+        "--skip-per-driver-plots",
+        "--skip-combined-set",
+        "--skip-passive-cardioid-set",
+        "--skip-driver-lem-artifacts",
+        "--skip-derived-acoustics",
+        "--skip-radiation-impedance",
+        "--skip-pressure-bases",
+        "--no-run-report",
+    }
+    assert expected <= set(cmd)
+    forwarded = {option for option, _attr in pipeline.OUTPUT_SKIP_FORWARD_OPTIONS}
+    assert expected == forwarded
+    assert args.open_report is True
+    assert args.skip_per_driver_plots is True
+    assert args.skip_combined_set is True
+    assert args.skip_passive_cardioid_set is True
+    assert args.skip_driver_lem_artifacts is True
+    assert args.skip_derived_acoustics is True
+    assert args.skip_radiation_impedance is True
+    assert args.skip_pressure_bases is True
+    assert args.no_run_report is True
 
 
 def test_build_pipeline_command_can_request_plot_theme():
@@ -927,6 +979,60 @@ def test_pipeline_orders_direct_solve_sources_hf_mf_lf(tmp_path, monkeypatch):
         "LF:20:2",
         "PORT_EXIT:8:10",
     ]
+
+
+def test_pipeline_forwards_output_skip_flags_to_direct_solve(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "wg_source_meshes_m": {},
+        "solver_ready": True,
+        "symmetry_planes": ["x0", "y0"],
+        "mesh_frequency_validation": {
+            "status": "valid",
+            "requested_max_frequency_hz": 2000.0,
+            "max_valid_frequency_hz": 3000.0,
+            "per_source": {
+                "HF": {"max_valid_frequency_hz": 3000.0, "status": "valid"},
+            },
+            "warnings": [],
+        },
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(calls, prep_manifest_payload=prep_manifest),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--freq-max-hz",
+            "2000",
+            "--run-solves",
+            "--skip-per-driver-plots",
+            "--skip-combined-set",
+            "--skip-passive-cardioid-set",
+            "--skip-driver-lem-artifacts",
+            "--skip-derived-acoustics",
+            "--skip-radiation-impedance",
+            "--skip-pressure-bases",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 0
+    solve_cmd = calls[-1][1]
+    for option, _attr in pipeline.OUTPUT_SKIP_FORWARD_OPTIONS:
+        assert option in solve_cmd
 
 
 def test_pipeline_forwards_plot_theme_to_direct_solve(tmp_path, monkeypatch):
@@ -1991,6 +2097,16 @@ def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     assert metadata["expected_paths"]["pipeline_manifest"].endswith(
         "fusion_wg_pipeline_manifest.json"
     )
+    assert metadata["expected_paths"]["combined_time_aligned_frequency_response_png"].endswith(
+        "combined/combined_frequency_response_time_aligned.png"
+    )
+    assert metadata["expected_paths"]["driver_time_alignment_txt"].endswith(
+        "combined/driver_time_alignment.txt"
+    )
+    assert metadata["expected_paths"]["port_exit_radiation_impedance_npz"].endswith(
+        "sources/port_exit_radiation_impedance_matrix.npz"
+    )
+    assert metadata["expected_paths"]["run_report_html"].endswith("report.html")
     json.dumps(metadata)
 
 

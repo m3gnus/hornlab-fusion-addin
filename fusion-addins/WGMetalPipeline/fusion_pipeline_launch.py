@@ -471,6 +471,7 @@ def build_pipeline_command(
     mesh_only: bool,
     open_wg: bool,
     open_output: bool,
+    open_report: bool = False,
     plot_theme: str = "hornlab",
     crossover_lf_mf_hz: str | None = None,
     crossover_mf_hf_hz: str | None = None,
@@ -483,6 +484,14 @@ def build_pipeline_command(
     underresolved_solve_policy: str = "warn",
     show_mesh_valid_markers: bool = True,
     export_vituixcad: bool = False,
+    output_per_driver_plots: bool = True,
+    output_combined_set: bool = True,
+    output_passive_cardioid_set: bool = True,
+    output_driver_lem_artifacts: bool = True,
+    output_derived_acoustics: bool = True,
+    output_radiation_impedance: bool = True,
+    output_pressure_bases: bool = True,
+    output_run_report: bool = True,
     notify: bool = True,
     bem_formulation: str = "complex_k",
     complex_k_shift: str = "0.005",
@@ -576,6 +585,8 @@ def build_pipeline_command(
         cmd.append("--open-wg")
     if open_output:
         cmd.append("--open-output-folder")
+    if open_report:
+        cmd.append("--open-report")
     if skip_missing_sources:
         cmd.append("--skip-missing-sources")
     if allow_underresolved_solve:
@@ -586,6 +597,22 @@ def build_pipeline_command(
         cmd.append("--no-mesh-valid-markers")
     if export_vituixcad:
         cmd.append("--export-vituixcad")
+    if not output_per_driver_plots:
+        cmd.append("--skip-per-driver-plots")
+    if not output_combined_set:
+        cmd.append("--skip-combined-set")
+    if not output_passive_cardioid_set:
+        cmd.append("--skip-passive-cardioid-set")
+    if not output_driver_lem_artifacts:
+        cmd.append("--skip-driver-lem-artifacts")
+    if not output_derived_acoustics:
+        cmd.append("--skip-derived-acoustics")
+    if not output_radiation_impedance:
+        cmd.append("--skip-radiation-impedance")
+    if not output_pressure_bases:
+        cmd.append("--skip-pressure-bases")
+    if not output_run_report:
+        cmd.append("--no-run-report")
     for name, raw_payload in (
         ("LF", lf_driver_lem),
         ("MF", mf_driver_lem),
@@ -737,6 +764,8 @@ def mirror_axes_for_symmetry_planes(symmetry_planes: str) -> str:
 
 def expected_pipeline_paths(out_dir: Path) -> dict[str, Any]:
     logs_dir = out_dir / "logs"
+    sources_dir = out_dir / "sources"
+    combined_dir = out_dir / "combined"
     return {
         "logs_dir": str(logs_dir),
         "launcher_stdout": str(logs_dir / "fusion_step_to_wg_pipeline.stdout.log"),
@@ -753,21 +782,22 @@ def expected_pipeline_paths(out_dir: Path) -> dict[str, Any]:
         "orientation_report": str(out_dir / "orientation_report.json"),
         "direct_solve_manifest": str(out_dir / "direct_solve_manifest.json"),
         "combined_time_aligned_frequency_response_png": str(
-            out_dir / "combined_frequency_response_time_aligned.png"
+            combined_dir / "combined_frequency_response_time_aligned.png"
         ),
         "combined_time_aligned_directivity_heatmap_png": str(
-            out_dir / "combined_directivity_heatmap_time_aligned.png"
+            combined_dir / "combined_directivity_heatmap_time_aligned.png"
         ),
         "combined_interference_heatmap_png": str(
-            out_dir / "combined_interference_heatmap_time_aligned.png"
+            combined_dir / "combined_interference_heatmap_time_aligned.png"
         ),
-        "driver_time_alignment_txt": str(out_dir / "driver_time_alignment.txt"),
+        "driver_time_alignment_txt": str(combined_dir / "driver_time_alignment.txt"),
         "vituixcad_export_dir": str(out_dir / "vituixcad"),
+        "run_report_html": str(out_dir / "report.html"),
         "port_exit_radiation_impedance_npz": str(
-            out_dir / "port_exit_radiation_impedance_matrix.npz"
+            sources_dir / "port_exit_radiation_impedance_matrix.npz"
         ),
         "port_exit_radiation_impedance_summary": str(
-            out_dir / "port_exit_radiation_impedance_matrix.summary.json"
+            sources_dir / "port_exit_radiation_impedance_matrix.summary.json"
         ),
     }
 

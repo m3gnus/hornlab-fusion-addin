@@ -142,7 +142,7 @@ def test_passive_cardioid_sync_preserves_requested_polar_window():
 def test_driver_lem_defaults_present():
     addin = _load_addin_with_fake_adsk()
 
-    assert addin.SETTINGS_VERSION == 12
+    assert addin.SETTINGS_VERSION == 13
     assert addin.DEFAULT_SETTINGS["passive_cardioid_coupled"] is False
     assert addin.DEFAULT_SETTINGS["lf_driver_lem"] == ""
     assert addin.DEFAULT_SETTINGS["mf_driver_lem"] == ""
@@ -152,6 +152,16 @@ def test_driver_lem_defaults_present():
     assert addin.DEFAULT_SETTINGS["hf_driver_rear_volume_l"] == ""
     assert addin.DEFAULT_SETTINGS["drive_voltage"] == "2.83"
     assert addin.DEFAULT_SETTINGS["rg_ohm"] == "0"
+    assert addin.DEFAULT_SETTINGS["open_report"] is False
+    assert addin.DEFAULT_SETTINGS["output_per_driver_plots"] is True
+    assert addin.DEFAULT_SETTINGS["output_combined_set"] is True
+    assert addin.DEFAULT_SETTINGS["output_passive_cardioid_set"] is True
+    assert addin.DEFAULT_SETTINGS["output_driver_lem_artifacts"] is True
+    assert addin.DEFAULT_SETTINGS["output_derived_acoustics"] is True
+    assert addin.DEFAULT_SETTINGS["export_vituixcad"] is False
+    assert addin.DEFAULT_SETTINGS["output_radiation_impedance"] is True
+    assert addin.DEFAULT_SETTINGS["output_pressure_bases"] is True
+    assert addin.DEFAULT_SETTINGS["output_run_report"] is True
     assert "passive_cardioid_driver_sd_cm2" not in addin.DEFAULT_SETTINGS
     assert "passive_cardioid_drive_voltage" not in addin.DEFAULT_SETTINGS
 
@@ -377,12 +387,14 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
             {
                 "settings_version": addin.SETTINGS_VERSION,
                 "mirror_plane": "Front/Back",
+                "export_vituixcad": True,
             }
         ),
         encoding="utf-8",
     )
     settings = addin._load_settings()
     assert settings["mirror_plane"] == "Front/Back"
+    assert settings["export_vituixcad"] is True
 
 
 def test_parse_helpers_reject_non_finite_values():

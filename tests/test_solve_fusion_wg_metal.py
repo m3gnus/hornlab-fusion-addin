@@ -893,6 +893,115 @@ def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch)
         (out_dir / "direct_solve_manifest.json").read_text(encoding="utf-8")
     )
     assert final_manifest["status"] == "complete"
+    assert final_manifest["layout_version"] == 2
+    assert final_manifest["layout"]["sources_dir"].endswith("out/sources")
+
+
+def test_solver_parser_accepts_output_skip_flags(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:4",
+            "--skip-per-driver-plots",
+            "--skip-combined-set",
+            "--skip-passive-cardioid-set",
+            "--skip-driver-lem-artifacts",
+            "--skip-derived-acoustics",
+            "--skip-radiation-impedance",
+            "--skip-pressure-bases",
+            "--no-run-report",
+        ]
+    )
+
+    assert args.skip_per_driver_plots is True
+    assert args.skip_combined_set is True
+    assert args.skip_passive_cardioid_set is True
+    assert args.skip_driver_lem_artifacts is True
+    assert args.skip_derived_acoustics is True
+    assert args.skip_radiation_impedance is True
+    assert args.skip_pressure_bases is True
+    assert args.no_run_report is True
+
+
+def test_skip_pressure_bases_keeps_internal_basis_private_for_derived_outputs(
+    tmp_path,
+):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    layout = module.SolverOutputLayout(out_dir, layout_version=2)
+    layout.ensure_dirs()
+
+    class FakeResult:
+        frequencies_hz = np.geomspace(100.0, 1000.0, 4)
+        observation_angles_deg = np.asarray([0.0, 45.0, 90.0])
+        observation_planes = np.asarray(["horizontal", "vertical"])
+        pressure_complex = np.full((4, 2, 3), 0.02 + 0.01j, dtype=np.complex128)
+        directivity_db = np.zeros((4, 2, 3), dtype=np.float64)
+        impedance = {}
+        surface_pressure_avg = {}
+        timings = {}
+        solver_log = []
+        mesh_info = {}
+
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(out_dir),
+            "--source",
+            "HF:4",
+            "--skip-pressure-bases",
+            "--skip-radiation-impedance",
+            "--no-run-report",
+        ]
+    )
+    frame = module._build_frame(args)
+    source_result = module._write_one_source_outputs(
+        FakeResult(),
+        mesh_path,
+        layout.sources_dir,
+        args,
+        source_name="HF",
+        source_tag=4,
+    )
+
+    assert source_result["pressure_basis_npz"] is None
+    assert not (layout.sources_dir / "HF_pressure_basis.npz").exists()
+    assert isinstance(source_result["_pressure_basis"], module.PressureBasis)
+
+    manifest = {"outputs": {}}
+    module._apply_post_solve_derived_outputs(
+        mesh_path,
+        out_dir,
+        layout,
+        args,
+        manifest=manifest,
+        manifest_path=out_dir / "direct_solve_manifest.json",
+        source_results=[source_result],
+        sources=[("HF", 4)],
+        port_exit_apertures=[],
+        source_freq_max={},
+        source_mesh_valid={},
+        source_aperture_valid={},
+        frame=frame,
+    )
+
+    assert (layout.derived_dir / "HF_group_delay.png").exists()
+    assert (layout.combined_dir / "combined_frequency_response.png").exists()
+    assert manifest["outputs"]["source_pressure_basis_npzs"] == {}
+    assert all(
+        not str(key).startswith("_")
+        for source in manifest["sources"]
+        for key in source
+    )
 
 
 def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
@@ -989,7 +1098,7 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
     assert module.main(argv) == 0
     npz_hashes = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in out_dir.glob("*.npz")
+        for path in out_dir.rglob("*.npz")
     }
     assert set(npz_hashes) == {
         "HF_pressure_basis.npz",
@@ -999,14 +1108,14 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
     }
 
     for path in (
-        out_dir / "MF_frequency_response.png",
-        out_dir / "MF_group_delay.png",
-        out_dir / "MF_beamwidth.csv",
-        out_dir / "MF_directivity_index_power_response.json",
-        out_dir / "combined_frequency_response_time_aligned.png",
-        out_dir / "combined_time_aligned_group_delay.csv",
-        out_dir / "combined_time_aligned_directivity_index_power_response.json",
-        out_dir / "driver_time_alignment.txt",
+        out_dir / "sources" / "MF_frequency_response.png",
+        out_dir / "derived" / "MF_group_delay.png",
+        out_dir / "derived" / "MF_beamwidth.csv",
+        out_dir / "derived" / "MF_directivity_index_power_response.json",
+        out_dir / "combined" / "combined_frequency_response_time_aligned.png",
+        out_dir / "derived" / "combined_time_aligned_group_delay.csv",
+        out_dir / "derived" / "combined_time_aligned_directivity_index_power_response.json",
+        out_dir / "combined" / "driver_time_alignment.txt",
         out_dir / "vituixcad" / "hor" / "MF 0.frd",
     ):
         path.unlink()
@@ -1028,24 +1137,25 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
 
     assert module.main([*argv, "--postprocess-only"]) == 0
     for path in (
-        out_dir / "MF_frequency_response.png",
-        out_dir / "MF_group_delay.png",
-        out_dir / "MF_beamwidth.csv",
-        out_dir / "MF_directivity_index_power_response.json",
-        out_dir / "combined_frequency_response_time_aligned.png",
-        out_dir / "combined_time_aligned_group_delay.csv",
-        out_dir / "combined_time_aligned_directivity_index_power_response.json",
-        out_dir / "driver_time_alignment.txt",
+        out_dir / "sources" / "MF_frequency_response.png",
+        out_dir / "derived" / "MF_group_delay.png",
+        out_dir / "derived" / "MF_beamwidth.csv",
+        out_dir / "derived" / "MF_directivity_index_power_response.json",
+        out_dir / "combined" / "combined_frequency_response_time_aligned.png",
+        out_dir / "derived" / "combined_time_aligned_group_delay.csv",
+        out_dir / "derived" / "combined_time_aligned_directivity_index_power_response.json",
+        out_dir / "combined" / "driver_time_alignment.txt",
         out_dir / "vituixcad" / "hor" / "MF 0.frd",
     ):
         assert path.exists()
         assert path.stat().st_size > 0
     assert {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in out_dir.glob("*.npz")
+        for path in out_dir.rglob("*.npz")
         if path.name in npz_hashes
     } == npz_hashes
     manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
+    assert manifest["layout_version"] == 2
     assert manifest["postprocess_only"] is True
     assert manifest["status"] == "complete"
     assert manifest["outputs"]["source_group_delay_pngs"]["MF"].endswith(
@@ -1119,6 +1229,7 @@ def test_postprocess_only_without_port_exit_mirrors_original_cardioid_skip(
     ]
     assert module.main(argv) == 0
     assert not (out_dir / "port_exit_radiation_impedance_matrix.npz").exists()
+    assert not (out_dir / "sources" / "port_exit_radiation_impedance_matrix.npz").exists()
 
     monkeypatch.setattr(
         module,
@@ -1195,6 +1306,9 @@ def test_postprocess_only_keyless_bases_use_corrected_phase_for_alignment_and_ca
         ]
     ) == 0
     manifest = json.loads((align_dir / "direct_solve_manifest.json").read_text())
+    assert manifest["layout_version"] == 1
+    assert (align_dir / "combined_frequency_response_time_aligned.png").exists()
+    assert not (align_dir / "combined" / "combined_frequency_response_time_aligned.png").exists()
     assert manifest["crossover_alignment"]["delays_ms"]["MF"] == pytest.approx(
         0.3,
         abs=1.0e-6,
@@ -1731,6 +1845,83 @@ def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
         for y, label in axhline_calls
     )
     assert not (tmp_path / "vituixcad" / "LF_impedance.zma").exists()
+
+
+def test_skip_driver_lem_artifacts_keeps_active_basis_private(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    freqs = np.array([100.0, 250.0], dtype=np.float64)
+    angles = np.array([0.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    basis = module.PressureBasis(
+        source_name="LF",
+        source_tag=2,
+        frequencies_hz=freqs,
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        pressure_complex=np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128),
+        surface_pressure_avg_solver=np.array([1.0 + 0.0j, 1.5 + 0.0j]),
+        source_area_m2=0.02,
+    )
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "fake.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "LF:2",
+            "--driver-lem",
+            "LF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3,Xmax=4.5",
+            "--skip-driver-lem-artifacts",
+            "--skip-per-driver-plots",
+        ]
+    )
+    module._normalize_driver_lem_args(args)
+
+    def fake_coupled_direct_radiator_response(_frequencies_hz, **kwargs):
+        return SimpleNamespace(
+            cone_volume_velocity=np.array([0.01 + 0.0j, 0.02 + 0.0j]),
+            acoustic_load=np.asarray(kwargs["z_self"], dtype=np.complex128),
+            electrical_input_impedance=np.array([5.0 + 0.0j, 6.0 + 0.0j]),
+            cone_excursion_m=np.array([0.001, 0.002]),
+            mmd_correction_kg=0.0,
+            diagnostics={
+                "mmd_source": "Mmd",
+                "mmd_eff_kg": 0.018,
+                "sd_eff_m2": 0.02,
+            },
+        )
+
+    monkeypatch.setattr(
+        module.driver_coupling,
+        "coupled_direct_radiator_response",
+        fake_coupled_direct_radiator_response,
+    )
+    source_result = {
+        "name": "LF",
+        "tag": 2,
+        "pressure_basis_npz": None,
+        "results_json": str(tmp_path / "LF_results.json"),
+        "_pressure_basis": basis,
+    }
+    payload = module._apply_driver_lem_coupling(
+        tmp_path / "fake.msh",
+        tmp_path,
+        args,
+        source_results=[source_result],
+    )
+
+    assert payload["sources"]["LF"]["status"] == "complete"
+    assert payload["sources"]["LF"]["outputs"] == {}
+    assert isinstance(source_result["_active_pressure_basis"], module.PressureBasis)
+    assert "active_pressure_basis_npz" not in source_result
+    assert not (tmp_path / "LF_driver_lem_pressure.npz").exists()
+    assert not (tmp_path / "LF_driver_lem_results.npz").exists()
+    assert not (tmp_path / "LF_impedance.zma").exists()
+    assert not (tmp_path / "LF_excursion.png").exists()
 
 
 def test_driver_lem_missing_surface_avg_skips_instead_of_crashing(

@@ -77,7 +77,7 @@ SETTINGS_PATH = (
     / "WGMetalPipeline"
     / "settings.json"
 )
-SETTINGS_VERSION = 12
+SETTINGS_VERSION = 13
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
     "output_root": str(DEFAULT_OUTPUT_ROOT),
@@ -104,7 +104,16 @@ DEFAULT_SETTINGS = {
     "mesh_only": False,
     "open_wg": False,
     "open_output": True,
+    "open_report": False,
+    "output_per_driver_plots": True,
+    "output_combined_set": True,
+    "output_passive_cardioid_set": True,
+    "output_driver_lem_artifacts": True,
+    "output_derived_acoustics": True,
     "export_vituixcad": False,
+    "output_radiation_impedance": True,
+    "output_pressure_bases": True,
+    "output_run_report": True,
     "clamp_to_mesh_limit": False,
     "show_mesh_valid_markers": True,
     "plot_theme": "hornlab",
@@ -693,15 +702,57 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 _setting_str(settings, "rg_ohm"),
             )
 
-            output_group = inputs.addGroupCommandInput("grp_output", "Output")
+            output_group = inputs.addGroupCommandInput("grp_output", "Outputs")
             output_group.isExpanded = True
             output = output_group.children
             output.addStringValueInput("output_root", "Output root", _setting_str(settings, "output_root"))
             output.addBoolValueInput("browse_output_root", "Browse output root", False, "", False)
             output.addBoolValueInput("open_output", "Open output folder", True, "", _setting_bool(settings, "open_output"))
+            output.addBoolValueInput(
+                "open_report",
+                "Open report",
+                True,
+                "",
+                _setting_bool(settings, "open_report"),
+            )
+            output.addBoolValueInput(
+                "output_per_driver_plots",
+                "Per-driver plots",
+                True,
+                "",
+                _setting_bool(settings, "output_per_driver_plots"),
+            )
+            output.addBoolValueInput(
+                "output_combined_set",
+                "Combined/crossover set",
+                True,
+                "",
+                _setting_bool(settings, "output_combined_set"),
+            )
+            output.addBoolValueInput(
+                "output_passive_cardioid_set",
+                "Passive-cardioid set",
+                True,
+                "",
+                _setting_bool(settings, "output_passive_cardioid_set"),
+            )
+            output.addBoolValueInput(
+                "output_driver_lem_artifacts",
+                "Driver-LEM artifacts",
+                True,
+                "",
+                _setting_bool(settings, "output_driver_lem_artifacts"),
+            )
+            output.addBoolValueInput(
+                "output_derived_acoustics",
+                "Derived acoustics",
+                True,
+                "",
+                _setting_bool(settings, "output_derived_acoustics"),
+            )
             vituixcad_input = output.addBoolValueInput(
                 "export_vituixcad",
-                "Export VituixCAD FRDs",
+                "VituixCAD export",
                 True,
                 "",
                 _setting_bool(settings, "export_vituixcad"),
@@ -711,6 +762,27 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 "vituixcad/ver) with a shared timing reference. When XO "
                 "settings are filled, also write HornLab_active_lr4.vxp with "
                 "the computed active LR4 filters, gains, and delays."
+            )
+            output.addBoolValueInput(
+                "output_radiation_impedance",
+                "Radiation-impedance matrix",
+                True,
+                "",
+                _setting_bool(settings, "output_radiation_impedance"),
+            )
+            output.addBoolValueInput(
+                "output_pressure_bases",
+                "Pressure bases",
+                True,
+                "",
+                _setting_bool(settings, "output_pressure_bases"),
+            )
+            output.addBoolValueInput(
+                "output_run_report",
+                "HTML report",
+                True,
+                "",
+                _setting_bool(settings, "output_run_report"),
             )
 
             advanced_group = inputs.addGroupCommandInput("grp_advanced", "Advanced")
@@ -991,7 +1063,15 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             mesh_only = bool(_input_value(inputs, "mesh_only"))
             clamp_to_mesh_limit = bool(_input_value(inputs, "clamp_to_mesh_limit"))
             show_mesh_valid_markers = bool(_input_value(inputs, "show_mesh_valid_markers"))
+            output_per_driver_plots = bool(_input_value(inputs, "output_per_driver_plots"))
+            output_combined_set = bool(_input_value(inputs, "output_combined_set"))
+            output_passive_cardioid_set = bool(_input_value(inputs, "output_passive_cardioid_set"))
+            output_driver_lem_artifacts = bool(_input_value(inputs, "output_driver_lem_artifacts"))
+            output_derived_acoustics = bool(_input_value(inputs, "output_derived_acoustics"))
             export_vituixcad = bool(_input_value(inputs, "export_vituixcad"))
+            output_radiation_impedance = bool(_input_value(inputs, "output_radiation_impedance"))
+            output_pressure_bases = bool(_input_value(inputs, "output_pressure_bases"))
+            output_run_report = bool(_input_value(inputs, "output_run_report"))
             passive_cardioid_enabled = bool(_input_value(inputs, "passive_cardioid_enabled"))
             passive_cardioid_rear_volume_l = str(
                 _input_value(inputs, "passive_cardioid_rear_volume_l") or ""
@@ -1028,6 +1108,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             )
             open_wg = bool(_input_value(inputs, "open_wg"))
             open_output = bool(_input_value(inputs, "open_output"))
+            open_report = bool(_input_value(inputs, "open_report"))
 
             if not sources:
                 raise RuntimeError(
@@ -1113,7 +1194,16 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "mesh_only": mesh_only,
                 "open_wg": open_wg,
                 "open_output": open_output,
+                "open_report": open_report,
+                "output_per_driver_plots": output_per_driver_plots,
+                "output_combined_set": output_combined_set,
+                "output_passive_cardioid_set": output_passive_cardioid_set,
+                "output_driver_lem_artifacts": output_driver_lem_artifacts,
+                "output_derived_acoustics": output_derived_acoustics,
                 "export_vituixcad": export_vituixcad,
+                "output_radiation_impedance": output_radiation_impedance,
+                "output_pressure_bases": output_pressure_bases,
+                "output_run_report": output_run_report,
                 "clamp_to_mesh_limit": clamp_to_mesh_limit,
                 "show_mesh_valid_markers": show_mesh_valid_markers,
                 "passive_cardioid_enabled": passive_cardioid_enabled,
@@ -1171,10 +1261,19 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 mesh_only=mesh_only,
                 open_wg=open_wg,
                 open_output=open_output,
+                open_report=open_report,
                 plot_theme=plot_theme,
                 underresolved_solve_policy=underresolved_solve_policy,
                 show_mesh_valid_markers=show_mesh_valid_markers,
                 export_vituixcad=export_vituixcad,
+                output_per_driver_plots=output_per_driver_plots,
+                output_combined_set=output_combined_set,
+                output_passive_cardioid_set=output_passive_cardioid_set,
+                output_driver_lem_artifacts=output_driver_lem_artifacts,
+                output_derived_acoustics=output_derived_acoustics,
+                output_radiation_impedance=output_radiation_impedance,
+                output_pressure_bases=output_pressure_bases,
+                output_run_report=output_run_report,
                 passive_cardioid_enabled=passive_cardioid_enabled,
                 passive_cardioid_rear_volume_l=passive_cardioid_rear_volume_l,
                 passive_cardioid_port_length_mm=passive_cardioid_port_length_mm,
@@ -1200,6 +1299,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 fusion_archive_path,
             )
             paths = expected_pipeline_paths(out_dir)
+            report_message = (
+                f"Run report:\n{paths['run_report_html']}\n\n"
+                if output_run_report
+                else ""
+            )
 
             message = (
                 "WG Metal pipeline started in the background.\n\n"
@@ -1214,6 +1318,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "Pipeline logs:\n"
                 f"{paths['launcher_stdout']}\n"
                 f"{paths['launcher_stderr']}\n\n"
+                f"{report_message}"
                 "Fusion can be used while the pipeline runs."
             )
             if not mesh_only:

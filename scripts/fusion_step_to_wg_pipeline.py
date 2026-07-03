@@ -30,6 +30,7 @@ DEFAULT_TOPOLOGY_TOL = 1e-5
 PREP_SCRIPT = REPO_ROOT / "scripts" / "prepare_step_for_wg_metal.py"
 DIAGNOSE_SCRIPT = REPO_ROOT / "scripts" / "diagnose_wg_metal_orientation.py"
 SOLVE_SCRIPT = REPO_ROOT / "scripts" / "solve_fusion_wg_metal.py"
+REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
 CANONICAL_SOURCE_TAGS = {
     "LF": 2,
     "MF": 3,
@@ -75,6 +76,16 @@ DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS = (
 DRIVER_LEM_VALUE_FORWARD_OPTIONS = (
     ("--drive-voltage", "drive_voltage"),
     ("--rg-ohm", "rg_ohm"),
+)
+OUTPUT_SKIP_FORWARD_OPTIONS = (
+    ("--skip-per-driver-plots", "skip_per_driver_plots"),
+    ("--skip-combined-set", "skip_combined_set"),
+    ("--skip-passive-cardioid-set", "skip_passive_cardioid_set"),
+    ("--skip-driver-lem-artifacts", "skip_driver_lem_artifacts"),
+    ("--skip-derived-acoustics", "skip_derived_acoustics"),
+    ("--skip-radiation-impedance", "skip_radiation_impedance"),
+    ("--skip-pressure-bases", "skip_pressure_bases"),
+    ("--no-run-report", "no_run_report"),
 )
 SYMMETRY_PLANE_ALIASES = {
     "": (),
@@ -364,6 +375,14 @@ def _open_output_folder(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def _render_run_report(out_dir: Path, *, python: str) -> tuple[int, list[str]] | None:
+    if not REPORT_SCRIPT.exists():
+        return None
+    cmd = [str(Path(python).expanduser()), str(REPORT_SCRIPT), str(out_dir)]
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), text=True, check=False)
+    return int(result.returncode), cmd
+
+
 def _notify(title: str, message: str) -> None:
     if sys.platform != "darwin":
         return
@@ -518,6 +537,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--wg-dir", type=Path, default=DEFAULT_WG_DIR)
     parser.add_argument("--open-wg", action="store_true", help="Launch Waveguide Generator after pipeline completion")
     parser.add_argument("--open-output-folder", action="store_true")
+    parser.add_argument("--open-report", action="store_true", help="Open report.html after pipeline completion")
     parser.add_argument("--allow-leaks", action="store_true")
     parser.add_argument(
         "--skip-missing-sources",
@@ -650,6 +670,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Forward the VituixCAD per-angle FRD export to the direct solve."
         ),
     )
+    parser.add_argument("--skip-per-driver-plots", action="store_true")
+    parser.add_argument("--skip-combined-set", action="store_true")
+    parser.add_argument("--skip-passive-cardioid-set", action="store_true")
+    parser.add_argument("--skip-driver-lem-artifacts", action="store_true")
+    parser.add_argument("--skip-derived-acoustics", action="store_true")
+    parser.add_argument("--skip-radiation-impedance", action="store_true")
+    parser.add_argument("--skip-pressure-bases", action="store_true")
+    parser.add_argument("--no-run-report", action="store_true")
     parser.add_argument("--passive-cardioid-rear-volume-l", type=float, default=None)
     parser.add_argument("--passive-cardioid-port-length-mm", type=float, default=None)
     parser.add_argument("--passive-cardioid-port-area-cm2", type=float, default=None)
@@ -1242,6 +1270,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         _extend_option_value(solve_cmd, "--frame-v", frame_v)
         if args.export_vituixcad:
             solve_cmd.append("--export-vituixcad")
+        for option, attr in OUTPUT_SKIP_FORWARD_OPTIONS:
+            if getattr(args, attr):
+                solve_cmd.append(option)
         for option, attr in DRIVER_LEM_REPEATABLE_FORWARD_OPTIONS:
             for value in getattr(args, attr):
                 solve_cmd.extend([option, str(value)])
@@ -1353,11 +1384,28 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     pipeline_manifest["status"] = "complete"
     pipeline_manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    if not args.no_run_report:
+        pipeline_manifest["report_html"] = str(out_dir / "report.html")
     _write_json(pipeline_manifest_path, pipeline_manifest)
     _write_json(out_dir / "final_summary_manifest.json", pipeline_manifest)
 
+    if not args.no_run_report:
+        report_result = _render_run_report(out_dir, python=args.python)
+        if report_result is not None:
+            report_returncode, report_cmd = report_result
+            pipeline_manifest["commands"]["report"] = report_cmd
+            pipeline_manifest["report"] = {
+                "path": str(out_dir / "report.html"),
+                "returncode": report_returncode,
+                "status": "complete" if report_returncode == 0 else "failed",
+            }
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _write_json(out_dir / "final_summary_manifest.json", pipeline_manifest)
+
     if args.open_output_folder:
         _open_output_folder(out_dir)
+    if args.open_report and not args.no_run_report and (out_dir / "report.html").exists():
+        _open_output_folder(out_dir / "report.html")
     if args.open_wg:
         _launch_waveguide_generator(wg_dir, pipeline_manifest_path)
 

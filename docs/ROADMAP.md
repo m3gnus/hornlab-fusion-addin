@@ -4,7 +4,7 @@ Prioritized improvement plan for the WGMetalPipeline add-in and pipeline.
 Ordered by leverage-per-complexity; the add-in should stay small, so each
 item states what it *removes* or reuses, not just what it adds.
 
-Status 2026-07-02: items 1, 2, and 4 DONE. Item 2 followed the accepted plan in
+Status 2026-07-03: items 1, 2, 4, 5, and 6 DONE. Item 2 followed the accepted plan in
 [plans/per-driver-lem-coupling.md](plans/per-driver-lem-coupling.md).
 Item 3's N-driver table is DEFERRED by owner decision (three fixed slots are
 enough for now); its T/S + Hornresp-import half moved into item 2.
@@ -107,23 +107,21 @@ extrapolated to `4*pi`.
 Deliberately later: impulse/step responses (needs a dense linear frequency
 grid — a solve-cost decision, not a post-processing one).
 
-## 5. Output panel and structured run folders
+## 5. Output panel and structured run folders — DONE
 
-A run folder currently collects 20+ files flat at the root. Two changes:
+Run folders now keep solver outputs under category folders while manifests
+stay at the root:
 
-- **Dialog**: replace the single `Export VituixCAD FRDs` toggle with an
-  "Outputs" group listing every artifact category with a checkbox —
-  per-driver plots, combined/crossover set, cardioid set, VituixCAD export,
-  radiation-impedance matrix, pressure bases — so everything the pipeline
-  *can* produce is visible in one place.
-- **Folder layout**: subfolders per category (`sources/`, `combined/`,
-  `cardioid/`, `vituixcad/`, `logs/`), manifests at the root.
-  `direct_solve_manifest.json` already maps logical names → paths, so
-  readers should go through the manifest; add a `layout_version` key and
-  keep `regenerate_fusion_derived_artifacts.py` able to read both layouts
-  (old runs must stay postprocess-able).
+- `sources/`, `combined/`, `cardioid/`, `driver-lem/`, `derived/`,
+  `vituixcad/`, and `logs/`
+- `direct_solve_manifest.json` records `layout_version: 2` and all concrete
+  output paths under its `outputs` dictionary
+- `--postprocess-only` and `regenerate_fusion_derived_artifacts.py` still
+  read flat layout-1 runs and regenerate beside those old flat artifacts
+- the Fusion dialog's **Outputs** group lists every artifact category with
+  checkboxes, plus the preserved default-off VituixCAD export toggle
 
-## 6. Post-hoc exploration ("side viewer app") — deliberately minimal
+## 6. Post-hoc exploration ("side viewer app") — DONE
 
 The pressure bases make any crossover change a cheap linear recombination —
 no re-solve needed — and `regenerate_fusion_derived_artifacts.py` already
@@ -133,9 +131,10 @@ stored bases. Rather than a new GUI application:
 - rely on **VituixCAD** for interactive filter experimentation (item 2
   completes its inputs; its live six-pack is better than anything a custom
   viewer would reach soon)
-- add a **static HTML report** per run (PNG gallery + manifest summary) and
-  a small index page over the output root for flicking through runs without
-  Fusion
+- added a **static HTML report** per run (`report.html`) with a PNG gallery,
+  manifest summary, artifact links, and logs
+- added `scripts/render_run_report.py --index <output-root>` to write an
+  output-root `index.html` linking child run folders newest first
 - revisit a real viewer only if these prove insufficient — a custom app is
   a permanent maintenance surface and mostly duplicates the two above
 

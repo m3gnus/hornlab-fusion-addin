@@ -74,68 +74,94 @@ are `Sd` cm2, `Mmd`/`Mms` g, `Cms` m/N, `Rms` kg/s, `Le`/`Le2` mH,
 and `Vrc*` keys are warned and ignored. Coupling changes that driver's pressure
 basis from unit acceleration to SPL at the chosen drive voltage.
 
-Output: choose the output root, whether to open it, and whether to export
-VituixCAD FRDs. When VituixCAD export is enabled, the solve writes `vituixcad/`
-with `hor/`, `ver/`, `README.txt`, copied ZMA files for coupled drivers, and
-`HornLab_active_lr4.vxp` when crossover alignment completed.
+Outputs: choose the output root, whether to open the folder, whether to open
+the generated report, and which artifact categories to write. The category
+checkboxes cover per-driver plots, combined/crossover outputs, passive
+cardioid outputs, Driver LEM sidecars, derived acoustics, VituixCAD export,
+radiation-impedance matrices, pressure bases, and the HTML report. All
+categories default on except VituixCAD, preserving earlier run behavior.
 
 Advanced: choose Python, optional Waveguide Generator folder launch, and mirror
 plane override.
 
 ## 4. Reading The Outputs
 
-Start with per-driver files:
+New runs use solver layout version 2. Manifests stay at the run root, while
+solver artifacts are grouped by category:
+
+- `sources/`: per-source result JSON, pressure bases, direct source plots, and
+  port-exit radiation-impedance matrices
+- `combined/`: combined response plots, crossover/alignment plots, off-axis
+  plots, interference heatmaps, and `driver_time_alignment.txt`
+- `derived/`: DI/power-response, beamwidth, and group-delay PNG/CSV/JSON files
+- `driver-lem/`: Driver LEM active pressure, ZMA, excursion, and sidecar files
+- `cardioid/`: passive-cardioid MF artifacts
+- `vituixcad/`: VituixCAD FRD/ZMA/project export when enabled
+- `logs/`: pipeline command logs
+
+Use `direct_solve_manifest.json` as the authoritative map from logical output
+names to concrete paths; old layout-1 flat runs remain readable by
+postprocess-only regeneration.
+
+Start with per-driver files in `sources/`:
 
 - `<SOURCE>_frequency_response.png`: on-axis SPL for that source. Coupled
   Driver LEM sources are at the run voltage; uncoupled sources are unit-source
   levels. Dashed overlays show wrapped on-axis phase on the right axis.
 - `<SOURCE>_directivity_heatmap.png`: normalized directivity over the solved
   polar grid.
-- `<SOURCE>_directivity_index_power_response.*`: DI and power-response PNG,
-  CSV, and JSON from solid-angle-weighted polar-cut intensity integration. The
-  report text notes that this is an approximation because the stored cuts are
-  not full-sphere samples.
-- `<SOURCE>_beamwidth.*`: per-plane -6 dB beamwidth vs frequency as PNG, CSV,
-  and JSON.
-- `<SOURCE>_group_delay.*`: on-axis group delay vs frequency as PNG, CSV, and
-  JSON, computed from unwrapped engineering-convention pressure phase.
-- `<SOURCE>_pressure_basis.npz`: saved complex pressure basis used for
+- `derived/<SOURCE>_directivity_index_power_response.*`: DI and power-response
+  PNG, CSV, and JSON from solid-angle-weighted polar-cut intensity integration.
+  The report text notes that this is an approximation because the stored cuts
+  are not full-sphere samples.
+- `derived/<SOURCE>_beamwidth.*`: per-plane -6 dB beamwidth vs frequency as
+  PNG, CSV, and JSON.
+- `derived/<SOURCE>_group_delay.*`: on-axis group delay vs frequency as PNG,
+  CSV, and JSON, computed from unwrapped engineering-convention pressure phase.
+- `sources/<SOURCE>_pressure_basis.npz`: saved complex pressure basis used for
   postprocess reruns.
-- `<SOURCE>_impedance.zma` and `<SOURCE>_excursion.png`: written for direct
-  sources with Driver LEM specs. The excursion plot includes an Xmax line when
-  `Xmax` was supplied.
+- `driver-lem/<SOURCE>_impedance.zma` and
+  `driver-lem/<SOURCE>_excursion.png`: written for direct sources with Driver
+  LEM specs. The excursion plot includes an Xmax line when `Xmax` was supplied.
 
-Then read combined outputs:
+Then read combined outputs in `combined/`:
 
-- `combined_frequency_response.png`: direct source responses together, with
+- `combined/combined_frequency_response.png`: direct source responses together, with
   wrapped phase overlays.
-- `combined_frequency_response_time_aligned.png`: LR4 filtered, level-matched,
+- `combined/combined_frequency_response_time_aligned.png`: LR4 filtered, level-matched,
   delay-aligned sum when crossover fields are set, with wrapped phase overlays.
-- `combined_directivity_heatmap_time_aligned.png`: directivity of that aligned
-  sum.
-- `combined_time_aligned_directivity_index_power_response.*`,
-  `combined_time_aligned_beamwidth.*`, and
-  `combined_time_aligned_group_delay.*`: the same DI/power, beamwidth, and
-  group-delay sidecars for the aligned crossover sum.
-- `combined_interference_heatmap_time_aligned.png`: coherent vs incoherent
+- `combined/combined_directivity_heatmap_time_aligned.png`: directivity of
+  that aligned sum.
+- `derived/combined_time_aligned_directivity_index_power_response.*`,
+  `derived/combined_time_aligned_beamwidth.*`, and
+  `derived/combined_time_aligned_group_delay.*`: the same DI/power,
+  beamwidth, and group-delay sidecars for the aligned crossover sum.
+- `combined/combined_interference_heatmap_time_aligned.png`: coherent vs incoherent
   interaction between drivers.
-- `combined_frequency_response_off_axis_<plane>.png`: off-axis aligned sum
+- `combined/combined_frequency_response_off_axis_<plane>.png`: off-axis aligned sum
   plots with wrapped phase overlays.
-- `driver_time_alignment.txt`: crossover frequencies, level trims, delays,
+- `combined/driver_time_alignment.txt`: crossover frequencies, level trims, delays,
   arrival offsets, and any mesh-band alignment warnings.
 
-Passive cardioid outputs, when enabled, are `MF_passive_cardioid_*`. Coupled
-mode also writes `MF_passive_cardioid_coupled_results.npz`,
+Passive cardioid outputs, when enabled, are in `cardioid/` as
+`MF_passive_cardioid_*`. Coupled mode also writes
+`MF_passive_cardioid_coupled_results.npz`,
 `MF_passive_cardioid_coupled_frequency_response.png`, and
 `MF_passive_cardioid_impedance.zma`.
 
 Manifests and logs are the audit trail: `manifest.json` from mesh prep,
 `direct_solve_manifest.json`, `fusion_wg_pipeline_manifest.json`,
 `final_summary_manifest.json`, `fusion_addin_launch.json`, and `logs/*.log`.
+Open `report.html` for a static gallery and run summary. To build or refresh
+an index over an output root:
+
+```bash
+.venv/bin/python scripts/render_run_report.py --index runs/fusion360
+```
 
 ## 5. VituixCAD Workflow
 
-Enable Output > Export VituixCAD FRDs before running. Open `vituixcad/README.txt`
+Enable Outputs > VituixCAD export before running. Open `vituixcad/README.txt`
 first; it restates the import assumptions for that run.
 
 Load the FRD angle sets from `vituixcad/hor/` and `vituixcad/ver/` for each
@@ -183,6 +209,8 @@ run folder, sources, and `--postprocess-only`, overriding the crossover fields:
 Postprocess-only reuses saved pressure bases and existing radiation matrix
 artifacts. Driver LEM reruns use stored surface averages when available; old
 runs with empty averages skip that Driver LEM source with a warning.
+Layout-2 runs regenerate into their category folders; old flat layout-1 runs
+regenerate beside the original flat artifacts so archived runs stay usable.
 
 ## 7. Troubleshooting
 

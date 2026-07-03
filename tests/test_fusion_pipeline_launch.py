@@ -353,6 +353,18 @@ def test_build_pipeline_command_forwards_output_skip_flags():
     assert args.no_run_report is True
 
 
+def test_build_pipeline_command_rejects_vituixcad_crossover_without_combined():
+    helper = _load_helper()
+
+    with pytest.raises(ValueError, match="Combined/crossover"):
+        _helper_command(
+            helper,
+            export_vituixcad=True,
+            output_combined_set=False,
+            crossover_mf_hf_hz="1000",
+        )
+
+
 def test_build_pipeline_command_can_request_plot_theme():
     helper = _load_helper()
     pipeline = _load_pipeline()
@@ -1161,6 +1173,80 @@ def test_pipeline_writes_solving_manifest_before_direct_solve_returns(
     )
 
     assert rc == 0
+
+
+def test_pipeline_opens_output_folder_after_solve_failure(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    out_dir = tmp_path / "out"
+    opened = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "wg_source_meshes_m": {},
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {
+            "status": "valid",
+            "requested_max_frequency_hz": 2000.0,
+            "max_valid_frequency_hz": 3000.0,
+            "per_source": {
+                "HF": {"max_valid_frequency_hz": 3000.0, "status": "valid"},
+            },
+            "warnings": [],
+        },
+    }
+
+    def fake_run_logged(cmd, *, cwd, stdout_path, stderr_path):
+        script_name = Path(cmd[1]).name
+        command_out = Path(cmd[cmd.index("--out") + 1])
+        if script_name == "prepare_step_for_wg_metal.py":
+            (command_out / "manifest.json").write_text(
+                json.dumps(prep_manifest) + "\n",
+                encoding="utf-8",
+            )
+            return 0
+        if script_name == "diagnose_wg_metal_orientation.py":
+            (command_out / "orientation_report.json").write_text(
+                json.dumps(
+                    {
+                        "expanded_mesh": {},
+                        "expanded_4quarter": {},
+                        "source_frame_inference": DEFAULT_FRAME_INFERENCE,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return 0
+        if script_name == "solve_fusion_wg_metal.py":
+            return 7
+        raise AssertionError(f"unexpected command: {script_name}")
+
+    monkeypatch.setattr(pipeline, "_run_logged", fake_run_logged)
+    monkeypatch.setattr(
+        pipeline,
+        "_open_output_folder",
+        lambda path: opened.append(Path(path)),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(out_dir),
+            "--source",
+            "HF:5",
+            "--freq-max-hz",
+            "2000",
+            "--run-solves",
+            "--open-output-folder",
+        ]
+    )
+
+    assert rc == 7
+    assert opened == [out_dir]
 
 
 def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, monkeypatch):

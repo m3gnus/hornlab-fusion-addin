@@ -997,6 +997,12 @@ def test_skip_pressure_bases_keeps_internal_basis_private_for_derived_outputs(
     assert (layout.derived_dir / "HF_group_delay.png").exists()
     assert (layout.combined_dir / "combined_frequency_response.png").exists()
     assert manifest["outputs"]["source_pressure_basis_npzs"] == {}
+    assert manifest["outputs"]["source_results_jsons"]["HF"].endswith(
+        "HF_results.json"
+    )
+    assert manifest["outputs"]["source_directivity_heatmap_pngs"]["HF"].endswith(
+        "HF_directivity_heatmap.png"
+    )
     assert all(
         not str(key).startswith("_")
         for source in manifest["sources"]
@@ -1614,6 +1620,32 @@ def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatc
     assert np.all(impedance.real >= 5.5 - 1.0e-9)
 
 
+def test_passive_cardioid_mf_uses_stored_source_area_when_available(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    fixture = _write_passive_cardioid_fixture(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "_mesh_tag_area_m2",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stored pressure-basis area should avoid mesh lookup")
+        ),
+    )
+
+    payload = module._solve_passive_cardioid_mf(
+        tmp_path / "fake.msh",
+        tmp_path,
+        _passive_cardioid_args(module, tmp_path, tmp_path),
+        source_results=fixture["source_results"],
+        radiation_payload={"outputs": {"npz": str(fixture["matrix_npz"])}},
+    )
+
+    assert payload["status"] == "complete"
+    assert (tmp_path / "MF_passive_cardioid_results.npz").exists()
+
+
 def test_passive_cardioid_coupled_args_validate_driver_requirements(tmp_path):
     module = _load_script()
     base = [
@@ -1923,6 +1955,17 @@ def test_skip_driver_lem_artifacts_keeps_active_basis_private(
     assert not (tmp_path / "LF_impedance.zma").exists()
     assert not (tmp_path / "LF_excursion.png").exists()
 
+    vituixcad_payload = module._write_vituixcad_export(
+        tmp_path,
+        [source_result],
+        polar_distance_m=2.0,
+    )
+    export_dir = Path(vituixcad_payload["export_dir"])
+    assert (export_dir / "LF_impedance.zma").exists()
+    assert vituixcad_payload["outputs"]["vituixcad_driver_zmas"]["LF"].endswith(
+        "LF_impedance.zma"
+    )
+
 
 def test_driver_lem_missing_surface_avg_skips_instead_of_crashing(
     tmp_path,
@@ -2055,9 +2098,9 @@ def _write_synthetic_basis(
     angles,
     planes,
     pressure,
+    source_area_m2=None,
 ):
-    np.savez_compressed(
-        path,
+    arrays = dict(
         source_name=np.asarray(name),
         source_tag=np.asarray(tag, dtype=np.int32),
         frequencies_hz=np.asarray(freqs, dtype=np.float64),
@@ -2065,6 +2108,9 @@ def _write_synthetic_basis(
         observation_planes=np.asarray(planes, dtype=str),
         pressure_complex=np.asarray(pressure, dtype=np.complex128),
     )
+    if source_area_m2 is not None:
+        arrays["source_area_m2"] = np.asarray(float(source_area_m2), dtype=np.float64)
+    np.savez_compressed(path, **arrays)
 
 
 def _synthetic_source_result(path, name, tag):
@@ -2115,6 +2161,7 @@ def _write_passive_cardioid_fixture(tmp_path, *, include_mf_matrix=True):
         angles=angles,
         planes=planes,
         pressure=mf_pressure,
+        source_area_m2=0.02,
     )
     _write_synthetic_basis(
         port_basis,
@@ -2124,6 +2171,7 @@ def _write_passive_cardioid_fixture(tmp_path, *, include_mf_matrix=True):
         angles=angles,
         planes=planes,
         pressure=port_pressure,
+        source_area_m2=0.01,
     )
     matrix_npz = tmp_path / "port_exit_radiation_impedance_matrix.npz"
     if include_mf_matrix:
@@ -3186,6 +3234,100 @@ def test_passive_cardioid_monopole_pair_nulls_at_rear(tmp_path, monkeypatch):
         assert np.min(np.abs(total[:, :, front])) > 0.5
 
 
+def test_export_vituixcad_crossover_requires_combined_set(tmp_path):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="combined/crossover set"):
+        module.main(
+            [
+                "--mesh",
+                str(mesh_path),
+                "--out",
+                str(tmp_path / "out"),
+                "--source",
+                "MF:3",
+                "--source",
+                "HF:4",
+                "--freq-min-hz",
+                "100",
+                "--freq-max-hz",
+                "2000",
+                "--crossover-mf-hf-hz",
+                "1000",
+                "--export-vituixcad",
+                "--skip-combined-set",
+                "--dry-run",
+            ]
+        )
+
+
+def test_postprocess_only_vituixcad_skip_combined_regenerates_frd_without_vxp(
+    tmp_path,
+):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 2000.0, 8)
+    angles = np.array([0.0, 45.0, 90.0], dtype=np.float64)
+    planes = np.array(["horizontal"], dtype=str)
+    for name, tag in (("MF", 3), ("HF", 4)):
+        _write_synthetic_basis(
+            tmp_path / f"{name}_pressure_basis.npz",
+            name=name,
+            tag=tag,
+            freqs=freqs,
+            angles=angles,
+            planes=planes,
+            pressure=_delayed_pressure(freqs, planes, angles, arrival_s=0.0),
+        )
+    (tmp_path / "direct_solve_manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "MF",
+                        "tag": 3,
+                        "pressure_basis_npz": str(tmp_path / "MF_pressure_basis.npz"),
+                    },
+                    {
+                        "name": "HF",
+                        "tag": 4,
+                        "pressure_basis_npz": str(tmp_path / "HF_pressure_basis.npz"),
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert module.main(
+        [
+            "--mesh",
+            str(tmp_path / "old-run-mesh.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "MF:3",
+            "--source",
+            "HF:4",
+            "--freq-min-hz",
+            "100",
+            "--freq-max-hz",
+            "2000",
+            "--crossover-mf-hf-hz",
+            "1000",
+            "--export-vituixcad",
+            "--skip-combined-set",
+            "--postprocess-only",
+            "--no-run-report",
+        ]
+    ) == 0
+
+    assert (tmp_path / "vituixcad" / "hor" / "MF 0.frd").exists()
+    assert (tmp_path / "vituixcad" / "hor" / "HF 0.frd").exists()
+    assert not (tmp_path / "vituixcad" / "HornLab_active_lr4.vxp").exists()
+
+
 def test_vituixcad_export_writes_frd_sets_with_shared_timing(tmp_path):
     module = _load_script()
     freqs = np.geomspace(100.0, 10000.0, 20)
@@ -3580,6 +3722,40 @@ def test_regenerate_driver_recovers_reference_style_solve_command(tmp_path):
     assert command[command.index("--out") + 1] == str(run_dir)
     assert command[command.index("--mesh") + 1] == str(run_dir / "tagged_sources.msh")
     assert command[command.index("--source") + 1] == "HF:4"
+
+
+def test_regenerate_driver_recovers_expanded_solve_mesh_by_basename(tmp_path):
+    driver = _load_regen_driver()
+    run_dir = tmp_path / "expanded-run"
+    run_dir.mkdir()
+    (run_dir / "tagged_sources.msh").write_text("$MeshFormat\n", encoding="utf-8")
+    expanded_mesh = run_dir / "expanded_4quarter.msh"
+    expanded_mesh.write_text("$MeshFormat\n", encoding="utf-8")
+    solve_cmd = [
+        "/venv/bin/python",
+        str(SCRIPT),
+        "--mesh",
+        "/old/location/expanded_4quarter.msh",
+        "--out",
+        "/old/location",
+        "--source",
+        "HF:4",
+    ]
+    (run_dir / "fusion_wg_pipeline_manifest.json").write_text(
+        json.dumps(
+            {
+                "solve_mesh": "/old/location/expanded_4quarter.msh",
+                "commands": {"solve": solve_cmd},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    command, reason = driver._recover_postprocess_command(run_dir)
+
+    assert reason is None
+    assert command[command.index("--mesh") + 1] == str(expanded_mesh)
+    assert command[command.index("--out") + 1] == str(run_dir)
 
 
 def test_regenerate_driver_reports_skip_without_recoverable_launch(

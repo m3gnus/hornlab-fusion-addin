@@ -60,6 +60,12 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
             "source_pressure_basis_npzs": {
                 "MF": str(run / "sources" / "MF_pressure_basis.npz")
             },
+            "source_results_jsons": {
+                "MF": str(run / "sources" / "MF_results.json")
+            },
+            "source_directivity_heatmap_pngs": {
+                "MF": str(run / "sources" / "MF_directivity_heatmap.png")
+            },
             "combined_time_aligned_frequency_response_png": _touch(
                 run / "combined" / "combined_frequency_response_time_aligned.png"
             ),
@@ -89,6 +95,26 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
             "passive_cardioid_summary_json": _touch(
                 run / "cardioid" / "MF_passive_cardioid_summary.json"
             ),
+            "port_exit_radiation_impedance_npz": _touch(
+                run / "sources" / "port_exit_radiation_impedance_matrix.npz"
+            ),
+            "port_exit_radiation_impedance_summary_json": _touch(
+                run / "sources" / "port_exit_radiation_impedance_matrix.summary.json"
+            ),
+            "vituixcad_export_dir": str(run / "vituixcad"),
+            "vituixcad_readme_txt": _touch(run / "vituixcad" / "README.txt"),
+            "vituixcad_active_lr4_vxp": _touch(
+                run / "vituixcad" / "HornLab_active_lr4.vxp"
+            ),
+            "vituixcad_driver_zmas": {
+                "MF": _touch(run / "vituixcad" / "MF_impedance.zma"),
+                "MF_cardioid": _touch(
+                    run / "vituixcad" / "MF_cardioid_impedance.zma"
+                ),
+            },
+            "vituixcad_mf_cardioid_zma": str(
+                run / "vituixcad" / "MF_cardioid_impedance.zma"
+            ),
         },
     }
     (run / "logs").mkdir(parents=True)
@@ -106,12 +132,19 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
     assert "Per-Driver Plots" in html
     assert "Combined / Crossover" in html
     assert "Derived Acoustics" in html
+    assert "Radiation Impedance" in html
     assert "Driver LEM" in html
     assert "Passive Cardioid" in html
+    assert "VituixCAD" in html
     assert "sources/MF_frequency_response.png" in html
+    assert "sources/MF_results.json" in html
     assert "derived/MF_group_delay.png" in html
     assert "driver-lem/MF_impedance.zma" in html
     assert "cardioid/MF_passive_cardioid_summary.json" in html
+    assert "sources/port_exit_radiation_impedance_matrix.npz" in html
+    assert "vituixcad/HornLab_active_lr4.vxp" in html
+    assert "vituixcad/MF_impedance.zma" in html
+    assert html.count("vituixcad/MF_cardioid_impedance.zma") == 1
     assert "logs/solve_fusion_wg_metal.stdout.log" in html
 
 

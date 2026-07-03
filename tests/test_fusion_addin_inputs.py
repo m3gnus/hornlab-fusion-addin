@@ -166,6 +166,22 @@ def test_driver_lem_defaults_present():
     assert "passive_cardioid_drive_voltage" not in addin.DEFAULT_SETTINGS
 
 
+def test_stale_install_warning_points_to_symlink_reinstall(tmp_path, monkeypatch):
+    addin = _load_addin_with_fake_adsk()
+    monkeypatch.setattr(addin, "ADDIN_DIR", tmp_path / "WGMetalPipeline")
+    monkeypatch.setattr(
+        addin,
+        "PIPELINE_SCRIPT",
+        tmp_path / "WGMetalPipeline" / "scripts" / "fusion_step_to_wg_pipeline.py",
+    )
+
+    warning = addin._stale_install_warning()
+
+    assert warning is not None
+    assert "copied install" in warning
+    assert "--symlink --replace" in warning
+
+
 def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
     addin = _load_addin_with_fake_adsk()
     driver_ids = [

@@ -126,6 +126,49 @@ def _replace_option_value(argv: list[str], flag: str, value: str) -> list[str]:
     return replaced
 
 
+def _option_value(argv: list[str], flag: str) -> str | None:
+    for index, item in enumerate(argv[:-1]):
+        if item == flag:
+            return argv[index + 1]
+    return None
+
+
+def _append_mesh_candidate(candidates: list[str], value: Any) -> None:
+    if isinstance(value, str) and value.strip():
+        candidates.append(value.strip())
+
+
+def _recover_mesh_path(run_dir: Path, argv: list[str]) -> Path | None:
+    candidates: list[str] = []
+    for manifest_name in (
+        "fusion_wg_pipeline_manifest.json",
+        "final_summary_manifest.json",
+        "direct_solve_manifest.json",
+    ):
+        manifest_path = run_dir / manifest_name
+        if not manifest_path.exists():
+            continue
+        manifest = _read_json(manifest_path)
+        _append_mesh_candidate(candidates, manifest.get("solve_mesh"))
+        _append_mesh_candidate(candidates, manifest.get("mesh"))
+        direct = manifest.get("direct_solve")
+        if isinstance(direct, dict):
+            _append_mesh_candidate(candidates, direct.get("mesh"))
+    _append_mesh_candidate(candidates, _option_value(argv, "--mesh"))
+
+    for raw in candidates:
+        path = Path(raw).expanduser()
+        if path.name:
+            local = run_dir / path.name
+            if local.exists():
+                return local
+        if path.exists():
+            return path
+
+    tagged = run_dir / "tagged_sources.msh"
+    return tagged if tagged.exists() else None
+
+
 def _recover_postprocess_command(run_dir: Path) -> tuple[list[str] | None, str | None]:
     # The launch json is the primary record but not required: the summary
     # manifests carry the same commands.solve argv (some early runs have
@@ -141,8 +184,8 @@ def _recover_postprocess_command(run_dir: Path) -> tuple[list[str] | None, str |
             script = SOLVER_SCRIPT
         argv = _strip_runtime_flags(candidate[script_idx + 1:])
         argv = _replace_option_value(argv, "--out", str(run_dir))
-        mesh_path = run_dir / "tagged_sources.msh"
-        if mesh_path.exists():
+        mesh_path = _recover_mesh_path(run_dir, argv)
+        if mesh_path is not None:
             argv = _replace_option_value(argv, "--mesh", str(mesh_path))
         argv.append("--postprocess-only")
         return [sys.executable, str(script), *argv], None

@@ -39,6 +39,7 @@ expected_pipeline_paths = _fusion_pipeline_launch.expected_pipeline_paths
 mirror_axes_for_symmetry_planes = _fusion_pipeline_launch.mirror_axes_for_symmetry_planes
 quadrants_for_symmetry_planes = _fusion_pipeline_launch.quadrants_for_symmetry_planes
 symmetry_planes_for_mirror_plane = _fusion_pipeline_launch.symmetry_planes_for_mirror_plane
+validate_output_options = _fusion_pipeline_launch.validate_output_options
 write_launch_metadata = _fusion_pipeline_launch.write_launch_metadata
 
 
@@ -1114,8 +1115,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 raise RuntimeError(
                     "At least one source mesh mm value is required."
                 )
-            if not PIPELINE_SCRIPT.exists():
-                raise RuntimeError(f"Missing pipeline script: {PIPELINE_SCRIPT}")
+            stale_warning = _stale_install_warning()
+            if stale_warning:
+                raise RuntimeError(stale_warning)
             if not python_path.exists():
                 raise RuntimeError(f"Python interpreter does not exist: {python_path}")
             if open_wg and not wg_dir.exists():
@@ -1166,6 +1168,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             )
             if lf_mf_xo is not None and mf_hf_xo is not None and lf_mf_xo >= mf_hf_xo:
                 raise RuntimeError("LF/MF XO Hz must be below MF/HF XO Hz.")
+            validate_output_options(
+                export_vituixcad=export_vituixcad,
+                output_combined_set=output_combined_set,
+                crossover_lf_mf_hz=crossover_lf_mf_hz,
+                crossover_mf_hf_hz=crossover_mf_hf_hz,
+            )
 
             _save_settings({
                 "settings_version": SETTINGS_VERSION,

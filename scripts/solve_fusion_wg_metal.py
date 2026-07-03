@@ -1899,13 +1899,38 @@ def _write_vituixcad_export(
         if not isinstance(driver_payload, dict) or driver_payload.get("status") != "complete":
             continue
         outputs = driver_payload.get("outputs", {})
-        if not isinstance(outputs, dict) or not outputs.get("impedance_zma"):
-            continue
-        source_zma = Path(outputs["impedance_zma"])
-        if source_zma.exists():
+        if isinstance(outputs, dict) and outputs.get("impedance_zma"):
+            source_zma = Path(outputs["impedance_zma"])
+            if not source_zma.exists():
+                continue
             export_dir.mkdir(parents=True, exist_ok=True)
             copied_zma = export_dir / source_zma.name
             shutil.copy2(source_zma, copied_zma)
+            copied_zmas[str(source_result["name"])] = copied_zma
+            continue
+        private_impedance = source_result.get("_driver_lem_impedance")
+        if isinstance(private_impedance, dict):
+            try:
+                freqs = np.asarray(private_impedance["frequencies_hz"], dtype=np.float64)
+                impedance = np.asarray(
+                    private_impedance["impedance_ohm"],
+                    dtype=np.complex128,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if freqs.shape != impedance.shape:
+                continue
+            export_dir.mkdir(parents=True, exist_ok=True)
+            copied_zma = export_dir / f"{_safe_stem(source_result['name'])}_impedance.zma"
+            _write_zma(
+                copied_zma,
+                freqs,
+                impedance,
+                comment=(
+                    f"{source_result['name']} driver LEM electrical input "
+                    "impedance exported for VituixCAD"
+                ),
+            )
             copied_zmas[str(source_result["name"])] = copied_zma
     if passive_payload is not None:
         coupled = passive_payload.get("coupled")
@@ -4193,6 +4218,13 @@ def _apply_driver_lem_coupling(
         if source_result.get("pressure_basis_npz"):
             source_result["unit_pressure_basis_npz"] = source_result["pressure_basis_npz"]
         source_result["_active_pressure_basis"] = active_basis
+        source_result["_driver_lem_impedance"] = {
+            "frequencies_hz": np.asarray(basis.frequencies_hz, dtype=np.float64),
+            "impedance_ohm": np.asarray(
+                coupled.electrical_input_impedance,
+                dtype=np.complex128,
+            ),
+        }
         if not args.skip_driver_lem_artifacts:
             source_result["active_pressure_basis_npz"] = str(active_npz)
         if not args.skip_per_driver_plots:
@@ -4296,11 +4328,14 @@ def _solve_passive_cardioid_mf(
             ),
         }
 
-    mf_area_m2 = _mesh_tag_area_m2(
-        mesh_path,
-        mf_basis.source_tag,
-        mesh_scale=float(args.mesh_scale),
-    )
+    if mf_basis.source_area_m2 is not None:
+        mf_area_m2 = float(mf_basis.source_area_m2)
+    else:
+        mf_area_m2 = _mesh_tag_area_m2(
+            mesh_path,
+            mf_basis.source_tag,
+            mesh_scale=float(args.mesh_scale),
+        )
     model_port_area_m2 = (
         _parse_optional_positive_m2_from_cm2(args.passive_cardioid_port_area_cm2)
         or bem_port_area_m2
@@ -5366,6 +5401,16 @@ def _apply_post_solve_derived_outputs(
         for source in source_results
         if source.get("pressure_basis_npz")
     }
+    manifest["outputs"]["source_results_jsons"] = {
+        source["name"]: source["results_json"]
+        for source in source_results
+        if source.get("results_json")
+    }
+    manifest["outputs"]["source_directivity_heatmap_pngs"] = {
+        source["name"]: source["directivity_heatmap_png"]
+        for source in source_results
+        if source.get("directivity_heatmap_png")
+    }
     if not args.skip_derived_acoustics:
         manifest["outputs"]["source_directivity_power_pngs"] = {
             source["name"]: source["directivity_power_png"] for source in source_results
@@ -6106,6 +6151,20 @@ def main(argv: list[str] | None = None) -> int:
         and args.crossover_lf_mf_hz >= args.crossover_mf_hf_hz
     ):
         raise SystemExit("--crossover-lf-mf-hz must be below --crossover-mf-hf-hz")
+    if (
+        args.export_vituixcad
+        and not args.postprocess_only
+        and args.skip_combined_set
+        and (
+            args.crossover_lf_mf_hz is not None
+            or args.crossover_mf_hf_hz is not None
+        )
+    ):
+        raise SystemExit(
+            "--export-vituixcad with crossover frequencies requires the "
+            "combined/crossover set; remove --skip-combined-set or omit the "
+            "crossover frequencies"
+        )
     if args.polar_distance_m <= 0.0:
         raise SystemExit("--polar-distance-m must be positive")
     if args.polar_angle_count <= 0:

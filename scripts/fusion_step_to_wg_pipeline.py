@@ -375,6 +375,14 @@ def _open_output_folder(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def _open_requested_outputs(args: argparse.Namespace, out_dir: Path) -> None:
+    if args.open_output_folder:
+        _open_output_folder(out_dir)
+    report_path = out_dir / "report.html"
+    if args.open_report and not args.no_run_report and report_path.exists():
+        _open_output_folder(report_path)
+
+
 def _render_run_report(out_dir: Path, *, python: str) -> tuple[int, list[str]] | None:
     if not REPORT_SCRIPT.exists():
         return None
@@ -962,6 +970,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         pipeline_manifest["error"] = "prepare_step_for_wg_metal.py failed"
         pipeline_manifest["returncode"] = prep_returncode
         _write_json(pipeline_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
         return prep_returncode
 
     prep_manifest = _read_json(prep_manifest_path)
@@ -971,6 +980,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         pipeline_manifest["status"] = "failed"
         pipeline_manifest["error"] = str(exc)
         _write_json(pipeline_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
         return 1
     pipeline_manifest["sources"] = sources
     pipeline_manifest["skipped_sources"] = prep_manifest.get("skipped_sources", {})
@@ -1040,6 +1050,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         pipeline_manifest["error"] = "diagnose_wg_metal_orientation.py failed"
         pipeline_manifest["returncode"] = diagnose_returncode
         _write_json(pipeline_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
         return diagnose_returncode
 
     orientation_report_path = diagnose_out / "orientation_report.json"
@@ -1053,6 +1064,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             pipeline_manifest["status"] = "failed"
             pipeline_manifest["error"] = "diagnostic did not produce expanded mesh for non-native symmetry"
             _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
             return 1
         solve_mesh_path = Path(str(expanded_mesh_path))
         solve_native_symmetry_plane = None
@@ -1084,6 +1096,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 "diagnostic; pass --frame-axis/--frame-origin explicitly"
             )
             _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
             return 2
         frame_axis = ",".join(f"{c:g}" for c in auto_frame["axis"])
         frame_origin = ",".join(f"{c:.6g}" for c in auto_frame["origin_m"])
@@ -1122,8 +1135,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     "or pass --allow-underresolved-solve for debugging"
                 )
                 _write_json(pipeline_manifest_path, pipeline_manifest)
-                if args.open_output_folder:
-                    _open_output_folder(out_dir)
+                _open_requested_outputs(args, out_dir)
                 return 2
 
             if args.underresolved_solve_policy == "warn":
@@ -1172,8 +1184,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                         "skipped_sources": skipped_solve_sources,
                     }
                     _write_json(pipeline_manifest_path, pipeline_manifest)
-                    if args.open_output_folder:
-                        _open_output_folder(out_dir)
+                    _open_requested_outputs(args, out_dir)
                     return 2
                 solve_sources = kept_sources
                 pipeline_manifest["solve_frequency_adjustment"] = {
@@ -1193,8 +1204,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     pipeline_manifest["status"] = "failed"
                     pipeline_manifest["error"] = "could not determine a mesh-valid solve frequency limit"
                     _write_json(pipeline_manifest_path, pipeline_manifest)
-                    if args.open_output_folder:
-                        _open_output_folder(out_dir)
+                    _open_requested_outputs(args, out_dir)
                     return 2
                 if clamped_freq_max_hz < args.freq_min_hz:
                     pipeline_manifest["status"] = "failed"
@@ -1209,8 +1219,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                         "clamped_freq_max_hz": float(clamped_freq_max_hz),
                     }
                     _write_json(pipeline_manifest_path, pipeline_manifest)
-                    if args.open_output_folder:
-                        _open_output_folder(out_dir)
+                    _open_requested_outputs(args, out_dir)
                     return 2
                 solve_freq_max_hz = min(args.freq_max_hz, clamped_freq_max_hz)
                 pipeline_manifest["solve_frequency_adjustment"] = {
@@ -1377,6 +1386,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             pipeline_manifest["error"] = "solve_fusion_wg_metal.py failed"
             pipeline_manifest["returncode"] = solve_returncode
             _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
             return solve_returncode
 
         solve_manifest = _read_json(solve_manifest_path)
@@ -1402,10 +1412,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             _write_json(pipeline_manifest_path, pipeline_manifest)
             _write_json(out_dir / "final_summary_manifest.json", pipeline_manifest)
 
-    if args.open_output_folder:
-        _open_output_folder(out_dir)
-    if args.open_report and not args.no_run_report and (out_dir / "report.html").exists():
-        _open_output_folder(out_dir / "report.html")
+    _open_requested_outputs(args, out_dir)
     if args.open_wg:
         _launch_waveguide_generator(wg_dir, pipeline_manifest_path)
 

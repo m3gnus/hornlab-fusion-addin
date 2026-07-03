@@ -264,6 +264,24 @@ def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> 
         cmd.extend([flag, str(value).strip()])
 
 
+def validate_output_options(
+    *,
+    export_vituixcad: bool,
+    output_combined_set: bool,
+    crossover_lf_mf_hz: str | None = None,
+    crossover_mf_hf_hz: str | None = None,
+) -> None:
+    has_crossover = bool(str(crossover_lf_mf_hz or "").strip()) or bool(
+        str(crossover_mf_hf_hz or "").strip()
+    )
+    if export_vituixcad and not output_combined_set and has_crossover:
+        raise ValueError(
+            "VituixCAD export with crossover frequencies requires the "
+            "Combined/crossover output set. Enable that output or clear the "
+            "crossover frequencies."
+        )
+
+
 def estimate_clamped_solve_band(
     *,
     sources: str,
@@ -522,6 +540,12 @@ def build_pipeline_command(
     drive_voltage: str | None = None,
     rg_ohm: str | None = None,
 ) -> list[str]:
+    validate_output_options(
+        export_vituixcad=export_vituixcad,
+        output_combined_set=output_combined_set,
+        crossover_lf_mf_hz=crossover_lf_mf_hz,
+        crossover_mf_hf_hz=crossover_mf_hf_hz,
+    )
     plot_theme_value = str(plot_theme or "").strip() or "hornlab"
     cmd = [
         str(python_path),

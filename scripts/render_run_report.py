@@ -107,6 +107,8 @@ def _per_driver_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
     outputs = _as_dict(direct_manifest.get("outputs"))
     response_by_source = _as_dict(outputs.get("source_frequency_response_pngs"))
     basis_by_source = _as_dict(outputs.get("source_pressure_basis_npzs"))
+    result_by_source = _as_dict(outputs.get("source_results_jsons"))
+    heatmap_by_source = _as_dict(outputs.get("source_directivity_heatmap_pngs"))
     chunks: list[str] = []
     for source in _as_list(direct_manifest.get("sources")):
         if not isinstance(source, dict):
@@ -114,13 +116,13 @@ def _per_driver_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
         name = str(source.get("name", "source"))
         figures = [
             _image(run_dir, response_by_source.get(name) or source.get("frequency_response_png"), f"{name} frequency response"),
-            _image(run_dir, source.get("directivity_heatmap_png"), f"{name} directivity heatmap"),
+            _image(run_dir, heatmap_by_source.get(name) or source.get("directivity_heatmap_png"), f"{name} directivity heatmap"),
         ]
         links = []
         if basis_by_source.get(name) or source.get("pressure_basis_npz"):
             links.append(_link(run_dir, basis_by_source.get(name) or source.get("pressure_basis_npz"), "pressure basis"))
-        if source.get("results_json"):
-            links.append(_link(run_dir, source.get("results_json"), "results JSON"))
+        if result_by_source.get(name) or source.get("results_json"):
+            links.append(_link(run_dir, result_by_source.get(name) or source.get("results_json"), "results JSON"))
         body = "".join(item for item in figures if item)
         if links:
             body += '<p class="links">' + " ".join(links) + "</p>"
@@ -207,6 +209,48 @@ def _cardioid_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
     return body
 
 
+def _radiation_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
+    outputs = _as_dict(direct_manifest.get("outputs"))
+    links = [
+        _link(
+            run_dir,
+            outputs.get("port_exit_radiation_impedance_npz"),
+            "radiation impedance matrix NPZ",
+        ),
+        _link(
+            run_dir,
+            outputs.get("port_exit_radiation_impedance_summary_json"),
+            "radiation impedance summary JSON",
+        ),
+    ]
+    links = [item for item in links if item]
+    return '<p class="links">' + " ".join(links) + "</p>" if links else ""
+
+
+def _vituixcad_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
+    outputs = _as_dict(direct_manifest.get("outputs"))
+    links = [
+        _link(run_dir, outputs.get("vituixcad_export_dir"), "export folder"),
+        _link(run_dir, outputs.get("vituixcad_readme_txt"), "README"),
+        _link(run_dir, outputs.get("vituixcad_active_lr4_vxp"), "active LR4 project"),
+    ]
+    shown_zmas: set[str] = set()
+    for name, zma in sorted(_as_dict(outputs.get("vituixcad_driver_zmas")).items()):
+        links.append(_link(run_dir, zma, f"{name} ZMA"))
+        shown_zmas.add(str(zma))
+    mf_cardioid_zma = outputs.get("vituixcad_mf_cardioid_zma")
+    if mf_cardioid_zma and str(mf_cardioid_zma) not in shown_zmas:
+        links.append(
+            _link(
+                run_dir,
+                mf_cardioid_zma,
+                "MF cardioid ZMA",
+            )
+        )
+    links = [item for item in links if item]
+    return '<p class="links">' + " ".join(links) + "</p>" if links else ""
+
+
 def _logs_section(run_dir: Path, final_manifest: dict[str, Any]) -> str:
     links: list[str] = []
     for value in _as_dict(final_manifest.get("logs")).values():
@@ -251,8 +295,10 @@ def render_run(run_dir: Path) -> Path:
             _section("Per-Driver Plots", _per_driver_section(run_dir, direct_manifest)),
             _section("Combined / Crossover", _combined_section(run_dir, direct_manifest)),
             _section("Derived Acoustics", _derived_section(run_dir, direct_manifest)),
+            _section("Radiation Impedance", _radiation_section(run_dir, direct_manifest)),
             _section("Driver LEM", _driver_lem_section(run_dir, direct_manifest)),
             _section("Passive Cardioid", _cardioid_section(run_dir, direct_manifest)),
+            _section("VituixCAD", _vituixcad_section(run_dir, direct_manifest)),
             _section("Logs", _logs_section(run_dir, final_manifest)),
             "</main></body></html>",
         ]

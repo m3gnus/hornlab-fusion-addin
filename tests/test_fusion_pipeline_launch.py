@@ -730,6 +730,83 @@ def test_build_source_specs_rejects_generic_and_side_port_exits_together():
         )
 
 
+def test_named_preset_round_trip_through_launch_helper(tmp_path):
+    helper = _load_helper()
+    settings = {
+        "settings_version": 13,
+        "lf_mesh_mm": "18",
+        "hf_mesh_mm": "4",
+        "freq_count": "47",
+        "output_run_report": False,
+    }
+
+    path = helper.save_preset("Sweep A", settings, presets_dir=tmp_path)
+    loaded = helper.load_preset("Sweep_A", presets_dir=tmp_path)
+
+    assert path == tmp_path / "Sweep_A.json"
+    assert helper.list_preset_names(presets_dir=tmp_path) == ["Sweep_A"]
+    assert loaded == settings
+
+
+def test_pipeline_preset_defaults_keep_explicit_cli_precedence(tmp_path):
+    pipeline = _load_pipeline()
+    preset = tmp_path / "headless.json"
+    preset.write_text(
+        json.dumps(
+            {
+                "settings_version": 13,
+                "lf_mesh_mm": "18",
+                "mf_mesh_mm": "",
+                "hf_mesh_mm": "4",
+                "freq_min_hz": "80",
+                "freq_max_hz": "12000",
+                "freq_count": "31",
+                "freq_spacing": "linear",
+                "transition_mm": "160",
+                "crossover_mf_hf_hz": "950",
+                "clamp_to_mesh_limit": True,
+                "show_mesh_valid_markers": False,
+                "output_combined_set": False,
+                "mesh_only": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = pipeline.parse_args(
+        [
+            "--step",
+            "/tmp/design.step",
+            "--out",
+            "/tmp/out",
+            "--preset",
+            str(preset),
+            "--source",
+            "MF:10",
+            "--freq-count",
+            "99",
+            # Explicitly passed AT the argparse default: must still beat the
+            # preset's 80 (guards against default-comparison merge regressions).
+            "--freq-min-hz",
+            "50",
+        ]
+    )
+
+    assert args.source == ["MF:10"]
+    assert args.sources == []
+    assert args.freq_min_hz == pytest.approx(50.0)
+    assert args.freq_max_hz == pytest.approx(12000.0)
+    assert args.freq_count == 99
+    assert args.freq_spacing == "linear"
+    assert args.transition_mm == pytest.approx(160.0)
+    assert args.crossover_mf_hf_hz == pytest.approx(950.0)
+    assert args.underresolved_solve_policy == "clamp-per-source"
+    assert args.mesh_valid_markers is False
+    assert args.skip_combined_set is True
+    assert args.run_solves is True
+    assert args.mesh_only is False
+
+
 def test_pipeline_normalizes_explicit_port_exit_source_tags():
     pipeline = _load_pipeline()
 

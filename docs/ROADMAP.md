@@ -138,18 +138,21 @@ stored bases. Rather than a new GUI application:
 - revisit a real viewer only if these prove insufficient — a custom app is
   a permanent maintenance surface and mostly duplicates the two above
 
-## 7. Smaller ideas
+## 7. Smaller ideas — mostly DONE
 
-- **Named presets**: save/load full dialog configurations as JSON (the
-  settings file only remembers last-used values); presets travel with a
-  design and double as headless-rerun configs.
-- **Headless batch**: document running `fusion_step_to_wg_pipeline.py`
-  against an already-exported STEP for parameter sweeps without Fusion.
-- **Half-space / ground-plane mode**: the Metal solver has an `xy` symmetry
-  kernel; a "rigid floor" toggle would emulate ground-plane measurement
-  conditions (needs observation-frame care on the mirrored axis).
-- **A/B compare**: overlay on-axis + DI curves of two run folders into one
-  report page.
+- **Named presets — DONE**: save/load full dialog configurations as JSON under
+  `~/Library/Application Support/HornLab/WGMetalPipeline/presets/`; the same
+  files feed `fusion_step_to_wg_pipeline.py --preset`, with explicit CLI flags
+  taking precedence.
+- **Headless batch — DONE**: documented in [HEADLESS.md](HEADLESS.md), covering
+  re-running an exported STEP, preset-driven source sweeps, postprocess
+  regeneration, report/index rendering, and A/B compare.
+- **Half-space / ground-plane mode — DEFERRED**: the Metal solver has an `xy`
+  symmetry kernel, but rigid-floor semantics need a separate design pass with
+  observation-frame care on the mirrored axis.
+- **A/B compare — DONE**: `scripts/compare_runs.py` overlays on-axis response,
+  directivity index, beamwidth, and group delay for two manifest-backed run
+  folders, and writes a config-diff table.
 
 ## Sequencing
 
@@ -158,4 +161,4 @@ stored bases. Rather than a new GUI application:
 3. Item 3 (N-driver table + Hornresp import) — builds on 2
 4. Item 4 (DI/power/group delay/excursion) — cheap, parallelizable
 5. Items 5–6 (outputs panel, folders, HTML report) — UX consolidation
-6. Item 7 as opportunity allows
+6. Remaining item 7 half-space / ground-plane design pass when needed

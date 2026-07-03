@@ -36,8 +36,12 @@ estimate_clamped_solve_band = _fusion_pipeline_launch.estimate_clamped_solve_ban
 estimate_design_mesh_cost = _fusion_pipeline_launch.estimate_design_mesh_cost
 format_mesh_cost_summary = _fusion_pipeline_launch.format_mesh_cost_summary
 expected_pipeline_paths = _fusion_pipeline_launch.expected_pipeline_paths
+list_preset_names = _fusion_pipeline_launch.list_preset_names
+load_preset = _fusion_pipeline_launch.load_preset
 mirror_axes_for_symmetry_planes = _fusion_pipeline_launch.mirror_axes_for_symmetry_planes
+preset_path = _fusion_pipeline_launch.preset_path
 quadrants_for_symmetry_planes = _fusion_pipeline_launch.quadrants_for_symmetry_planes
+save_preset = _fusion_pipeline_launch.save_preset
 symmetry_planes_for_mirror_plane = _fusion_pipeline_launch.symmetry_planes_for_mirror_plane
 validate_output_options = _fusion_pipeline_launch.validate_output_options
 write_launch_metadata = _fusion_pipeline_launch.write_launch_metadata
@@ -78,6 +82,7 @@ SETTINGS_PATH = (
     / "WGMetalPipeline"
     / "settings.json"
 )
+PRESETS_DIR = _fusion_pipeline_launch.DEFAULT_PRESETS_DIR
 SETTINGS_VERSION = 13
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
@@ -134,6 +139,11 @@ DEFAULT_SETTINGS = {
     "drive_voltage": "2.83",
     "rg_ohm": "0",
 }
+_SETTING_INPUT_IDS = tuple(
+    key for key in DEFAULT_SETTINGS.keys() if key != "settings_version"
+)
+_DROPDOWN_SETTING_IDS = frozenset({"freq_spacing", "mirror_plane"})
+_NO_PRESET_LABEL = "(none)"
 # Keys removed or redefined at a given settings version, mapped to the version
 # that made them stale. A stored key is dropped on load only when the file
 # predates that version, so a bump for one key no longer wipes the others.
@@ -335,6 +345,78 @@ def _save_settings(settings: dict) -> None:
     )
 
 
+def _bool_from_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _settings_from_inputs(inputs) -> dict:
+    settings = {"settings_version": SETTINGS_VERSION}
+    for input_id in _SETTING_INPUT_IDS:
+        item = _input_by_id(inputs, input_id)
+        if item is None:
+            settings[input_id] = DEFAULT_SETTINGS[input_id]
+            continue
+        if input_id in _DROPDOWN_SETTING_IDS:
+            selected = getattr(item, "selectedItem", None)
+            settings[input_id] = (
+                selected.name if selected is not None else DEFAULT_SETTINGS[input_id]
+            )
+            continue
+        value = getattr(item, "value", None)
+        if isinstance(DEFAULT_SETTINGS.get(input_id), bool):
+            settings[input_id] = bool(value)
+        else:
+            settings[input_id] = "" if value is None else str(value).strip()
+    return settings
+
+
+def _select_dropdown_value(item, value: str) -> None:
+    target = str(value)
+    selected = False
+    try:
+        items = item.listItems
+        for index in range(int(items.count)):
+            list_item = items.item(index)
+            list_item.isSelected = list_item.name == target
+            selected = selected or bool(list_item.isSelected)
+    except Exception:
+        selected = False
+    if not selected:
+        try:
+            item.selectedItem.name = target
+        except Exception:
+            pass
+
+
+def _set_input_from_setting(inputs, input_id: str, value) -> None:
+    item = _input_by_id(inputs, input_id)
+    if item is None:
+        return
+    if input_id in _DROPDOWN_SETTING_IDS:
+        _select_dropdown_value(item, value)
+        return
+    try:
+        if isinstance(DEFAULT_SETTINGS.get(input_id), bool):
+            item.value = _bool_from_value(value)
+        else:
+            item.value = "" if value is None else str(value)
+    except Exception:
+        pass
+
+
+def _apply_settings_to_inputs(inputs, loaded: dict) -> dict:
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update({key: value for key, value in loaded.items() if key in DEFAULT_SETTINGS})
+    settings["settings_version"] = SETTINGS_VERSION
+    for input_id in _SETTING_INPUT_IDS:
+        _set_input_from_setting(inputs, input_id, settings.get(input_id))
+    _sync_passive_cardioid_ui(inputs)
+    _update_size_prediction(inputs)
+    return settings
+
+
 def _setting_str(settings: dict, input_id: str) -> str:
     return str(settings.get(input_id, DEFAULT_SETTINGS.get(input_id, "")))
 
@@ -350,6 +432,82 @@ def _selected_dropdown_name(inputs, input_id: str) -> str:
     item = _input_by_id(inputs, input_id)
     selected = item.selectedItem if item else None
     return selected.name if selected else ""
+
+
+def _dropdown_names(dropdown) -> set[str]:
+    try:
+        items = dropdown.listItems
+        return {str(items.item(index).name) for index in range(int(items.count))}
+    except Exception:
+        return set()
+
+
+def _clear_dropdown(dropdown) -> bool:
+    try:
+        items = dropdown.listItems
+        for index in reversed(range(int(items.count))):
+            items.item(index).deleteMe()
+        return True
+    except Exception:
+        return False
+
+
+def _refresh_preset_dropdown(inputs, selected_name: str = "") -> None:
+    dropdown = _input_by_id(inputs, "preset_select")
+    if dropdown is None:
+        return
+    names = list_preset_names(presets_dir=PRESETS_DIR)
+    selected = selected_name if selected_name in names else (names[0] if names else "")
+    cleared = _clear_dropdown(dropdown)
+    existing = set() if cleared else _dropdown_names(dropdown)
+    if not names:
+        if _NO_PRESET_LABEL not in existing:
+            try:
+                dropdown.listItems.add(_NO_PRESET_LABEL, True)
+            except Exception:
+                pass
+        return
+    for name in names:
+        if name in existing:
+            continue
+        try:
+            dropdown.listItems.add(name, name == selected)
+        except Exception:
+            pass
+    if selected:
+        _select_dropdown_value(dropdown, selected)
+
+
+def _selected_preset_name(inputs) -> str:
+    typed = str(_input_value(inputs, "preset_name") or "").strip()
+    if typed:
+        return typed
+    selected = _selected_dropdown_name(inputs, "preset_select")
+    return "" if selected == _NO_PRESET_LABEL else selected
+
+
+def _save_named_preset_from_inputs(inputs) -> Path:
+    name = _selected_preset_name(inputs)
+    settings = _settings_from_inputs(inputs)
+    path = save_preset(name, settings, presets_dir=PRESETS_DIR)
+    safe_name = path.stem
+    name_input = _input_by_id(inputs, "preset_name")
+    if name_input is not None:
+        name_input.value = safe_name
+    _refresh_preset_dropdown(inputs, safe_name)
+    return path
+
+
+def _load_named_preset_into_inputs(inputs) -> Path:
+    name = _selected_preset_name(inputs)
+    path = preset_path(name, presets_dir=PRESETS_DIR)
+    settings = load_preset(name, presets_dir=PRESETS_DIR)
+    _apply_settings_to_inputs(inputs, settings)
+    name_input = _input_by_id(inputs, "preset_name")
+    if name_input is not None:
+        name_input.value = path.stem
+    _refresh_preset_dropdown(inputs, path.stem)
+    return path
 
 
 def _active_design_name(design) -> str:
@@ -511,6 +669,24 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             command = args.command
             inputs = command.commandInputs
             settings = _load_settings()
+
+            presets_group = inputs.addGroupCommandInput("grp_presets", "Presets")
+            presets_group.isExpanded = True
+            presets = presets_group.children
+            preset_select = presets.addDropDownCommandInput(
+                "preset_select",
+                "Preset",
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            preset_names = list_preset_names(presets_dir=PRESETS_DIR)
+            if preset_names:
+                for index, preset_name in enumerate(preset_names):
+                    preset_select.listItems.add(preset_name, index == 0)
+            else:
+                preset_select.listItems.add(_NO_PRESET_LABEL, True)
+            presets.addStringValueInput("preset_name", "Name", "")
+            presets.addBoolValueInput("load_preset", "Load preset", False, "", False)
+            presets.addBoolValueInput("save_preset", "Save preset", False, "", False)
 
             sources_group = inputs.addGroupCommandInput("grp_sources", "Sources and mesh")
             sources_group.isExpanded = True
@@ -846,7 +1022,21 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             changed = args.input
             input_id = changed.id if changed else ""
             inputs = args.inputs
-            if input_id == "browse_output_root":
+            if input_id == "preset_select":
+                selected = _selected_dropdown_name(inputs, "preset_select")
+                if selected and selected != _NO_PRESET_LABEL:
+                    name_input = _input_by_id(inputs, "preset_name")
+                    if name_input is not None:
+                        name_input.value = selected
+            elif input_id == "load_preset":
+                path = _load_named_preset_into_inputs(inputs)
+                changed.value = False
+                _show_message(f"Loaded preset:\n{path}")
+            elif input_id == "save_preset":
+                path = _save_named_preset_from_inputs(inputs)
+                changed.value = False
+                _show_message(f"Saved preset:\n{path}")
+            elif input_id == "browse_output_root":
                 _choose_folder(inputs, "output_root", "Select WG Metal output root")
                 changed.value = False
             elif input_id == "browse_wg_dir":

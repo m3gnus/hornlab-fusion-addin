@@ -413,6 +413,41 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
     assert settings["export_vituixcad"] is True
 
 
+def test_addin_named_preset_round_trip_applies_dialog_inputs(tmp_path, monkeypatch):
+    addin = _load_addin_with_fake_adsk()
+    monkeypatch.setattr(addin, "PRESETS_DIR", tmp_path)
+    top = _Inputs(
+        [
+            _Input("preset_name", "nearfield"),
+            _Input("preset_select", selected=_Selected("(none)")),
+            _Input("freq_count", "64"),
+            _Input("freq_spacing", selected=_Selected("linear")),
+            _Input("mirror_plane", selected=_Selected("Top/Bottom")),
+            _Input("output_run_report", False),
+            _Input("passive_cardioid_enabled", False),
+            _Input("passive_cardioid_rear_volume_l", ""),
+            _Input("passive_cardioid_port_length_mm", "0"),
+            _Input("passive_cardioid_port_area_cm2", ""),
+            _Input("passive_cardioid_foam_resistance_pa_s_m3", "0"),
+            _Input("passive_cardioid_invert_port", True),
+            _Input("passive_cardioid_coupled", False),
+        ]
+    )
+
+    path = addin._save_named_preset_from_inputs(top)
+    addin._input_by_id(top, "freq_count").value = "12"
+    addin._input_by_id(top, "freq_spacing").selectedItem.name = "log"
+    addin._input_by_id(top, "mirror_plane").selectedItem.name = "Auto detect"
+    addin._input_by_id(top, "output_run_report").value = True
+    addin._load_named_preset_into_inputs(top)
+
+    assert path == tmp_path / "nearfield.json"
+    assert addin._input_value(top, "freq_count") == "64"
+    assert addin._selected_dropdown_name(top, "freq_spacing") == "linear"
+    assert addin._selected_dropdown_name(top, "mirror_plane") == "Top/Bottom"
+    assert addin._input_value(top, "output_run_report") is False
+
+
 def test_parse_helpers_reject_non_finite_values():
     addin = _load_addin_with_fake_adsk()
     for raw in ("nan", "inf", "-inf"):

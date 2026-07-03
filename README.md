@@ -17,6 +17,7 @@ meshing and solves run:
 ## Docs
 
 - [User guide](docs/USER-GUIDE.md)
+- [Headless reruns, sweeps, and A/B compare](docs/HEADLESS.md)
 - [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)
 
 ## Install

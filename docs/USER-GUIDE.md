@@ -45,6 +45,12 @@ quarter, or full model.
 
 ## 3. The Dialog
 
+Presets: the top row loads and saves named full-dialog configurations. Enter a
+name and click Save preset, or choose an existing preset and click Load preset.
+Preset JSON files are stored under
+`~/Library/Application Support/HornLab/WGMetalPipeline/presets/` and can also
+be used by the headless `--preset` CLI flag.
+
 Sources and mesh: enter source patch mesh sizes for `LF`, `MF`, `HF`, and
 optionally `PORT_EXIT`. Blank means do not request that source. `Rigid body
 mesh mm` controls the background mesh, and `Transition mm` controls grading
@@ -159,6 +165,20 @@ an index over an output root:
 .venv/bin/python scripts/render_run_report.py --index runs/fusion360
 ```
 
+To compare two run folders:
+
+```bash
+.venv/bin/python scripts/compare_runs.py \
+  runs/fusion360/run-a \
+  runs/fusion360/run-b \
+  --out runs/fusion360/compare-run-a-run-b \
+  --plot-theme hornlab
+```
+
+The compare report writes `ab_compare.html` plus overlay PNGs for on-axis
+response, directivity index, beamwidth, and group delay. It reads both flat
+layout-1 runs and structured layout-2 runs through their manifests.
+
 ## 5. VituixCAD Workflow
 
 Enable Outputs > VituixCAD export before running. Open `vituixcad/README.txt`
@@ -181,6 +201,9 @@ the computed active LR4 filters, level gains, and delays from
 cardioid output is present.
 
 ## 6. Re-running Without Re-solving
+
+For complete headless reruns, preset-driven sweeps, report regeneration, and
+A/B compare examples, see [HEADLESS.md](HEADLESS.md).
 
 To regenerate derived artifacts from an existing run folder with the recorded
 solve command:

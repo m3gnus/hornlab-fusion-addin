@@ -205,16 +205,27 @@ Postprocess-only regeneration reads both layout-1 flat runs and layout-2 runs.
 Old flat runs regenerate beside the original flat artifacts; layout-2 runs
 regenerate into the category folders above.
 
+To compare two completed runs, use:
+
+```bash
+python3 scripts/compare_runs.py run-a run-b --out compare-a-b --plot-theme hornlab
+```
+
+The compare report writes `ab_compare.html` and overlay PNGs for on-axis
+response, directivity index, beamwidth, and group delay, resolving artifacts
+through manifests for both layout versions.
+
 ## Dialog
 
-Inputs are grouped: **Sources and mesh** (per-source resolutions, rigid body
-resolution, transition distance), **Mesh sizing** (refine overrides and the live
-Estimate readout), **Solve** (frequency band and polar grid, mesh-only toggle,
-mesh-valid clamp, mesh-valid plot-marker toggle), **Passive cardioid MF**
-(optional MF plus `PORT_EXIT` postprocess combine), **Driver LEM (optional)**
-(per-source T/S text or Hornresp driver-file path, rear volumes, shared drive
-voltage and source resistance), **Outputs** (output root, open folder, open
-report, and per-category checkboxes for per-driver plots, combined/crossover,
+Inputs are grouped: **Presets** (named full-dialog save/load JSON files),
+**Sources and mesh** (per-source resolutions, rigid body resolution, transition
+distance), **Mesh sizing** (refine overrides and the live Estimate readout),
+**Solve** (frequency band and polar grid, mesh-only toggle, mesh-valid clamp,
+mesh-valid plot-marker toggle), **Passive cardioid MF** (optional MF plus
+`PORT_EXIT` postprocess combine), **Driver LEM (optional)** (per-source T/S
+text or Hornresp driver-file path, rear volumes, shared drive voltage and
+source resistance), **Outputs** (output root, open folder, open report, and
+per-category checkboxes for per-driver plots, combined/crossover,
 passive-cardioid, Driver LEM, derived acoustics, VituixCAD, radiation
 impedance, pressure bases, and HTML report), and **Advanced** (mirror plane
 override, Python interpreter, Waveguide Generator folder, launch WG). Typical
@@ -283,6 +294,13 @@ The dialog remembers the last values used after a run. Settings are stored in:
 
 ```text
 ~/Library/Application Support/HornLab/WGMetalPipeline/settings.json
+```
+
+Named presets are stored separately and can be passed to headless runs with
+`fusion_step_to_wg_pipeline.py --preset <name-or-path>`:
+
+```text
+~/Library/Application Support/HornLab/WGMetalPipeline/presets/<name>.json
 ```
 
 Direct solves use the canonical `hornlab_metal_bem` package — from the

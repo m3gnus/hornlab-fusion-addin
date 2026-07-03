@@ -27,10 +27,20 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WG_DIR = REPO_ROOT.parent / "Waveguide Generator"
 DEFAULT_TOPOLOGY_TOL = 1e-5
+ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
 PREP_SCRIPT = REPO_ROOT / "scripts" / "prepare_step_for_wg_metal.py"
 DIAGNOSE_SCRIPT = REPO_ROOT / "scripts" / "diagnose_wg_metal_orientation.py"
 SOLVE_SCRIPT = REPO_ROOT / "scripts" / "solve_fusion_wg_metal.py"
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
+if ADDIN_DIR.is_dir() and str(ADDIN_DIR) not in sys.path:
+    sys.path.insert(0, str(ADDIN_DIR))
+from fusion_pipeline_launch import (  # noqa: E402
+    build_source_specs,
+    load_preset,
+    mirror_axes_for_symmetry_planes,
+    quadrants_for_symmetry_planes,
+    symmetry_planes_for_mirror_plane,
+)
 CANONICAL_SOURCE_TAGS = {
     "LF": 2,
     "MF": 3,
@@ -494,8 +504,277 @@ def _launch_waveguide_generator(wg_dir: Path, pipeline_manifest: Path) -> None:
         subprocess.Popen(["npm", "start"], cwd=str(wg_dir), env={**os.environ, "WG_FUSION_PIPELINE_MANIFEST": str(pipeline_manifest)})
 
 
+def _argv_has_option(argv: list[str], *options: str) -> bool:
+    for token in argv:
+        for option in options:
+            if token == option or token.startswith(f"{option}="):
+                return True
+    return False
+
+
+def _preset_text(settings: dict[str, Any], key: str) -> str | None:
+    if key not in settings or settings[key] is None:
+        return None
+    text = str(settings[key]).strip()
+    return text if text else None
+
+
+def _preset_bool(settings: dict[str, Any], key: str) -> bool | None:
+    if key not in settings or settings[key] is None:
+        return None
+    value = settings[key]
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _set_preset_value(
+    args: argparse.Namespace,
+    argv: list[str],
+    settings: dict[str, Any],
+    *,
+    key: str,
+    dest: str,
+    options: tuple[str, ...],
+    caster,
+) -> None:
+    if _argv_has_option(argv, *options):
+        return
+    raw = _preset_text(settings, key)
+    if raw is None:
+        return
+    try:
+        setattr(args, dest, caster(raw))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"preset {key!r} is invalid: {raw!r}") from exc
+
+
+def _apply_preset_sources(
+    args: argparse.Namespace,
+    argv: list[str],
+    settings: dict[str, Any],
+) -> None:
+    if _argv_has_option(argv, "--source", "--sources"):
+        return
+    try:
+        sources = build_source_specs(
+            lf_mesh_mm=_preset_text(settings, "lf_mesh_mm") or "",
+            mf_mesh_mm=_preset_text(settings, "mf_mesh_mm") or "",
+            hf_mesh_mm=_preset_text(settings, "hf_mesh_mm") or "",
+            port_exit_mesh_mm=_preset_text(settings, "port_exit_mesh_mm") or "",
+            port_exit_l_mesh_mm=_preset_text(settings, "port_exit_l_mesh_mm") or "",
+            port_exit_r_mesh_mm=_preset_text(settings, "port_exit_r_mesh_mm") or "",
+        )
+    except ValueError as exc:
+        raise SystemExit(f"preset source settings are invalid: {exc}") from exc
+    if sources:
+        args.source = []
+        args.sources = [sources]
+
+
+def _apply_preset_mirror_plane(
+    args: argparse.Namespace,
+    argv: list[str],
+    settings: dict[str, Any],
+) -> None:
+    if _argv_has_option(argv, "--symmetry-planes", "--quadrants", "--mirror-axes"):
+        return
+    mirror_plane = _preset_text(settings, "mirror_plane")
+    if not mirror_plane:
+        return
+    symmetry_planes = symmetry_planes_for_mirror_plane(mirror_plane)
+    args.symmetry_planes = symmetry_planes
+    quadrants = quadrants_for_symmetry_planes(symmetry_planes)
+    if quadrants != "auto":
+        args.quadrants = int(quadrants)
+    mirror_axes = mirror_axes_for_symmetry_planes(symmetry_planes)
+    if mirror_axes != "auto":
+        args.mirror_axes = mirror_axes
+
+
+def _set_preset_bool(
+    args: argparse.Namespace,
+    argv: list[str],
+    settings: dict[str, Any],
+    *,
+    key: str,
+    dest: str,
+    options: tuple[str, ...],
+    invert: bool = False,
+) -> None:
+    if _argv_has_option(argv, *options):
+        return
+    value = _preset_bool(settings, key)
+    if value is None:
+        return
+    setattr(args, dest, (not value) if invert else value)
+
+
+def _apply_preset_repeatables(
+    args: argparse.Namespace,
+    argv: list[str],
+    settings: dict[str, Any],
+) -> None:
+    if not _argv_has_option(argv, "--refine"):
+        refine = _preset_text(settings, "refine")
+        if refine:
+            args.refine = [entry.strip() for entry in refine.split(",") if entry.strip()]
+    if not _argv_has_option(argv, "--driver-lem"):
+        driver_entries = []
+        for name, key in (
+            ("LF", "lf_driver_lem"),
+            ("MF", "mf_driver_lem"),
+            ("HF", "hf_driver_lem"),
+        ):
+            payload = _preset_text(settings, key)
+            if payload:
+                driver_entries.append(f"{name}:{payload}")
+        if driver_entries:
+            args.driver_lem = driver_entries
+    if not _argv_has_option(argv, "--driver-rear-volume-l"):
+        volume_entries = []
+        for name, key in (
+            ("LF", "lf_driver_rear_volume_l"),
+            ("MF", "mf_driver_rear_volume_l"),
+            ("HF", "hf_driver_rear_volume_l"),
+        ):
+            value = _preset_text(settings, key)
+            if value:
+                volume_entries.append(f"{name}:{value}")
+        if volume_entries:
+            args.driver_rear_volume_l = volume_entries
+
+
+def _apply_preset_defaults(args: argparse.Namespace, argv: list[str]) -> None:
+    if not args.preset:
+        return
+    settings = load_preset(args.preset)
+    args.preset_path = str(args.preset)
+    _apply_preset_sources(args, argv, settings)
+    for key, dest, options, caster in (
+        ("transition_mm", "transition_mm", ("--transition-mm",), float),
+        ("rigid_res_mm", "rigid_res_mm", ("--rigid-res-mm", "--global-res-mm"), float),
+        ("freq_min_hz", "freq_min_hz", ("--freq-min-hz",), float),
+        ("freq_max_hz", "freq_max_hz", ("--freq-max-hz",), float),
+        ("freq_count", "freq_count", ("--freq-count",), int),
+        ("freq_spacing", "freq_spacing", ("--freq-spacing",), str),
+        ("polar_distance_m", "polar_distance_m", ("--polar-distance-m",), float),
+        ("polar_angle_min_deg", "polar_angle_min_deg", ("--polar-angle-min-deg",), float),
+        ("polar_angle_max_deg", "polar_angle_max_deg", ("--polar-angle-max-deg",), float),
+        ("polar_angle_count", "polar_angle_count", ("--polar-angle-count",), int),
+        ("plot_theme", "plot_theme", ("--plot-theme",), str),
+        ("crossover_lf_mf_hz", "crossover_lf_mf_hz", ("--crossover-lf-mf-hz",), float),
+        ("crossover_mf_hf_hz", "crossover_mf_hf_hz", ("--crossover-mf-hf-hz",), float),
+        ("drive_voltage", "drive_voltage", ("--drive-voltage",), float),
+        ("rg_ohm", "rg_ohm", ("--rg-ohm",), float),
+        (
+            "passive_cardioid_rear_volume_l",
+            "passive_cardioid_rear_volume_l",
+            ("--passive-cardioid-rear-volume-l",),
+            float,
+        ),
+        (
+            "passive_cardioid_port_length_mm",
+            "passive_cardioid_port_length_mm",
+            ("--passive-cardioid-port-length-mm",),
+            float,
+        ),
+        (
+            "passive_cardioid_port_area_cm2",
+            "passive_cardioid_port_area_cm2",
+            ("--passive-cardioid-port-area-cm2",),
+            float,
+        ),
+        (
+            "passive_cardioid_foam_resistance_pa_s_m3",
+            "passive_cardioid_foam_resistance_pa_s_m3",
+            ("--passive-cardioid-foam-resistance-pa-s-m3",),
+            float,
+        ),
+    ):
+        _set_preset_value(
+            args,
+            argv,
+            settings,
+            key=key,
+            dest=dest,
+            options=options,
+            caster=caster,
+        )
+    if args.freq_spacing not in {"log", "linear"}:
+        raise SystemExit("preset 'freq_spacing' must be 'log' or 'linear'")
+    _apply_preset_mirror_plane(args, argv, settings)
+    if not _argv_has_option(argv, "--mesh-only", "--run-solves"):
+        mesh_only = _preset_bool(settings, "mesh_only")
+        if mesh_only is not None:
+            args.mesh_only = mesh_only
+            args.run_solves = not mesh_only
+    if not _argv_has_option(argv, "--allow-underresolved-solve", "--underresolved-solve-policy"):
+        clamp = _preset_bool(settings, "clamp_to_mesh_limit")
+        if clamp is not None:
+            args.underresolved_solve_policy = "clamp-per-source" if clamp else "warn"
+    _set_preset_bool(
+        args,
+        argv,
+        settings,
+        key="show_mesh_valid_markers",
+        dest="mesh_valid_markers",
+        options=("--mesh-valid-markers", "--no-mesh-valid-markers"),
+    )
+    for key, dest, options in (
+        ("open_wg", "open_wg", ("--open-wg",)),
+        ("open_output", "open_output_folder", ("--open-output-folder",)),
+        ("open_report", "open_report", ("--open-report",)),
+        ("export_vituixcad", "export_vituixcad", ("--export-vituixcad",)),
+        ("passive_cardioid_enabled", "passive_cardioid_mf", ("--passive-cardioid-mf",)),
+        ("passive_cardioid_coupled", "passive_cardioid_coupled", ("--passive-cardioid-coupled",)),
+    ):
+        _set_preset_bool(args, argv, settings, key=key, dest=dest, options=options)
+    for key, dest, options in (
+        ("output_per_driver_plots", "skip_per_driver_plots", ("--skip-per-driver-plots",)),
+        ("output_combined_set", "skip_combined_set", ("--skip-combined-set",)),
+        ("output_passive_cardioid_set", "skip_passive_cardioid_set", ("--skip-passive-cardioid-set",)),
+        ("output_driver_lem_artifacts", "skip_driver_lem_artifacts", ("--skip-driver-lem-artifacts",)),
+        ("output_derived_acoustics", "skip_derived_acoustics", ("--skip-derived-acoustics",)),
+        ("output_radiation_impedance", "skip_radiation_impedance", ("--skip-radiation-impedance",)),
+        ("output_pressure_bases", "skip_pressure_bases", ("--skip-pressure-bases",)),
+        ("output_run_report", "no_run_report", ("--no-run-report",)),
+    ):
+        _set_preset_bool(
+            args,
+            argv,
+            settings,
+            key=key,
+            dest=dest,
+            options=options,
+            invert=True,
+        )
+    _set_preset_bool(
+        args,
+        argv,
+        settings,
+        key="passive_cardioid_invert_port",
+        dest="passive_cardioid_invert_port",
+        options=("--passive-cardioid-invert-port", "--no-passive-cardioid-invert-port"),
+    )
+    _apply_preset_repeatables(args, argv, settings)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # allow_abbrev=False: preset precedence scans raw argv for exact option
+    # tokens; an abbreviated flag would parse but evade the scan, letting the
+    # preset silently override an explicitly passed value.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--preset",
+        default=None,
+        help=(
+            "Preset JSON path or saved preset name from "
+            "~/Library/Application Support/HornLab/WGMetalPipeline/presets. "
+            "Explicit CLI flags override preset values."
+        ),
+    )
     parser.add_argument("--step", type=Path, required=True, help="STEP file exported from Fusion")
     parser.add_argument("--out", type=Path, required=True, help="Output folder for all generated artifacts")
     parser.add_argument(
@@ -743,7 +1022,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--passive-cardioid-driver-count", type=int, default=None)
     parser.add_argument("--passive-cardioid-drive-voltage", type=float, default=None)
     parser.add_argument("--passive-cardioid-rg-ohm", type=float, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
+    _apply_preset_defaults(args, raw_argv)
+    return args
 
 
 def _quadrants_for_planes(symmetry_planes: tuple[str, ...]) -> int | None:

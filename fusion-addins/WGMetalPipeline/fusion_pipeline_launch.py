@@ -21,6 +21,14 @@ MIRROR_PLANE_SYMMETRY_PLANES = {
     "Top/Bottom": "z0",
     "Full model": "none",
 }
+APP_SUPPORT_DIR = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "HornLab"
+    / "WGMetalPipeline"
+)
+DEFAULT_PRESETS_DIR = APP_SUPPORT_DIR / "presets"
 
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
@@ -262,6 +270,77 @@ def build_driver_lem_cli_entry(name: str, raw_payload: str | None) -> str | None
 def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> None:
     if value and str(value).strip():
         cmd.extend([flag, str(value).strip()])
+
+
+def sanitize_preset_name(raw_name: str) -> str:
+    name = str(raw_name or "").strip()
+    if name.lower().endswith(".json"):
+        name = name[:-5]
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    if not name:
+        raise ValueError("Preset name is required.")
+    return name
+
+
+def preset_path(
+    name_or_path: str | Path,
+    *,
+    presets_dir: Path = DEFAULT_PRESETS_DIR,
+) -> Path:
+    raw = str(name_or_path or "").strip()
+    if not raw:
+        raise ValueError("Preset name or path is required.")
+    candidate = Path(raw).expanduser()
+    is_path = (
+        candidate.is_absolute()
+        or "/" in raw
+        or "\\" in raw
+        or candidate.suffix.lower() == ".json"
+    )
+    if is_path:
+        return candidate if candidate.suffix else candidate.with_suffix(".json")
+    return Path(presets_dir).expanduser() / f"{sanitize_preset_name(raw)}.json"
+
+
+def list_preset_names(*, presets_dir: Path = DEFAULT_PRESETS_DIR) -> list[str]:
+    directory = Path(presets_dir).expanduser()
+    if not directory.is_dir():
+        return []
+    return sorted(path.stem for path in directory.glob("*.json") if path.is_file())
+
+
+def load_preset(
+    name_or_path: str | Path,
+    *,
+    presets_dir: Path = DEFAULT_PRESETS_DIR,
+) -> dict[str, Any]:
+    path = preset_path(name_or_path, presets_dir=presets_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Preset not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Preset is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Preset must contain a JSON object: {path}")
+    return payload
+
+
+def save_preset(
+    name: str,
+    settings: dict[str, Any],
+    *,
+    presets_dir: Path = DEFAULT_PRESETS_DIR,
+) -> Path:
+    if not isinstance(settings, dict):
+        raise ValueError("Preset settings must be a dictionary.")
+    path = Path(presets_dir).expanduser() / f"{sanitize_preset_name(name)}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(settings, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def validate_output_options(

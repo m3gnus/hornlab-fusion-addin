@@ -100,7 +100,8 @@ solver artifacts are grouped by category:
 - `combined/`: combined response plots, crossover/alignment plots, off-axis
   plots, interference heatmaps, and `driver_time_alignment.txt`
 - `derived/`: DI/power-response, beamwidth, and group-delay PNG/CSV/JSON files
-- `driver-lem/`: Driver LEM active pressure, ZMA, excursion, and sidecar files
+- `driver-lem/`: Driver LEM active pressure, impedance ZMA/PNG, excursion,
+  and sidecar files
 - `cardioid/`: passive-cardioid MF artifacts
 - `vituixcad/`: VituixCAD FRD/ZMA/project export when enabled
 - `logs/`: pipeline command logs
@@ -126,7 +127,8 @@ Start with per-driver files in `sources/`:
   CSV, and JSON, computed from unwrapped engineering-convention pressure phase.
 - `sources/<SOURCE>_pressure_basis.npz`: saved complex pressure basis used for
   postprocess reruns.
-- `driver-lem/<SOURCE>_impedance.zma` and
+- `driver-lem/<SOURCE>_impedance.zma`,
+  `driver-lem/<SOURCE>_impedance.png`, and
   `driver-lem/<SOURCE>_excursion.png`: written for direct sources with Driver
   LEM specs. The excursion plot includes an Xmax line when `Xmax` was supplied.
 
@@ -153,7 +155,7 @@ Passive cardioid outputs, when enabled, are in `cardioid/` as
 `MF_passive_cardioid_*`. Coupled mode also writes
 `MF_passive_cardioid_coupled_results.npz`,
 `MF_passive_cardioid_coupled_frequency_response.png`, and
-`MF_passive_cardioid_impedance.zma`.
+`MF_passive_cardioid_impedance.zma` plus `MF_passive_cardioid_impedance.png`.
 
 Manifests and logs are the audit trail: `manifest.json` from mesh prep,
 `direct_solve_manifest.json`, `fusion_wg_pipeline_manifest.json`,

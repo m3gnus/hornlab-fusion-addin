@@ -68,9 +68,14 @@ from fusion_pipeline_launch import (  # noqa: E402
 )
 from hornlab_plots import (  # noqa: E402
     FrequencyResponseCurve,
-    get_theme,
+    save_beamwidth_plot,
     save_directivity_plot,
+    save_directivity_power_plot,
+    save_excursion_plot,
     save_frequency_response_plot as _save_frequency_response_plot,
+    save_group_delay_plot,
+    save_impedance_plot,
+    save_interference_heatmap,
     set_theme,
 )
 from hornlab_metal_bem import (  # noqa: E402
@@ -1156,96 +1161,6 @@ def _write_time_alignment_report(
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
-
-def _save_interference_heatmap(
-    output_png: Path,
-    freqs: np.ndarray,
-    aligned_grids: dict[str, np.ndarray],
-    *,
-    members: list[str],
-    crossovers_hz: list[float] | None = None,
-    angles_deg: np.ndarray,
-    planes: np.ndarray,
-    mesh_valid_hz: float | None,
-    mesh_valid_radiating_hz: float | None,
-) -> Path:
-    """Heatmap of the coherent-vs-incoherent sum ratio per angle/frequency.
-
-    ``20*log10(|sum p| / sum |p|)`` is 0 dB where the drivers add fully in
-    phase and drops toward the clip floor where driver-spacing path
-    differences cancel; the crossover bands, where two drivers carry
-    comparable level, are where it matters.
-    """
-    import matplotlib.pyplot as plt
-    from hornlab_plots import prepare_heatmap_data, render_single_heatmap
-
-    theme_obj = get_theme()
-    coherent = np.abs(sum(aligned_grids[name] for name in members))
-    incoherent = sum(np.abs(aligned_grids[name]) for name in members)
-    ratio_db = 20.0 * np.log10(
-        np.maximum(coherent, 1.0e-30) / np.maximum(incoherent, 1.0e-30)
-    )
-
-    plane_names = [str(plane) for plane in planes]
-    fig, axes = plt.subplots(
-        len(plane_names), 1, figsize=(11.0, 4.6 * len(plane_names))
-    )
-    if len(plane_names) == 1:
-        axes = [axes]
-    fig.patch.set_facecolor(theme_obj.figure_bg)
-    for plane_index, (ax, plane) in enumerate(zip(axes, plane_names)):
-        values = ratio_db[:, plane_index, :].T  # (n_angle, n_freq)
-        angles_p, freqs_p, values_p = prepare_heatmap_data(
-            np.asarray(angles_deg, dtype=float),
-            np.asarray(freqs, dtype=float),
-            values,
-        )
-        render_single_heatmap(
-            ax,
-            freqs_p,
-            angles_p,
-            values_p,
-            f"{plane[:1].upper()} Driver Interference (0 dB = coherent sum)",
-            reference_level=-6.0,
-            mesh_valid_hz=mesh_valid_hz,
-            mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-            theme=theme_obj,
-        )
-        # Point straight at the bands that matter: cancellation lives where
-        # two drivers carry comparable level, around each crossover.
-        for xo in crossovers_hz or []:
-            ax.axvline(
-                float(xo),
-                color=theme_obj.text_color,
-                linestyle=":",
-                linewidth=1.2,
-                alpha=0.8,
-                zorder=4,
-            )
-            ax.annotate(
-                f"XO {xo:g} Hz",
-                xy=(float(xo), angles_p[-1]),
-                xytext=(3, -12),
-                textcoords="offset points",
-                color=theme_obj.text_color,
-                fontsize=8,
-                alpha=0.9,
-            )
-    fig.tight_layout(pad=1.5)
-    out = Path(output_png)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(
-        str(out),
-        format="png",
-        dpi=150,
-        facecolor=fig.get_facecolor(),
-        edgecolor="none",
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-    return out
-
-
 # Roles cycled through the off-axis curves purely for distinct canonical
 # colors; 0 deg gets the bold "combined" style.
 _OFF_AXIS_TARGET_ANGLES_DEG = (0.0, 15.0, 30.0, 45.0, 60.0)
@@ -2298,14 +2213,14 @@ def _write_crossover_alignment_outputs(
         )
 
     interference_png = out_dir / "combined_interference_heatmap_time_aligned.png"
-    _save_interference_heatmap(
+    save_interference_heatmap(
         interference_png,
         freqs,
         aligned_grids,
+        angles_deg,
+        planes,
         members=members,
         crossovers_hz=crossovers_hz,
-        angles_deg=angles_deg,
-        planes=planes,
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
     )
@@ -2467,9 +2382,6 @@ POLAR_POWER_APPROXIMATION_NOTE = (
     "Polar-cut estimate: intensity is averaged over the stored planes at each "
     "polar angle, solid-angle weighted, and extrapolated to 4*pi; this is not "
     "a full-sphere integration."
-)
-BEAMWIDTH_SYMMETRY_NOTE = (
-    "One-sided angle grid: -6 dB beamwidth assumes symmetry about 0 deg."
 )
 
 
@@ -2705,243 +2617,6 @@ def _beamwidth_minus6_db_by_plane(
     return widths, limited, assumed_symmetric
 
 
-def _apply_mesh_valid_markers(
-    ax: Any,
-    freqs: np.ndarray,
-    *,
-    mesh_valid_hz: float | None,
-    mesh_valid_radiating_hz: float | None,
-) -> None:
-    if mesh_valid_hz is None and mesh_valid_radiating_hz is None:
-        return
-    from hornlab_plots._heatmap import _draw_mesh_valid_markers  # noqa: PLC0415
-
-    _draw_mesh_valid_markers(
-        ax,
-        lo=float(np.min(freqs)),
-        hi=float(np.max(freqs)),
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-        span_zorder=0,
-        line_zorder=1,
-    )
-
-
-def _style_line_axes(ax: Any, *, title: str, xlabel: str, ylabel: str) -> None:
-    from matplotlib.ticker import FuncFormatter  # noqa: PLC0415
-    from hornlab_plots._grid import freq_formatter, log_grid_lines, preferred_frequency_ticks  # noqa: PLC0415
-
-    theme_obj = get_theme()
-    ax.set_facecolor(theme_obj.axes_bg)
-    ax.set_title(title, color=theme_obj.text_color, fontsize=13, fontweight="600", pad=8)
-    ax.set_xlabel(xlabel, color=theme_obj.text_color, fontsize=11)
-    ax.set_ylabel(ylabel, color=theme_obj.text_color, fontsize=11)
-    ax.tick_params(colors=theme_obj.tick_color, labelsize=9)
-    for spine in ax.spines.values():
-        spine.set_color(theme_obj.spine_color)
-    ax.xaxis.set_major_formatter(FuncFormatter(freq_formatter))
-    ticks = preferred_frequency_ticks(*ax.get_xlim())
-    if ticks:
-        ax.set_xticks(ticks)
-    for freq in log_grid_lines(*ax.get_xlim()):
-        major = any(np.isclose(freq, tick, rtol=1.0e-6, atol=1.0e-6) for tick in ticks)
-        ax.axvline(
-            freq,
-            color=theme_obj.grid_color,
-            alpha=theme_obj.primary_grid_alpha if major else theme_obj.secondary_grid_alpha,
-            linewidth=0.7 if major else 0.5,
-            zorder=0,
-        )
-    ax.grid(True, axis="y", alpha=theme_obj.secondary_grid_alpha, color=theme_obj.grid_color, linewidth=0.5)
-
-
-def _save_directivity_power_plot(
-    path: Path,
-    freqs: np.ndarray,
-    metrics: dict[str, Any],
-    *,
-    title: str,
-    mesh_valid_hz: float | None,
-    mesh_valid_radiating_hz: float | None,
-) -> None:
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    theme_obj = get_theme()
-    fig, ax = plt.subplots(figsize=(10.0, 4.8))
-    fig.patch.set_facecolor(theme_obj.figure_bg)
-    freqs = np.asarray(freqs, dtype=np.float64)
-    ax.semilogx(
-        freqs,
-        metrics["directivity_index_db"],
-        color=theme_obj.response_colors["combined"],
-        linewidth=2.2,
-        label="DI",
-    )
-    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
-    _apply_mesh_valid_markers(
-        ax,
-        freqs,
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
-    _style_line_axes(
-        ax,
-        title=title,
-        xlabel="Frequency [Hz]",
-        ylabel="Directivity index [dB]",
-    )
-    ax2 = ax.twinx()
-    ax2.semilogx(
-        freqs,
-        metrics["power_response_db"],
-        color=theme_obj.response_colors["mf"],
-        linewidth=1.6,
-        linestyle="--",
-        alpha=0.82,
-        label="Power response",
-    )
-    ax2.set_ylabel("Power response [dB SPL avg]", color=theme_obj.text_color, fontsize=10)
-    ax2.tick_params(colors=theme_obj.tick_color, labelsize=8)
-    ax2.set_facecolor(theme_obj.axes_bg)
-    ax2.spines["right"].set_color(theme_obj.spine_color)
-    lines = [*ax.get_lines(), *ax2.get_lines()]
-    labels = [line.get_label() for line in lines]
-    legend = ax.legend(
-        lines,
-        labels,
-        loc="best",
-        fontsize=9,
-        facecolor=theme_obj.axes_bg,
-        edgecolor=theme_obj.spine_color,
-        labelcolor=theme_obj.text_color,
-    )
-    legend.get_frame().set_alpha(0.92)
-    fig.text(
-        0.5,
-        0.01,
-        POLAR_POWER_APPROXIMATION_NOTE,
-        ha="center",
-        va="bottom",
-        color=theme_obj.text_color,
-        fontsize=8,
-        alpha=0.78,
-    )
-    fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0), pad=1.5)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
-    plt.close(fig)
-
-
-def _save_beamwidth_plot(
-    path: Path,
-    freqs: np.ndarray,
-    beamwidths: dict[str, np.ndarray],
-    *,
-    title: str,
-    mesh_valid_hz: float | None,
-    mesh_valid_radiating_hz: float | None,
-    assumed_symmetric_from_one_sided_grid: bool = False,
-) -> None:
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    theme_obj = get_theme()
-    fig, ax = plt.subplots(figsize=(10.0, 4.5))
-    fig.patch.set_facecolor(theme_obj.figure_bg)
-    freqs = np.asarray(freqs, dtype=np.float64)
-    colors = [
-        theme_obj.response_colors["combined"],
-        theme_obj.response_colors["mf"],
-        theme_obj.response_colors["hf"],
-    ]
-    for index, (plane, values) in enumerate(beamwidths.items()):
-        ax.semilogx(
-            freqs,
-            values,
-            linewidth=2.0,
-            color=colors[index % len(colors)],
-            label=plane,
-        )
-    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
-    ax.set_ylim(0.0, 360.0)
-    _apply_mesh_valid_markers(
-        ax,
-        freqs,
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
-    _style_line_axes(
-        ax,
-        title=title,
-        xlabel="Frequency [Hz]",
-        ylabel="-6 dB beamwidth [deg]",
-    )
-    legend = ax.legend(
-        loc="best",
-        fontsize=9,
-        facecolor=theme_obj.axes_bg,
-        edgecolor=theme_obj.spine_color,
-        labelcolor=theme_obj.text_color,
-    )
-    legend.get_frame().set_alpha(0.92)
-    if assumed_symmetric_from_one_sided_grid:
-        fig.text(
-            0.5,
-            0.01,
-            BEAMWIDTH_SYMMETRY_NOTE,
-            ha="center",
-            va="bottom",
-            color=theme_obj.text_color,
-            fontsize=8,
-            alpha=0.78,
-        )
-        fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0), pad=1.5)
-    else:
-        fig.tight_layout(pad=1.5)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
-    plt.close(fig)
-
-
-def _save_group_delay_plot(
-    path: Path,
-    freqs: np.ndarray,
-    group_delay_s: np.ndarray,
-    *,
-    title: str,
-    mesh_valid_hz: float | None,
-    mesh_valid_radiating_hz: float | None,
-) -> None:
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    theme_obj = get_theme()
-    fig, ax = plt.subplots(figsize=(10.0, 4.5))
-    fig.patch.set_facecolor(theme_obj.figure_bg)
-    freqs = np.asarray(freqs, dtype=np.float64)
-    ax.semilogx(
-        freqs,
-        np.asarray(group_delay_s, dtype=np.float64) * 1000.0,
-        color=theme_obj.response_colors["combined"],
-        linewidth=2.0,
-    )
-    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
-    _apply_mesh_valid_markers(
-        ax,
-        freqs,
-        mesh_valid_hz=mesh_valid_hz,
-        mesh_valid_radiating_hz=mesh_valid_radiating_hz,
-    )
-    _style_line_axes(
-        ax,
-        title=title,
-        xlabel="Frequency [Hz]",
-        ylabel="Group delay [ms]",
-    )
-    fig.tight_layout(pad=1.5)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(path), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
-    plt.close(fig)
-
-
 def _write_pressure_grid_derived_artifacts(
     out_dir: Path,
     stem: str,
@@ -2969,10 +2644,11 @@ def _write_pressure_grid_derived_artifacts(
         angles,
         polar_distance_m=polar_distance_m,
     )
-    _save_directivity_power_plot(
+    save_directivity_power_plot(
         directivity_png,
         freqs,
-        metrics,
+        directivity_index_db=metrics["directivity_index_db"],
+        power_response_db=metrics["power_response_db"],
         title=f"{label} Directivity Index and Power Response",
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
@@ -3042,7 +2718,7 @@ def _write_pressure_grid_derived_artifacts(
         angles,
         plane_names,
     )
-    _save_beamwidth_plot(
+    save_beamwidth_plot(
         beamwidth_png,
         freqs,
         beamwidths,
@@ -3096,7 +2772,7 @@ def _write_pressure_grid_derived_artifacts(
         polar_distance_m=polar_distance_m,
         warning_label=label,
     )
-    _save_group_delay_plot(
+    save_group_delay_plot(
         group_delay_png,
         freqs,
         group_delay_s,
@@ -3873,53 +3549,6 @@ def _driver_lem_parameter_echo(spec: DriverLemSpec, coupled) -> dict[str, Any]:
     return echo
 
 
-def _write_excursion_plot(
-    path: Path,
-    freqs: np.ndarray,
-    excursion_m: np.ndarray,
-    *,
-    source_name: str,
-    xmax_m: float | None,
-) -> None:
-    import matplotlib.pyplot as plt  # noqa: PLC0415
-
-    theme_obj = get_theme()
-    fig, ax = plt.subplots(figsize=(8.0, 4.5), constrained_layout=True)
-    fig.patch.set_facecolor(theme_obj.figure_bg)
-    ax.semilogx(
-        freqs,
-        np.asarray(excursion_m, dtype=np.float64) * 1.0e3,
-        color=theme_obj.response_colors["combined"],
-        linewidth=2.0,
-        label=source_name,
-    )
-    if xmax_m is not None:
-        ax.axhline(
-            float(xmax_m) * 1.0e3,
-            color=theme_obj.mesh_limit_color,
-            linestyle="--",
-            label="Xmax",
-        )
-    ax.set_xlim(float(np.min(freqs)), float(np.max(freqs)))
-    _style_line_axes(
-        ax,
-        title=f"{source_name} Cone Excursion",
-        xlabel="Frequency [Hz]",
-        ylabel="Excursion [mm RMS]",
-    )
-    legend = ax.legend(
-        loc="best",
-        fontsize=9,
-        facecolor=theme_obj.axes_bg,
-        edgecolor=theme_obj.spine_color,
-        labelcolor=theme_obj.text_color,
-    )
-    legend.get_frame().set_alpha(0.92)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=160, facecolor=fig.get_facecolor(), edgecolor="none")
-    plt.close(fig)
-
-
 def _driver_spec_for_source(
     specs: dict[str, DriverLemSpec],
     source_name: str,
@@ -4079,6 +3708,7 @@ def _apply_driver_lem_coupling(
         results_npz = out_dir / f"{safe_name}_driver_lem_results.npz"
         response_png = out_dir / f"{safe_name}_frequency_response.png"
         impedance_zma = out_dir / f"{safe_name}_impedance.zma"
+        impedance_png = out_dir / f"{safe_name}_impedance.png"
         excursion_png = out_dir / f"{safe_name}_excursion.png"
         active_basis = _active_pressure_basis(
             basis,
@@ -4152,13 +3782,19 @@ def _apply_driver_lem_coupling(
                     f"at {args.drive_voltage:g} V RMS"
                 ),
             )
+            save_impedance_plot(
+                impedance_png,
+                basis.frequencies_hz,
+                np.real(coupled.electrical_input_impedance),
+                np.imag(coupled.electrical_input_impedance),
+            )
         xmax_m = float(spec.params["xmax_m"]) if "xmax_m" in spec.params else None
         if not args.skip_driver_lem_artifacts:
-            _write_excursion_plot(
+            save_excursion_plot(
                 excursion_png,
                 basis.frequencies_hz,
                 coupled.cone_excursion_m,
-                source_name=matching_name,
+                label=matching_name,
                 xmax_m=xmax_m,
             )
         excursion_max_idx = int(np.argmax(coupled.cone_excursion_m))
@@ -4202,6 +3838,7 @@ def _apply_driver_lem_coupling(
                         "active_pressure_npz": str(active_npz),
                         "results_npz": str(results_npz),
                         "impedance_zma": str(impedance_zma),
+                        "impedance_png": str(impedance_png),
                         "excursion_png": str(excursion_png),
                     }
                     if not args.skip_driver_lem_artifacts
@@ -4234,6 +3871,7 @@ def _apply_driver_lem_coupling(
         if not args.skip_driver_lem_artifacts:
             source_result["driver_lem_results_npz"] = str(results_npz)
             source_result["driver_lem_impedance_zma"] = str(impedance_zma)
+            source_result["driver_lem_impedance_png"] = str(impedance_png)
             source_result["driver_lem_excursion_png"] = str(excursion_png)
     return payload
 
@@ -4684,6 +4322,7 @@ def _solve_passive_cardioid_mf(
                 out_dir / "MF_passive_cardioid_coupled_frequency_response.png"
             )
             impedance_zma = out_dir / "MF_passive_cardioid_impedance.zma"
+            impedance_png = out_dir / "MF_passive_cardioid_impedance.png"
             np.savez_compressed(
                 coupled_npz,
                 frequencies_hz=mf_basis.frequencies_hz,
@@ -4744,6 +4383,12 @@ def _solve_passive_cardioid_mf(
                     f"at {args.drive_voltage:g} V RMS"
                 ),
             )
+            save_impedance_plot(
+                impedance_png,
+                mf_basis.frequencies_hz,
+                np.real(coupled.electrical_input_impedance),
+                np.imag(coupled.electrical_input_impedance),
+            )
 
             sd_eff_m2 = float(coupled.diagnostics["sd_eff_m2"])
             sd_vs_mesh_area_pct = 100.0 * (sd_eff_m2 - mf_area_m2) / mf_area_m2
@@ -4764,12 +4409,14 @@ def _solve_passive_cardioid_mf(
                 "results_npz": str(coupled_npz),
                 "frequency_response_png": str(coupled_response_png),
                 "impedance_zma": str(impedance_zma),
+                "impedance_png": str(impedance_png),
             }
             payload["outputs"]["coupled_results_npz"] = str(coupled_npz)
             payload["outputs"]["coupled_frequency_response_png"] = (
                 str(coupled_response_png)
             )
             payload["outputs"]["impedance_zma"] = str(impedance_zma)
+            payload["outputs"]["impedance_png"] = str(impedance_png)
             payload["coupled"] = {
                 "status": "complete",
                 "driver": _driver_lem_parameter_echo(mf_driver_spec, coupled),
@@ -5304,6 +4951,10 @@ def _apply_post_solve_derived_outputs(
                 manifest["outputs"].setdefault("driver_lem_impedance_zmas", {})[
                     source_name
                 ] = outputs["impedance_zma"]
+            if outputs.get("impedance_png"):
+                manifest["outputs"].setdefault("driver_lem_impedance_pngs", {})[
+                    source_name
+                ] = outputs["impedance_png"]
             if outputs.get("excursion_png"):
                 manifest["outputs"].setdefault("driver_lem_excursion_pngs", {})[
                     source_name
@@ -5559,6 +5210,10 @@ def _apply_post_solve_derived_outputs(
             if outputs.get("impedance_zma"):
                 manifest["outputs"]["passive_cardioid_impedance_zma"] = (
                     outputs["impedance_zma"]
+                )
+            if outputs.get("impedance_png"):
+                manifest["outputs"]["passive_cardioid_impedance_png"] = (
+                    outputs["impedance_png"]
                 )
     if (
         passive_payload is not None

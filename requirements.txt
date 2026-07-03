@@ -10,11 +10,12 @@ git+https://github.com/m3gnus/hornlab-metal-bem.git@723f22803b17c830650e8a9f2ce8
 matplotlib
 Pillow
 
-# LEM/coupling physics and canonical plotting for the solve step. Discovery
-# order is top-level workspace siblings, legacy HornLab-internal fallbacks,
-# then the installed environment (see scripts/solve_fusion_wg_metal.py).
+# LEM/coupling physics and canonical plotting (incl. hornlab_plots.derived,
+# which the solve step imports at module level). Discovery order is
+# top-level workspace siblings, legacy HornLab-internal fallbacks, then the
+# installed environment (see scripts/solve_fusion_wg_metal.py).
 git+https://github.com/m3gnus/hornlab-sim.git@218eabea11e8c6e7705857164e90dac551ba526a
-git+https://github.com/m3gnus/hornlab-plots.git@f166cec044e738b345439c23932e115910a9782e
+git+https://github.com/m3gnus/hornlab-plots.git@5bc58b199d4bafac382a43126068660291a6ee61
 
 # Tests
 pytest

@@ -98,6 +98,9 @@ Per-driver complex pressure over the full angle grid is already stored in
   engineering `e^{+j omega t}` pressure; a synthetic `e^{-j omega tau}` delay
   reports `+tau`.
 - **Phase overlay** on frequency-response PNGs using wrapped engineering phase.
+- **Renderer ownership:** the DI/power, beamwidth, group-delay, interference,
+  and excursion PNG renderers are now canonical in `hornlab_plots.derived`;
+  this repo keeps only the data derivation and artifact wiring.
 
 The DI/power response is a solid-angle-weighted polar-cut approximation:
 stored horizontal/vertical cuts are not a full sphere, so the plot caption and

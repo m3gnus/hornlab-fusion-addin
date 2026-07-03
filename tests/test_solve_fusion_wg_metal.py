@@ -68,6 +68,18 @@ def _write_fake_solver_imports(workspace_root: Path, *, origin: str) -> None:
                 "        self.__dict__.update(kwargs)",
                 "def save_directivity_plot(*args, **kwargs):",
                 "    return None",
+                "def save_interference_heatmap(*args, **kwargs):",
+                "    return None",
+                "def save_directivity_power_plot(*args, **kwargs):",
+                "    return None",
+                "def save_beamwidth_plot(*args, **kwargs):",
+                "    return None",
+                "def save_group_delay_plot(*args, **kwargs):",
+                "    return None",
+                "def save_excursion_plot(*args, **kwargs):",
+                "    return None",
+                "def save_impedance_plot(*args, **kwargs):",
+                "    return None",
                 "def save_frequency_response_plot(*args, **kwargs):",
                 "    return None",
                 "def get_theme(*args, **kwargs):",
@@ -1010,6 +1022,86 @@ def test_skip_pressure_bases_keeps_internal_basis_private_for_derived_outputs(
     )
 
 
+def test_post_solve_manifest_registers_driver_lem_impedance_png(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    mesh_path = tmp_path / "fake.msh"
+    mesh_path.write_text("$MeshFormat\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+    layout = module.SolverOutputLayout(out_dir, layout_version=2)
+    layout.ensure_dirs()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(out_dir),
+            "--source",
+            "LF:2",
+            "--skip-derived-acoustics",
+            "--skip-combined-set",
+            "--skip-radiation-impedance",
+            "--skip-passive-cardioid-set",
+            "--no-run-report",
+        ]
+    )
+    frame = module._build_frame(args)
+    source_result = {
+        "name": "LF",
+        "tag": 2,
+        "frequencies_hz": np.asarray([100.0, 200.0]),
+        "on_axis_spl_db": np.asarray([80.0, 81.0]),
+    }
+
+    def fake_apply_driver_lem_coupling(_mesh_path, _out_dir, _args, *, source_results):
+        outputs = {
+            "results_npz": str(layout.driver_lem_dir / "LF_driver_lem_results.npz"),
+            "impedance_zma": str(layout.driver_lem_dir / "LF_impedance.zma"),
+            "impedance_png": str(layout.driver_lem_dir / "LF_impedance.png"),
+            "excursion_png": str(layout.driver_lem_dir / "LF_excursion.png"),
+        }
+        source_results[0]["driver_lem"] = {
+            "status": "complete",
+            "outputs": outputs,
+        }
+        return {
+            "status": "complete",
+            "type": "per_driver_lem_coupling",
+            "sources": {"LF": source_results[0]["driver_lem"]},
+        }
+
+    monkeypatch.setattr(
+        module,
+        "_apply_driver_lem_coupling",
+        fake_apply_driver_lem_coupling,
+    )
+    manifest = {"outputs": {}}
+    module._apply_post_solve_derived_outputs(
+        mesh_path,
+        out_dir,
+        layout,
+        args,
+        manifest=manifest,
+        manifest_path=out_dir / "direct_solve_manifest.json",
+        source_results=[source_result],
+        sources=[("LF", 2)],
+        port_exit_apertures=[],
+        source_freq_max={},
+        source_mesh_valid={},
+        source_aperture_valid={},
+        frame=frame,
+    )
+
+    assert manifest["outputs"]["driver_lem_impedance_zmas"]["LF"].endswith(
+        "LF_impedance.zma"
+    )
+    assert manifest["outputs"]["driver_lem_impedance_pngs"]["LF"].endswith(
+        "LF_impedance.png"
+    )
+
+
 def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
     tmp_path,
     monkeypatch,
@@ -1569,6 +1661,7 @@ def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatc
     assert (on_dir / "MF_passive_cardioid_coupled_results.npz").exists()
     assert (on_dir / "MF_passive_cardioid_coupled_frequency_response.png").stat().st_size > 500
     assert (on_dir / "MF_passive_cardioid_impedance.zma").exists()
+    assert (on_dir / "MF_passive_cardioid_impedance.png").stat().st_size > 500
     assert not (on_dir / "MF_passive_cardioid_coupled_directivity_heatmap.png").exists()
 
     with np.load(off_dir / "MF_passive_cardioid_results.npz") as off:
@@ -1604,6 +1697,12 @@ def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatc
     assert summary["coupled"]["drive_voltage_v"] == pytest.approx(2.83)
     assert summary["outputs"]["coupled_results_npz"].endswith(
         "MF_passive_cardioid_coupled_results.npz"
+    )
+    assert summary["outputs"]["impedance_png"].endswith(
+        "MF_passive_cardioid_impedance.png"
+    )
+    assert summary["coupled"]["outputs"]["impedance_png"].endswith(
+        "MF_passive_cardioid_impedance.png"
     )
 
     rows = [
@@ -1876,6 +1975,11 @@ def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
         label == "Xmax" and y == pytest.approx(4.5)
         for y, label in axhline_calls
     )
+    assert (tmp_path / "LF_impedance.png").stat().st_size > 500
+    assert payload["sources"]["LF"]["outputs"]["impedance_png"].endswith(
+        "LF_impedance.png"
+    )
+    assert source_result["driver_lem_impedance_png"].endswith("LF_impedance.png")
     assert not (tmp_path / "vituixcad" / "LF_impedance.zma").exists()
 
 
@@ -1953,6 +2057,7 @@ def test_skip_driver_lem_artifacts_keeps_active_basis_private(
     assert not (tmp_path / "LF_driver_lem_pressure.npz").exists()
     assert not (tmp_path / "LF_driver_lem_results.npz").exists()
     assert not (tmp_path / "LF_impedance.zma").exists()
+    assert not (tmp_path / "LF_impedance.png").exists()
     assert not (tmp_path / "LF_excursion.png").exists()
 
     vituixcad_payload = module._write_vituixcad_export(

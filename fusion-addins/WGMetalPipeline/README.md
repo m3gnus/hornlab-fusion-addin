@@ -51,7 +51,8 @@ The add-in is designed to not fail on configuration drift:
   MF coupling is skipped rather than applied twice. Coupled mode also writes
   `MF_passive_cardioid_coupled_results.npz`,
   `MF_passive_cardioid_coupled_frequency_response.png`, and
-  `MF_passive_cardioid_impedance.zma`, and the summary JSON gains a
+  `MF_passive_cardioid_impedance.zma` plus
+  `MF_passive_cardioid_impedance.png`, and the summary JSON gains a
   `coupled` block with the driver echo, excursion, impedance, and area
   diagnostics. The `.zma` is VituixCAD-compatible (`freq_Hz |Z| phase_deg`);
   when VituixCAD export is enabled it is copied for the `MF_cardioid` driver.
@@ -80,10 +81,11 @@ The add-in is designed to not fail on configuration drift:
   self-load from that source's surface-average pressure and patch area, runs
   `hornlab_sim.methods.driver_coupling.coupled_direct_radiator_response`, and
   scales the pressure basis for response plots, crossover input, and VituixCAD
-  export. Outputs include `<NAME>_impedance.zma`, `<NAME>_excursion.png`, and a
-  manifest `driver_lem` block with normalized parameter echo, Mmd/Mms provenance,
-  self-impedance provenance, excursion maximum, impedance range, and the explicit
-  note that driver-driver mutual coupling is neglected.
+  export. Outputs include `<NAME>_impedance.zma`,
+  `<NAME>_impedance.png`, `<NAME>_excursion.png`, and a manifest `driver_lem`
+  block with normalized parameter echo, Mmd/Mms provenance, self-impedance
+  provenance, excursion maximum, impedance range, and the explicit note that
+  driver-driver mutual coupling is neglected.
 - **Elements use explicit millimetre sizing.** Source patches use their source
   mesh mm values, rigid/shadow surfaces use `Rigid body mesh mm`, and the
   near-field baffle grades from each source's own size out to the background
@@ -185,8 +187,8 @@ Solver outputs are grouped by category:
   directivity, interference, off-axis plots, and `driver_time_alignment.txt`.
 - `derived/`: per-source and combined DI/power-response, beamwidth, and
   group-delay PNG/CSV/JSON sidecars.
-- `driver-lem/`: Driver LEM active pressure, results NPZ, impedance ZMA, and
-  excursion sidecars for coupled direct sources.
+- `driver-lem/`: Driver LEM active pressure, results NPZ, impedance ZMA/PNG,
+  and excursion sidecars for coupled direct sources.
 - `cardioid/`: passive-cardioid MF artifacts and coupled-cardioid sidecars.
 - `vituixcad/`: when **VituixCAD export** is checked, per-driver angle FRDs,
   copied ZMAs for coupled drivers, `README.txt`, and `HornLab_active_lr4.vxp`

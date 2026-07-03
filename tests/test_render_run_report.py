@@ -86,11 +86,17 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
             "driver_lem_impedance_zmas": {
                 "MF": _touch(run / "driver-lem" / "MF_impedance.zma")
             },
+            "driver_lem_impedance_pngs": {
+                "MF": _touch(run / "driver-lem" / "MF_impedance.png")
+            },
             "driver_lem_excursion_pngs": {
                 "MF": _touch(run / "driver-lem" / "MF_excursion.png")
             },
             "passive_cardioid_frequency_response_png": _touch(
                 run / "cardioid" / "MF_passive_cardioid_frequency_response.png"
+            ),
+            "passive_cardioid_impedance_png": _touch(
+                run / "cardioid" / "MF_passive_cardioid_impedance.png"
             ),
             "passive_cardioid_summary_json": _touch(
                 run / "cardioid" / "MF_passive_cardioid_summary.json"
@@ -140,6 +146,8 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
     assert "sources/MF_results.json" in html
     assert "derived/MF_group_delay.png" in html
     assert "driver-lem/MF_impedance.zma" in html
+    assert "driver-lem/MF_impedance.png" in html
+    assert "cardioid/MF_passive_cardioid_impedance.png" in html
     assert "cardioid/MF_passive_cardioid_summary.json" in html
     assert "sources/port_exit_radiation_impedance_matrix.npz" in html
     assert "vituixcad/HornLab_active_lr4.vxp" in html

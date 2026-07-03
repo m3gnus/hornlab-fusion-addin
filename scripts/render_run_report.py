@@ -177,12 +177,14 @@ def _driver_lem_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
     outputs = _as_dict(direct_manifest.get("outputs"))
     chunks: list[str] = []
     for name, zma in sorted(_as_dict(outputs.get("driver_lem_impedance_zmas")).items()):
+        impedance = _as_dict(outputs.get("driver_lem_impedance_pngs")).get(name)
         excursion = _as_dict(outputs.get("driver_lem_excursion_pngs")).get(name)
         links = [_link(run_dir, zma, f"{name} ZMA")]
         results = _as_dict(outputs.get("driver_lem_results_npzs")).get(name)
         if results:
             links.append(_link(run_dir, results, "results NPZ"))
-        body = _image(run_dir, excursion, f"{name} excursion")
+        body = _image(run_dir, impedance, f"{name} impedance")
+        body += _image(run_dir, excursion, f"{name} excursion")
         body += '<p class="links">' + " ".join(links) + "</p>"
         chunks.append(f"<h3>{_html(name)}</h3>{body}")
     return "".join(chunks)
@@ -195,6 +197,7 @@ def _cardioid_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
         ("passive_cardioid_frequency_response_png", "Passive-cardioid frequency response"),
         ("passive_cardioid_directivity_heatmap_png", "Passive-cardioid directivity"),
         ("passive_cardioid_coupled_frequency_response_png", "Coupled passive-cardioid response"),
+        ("passive_cardioid_impedance_png", "Passive-cardioid impedance"),
     ):
         body += _image(run_dir, outputs.get(key), label)
     links = [

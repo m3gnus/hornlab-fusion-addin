@@ -15,7 +15,7 @@ Pillow
 # top-level workspace siblings, legacy HornLab-internal fallbacks, then the
 # installed environment (see scripts/solve_fusion_wg_metal.py).
 git+https://github.com/m3gnus/hornlab-sim.git@218eabea11e8c6e7705857164e90dac551ba526a
-git+https://github.com/m3gnus/hornlab-plots.git@5bc58b199d4bafac382a43126068660291a6ee61
+git+https://github.com/m3gnus/hornlab-plots.git@8585babaea27e0b8a687aa2cd8c01be96017a6c8
 
 # Tests
 pytest

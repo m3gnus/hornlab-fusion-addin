@@ -3787,6 +3787,8 @@ def _apply_driver_lem_coupling(
                 basis.frequencies_hz,
                 np.real(coupled.electrical_input_impedance),
                 np.imag(coupled.electrical_input_impedance),
+                title="Electrical Input Impedance",
+                ylabel="|Z| [ohm] / phase-split real+imag [ohm]",
             )
         xmax_m = float(spec.params["xmax_m"]) if "xmax_m" in spec.params else None
         if not args.skip_driver_lem_artifacts:
@@ -4388,6 +4390,8 @@ def _solve_passive_cardioid_mf(
                 mf_basis.frequencies_hz,
                 np.real(coupled.electrical_input_impedance),
                 np.imag(coupled.electrical_input_impedance),
+                title="Electrical Input Impedance",
+                ylabel="|Z| [ohm] / phase-split real+imag [ohm]",
             )
 
             sd_eff_m2 = float(coupled.diagnostics["sd_eff_m2"])

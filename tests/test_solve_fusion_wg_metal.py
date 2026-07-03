@@ -1634,6 +1634,14 @@ def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatc
     module = _load_script()
     fixture = _write_passive_cardioid_fixture(tmp_path)
     monkeypatch.setattr(module, "_mesh_tag_area_m2", lambda _m, _t, mesh_scale: 0.02)
+    impedance_plot_calls = []
+    original_save_impedance_plot = module.save_impedance_plot
+
+    def spy_save_impedance_plot(*args, **kwargs):
+        impedance_plot_calls.append(kwargs)
+        return original_save_impedance_plot(*args, **kwargs)
+
+    monkeypatch.setattr(module, "save_impedance_plot", spy_save_impedance_plot)
     off_dir = tmp_path / "off"
     on_dir = tmp_path / "on"
     off_dir.mkdir()
@@ -1662,6 +1670,11 @@ def test_passive_cardioid_coupled_writes_additive_artifacts(tmp_path, monkeypatc
     assert (on_dir / "MF_passive_cardioid_coupled_frequency_response.png").stat().st_size > 500
     assert (on_dir / "MF_passive_cardioid_impedance.zma").exists()
     assert (on_dir / "MF_passive_cardioid_impedance.png").stat().st_size > 500
+    assert impedance_plot_calls[-1]["title"] == "Electrical Input Impedance"
+    assert (
+        impedance_plot_calls[-1]["ylabel"]
+        == "|Z| [ohm] / phase-split real+imag [ohm]"
+    )
     assert not (on_dir / "MF_passive_cardioid_coupled_directivity_heatmap.png").exists()
 
     with np.load(off_dir / "MF_passive_cardioid_results.npz") as off:
@@ -1934,6 +1947,14 @@ def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
         "coupled_direct_radiator_response",
         fake_coupled_direct_radiator_response,
     )
+    impedance_plot_calls = []
+    original_save_impedance_plot = module.save_impedance_plot
+
+    def spy_save_impedance_plot(*args, **kwargs):
+        impedance_plot_calls.append(kwargs)
+        return original_save_impedance_plot(*args, **kwargs)
+
+    monkeypatch.setattr(module, "save_impedance_plot", spy_save_impedance_plot)
     import matplotlib.axes
 
     axhline_calls = []
@@ -1976,6 +1997,11 @@ def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
         for y, label in axhline_calls
     )
     assert (tmp_path / "LF_impedance.png").stat().st_size > 500
+    assert impedance_plot_calls[-1]["title"] == "Electrical Input Impedance"
+    assert (
+        impedance_plot_calls[-1]["ylabel"]
+        == "|Z| [ohm] / phase-split real+imag [ohm]"
+    )
     assert payload["sources"]["LF"]["outputs"]["impedance_png"].endswith(
         "LF_impedance.png"
     )

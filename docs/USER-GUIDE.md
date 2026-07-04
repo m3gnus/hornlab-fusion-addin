@@ -73,12 +73,16 @@ LEM` uses the `MF driver T/S` entry from Driver LEM and makes the MF+port branch
 voltage-driven; generic per-driver MF coupling is skipped to avoid double
 coupling.
 
-Driver LEM: each `LF/MF/HF driver T/S` field accepts pasted Hornresp-style
-`Key=Value` text or a path to a readable driver file. Supported Hornresp units
-are `Sd` cm2, `Mmd`/`Mms` g, `Cms` m/N, `Rms` kg/s, `Le`/`Le2` mH,
-`Re`/`Re2` ohm, `Xmax` mm, and optional `N`/`Nd` count. `Leb`, `Ke`, `Rss`,
-and `Vrc*` keys are warned and ignored. Coupling changes that driver's pressure
-basis from unit acceleration to SPL at the chosen drive voltage.
+Driver LEM: choose a local database row, import a Hornresp-style driver file,
+or edit the `LF/MF/HF driver T/S` field manually. Database rows are loaded from
+the HornLab driver CSVs when that workspace is present and from
+`~/Library/Application Support/HornLab/WGMetalPipeline/driver-databases/*.csv`
+for your own CSVs. The manual field accepts pasted `Key=Value` text or a path
+to a readable driver file. Supported Hornresp units are `Sd` cm2,
+`Mmd`/`Mms` g, `Cms` m/N, `Rms` kg/s, `Le`/`Le2` mH, `Re`/`Re2` ohm,
+`Xmax` mm, and optional `N`/`Nd` count. `Leb`, `Ke`, `Rss`, and `Vrc*` keys
+are warned and ignored. Coupling changes that driver's pressure basis from unit
+acceleration to SPL at the chosen drive voltage.
 
 Outputs: choose the output root, whether to open the folder, whether to open
 the generated report, and which artifact categories to write. The category
@@ -93,8 +97,11 @@ plane override.
 ## 4. Reading The Outputs
 
 New runs use solver layout version 2. Manifests stay at the run root, while
-solver artifacts are grouped by category:
+exports, mesh-prep files, and solver artifacts are grouped by category:
 
+- `exports/`: Fusion STEP and native `.f3d` archive
+- `mesh/`: prepared tagged mesh, per-source WG meshes, orientation report,
+  expanded full-domain mesh previews, and mesh-prep `manifest.json`
 - `sources/`: per-source result JSON, pressure bases, direct source plots, and
   port-exit radiation-impedance matrices
 - `combined/`: combined response plots, crossover/alignment plots, off-axis
@@ -105,16 +112,20 @@ solver artifacts are grouped by category:
 - `cardioid/`: passive-cardioid MF artifacts
 - `vituixcad/`: VituixCAD FRD/ZMA/project export when enabled
 - `logs/`: pipeline command logs
+- `manifests/`: launch, pipeline, final summary, and direct-solve manifests
 
-Use `direct_solve_manifest.json` as the authoritative map from logical output
-names to concrete paths; old layout-1 flat runs remain readable by
-postprocess-only regeneration.
+Use `manifests/direct_solve_manifest.json` as the authoritative map from
+logical output names to concrete paths; old layout-1 flat runs remain readable
+by postprocess-only regeneration.
 
 Start with per-driver files in `sources/`:
 
 - `<SOURCE>_frequency_response.png`: on-axis SPL for that source. Coupled
   Driver LEM sources are at the run voltage; uncoupled sources are unit-source
-  levels. Dashed overlays show wrapped on-axis phase on the right axis.
+  levels. Dashed overlays show display-flattened wrapped on-axis phase on the
+  right axis. When crossover fields are set, LF/MF/HF phase is flattened over
+  that driver's operating band; otherwise the full plotted band is used. This
+  changes only the plot reference delay, not the stored complex pressure.
 - `<SOURCE>_directivity_heatmap.png`: normalized directivity over the solved
   polar grid.
 - `derived/<SOURCE>_directivity_index_power_response.*`: DI and power-response
@@ -134,10 +145,11 @@ Start with per-driver files in `sources/`:
 
 Then read combined outputs in `combined/`:
 
-- `combined/combined_frequency_response.png`: direct source responses together, with
-  wrapped phase overlays.
+- `combined/combined_frequency_response.png`: direct source responses together,
+  with display-flattened wrapped phase overlays.
 - `combined/combined_frequency_response_time_aligned.png`: LR4 filtered, level-matched,
-  delay-aligned sum when crossover fields are set, with wrapped phase overlays.
+  delay-aligned sum when crossover fields are set, with display-flattened
+  wrapped phase overlays.
 - `combined/combined_directivity_heatmap_time_aligned.png`: directivity of
   that aligned sum.
 - `derived/combined_time_aligned_directivity_index_power_response.*`,
@@ -147,7 +159,7 @@ Then read combined outputs in `combined/`:
 - `combined/combined_interference_heatmap_time_aligned.png`: coherent vs incoherent
   interaction between drivers.
 - `combined/combined_frequency_response_off_axis_<plane>.png`: off-axis aligned sum
-  plots with wrapped phase overlays.
+  plots with display-flattened wrapped phase overlays.
 - `combined/driver_time_alignment.txt`: crossover frequencies, level trims, delays,
   arrival offsets, and any mesh-band alignment warnings.
 
@@ -157,9 +169,11 @@ Passive cardioid outputs, when enabled, are in `cardioid/` as
 `MF_passive_cardioid_coupled_frequency_response.png`, and
 `MF_passive_cardioid_impedance.zma` plus `MF_passive_cardioid_impedance.png`.
 
-Manifests and logs are the audit trail: `manifest.json` from mesh prep,
-`direct_solve_manifest.json`, `fusion_wg_pipeline_manifest.json`,
-`final_summary_manifest.json`, `fusion_addin_launch.json`, and `logs/*.log`.
+Manifests and logs are the audit trail: `mesh/manifest.json` from mesh prep,
+`manifests/direct_solve_manifest.json`,
+`manifests/fusion_wg_pipeline_manifest.json`,
+`manifests/final_summary_manifest.json`,
+`manifests/fusion_addin_launch.json`, and `logs/*.log`.
 Open `report.html` for a static gallery and run summary. To build or refresh
 an index over an output root:
 
@@ -190,7 +204,8 @@ Load the FRD angle sets from `vituixcad/hor/` and `vituixcad/ver/` for each
 driver. Keep every VituixCAD driver X/Y/Z offset and delay at 0: the BEM export
 already contains one shared mic grid, one timing reference, and the relative
 phase between drivers. The exporter removes only the common time of flight to
-reduce phase wrap.
+reduce phase wrap. The display-flattened phase used on PNG response overlays is
+not used for FRD export or any stored pressure data.
 
 Coupled Driver LEM sources export voltage-driven FRDs and their calculated
 `<SOURCE>_impedance.zma`. Uncoupled sources export unit-source FRDs and no ZMA;
@@ -223,7 +238,7 @@ run folder, sources, and `--postprocess-only`, overriding the crossover fields:
 
 ```bash
 .venv/bin/python scripts/solve_fusion_wg_metal.py \
-  --mesh runs/fusion360/<run-folder>/tagged_sources.msh \
+  --mesh runs/fusion360/<run-folder>/mesh/tagged_sources.msh \
   --out runs/fusion360/<run-folder> \
   --source LF:2 --source MF:3 --source HF:4 \
   --crossover-lf-mf-hz 160 \
@@ -243,7 +258,7 @@ Copied-install warning: reinstall with
 `python3 scripts/install_fusion_wg_metal_addin.py --symlink --replace`, then
 restart Fusion.
 
-Missing sources skipped: check the source names in `manifest.json` and the
+Missing sources skipped: check the source names in `mesh/manifest.json` and the
 available shell/appearance names reported in errors. Paint or name faces as
 `LF`, `MF`, `HF`, or `PORT_EXIT`, or leave that source blank in the dialog.
 

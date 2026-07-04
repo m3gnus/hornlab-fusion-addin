@@ -6,6 +6,7 @@ launch metadata can be checked outside Fusion.
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import re
@@ -29,6 +30,23 @@ APP_SUPPORT_DIR = (
     / "WGMetalPipeline"
 )
 DEFAULT_PRESETS_DIR = APP_SUPPORT_DIR / "presets"
+USER_DRIVER_DATABASE_DIR = APP_SUPPORT_DIR / "driver-databases"
+FUSION_ADDIN_REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = FUSION_ADDIN_REPO_ROOT.parent
+HORNLAB_DRIVER_DATABASE_DIR = WORKSPACE_ROOT / "HornLab" / "MEH-Lab" / "data"
+RUN_MANIFESTS_DIR_NAME = "manifests"
+DEFAULT_DRIVER_DATABASE_FILENAMES = (
+    "bigmeh_lf_master_260519.csv",
+    "bigmeh_driver_database_260515.csv",
+    "18sound_lf_mid_drivers_ts_params.csv",
+    "bc_speakers_lf_drivers_ts_params.csv",
+    "beyma_lf_mid_drivers_ts_params.csv",
+    "bms_mid_drivers_ts_params.csv",
+    "faitalpro_lf_loudspeakers_ts_params.csv",
+    "lavoce_lf_mid_drivers_ts_params.csv",
+    "sb_audience_woofers_ts_params.csv",
+)
+DRIVER_DATABASE_MANUAL_LABEL = "(manual/import)"
 
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
@@ -95,6 +113,25 @@ class DriverLemSpec:
 
     def cli_entry(self) -> str:
         return f"{self.name}:{self.canonical_payload()}"
+
+
+class DriverDatabaseEntry:
+    """One Driver LEM-compatible database row."""
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        payload: str,
+        source_path: Path,
+        row_index: int,
+        row: dict[str, str],
+    ) -> None:
+        self.label = label
+        self.payload = payload
+        self.source_path = source_path
+        self.row_index = row_index
+        self.row = row
 
 
 _DRIVER_KEY_MAP: dict[str, tuple[str, float, str]] = {
@@ -267,6 +304,191 @@ def build_driver_lem_cli_entry(name: str, raw_payload: str | None) -> str | None
     return parse_driver_lem_spec(name, str(raw_payload)).cli_entry()
 
 
+def _driver_database_candidate_paths() -> list[Path]:
+    paths: list[Path] = []
+    if USER_DRIVER_DATABASE_DIR.is_dir():
+        paths.extend(sorted(USER_DRIVER_DATABASE_DIR.glob("*.csv")))
+    for filename in DEFAULT_DRIVER_DATABASE_FILENAMES:
+        path = HORNLAB_DRIVER_DATABASE_DIR / filename
+        if path.is_file():
+            paths.append(path)
+    return paths
+
+
+def _db_text(row: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = row.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"n/a", "na", "none", "null", "-"}:
+            return text
+    return ""
+
+
+def _db_float(row: dict[str, str], *names: str) -> float | None:
+    text = _db_text(row, *names)
+    if not text:
+        return None
+    cleaned = text.replace(",", ".")
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", cleaned)
+    if match is None:
+        return None
+    try:
+        value = float(match.group(0))
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _append_db_value(
+    pieces: list[tuple[str, float | int]],
+    label: str,
+    value: float | int | None,
+) -> None:
+    if value is not None:
+        pieces.append((label, value))
+
+
+def _driver_database_payload_from_row(row: dict[str, str]) -> str | None:
+    sd_cm2 = _db_float(row, "Sd_cm2", "Sd", "Sd_cm^2")
+    bl_tm = _db_float(row, "Bl_Tm", "BL_Tm", "Bl", "BL")
+    re_ohm = _db_float(row, "Re_ohm", "Re", "Revc_ohm")
+    if sd_cm2 is None or bl_tm is None or re_ohm is None:
+        return None
+
+    mmd_g = _db_float(row, "Mmd_g", "Mmd")
+    mms_g = _db_float(row, "Mms_g", "Mms")
+    if mmd_g is None and mms_g is None:
+        return None
+
+    cms_m_per_n = _db_float(row, "Cms_m_per_N", "Cms_mN", "Cms")
+    cms_mm_per_n = _db_float(row, "Cms_mm_per_N", "Cms_mmN", "Cms_mm_per_N")
+    vas_l = _db_float(row, "Vas_L", "Vas")
+    fs_hz = _db_float(row, "Fs_Hz", "Fs")
+    if cms_m_per_n is None and cms_mm_per_n is None and vas_l is None and fs_hz is None:
+        return None
+
+    pieces: list[tuple[str, float | int]] = [
+        ("Sd", sd_cm2),
+        ("Bl", bl_tm),
+        ("Re", re_ohm),
+    ]
+    le_mh = _db_float(row, "Le_mH", "Le")
+    if le_mh is not None and le_mh >= 0.0:
+        pieces.append(("Le", le_mh))
+    if mmd_g is not None:
+        pieces.append(("Mmd", mmd_g))
+    else:
+        pieces.append(("Mms", float(mms_g)))
+    if cms_m_per_n is not None:
+        pieces.append(("Cms", cms_m_per_n))
+    elif cms_mm_per_n is not None:
+        pieces.append(("Cms", cms_mm_per_n * 1.0e-3))
+    else:
+        _append_db_value(pieces, "Vas", vas_l)
+        _append_db_value(pieces, "Fs", fs_hz)
+    rms = _db_float(row, "Rms_kg_per_s", "Rms")
+    qms = _db_float(row, "Qms")
+    if rms is not None:
+        pieces.append(("Rms", rms))
+    elif qms is not None:
+        pieces.append(("Qms", qms))
+    _append_db_value(pieces, "Xmax", _db_float(row, "Xmax_mm", "Xmax"))
+    return ",".join(f"{key}={value:g}" for key, value in pieces)
+
+
+def _driver_database_label(row: dict[str, str], source_path: Path) -> str:
+    brand = _db_text(row, "Brand", "Manufacturer", "Make")
+    model = _db_text(row, "Model", "Part", "PartNumber", "Part_Number")
+    name = " ".join(part for part in (brand, model) if part).strip()
+    if not name:
+        name = f"{source_path.stem} row"
+    bits: list[str] = []
+    size = _db_float(row, "Size_in", "Size")
+    if size is not None:
+        bits.append(f"{size:g} in")
+    impedance = _db_float(row, "Z_ohm", "Impedance_ohm", "Nominal_Impedance_ohm")
+    if impedance is not None:
+        bits.append(f"{impedance:g} ohm")
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    return f"{name}{suffix} - {source_path.stem}"
+
+
+def _driver_database_matches_source(row: dict[str, str], source_name: str | None) -> bool:
+    source = str(source_name or "").strip().upper()
+    if source not in {"LF", "MF", "HF"}:
+        return True
+    size = _db_float(row, "Size_in", "Size")
+    if size is None:
+        return True
+    if source == "LF":
+        return size >= 8.0
+    if source == "MF":
+        return 3.0 <= size <= 12.0
+    return size <= 8.0
+
+
+def load_driver_database_entries(
+    *,
+    source_name: str | None = None,
+    database_paths: list[Path] | tuple[Path, ...] | None = None,
+) -> list[DriverDatabaseEntry]:
+    """Load local driver database rows that can produce Driver LEM payloads."""
+    paths = list(database_paths) if database_paths is not None else _driver_database_candidate_paths()
+    entries: list[DriverDatabaseEntry] = []
+    seen_payloads: set[str] = set()
+    used_labels: dict[str, int] = {}
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            with path.open(newline="", encoding="utf-8-sig", errors="replace") as file:
+                rows = list(csv.DictReader(file))
+        except OSError:
+            continue
+        for row_index, row in enumerate(rows, start=2):
+            if not _driver_database_matches_source(row, source_name):
+                continue
+            payload = _driver_database_payload_from_row(row)
+            if payload is None:
+                continue
+            if payload in seen_payloads:
+                continue
+            label = _driver_database_label(row, path)
+            duplicate_count = used_labels.get(label, 0)
+            used_labels[label] = duplicate_count + 1
+            if duplicate_count:
+                label = f"{label} [{duplicate_count + 1}]"
+            seen_payloads.add(payload)
+            entries.append(
+                DriverDatabaseEntry(
+                    label=label,
+                    payload=payload,
+                    source_path=path,
+                    row_index=row_index,
+                    row=dict(row),
+                )
+            )
+    entries.sort(key=lambda entry: entry.label.lower())
+    return entries
+
+
+def driver_database_payloads_by_label(
+    *,
+    source_name: str | None = None,
+    database_paths: list[Path] | tuple[Path, ...] | None = None,
+) -> dict[str, str]:
+    return {
+        entry.label: entry.payload
+        for entry in load_driver_database_entries(
+            source_name=source_name,
+            database_paths=database_paths,
+        )
+    }
+
+
 def _append_optional_cli_value(cmd: list[str], flag: str, value: str | None) -> None:
     if value and str(value).strip():
         cmd.extend([flag, str(value).strip()])
@@ -349,9 +571,12 @@ def validate_output_options(
     output_combined_set: bool,
     crossover_lf_mf_hz: str | None = None,
     crossover_mf_hf_hz: str | None = None,
+    crossover_lf_hf_hz: str | None = None,
 ) -> None:
-    has_crossover = bool(str(crossover_lf_mf_hz or "").strip()) or bool(
-        str(crossover_mf_hf_hz or "").strip()
+    has_crossover = (
+        bool(str(crossover_lf_mf_hz or "").strip())
+        or bool(str(crossover_mf_hf_hz or "").strip())
+        or bool(str(crossover_lf_hf_hz or "").strip())
     )
     if export_vituixcad and not output_combined_set and has_crossover:
         raise ValueError(
@@ -572,6 +797,7 @@ def build_pipeline_command(
     plot_theme: str = "hornlab",
     crossover_lf_mf_hz: str | None = None,
     crossover_mf_hf_hz: str | None = None,
+    crossover_lf_hf_hz: str | None = None,
     symmetry_planes: str = "auto",
     quadrants: str | None = None,
     mirror_axes: str | None = None,
@@ -624,6 +850,7 @@ def build_pipeline_command(
         output_combined_set=output_combined_set,
         crossover_lf_mf_hz=crossover_lf_mf_hz,
         crossover_mf_hf_hz=crossover_mf_hf_hz,
+        crossover_lf_hf_hz=crossover_lf_hf_hz,
     )
     plot_theme_value = str(plot_theme or "").strip() or "hornlab"
     cmd = [
@@ -680,6 +907,8 @@ def build_pipeline_command(
         cmd.extend(["--crossover-lf-mf-hz", str(crossover_lf_mf_hz).strip()])
     if crossover_mf_hf_hz and str(crossover_mf_hf_hz).strip():
         cmd.extend(["--crossover-mf-hf-hz", str(crossover_mf_hf_hz).strip()])
+    if crossover_lf_hf_hz and str(crossover_lf_hf_hz).strip():
+        cmd.extend(["--crossover-lf-hf-hz", str(crossover_lf_hf_hz).strip()])
     if mesh_only:
         cmd.append("--mesh-only")
     else:
@@ -867,10 +1096,16 @@ def mirror_axes_for_symmetry_planes(symmetry_planes: str) -> str:
 
 def expected_pipeline_paths(out_dir: Path) -> dict[str, Any]:
     logs_dir = out_dir / "logs"
+    exports_dir = out_dir / "exports"
+    mesh_dir = out_dir / "mesh"
+    manifests_dir = out_dir / RUN_MANIFESTS_DIR_NAME
     sources_dir = out_dir / "sources"
     combined_dir = out_dir / "combined"
     return {
         "logs_dir": str(logs_dir),
+        "exports_dir": str(exports_dir),
+        "mesh_dir": str(mesh_dir),
+        "manifests_dir": str(manifests_dir),
         "launcher_stdout": str(logs_dir / "fusion_step_to_wg_pipeline.stdout.log"),
         "launcher_stderr": str(logs_dir / "fusion_step_to_wg_pipeline.stderr.log"),
         "prepare_stdout": str(logs_dir / "prepare_step_for_wg_metal.stdout.log"),
@@ -879,11 +1114,13 @@ def expected_pipeline_paths(out_dir: Path) -> dict[str, Any]:
         "diagnose_stderr": str(logs_dir / "diagnose_wg_metal_orientation.stderr.log"),
         "solve_stdout": str(logs_dir / "solve_fusion_wg_metal.stdout.log"),
         "solve_stderr": str(logs_dir / "solve_fusion_wg_metal.stderr.log"),
-        "pipeline_manifest": str(out_dir / "fusion_wg_pipeline_manifest.json"),
-        "final_summary_manifest": str(out_dir / "final_summary_manifest.json"),
-        "prepare_manifest": str(out_dir / "manifest.json"),
-        "orientation_report": str(out_dir / "orientation_report.json"),
-        "direct_solve_manifest": str(out_dir / "direct_solve_manifest.json"),
+        "launch_metadata": str(manifests_dir / "fusion_addin_launch.json"),
+        "pipeline_manifest": str(manifests_dir / "fusion_wg_pipeline_manifest.json"),
+        "final_summary_manifest": str(manifests_dir / "final_summary_manifest.json"),
+        "prepare_manifest": str(mesh_dir / "manifest.json"),
+        "tagged_sources_msh": str(mesh_dir / "tagged_sources.msh"),
+        "orientation_report": str(mesh_dir / "orientation_report.json"),
+        "direct_solve_manifest": str(manifests_dir / "direct_solve_manifest.json"),
         "combined_time_aligned_frequency_response_png": str(
             combined_dir / "combined_frequency_response_time_aligned.png"
         ),
@@ -931,7 +1168,8 @@ def build_launch_metadata(
             "Fusion exported STEP and a native .f3d archive synchronously, "
             "then launched this process in the background.",
             "Fusion can be used while the external pipeline runs.",
-            "Check fusion_wg_pipeline_manifest.json or final_summary_manifest.json for completion status.",
+            "Check manifests/fusion_wg_pipeline_manifest.json or "
+            "manifests/final_summary_manifest.json for completion status.",
         ],
     }
     if error:
@@ -940,4 +1178,5 @@ def build_launch_metadata(
 
 
 def write_launch_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -28,6 +28,7 @@ import fcntl
 from datetime import datetime
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -100,6 +101,7 @@ CANONICAL_SOLVE_SOURCE_PRIORITY = {
     "LF": 2,
 }
 DEFAULT_DIRECT_SOLVE_LOCK_PATH = Path("/tmp/hornlab-fusion-direct-solve.lock")
+RUN_MANIFESTS_DIR_NAME = "manifests"
 SOLVER_LAYOUT_VERSION = 2
 
 
@@ -277,7 +279,7 @@ def save_frequency_response_plot(
     phase_ax.text(
         0.995,
         0.02,
-        "dashed: wrapped phase",
+        "dashed: display-flattened phase",
         transform=phase_ax.transAxes,
         ha="right",
         va="bottom",
@@ -470,6 +472,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(_jsonable(data), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -853,16 +856,77 @@ def _wrapped_phase_deg(value: complex) -> float:
     return float(np.degrees(np.angle(value)))
 
 
-def _phase_equivalent_delay_s(phase_diff_rad: float, freq_hz: float) -> float:
+def _ratio_group_delay_s(
+    freqs: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    target_hz: float,
+    *,
+    rel_window: float = 0.15,
+) -> float | None:
+    """Local group delay of ``lower/upper`` at ``target_hz`` in the ``e^{-j w
+    tau}`` (delay-to-apply-to-lower) sense: ``d/dw arg(lower/upper)``.
+
+    Estimated by a linear fit of the unwrapped ratio phase against angular
+    frequency over ``target_hz * (1 +/- rel_window)`` (falling back to the
+    nearest few master-grid samples). For two pure-arrival radiators this
+    recovers the physical arrival offset ``t_upper - t_lower``; here it is used
+    only to pick the correct period branch of the phase-value alignment, so a
+    rough slope is enough. Returns ``None`` when it cannot be estimated.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    ratio = np.asarray(lower, dtype=np.complex128) / np.asarray(
+        upper, dtype=np.complex128
+    )
+    if not np.all(np.isfinite(ratio)):
+        return None
+    window = (freqs >= target_hz * (1.0 - rel_window)) & (
+        freqs <= target_hz * (1.0 + rel_window)
+    )
+    if np.count_nonzero(window) < 3:
+        centre = int(np.argmin(np.abs(freqs - target_hz)))
+        lo_i = max(0, centre - 2)
+        hi_i = min(freqs.size, centre + 3)
+        sel = np.zeros(freqs.size, dtype=bool)
+        sel[lo_i:hi_i] = True
+        window = sel
+    f_sel = freqs[window]
+    if f_sel.size < 2:
+        return None
+    phase = np.unwrap(np.angle(ratio))[window]
+    omega = 2.0 * np.pi * f_sel
+    slope = float(np.polyfit(omega, phase, 1)[0])  # d(arg)/d(omega)
+    if not np.isfinite(slope):
+        return None
+    return slope
+
+
+def _phase_equivalent_delay_s(
+    phase_diff_rad: float,
+    freq_hz: float,
+    *,
+    group_delay_hint_s: float | None = None,
+) -> float:
     period_s = 1.0 / float(freq_hz)
-    delay_s = float(phase_diff_rad) / (2.0 * np.pi * float(freq_hz))
-    delay_s = float(delay_s % period_s)
-    # An already-aligned pair with tiny negative phase noise wraps to almost
-    # exactly one full period; snap that back to zero rather than delaying a
-    # full cycle (coherent at the crossover, wrong at every other frequency).
-    if period_s - delay_s <= period_s * 1.0e-9:
-        return 0.0
-    return delay_s
+    # np.angle returns the principal value in (-pi, pi], so this principal
+    # delay already lies in (-T/2, T/2] and is exactly phase-coherent at fc.
+    principal_s = float(phase_diff_rad) / (2.0 * np.pi * float(freq_hz))
+    if group_delay_hint_s is None or not np.isfinite(group_delay_hint_s):
+        # No physical disambiguation: pick the smallest |delay| branch (nearest
+        # zero relative delay). Correct whenever the true inter-driver arrival
+        # gap is under half a period at the crossover.
+        return (principal_s + 0.5 * period_s) % period_s - 0.5 * period_s
+    # The phase at fc fixes the delay only modulo one period. Choose the period
+    # branch nearest the measured group delay of the (unfiltered) driver ratio
+    # -- the physical arrival offset -- so the sum is coherent at fc AND on the
+    # correct cycle even when that offset exceeds half a period (a high MF/HF
+    # crossover with a real tap-to-throat path difference). The old
+    # minimum-non-negative wrap ignored this and turned a small negative phase
+    # (e.g. a passive-cardioid port pulling MF a few degrees past LF) into a
+    # near-full-period delay that cancelled hard just off fc. Downstream global
+    # normalization (delays_s -= min) restores non-negative, realizable delays.
+    n = round((float(group_delay_hint_s) - principal_s) / period_s)
+    return principal_s + n * period_s
 
 
 def _crossover_chain(
@@ -870,13 +934,17 @@ def _crossover_chain(
     *,
     lf_mf_hz: float | None,
     mf_hf_hz: float | None,
+    lf_hf_hz: float | None = None,
 ) -> tuple[list[str], list[float]] | tuple[None, str]:
     """Pick the ordered driver chain and its crossover frequencies.
 
-    Three drivers need both crossover fields. Two drivers form a two-way
-    from the pair's natural field first (LF+MF -> LF/MF XO, MF+HF -> MF/HF
-    XO), falling back to the single filled field; an LF+HF pair with both
-    fields filled is ambiguous. Returns ``(members, crossovers_hz)`` or
+    Three drivers need both the LF/MF and MF/HF crossover fields. Two drivers
+    take the pair's natural field: LF+MF -> LF/MF, MF+HF -> MF/HF, and the
+    non-adjacent LF+HF two-way (MF absent) -> the dedicated LF/HF field, which
+    overrides any leftover LF/MF or MF/HF value. A pair whose natural field is
+    empty falls back to the single filled field; an LF+HF pair with no LF/HF
+    field but both LF/MF and MF/HF filled stays ambiguous (the tool refuses to
+    guess which one bridges LF->HF). Returns ``(members, crossovers_hz)`` or
     ``(None, reason)``.
     """
     members = [name for name in ("LF", "MF", "HF") if name in present]
@@ -886,19 +954,27 @@ def _crossover_chain(
         if lf_mf_hz is None or mf_hf_hz is None:
             return None, "three-way sum needs both LF/MF and MF/HF crossover frequencies"
         return members, [float(lf_mf_hz), float(mf_hf_hz)]
+    pair = (members[0], members[1])
     natural = {
         ("LF", "MF"): lf_mf_hz,
         ("MF", "HF"): mf_hf_hz,
-    }.get((members[0], members[1]))
+        ("LF", "HF"): lf_hf_hz,
+    }.get(pair)
     if natural is not None:
         return members, [float(natural)]
-    provided = [value for value in (lf_mf_hz, mf_hf_hz) if value is not None]
+    provided = [value for value in (lf_mf_hz, mf_hf_hz, lf_hf_hz) if value is not None]
     if len(provided) == 1:
         return members, [float(provided[0])]
     if not provided:
         return None, "no crossover frequency provided"
+    if pair == ("LF", "HF"):
+        return None, (
+            "ambiguous crossover for the LF/HF two-way: set the LF/HF crossover "
+            "field, or clear one of LF/MF and MF/HF so exactly one crossover "
+            "frequency remains"
+        )
     return None, (
-        f"ambiguous crossover for the {members[0]}/{members[1]} pair: "
+        f"ambiguous crossover for the {pair[0]}/{pair[1]} pair: "
         "fill exactly one crossover frequency field"
     )
 
@@ -1093,7 +1169,7 @@ def _write_time_alignment_report(
         f"- Uses saved complex on-axis BEM pressure bases for {', '.join(members)}.",
         "- Applies LR4 low-pass/band-pass/high-pass filters along the chain.",
         "- Level-matches each channel to the median in-band filtered SPL before summing.",
-        "- Chooses the minimum non-negative phase-equivalent delay solution at each crossover frequency.",
+        "- Chooses the minimum-magnitude phase-equivalent delay per crossover (branch nearest zero relative delay), then normalizes the chain to non-negative delays.",
         "- Phase is periodic, so these are DSP/acoustic alignment delays, not a unique mechanical path measurement.",
     ])
     if mf_basis_kind != "direct":
@@ -1213,7 +1289,12 @@ def _save_off_axis_response_plot(
         phase_curves=[
             (
                 freqs,
-                _phase_deg_from_pressure(combined_grid[:, plane_index, index]),
+                _phase_deg_from_pressure(
+                    combined_grid[:, plane_index, index],
+                    frequencies_hz=freqs,
+                    polar_distance_m=polar_distance_m,
+                    impulse_aligned=True,
+                ),
                 f"{angles[index]:g} deg",
                 _OFF_AXIS_CURVE_ROLES[min(order, len(_OFF_AXIS_CURVE_ROLES) - 1)],
             )
@@ -1999,6 +2080,7 @@ def _write_crossover_alignment_outputs(
     *,
     lf_mf_hz: float | None,
     mf_hf_hz: float | None,
+    lf_hf_hz: float | None = None,
     polar_distance_m: float,
     mesh_valid_hz: float | None,
     mesh_valid_radiating_hz: float | None,
@@ -2006,13 +2088,14 @@ def _write_crossover_alignment_outputs(
     mf_override_kind: str = "direct",
     derived_dir: Path | None | object = _DEFAULT_DERIVED_DIR,
 ) -> dict[str, Any] | None:
-    if lf_mf_hz is None and mf_hf_hz is None:
+    if lf_mf_hz is None and mf_hf_hz is None and lf_hf_hz is None:
         return None
     by_name = {str(result["name"]).strip().upper(): result for result in source_results}
     chain, chain_or_reason = _crossover_chain(
         [name for name in ("LF", "MF", "HF") if name in by_name],
         lf_mf_hz=lf_mf_hz,
         mf_hf_hz=mf_hf_hz,
+        lf_hf_hz=lf_hf_hz,
     )
     if chain is None:
         return {"status": "skipped", "reason": str(chain_or_reason)}
@@ -2059,10 +2142,12 @@ def _write_crossover_alignment_outputs(
     }
 
     # Alignment delays accumulate down the chain from the top driver: each
-    # crossover contributes the minimum non-negative phase-equivalent delay
-    # between its adjacent pair. A crossover above a clamped member's solved
-    # top would read the zero-filled region (phase 0 -> bogus delay), so the
-    # pair phase is measured at the highest frequency both members solved.
+    # crossover contributes the minimum-magnitude phase-equivalent delay
+    # between its adjacent pair (see _phase_equivalent_delay_s), and the chain
+    # is normalized to non-negative delays afterward. A crossover above a
+    # clamped member's solved top would read the zero-filled region (phase 0 ->
+    # bogus delay), so the pair phase is measured at the highest frequency both
+    # members solved.
     alignment_warnings: list[str] = []
     pair_eval_hz: dict[str, float] = {}
     delays_s = {members[-1]: 0.0}
@@ -2085,8 +2170,17 @@ def _write_crossover_alignment_outputs(
         pair_eval_hz[f"{lower}-{upper}"] = eval_hz
         lower_at_xo = _interp_complex(freqs, filtered[lower], eval_hz)
         upper_at_xo = _interp_complex(freqs, filtered[upper], eval_hz)
+        # Disambiguate the period branch with the physical arrival offset,
+        # measured as the group delay of the *unfiltered* driver ratio near the
+        # crossover (the LR4 filter phases cancel at fc but their group delays
+        # do not, so the raw pressures give the cleaner arrival estimate).
+        group_delay_hint_s = _ratio_group_delay_s(
+            freqs, pressures[lower], pressures[upper], eval_hz
+        )
         pair_delay = _phase_equivalent_delay_s(
-            np.angle(lower_at_xo / upper_at_xo), eval_hz
+            np.angle(lower_at_xo / upper_at_xo),
+            eval_hz,
+            group_delay_hint_s=group_delay_hint_s,
         )
         delays_s[lower] = delays_s[upper] + pair_delay
     min_delay = min(delays_s.values())
@@ -2148,7 +2242,17 @@ def _write_crossover_alignment_outputs(
         phase_curves=[
             (
                 freqs,
-                _phase_deg_from_pressure(aligned[name]),
+                _phase_deg_from_pressure(
+                    aligned[name],
+                    frequencies_hz=freqs,
+                    polar_distance_m=polar_distance_m,
+                    impulse_aligned=True,
+                    fit_frequency_range_hz=_member_phase_fit_band_hz(
+                        freqs,
+                        index,
+                        crossovers_hz,
+                    ),
+                ),
                 _member_filter_label(
                     name, index, members, crossovers_hz, level_gains_db[name]
                 ),
@@ -2160,13 +2264,23 @@ def _write_crossover_alignment_outputs(
         + [
             (
                 freqs,
-                _phase_deg_from_pressure(combined_unaligned),
+                _phase_deg_from_pressure(
+                    combined_unaligned,
+                    frequencies_hz=freqs,
+                    polar_distance_m=polar_distance_m,
+                    impulse_aligned=True,
+                ),
                 "Combined before delay",
                 "raw",
             ),
             (
                 freqs,
-                _phase_deg_from_pressure(combined_aligned),
+                _phase_deg_from_pressure(
+                    combined_aligned,
+                    frequencies_hz=freqs,
+                    polar_distance_m=polar_distance_m,
+                    impulse_aligned=True,
+                ),
                 "Combined time aligned",
                 "combined",
             ),
@@ -2508,8 +2622,167 @@ def _directivity_power_metrics_from_pressure(
     }
 
 
-def _phase_deg_from_pressure(pressure: np.ndarray) -> np.ndarray:
-    return np.degrees(np.angle(np.asarray(pressure, dtype=np.complex128)))
+def _estimate_impulse_peak_delay_s(
+    frequencies_hz: np.ndarray,
+    pressure: np.ndarray,
+    *,
+    polar_distance_m: float | None = None,
+    fit_frequency_range_hz: tuple[float | None, float | None] | None = None,
+) -> float:
+    """Estimate the bulk delay whose removal aligns phase at the impulse peak.
+
+    The solve grid is usually sparse/log-spaced, so this intentionally uses a
+    weighted linear phase fit rather than synthesizing an FFT impulse. When a
+    fit band is supplied, only that operating band controls the displayed
+    delay; this keeps LF/MF/HF phase overlays visually flat where the driver is
+    actually used.
+    """
+    freqs = np.asarray(frequencies_hz, dtype=np.float64).reshape(-1)
+    values = np.asarray(pressure, dtype=np.complex128).reshape(-1)
+    common_delay_s = (
+        float(polar_distance_m) / SPEED_OF_SOUND_M_S
+        if polar_distance_m is not None
+        else 0.0
+    )
+    n = min(freqs.size, values.size)
+    if n < 2:
+        return common_delay_s
+    freqs = freqs[:n]
+    values = values[:n]
+    omega = 2.0 * np.pi * freqs
+    magnitudes = np.abs(values)
+    finite = (
+        np.isfinite(freqs)
+        & np.isfinite(values.real)
+        & np.isfinite(values.imag)
+        & np.isfinite(magnitudes)
+        & (freqs > 0.0)
+    )
+    if not np.any(finite):
+        return common_delay_s
+    max_mag = float(np.max(magnitudes[finite]))
+    if max_mag <= 0.0:
+        return common_delay_s
+    finite &= magnitudes >= max_mag * 1.0e-8
+    if fit_frequency_range_hz is not None:
+        lo_hz, hi_hz = fit_frequency_range_hz
+        band = finite.copy()
+        if lo_hz is not None:
+            band &= freqs >= float(lo_hz)
+        if hi_hz is not None:
+            band &= freqs <= float(hi_hz)
+        if np.count_nonzero(band) >= 2:
+            finite = band
+    if np.count_nonzero(finite) < 2:
+        return common_delay_s
+    omega = omega[finite]
+    values = values[finite]
+    magnitudes = magnitudes[finite]
+    residual = values * np.exp(1j * omega * common_delay_s)
+    phase = np.unwrap(np.angle(residual))
+    weights = np.sqrt(np.maximum(magnitudes / max_mag, 1.0e-8))
+    weight_sum = float(np.sum(weights))
+    if weight_sum <= 0.0:
+        return common_delay_s
+    weights = weights / weight_sum
+    omega_center = float(np.sum(weights * omega))
+    phase_center = float(np.sum(weights * phase))
+    omega_delta = omega - omega_center
+    denominator = float(np.sum(weights * omega_delta * omega_delta))
+    if denominator <= 0.0:
+        return common_delay_s
+    slope = float(np.sum(weights * omega_delta * (phase - phase_center)) / denominator)
+    delay = common_delay_s - slope
+    return delay if math.isfinite(delay) else common_delay_s
+
+
+def _phase_deg_from_pressure(
+    pressure: np.ndarray,
+    *,
+    frequencies_hz: np.ndarray | None = None,
+    polar_distance_m: float | None = None,
+    impulse_aligned: bool = False,
+    fit_frequency_range_hz: tuple[float | None, float | None] | None = None,
+) -> np.ndarray:
+    values = np.asarray(pressure, dtype=np.complex128)
+    if impulse_aligned and frequencies_hz is not None:
+        freqs = np.asarray(frequencies_hz, dtype=np.float64)
+        if freqs.shape == values.shape:
+            delay_s = _estimate_impulse_peak_delay_s(
+                freqs,
+                values,
+                polar_distance_m=polar_distance_m,
+                fit_frequency_range_hz=fit_frequency_range_hz,
+            )
+            values = values * np.exp(1j * 2.0 * np.pi * freqs * delay_s)
+    return np.degrees(np.angle(values))
+
+
+def _source_phase_fit_band_hz(
+    source_name: str,
+    frequencies_hz: np.ndarray,
+    *,
+    lf_mf_hz: float | None = None,
+    mf_hf_hz: float | None = None,
+) -> tuple[float | None, float | None] | None:
+    source = str(source_name or "").strip().upper()
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    finite = freqs[np.isfinite(freqs) & (freqs > 0.0)]
+    if finite.size < 2:
+        return None
+    lo_hz: float | None = float(np.min(finite))
+    hi_hz: float | None = float(np.max(finite))
+    if source == "LF" and lf_mf_hz is not None:
+        hi_hz = min(float(hi_hz), float(lf_mf_hz))
+    elif source == "HF" and mf_hf_hz is not None:
+        lo_hz = max(float(lo_hz), float(mf_hf_hz))
+    elif source == "MF":
+        if lf_mf_hz is not None:
+            lo_hz = max(float(lo_hz), float(lf_mf_hz))
+        if mf_hf_hz is not None:
+            hi_hz = min(float(hi_hz), float(mf_hf_hz))
+    return (lo_hz, hi_hz) if lo_hz < hi_hz else None
+
+
+def _member_phase_fit_band_hz(
+    frequencies_hz: np.ndarray,
+    member_index: int,
+    crossovers_hz: list[float],
+) -> tuple[float | None, float | None] | None:
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    finite = freqs[np.isfinite(freqs) & (freqs > 0.0)]
+    if finite.size < 2:
+        return None
+    edges = [
+        float(np.min(finite)),
+        *[float(xo) for xo in crossovers_hz],
+        float(np.max(finite)),
+    ]
+    if member_index < 0 or member_index + 1 >= len(edges):
+        return None
+    lo_hz = edges[member_index]
+    hi_hz = edges[member_index + 1]
+    return (lo_hz, hi_hz) if lo_hz < hi_hz else None
+
+
+def _source_phase_deg_for_plot(
+    pressure: np.ndarray,
+    frequencies_hz: np.ndarray,
+    args: argparse.Namespace,
+    source_name: str,
+) -> np.ndarray:
+    return _phase_deg_from_pressure(
+        pressure,
+        frequencies_hz=frequencies_hz,
+        polar_distance_m=float(args.polar_distance_m),
+        impulse_aligned=True,
+        fit_frequency_range_hz=_source_phase_fit_band_hz(
+            source_name,
+            frequencies_hz,
+            lf_mf_hz=args.crossover_lf_mf_hz,
+            mf_hf_hz=args.crossover_mf_hf_hz,
+        ),
+    )
 
 
 def _group_delay_from_pressure(
@@ -3766,7 +4039,12 @@ def _apply_driver_lem_coupling(
                 phase_curves=[
                     (
                         basis.frequencies_hz,
-                        _phase_deg_from_pressure(pressure[:, 0, on_axis_idx]),
+                        _source_phase_deg_for_plot(
+                            pressure[:, 0, on_axis_idx],
+                            basis.frequencies_hz,
+                            args,
+                            matching_name,
+                        ),
                         matching_name,
                         _source_role(matching_name),
                     )
@@ -4171,19 +4449,37 @@ def _solve_passive_cardioid_mf(
         phase_curves=[
             (
                 mf_basis.frequencies_hz,
-                _phase_deg_from_pressure(mf_basis.pressure_complex[:, 0, on_axis_idx]),
+                _phase_deg_from_pressure(
+                    mf_basis.pressure_complex[:, 0, on_axis_idx],
+                    frequencies_hz=mf_basis.frequencies_hz,
+                    polar_distance_m=float(args.polar_distance_m),
+                    impulse_aligned=True,
+                    fit_frequency_range_hz=(band_lo_hz, band_hi_hz),
+                ),
                 mf_name,
                 "mf",
             ),
             (
                 mf_basis.frequencies_hz,
-                _phase_deg_from_pressure(port_pressure[:, 0, on_axis_idx]),
+                _phase_deg_from_pressure(
+                    port_pressure[:, 0, on_axis_idx],
+                    frequencies_hz=mf_basis.frequencies_hz,
+                    polar_distance_m=float(args.polar_distance_m),
+                    impulse_aligned=True,
+                    fit_frequency_range_hz=(band_lo_hz, band_hi_hz),
+                ),
                 f"{port_name} weighted",
                 "other",
             ),
             (
                 mf_basis.frequencies_hz,
-                _phase_deg_from_pressure(total_pressure[:, 0, on_axis_idx]),
+                _phase_deg_from_pressure(
+                    total_pressure[:, 0, on_axis_idx],
+                    frequencies_hz=mf_basis.frequencies_hz,
+                    polar_distance_m=float(args.polar_distance_m),
+                    impulse_aligned=True,
+                    fit_frequency_range_hz=(band_lo_hz, band_hi_hz),
+                ),
                 "MF passive cardioid",
                 "combined",
             ),
@@ -4369,7 +4665,11 @@ def _solve_passive_cardioid_mf(
                     (
                         mf_basis.frequencies_hz,
                         _phase_deg_from_pressure(
-                            coupled_pressure[:, 0, on_axis_idx]
+                            coupled_pressure[:, 0, on_axis_idx],
+                            frequencies_hz=mf_basis.frequencies_hz,
+                            polar_distance_m=float(args.polar_distance_m),
+                            impulse_aligned=True,
+                            fit_frequency_range_hz=(band_lo_hz, band_hi_hz),
                         ),
                         "MF passive cardioid coupled",
                         "combined",
@@ -4676,7 +4976,12 @@ def _write_one_source_outputs(
             phase_curves=[
                 (
                     result.frequencies_hz,
-                    _phase_deg_from_pressure(pressure_engineering[:, 0, on_axis_idx]),
+                    _source_phase_deg_for_plot(
+                        pressure_engineering[:, 0, on_axis_idx],
+                        result.frequencies_hz,
+                        args,
+                        source_name,
+                    ),
                     source_name,
                     _source_role(source_name),
                 )
@@ -4797,8 +5102,11 @@ def _write_one_source_derived_outputs_from_basis(
             phase_curves=[
                 (
                     basis.frequencies_hz,
-                    _phase_deg_from_pressure(
-                        basis.pressure_complex[:, 0, on_axis_idx]
+                    _source_phase_deg_for_plot(
+                        basis.pressure_complex[:, 0, on_axis_idx],
+                        basis.frequencies_hz,
+                        args,
+                        source_name,
                     ),
                     source_name,
                     _source_role(source_name),
@@ -5028,12 +5336,15 @@ def _apply_post_solve_derived_outputs(
             phase_curves=[
                 (
                     basis.frequencies_hz,
-                    _phase_deg_from_pressure(
+                    _source_phase_deg_for_plot(
                         basis.pressure_complex[
                             :,
                             0,
                             int(np.argmin(np.abs(basis.observation_angles_deg))),
-                        ]
+                        ],
+                        basis.frequencies_hz,
+                        args,
+                        name,
                     ),
                     name,
                     _source_role(name),
@@ -5111,6 +5422,7 @@ def _apply_post_solve_derived_outputs(
             source_results,
             lf_mf_hz=args.crossover_lf_mf_hz,
             mf_hf_hz=args.crossover_mf_hf_hz,
+            lf_hf_hz=args.crossover_lf_hf_hz,
             polar_distance_m=float(args.polar_distance_m),
             mesh_valid_hz=combined_mesh_valid_hz,
             mesh_valid_radiating_hz=combined_aperture_valid_hz,
@@ -5123,6 +5435,14 @@ def _apply_post_solve_derived_outputs(
             outputs = crossover_payload.get("outputs", {})
             if crossover_payload.get("status") == "complete" and isinstance(outputs, dict):
                 manifest["outputs"].update(outputs)
+            elif crossover_payload.get("status") == "skipped" and mf_override_npz is None:
+                # Surface loudly: a skipped combine otherwise leaves no combined
+                # directivity heatmap with only a buried manifest note.
+                print(
+                    "CROSSOVER WARNING: combined/time-aligned outputs skipped — "
+                    f"{crossover_payload.get('reason')}",
+                    flush=True,
+                )
         return crossover_payload
 
     active_crossover_payload = None
@@ -5253,6 +5573,41 @@ def _read_json_if_exists(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_manifest_dir(out_dir: Path) -> Path:
+    return out_dir / RUN_MANIFESTS_DIR_NAME
+
+
+def _run_manifest_path(out_dir: Path, name: str) -> Path:
+    return _run_manifest_dir(out_dir) / name
+
+
+def _run_manifest_read_path(out_dir: Path, name: str) -> Path:
+    preferred = _run_manifest_path(out_dir, name)
+    if preferred.exists():
+        return preferred
+    return out_dir / name
+
+
+def _run_manifest_write_path(out_dir: Path, name: str) -> Path:
+    preferred = _run_manifest_path(out_dir, name)
+    legacy = out_dir / name
+    if legacy.exists() and not preferred.exists():
+        return legacy
+    return preferred
+
+
+def _existing_run_manifest_paths(out_dir: Path, name: str) -> list[Path]:
+    paths = []
+    for path in (_run_manifest_path(out_dir, name), out_dir / name):
+        if path.exists() and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _read_run_manifest_if_exists(out_dir: Path, name: str) -> dict[str, Any]:
+    return _read_json_if_exists(_run_manifest_read_path(out_dir, name))
 
 
 def _manifest_path_in_run(
@@ -5389,21 +5744,24 @@ def _load_existing_radiation_payload(
 
 
 def _update_pipeline_summary_manifests(out_dir: Path, direct_manifest: dict[str, Any]) -> None:
-    for path in (
-        out_dir / "fusion_wg_pipeline_manifest.json",
-        out_dir / "final_summary_manifest.json",
-    ):
-        if not path.exists():
-            continue
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict):
-            payload["direct_solve"] = direct_manifest
-            payload["status"] = "complete"
-            payload["finished_at"] = direct_manifest.get(
-                "finished_at",
-                datetime.now().isoformat(timespec="seconds"),
-            )
-            _write_json(path, payload)
+    for name in ("fusion_wg_pipeline_manifest.json", "final_summary_manifest.json"):
+        for path in _existing_run_manifest_paths(out_dir, name):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                payload["direct_solve"] = direct_manifest
+                payload["status"] = "complete"
+                payload["finished_at"] = direct_manifest.get(
+                    "finished_at",
+                    datetime.now().isoformat(timespec="seconds"),
+                )
+                _write_json(path, payload)
+
+
+def _missing_postprocess_manifest_error() -> str:
+    return (
+        "postprocess-only requires direct_solve_manifest.json or "
+        "final_summary_manifest.json in the run folder or manifests folder"
+    )
 
 
 def _finalize_run_report(
@@ -5443,10 +5801,7 @@ def _run_postprocess_only(
     final_manifest: dict[str, Any],
 ) -> None:
     if not direct_manifest and not final_manifest:
-        raise RuntimeError(
-            "postprocess-only requires direct_solve_manifest.json or "
-            "final_summary_manifest.json in the run folder"
-        )
+        raise RuntimeError(_missing_postprocess_manifest_error())
     source_entries = {
         str(entry["name"]): entry
         for entry in _source_entries_from_manifests(direct_manifest, final_manifest)
@@ -5586,6 +5941,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Optional MF/HF LR4 crossover frequency for the time-aligned "
             "crossover sum (see --crossover-lf-mf-hz)."
+        ),
+    )
+    parser.add_argument(
+        "--crossover-lf-hf-hz",
+        type=float,
+        default=None,
+        help=(
+            "Optional LF/HF LR4 crossover for a two-way with only LF and HF "
+            "solved (no MF). Names the LF->HF crossover directly so it is "
+            "unambiguous, and overrides any leftover LF/MF or MF/HF value for "
+            "the LF+HF pair."
         ),
     )
     parser.add_argument("--polar-distance-m", type=float, default=2.0)
@@ -5743,8 +6109,14 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     if not mesh_path.exists() and not args.postprocess_only:
         raise SystemExit(f"mesh not found: {mesh_path}")
-    previous_direct_manifest = _read_json_if_exists(out_dir / "direct_solve_manifest.json")
-    previous_final_manifest = _read_json_if_exists(out_dir / "final_summary_manifest.json")
+    previous_direct_manifest = _read_run_manifest_if_exists(
+        out_dir,
+        "direct_solve_manifest.json",
+    )
+    previous_final_manifest = _read_run_manifest_if_exists(
+        out_dir,
+        "final_summary_manifest.json",
+    )
     layout = SolverOutputLayout(
         out_dir,
         layout_version=_layout_version_for_run(
@@ -5797,6 +6169,7 @@ def main(argv: list[str] | None = None) -> int:
     for flag, value in (
         ("--crossover-lf-mf-hz", args.crossover_lf_mf_hz),
         ("--crossover-mf-hf-hz", args.crossover_mf_hf_hz),
+        ("--crossover-lf-hf-hz", args.crossover_lf_hf_hz),
     ):
         if value is None:
             continue
@@ -5817,6 +6190,7 @@ def main(argv: list[str] | None = None) -> int:
         and (
             args.crossover_lf_mf_hz is not None
             or args.crossover_mf_hf_hz is not None
+            or args.crossover_lf_hf_hz is not None
         )
     ):
         raise SystemExit(
@@ -5861,6 +6235,7 @@ def main(argv: list[str] | None = None) -> int:
             "crossover": {
                 "lf_mf_hz": args.crossover_lf_mf_hz,
                 "mf_hf_hz": args.crossover_mf_hf_hz,
+                "lf_hf_hz": args.crossover_lf_hf_hz,
                 "type": "lr4",
             },
             "polar_distance_m": args.polar_distance_m,
@@ -5936,7 +6311,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest["config"]["passive_cardioid"]["driver_source"] = (
             "driver_lem_mf_spec"
         )
-    manifest_path = out_dir / "direct_solve_manifest.json"
+    manifest_path = _run_manifest_write_path(out_dir, "direct_solve_manifest.json")
 
     if args.dry_run:
         manifest["sources"] = [

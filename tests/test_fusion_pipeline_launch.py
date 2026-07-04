@@ -33,6 +33,12 @@ def _load_pipeline():
     return module
 
 
+def _run_manifest_path(run_dir: Path, name: str) -> Path:
+    path = run_dir / "manifests" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _helper_command(helper, **overrides):
     kwargs = dict(
         python_path=Path("/venv/bin/python"),
@@ -169,6 +175,44 @@ def test_driver_lem_parser_accepts_mms_and_lr2_pair():
     assert spec.params["re2_ohm"] == pytest.approx(4.0)
     assert spec.params["n_drivers"] == 2
     assert "Mms=55" in spec.canonical_payload()
+
+
+def test_driver_database_loader_builds_lem_payloads_from_csv(tmp_path):
+    helper = _load_helper()
+    database = tmp_path / "drivers.csv"
+    database.write_text(
+        "\n".join(
+            [
+                "Brand,Model,Size_in,Z_ohm,Fs_Hz,Qms,Vas_L,Sd_cm2,Bl_Tm,Re_ohm,Le_mH,Mms_g,Cms_mm_per_N,Xmax_mm",
+                "B&C,10CL51,10,8,58,3.5,36,320,11.6,5.2,0.8,30.5,0.252,5.5",
+                "Broken,NoMotor,10,8,58,3.5,36,320,,5.2,0.8,30.5,0.252,5.5",
+                "Big,LFOnly,15,8,38,5.1,100,855,22,5.4,1.2,100,,7",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    mf_entries = helper.load_driver_database_entries(
+        source_name="MF",
+        database_paths=[database],
+    )
+
+    assert [entry.label for entry in mf_entries] == [
+        "B&C 10CL51 (10 in, 8 ohm) - drivers"
+    ]
+    spec = helper.parse_driver_lem_spec("MF", mf_entries[0].payload)
+    assert spec.params["sd_m2"] == pytest.approx(0.032)
+    assert spec.params["cms_m_per_n"] == pytest.approx(0.000252)
+    assert spec.params["mms_kg"] == pytest.approx(0.0305)
+    assert spec.params["xmax_m"] == pytest.approx(0.0055)
+
+    lf_payloads = helper.driver_database_payloads_by_label(
+        source_name="LF",
+        database_paths=[database],
+    )
+    assert "Big LFOnly (15 in, 8 ohm) - drivers" in lf_payloads
+    assert "Vas=100" in lf_payloads["Big LFOnly (15 in, 8 ohm) - drivers"]
 
 
 def test_pipeline_parser_accepts_and_groups_new_driver_lem_flags():
@@ -966,7 +1010,7 @@ def _fake_run_logged(
             )
         elif script_name == "solve_fusion_wg_metal.py":
             payload = solve_manifest_payload or {"status": "complete"}
-            (out_dir / "direct_solve_manifest.json").write_text(
+            _run_manifest_path(out_dir, "direct_solve_manifest.json").write_text(
                 json.dumps(payload) + "\n",
                 encoding="utf-8",
             )
@@ -1218,14 +1262,14 @@ def test_pipeline_writes_solving_manifest_before_direct_solve_returns(
             )
         elif script_name == "solve_fusion_wg_metal.py":
             manifest = json.loads(
-                (out_dir / "fusion_wg_pipeline_manifest.json").read_text(
+                _run_manifest_path(out_dir, "fusion_wg_pipeline_manifest.json").read_text(
                     encoding="utf-8"
                 )
             )
             assert manifest["status"] == "solving"
             assert manifest["commands"]["solve"] == cmd
             assert manifest["solve_sources"] == ["HF:5:4"]
-            (out_dir / "direct_solve_manifest.json").write_text(
+            _run_manifest_path(out_dir, "direct_solve_manifest.json").write_text(
                 json.dumps({"status": "complete"}) + "\n",
                 encoding="utf-8",
             )
@@ -1442,7 +1486,7 @@ def test_pipeline_default_warns_and_solves_underresolved_sources(tmp_path, monke
     assert "--native-check-open-edges" in solve_cmd
     assert "--no-native-check-open-edges" not in solve_cmd
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1487,7 +1531,7 @@ def test_pipeline_overlays_mesh_valid_markers_by_default(tmp_path, monkeypatch):
     }
     assert overlays == {"LF:1475.0", "HF:9767.0"}
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1526,7 +1570,7 @@ def test_pipeline_hides_mesh_valid_markers_when_disabled(tmp_path, monkeypatch):
     assert "--source-mesh-valid-hz" not in solve_cmd
     assert "--source-aperture-valid-hz" not in solve_cmd
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1630,7 +1674,7 @@ def test_pipeline_clamp_policy_clamps_each_underresolved_source_separately(
     }
     assert limits == {"LF:1475.0", "HF:9767.0"}
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1673,7 +1717,7 @@ def test_pipeline_default_skips_sources_below_freq_min(tmp_path, monkeypatch):
     assert "LF:30:2" not in solve_cmd
     assert "HF:5:4" in solve_cmd
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1714,7 +1758,7 @@ def test_pipeline_fails_when_no_source_can_solve_above_freq_min(tmp_path, monkey
         "diagnose_wg_metal_orientation.py",
     ]
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1750,7 +1794,7 @@ def test_pipeline_strict_fail_policy_still_refuses_underresolved_solve(tmp_path,
         "diagnose_wg_metal_orientation.py",
     ]
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1789,7 +1833,7 @@ def test_pipeline_warns_and_solves_underresolved_when_policy_is_warn(tmp_path, m
     assert "--native-check-open-edges" in solve_cmd
     assert "--no-native-check-open-edges" not in solve_cmd
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1861,7 +1905,7 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
     solve_cmd = calls[2][1]
     assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] == "yz"
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -1917,7 +1961,7 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
                 encoding="utf-8",
             )
         elif script_name == "solve_fusion_wg_metal.py":
-            (out_dir / "direct_solve_manifest.json").write_text(
+            _run_manifest_path(out_dir, "direct_solve_manifest.json").write_text(
                 json.dumps({"status": "complete"}) + "\n",
                 encoding="utf-8",
             )
@@ -1943,7 +1987,7 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
 
     assert rc == 0
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2020,7 +2064,7 @@ def test_pipeline_auto_frame_follows_inferred_horn_axis(tmp_path, monkeypatch):
     assert solve_cmd[solve_cmd.index("--frame-origin") + 1] == "0.814,1.133,0"
     assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] == "xy"
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2086,7 +2130,7 @@ def test_pipeline_auto_frame_constrains_axis_to_cut_planes_for_meh(tmp_path, mon
                 encoding="utf-8",
             )
         elif script_name == "solve_fusion_wg_metal.py":
-            (out_dir / "direct_solve_manifest.json").write_text(
+            _run_manifest_path(out_dir, "direct_solve_manifest.json").write_text(
                 json.dumps({"status": "complete"}) + "\n", encoding="utf-8"
             )
         return 0
@@ -2114,7 +2158,7 @@ def test_pipeline_auto_frame_constrains_axis_to_cut_planes_for_meh(tmp_path, mon
     assert solve_cmd[solve_cmd.index("--frame-axis") + 1] == "0,0,1"
     assert solve_cmd[solve_cmd.index("--frame-origin") + 1] == "0,0,0.298"
     manifest = json.loads(
-        (tmp_path / "out" / "fusion_wg_pipeline_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -2257,8 +2301,24 @@ def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     assert metadata["expected_paths"]["solve_stdout"].endswith(
         "logs/solve_fusion_wg_metal.stdout.log"
     )
+    assert metadata["expected_paths"]["launch_metadata"].endswith(
+        "manifests/fusion_addin_launch.json"
+    )
     assert metadata["expected_paths"]["pipeline_manifest"].endswith(
-        "fusion_wg_pipeline_manifest.json"
+        "manifests/fusion_wg_pipeline_manifest.json"
+    )
+    assert metadata["expected_paths"]["final_summary_manifest"].endswith(
+        "manifests/final_summary_manifest.json"
+    )
+    assert metadata["expected_paths"]["direct_solve_manifest"].endswith(
+        "manifests/direct_solve_manifest.json"
+    )
+    assert metadata["expected_paths"]["prepare_manifest"].endswith("mesh/manifest.json")
+    assert metadata["expected_paths"]["tagged_sources_msh"].endswith(
+        "mesh/tagged_sources.msh"
+    )
+    assert metadata["expected_paths"]["orientation_report"].endswith(
+        "mesh/orientation_report.json"
     )
     assert metadata["expected_paths"]["combined_time_aligned_frequency_response_png"].endswith(
         "combined/combined_frequency_response_time_aligned.png"

@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any
 
 
+RUN_MANIFESTS_DIR_NAME = "manifests"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -20,9 +23,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _run_manifest_path(run_dir: Path, name: str) -> Path:
+    preferred = run_dir / RUN_MANIFESTS_DIR_NAME / name
+    if preferred.exists():
+        return preferred
+    return run_dir / name
+
+
+def _has_run_manifest(run_dir: Path, name: str) -> bool:
+    return (run_dir / RUN_MANIFESTS_DIR_NAME / name).exists() or (run_dir / name).exists()
+
+
 def _run_manifests(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    final_manifest = _read_json(run_dir / "final_summary_manifest.json")
-    direct_manifest = _read_json(run_dir / "direct_solve_manifest.json")
+    final_manifest = _read_json(_run_manifest_path(run_dir, "final_summary_manifest.json"))
+    direct_manifest = _read_json(_run_manifest_path(run_dir, "direct_solve_manifest.json"))
     if not direct_manifest:
         direct = final_manifest.get("direct_solve")
         if isinstance(direct, dict):
@@ -82,6 +96,9 @@ def _section(title: str, body: str) -> str:
 def _summary_table(final_manifest: dict[str, Any], direct_manifest: dict[str, Any]) -> str:
     config = _as_dict(direct_manifest.get("config"))
     crossover = _as_dict(config.get("crossover"))
+    crossover_summary = f"LF/MF {crossover.get('lf_mf_hz')} Hz, MF/HF {crossover.get('mf_hf_hz')} Hz"
+    if crossover.get("lf_hf_hz") is not None:
+        crossover_summary += f", LF/HF {crossover.get('lf_hf_hz')} Hz"
     rows = [
         ("Status", direct_manifest.get("status") or final_manifest.get("status") or "unknown"),
         ("Started", direct_manifest.get("started_at") or final_manifest.get("started_at") or ""),
@@ -89,7 +106,7 @@ def _summary_table(final_manifest: dict[str, Any], direct_manifest: dict[str, An
         ("Layout", direct_manifest.get("layout_version", 1)),
         ("Frequency", f"{config.get('freq_min_hz', '')} - {config.get('freq_max_hz', '')} Hz"),
         ("Count/spacing", f"{config.get('freq_count', '')} / {config.get('freq_spacing', '')}"),
-        ("Crossover", f"LF/MF {crossover.get('lf_mf_hz')} Hz, MF/HF {crossover.get('mf_hf_hz')} Hz"),
+        ("Crossover", crossover_summary),
         ("Mesh", direct_manifest.get("mesh") or final_manifest.get("solve_mesh") or ""),
     ]
     return (
@@ -132,13 +149,22 @@ def _per_driver_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
 
 def _combined_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
     outputs = _as_dict(direct_manifest.get("outputs"))
+    banner = ""
+    alignment = _as_dict(direct_manifest.get("crossover_alignment"))
+    if alignment.get("status") == "skipped":
+        banner = (
+            '<p style="background:#fff3cd;border:1px solid #ffe08a;border-radius:6px;'
+            'padding:10px 12px;color:#7a5b00;margin:0 0 14px">'
+            "<strong>Time-aligned combine skipped &mdash; no combined directivity "
+            f"heatmap.</strong> {_html(str(alignment.get('reason', '')))}</p>"
+        )
     keys = [
         ("combined_frequency_response_png", "Combined frequency response"),
         ("combined_time_aligned_frequency_response_png", "Time-aligned frequency response"),
         ("combined_time_aligned_directivity_heatmap_png", "Time-aligned directivity"),
         ("combined_interference_heatmap_png", "Interference heatmap"),
     ]
-    body = "".join(_image(run_dir, outputs.get(key), label) for key, label in keys)
+    body = banner + "".join(_image(run_dir, outputs.get(key), label) for key, label in keys)
     off_axis = _as_dict(outputs.get("combined_off_axis_frequency_response_pngs"))
     body += "".join(
         _image(run_dir, value, f"Off-axis response {plane}")
@@ -335,8 +361,8 @@ def render_index(output_root: Path) -> Path:
         for path in output_root.iterdir()
         if path.is_dir()
         and (
-            (path / "direct_solve_manifest.json").exists()
-            or (path / "final_summary_manifest.json").exists()
+            _has_run_manifest(path, "direct_solve_manifest.json")
+            or _has_run_manifest(path, "final_summary_manifest.json")
         )
     ]
     runs.sort(key=_manifest_sort_key, reverse=True)

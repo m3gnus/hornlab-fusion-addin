@@ -26,6 +26,12 @@ def _touch(path: Path) -> str:
     return str(path)
 
 
+def _write_manifest(run: Path, name: str, payload: dict) -> None:
+    path = run / "manifests" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_path):
     renderer = _load_renderer()
     run = tmp_path / "260703-120000-demo"
@@ -125,10 +131,11 @@ def test_render_run_report_includes_expected_sections_and_relative_paths(tmp_pat
     }
     (run / "logs").mkdir(parents=True)
     _touch(run / "logs" / "solve_fusion_wg_metal.stdout.log")
-    (run / "direct_solve_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (run / "final_summary_manifest.json").write_text(
-        json.dumps({"status": "complete", "direct_solve": manifest}),
-        encoding="utf-8",
+    _write_manifest(run, "direct_solve_manifest.json", manifest)
+    _write_manifest(
+        run,
+        "final_summary_manifest.json",
+        {"status": "complete", "direct_solve": manifest},
     )
 
     report = renderer.render_run(run)
@@ -166,15 +173,14 @@ def test_render_index_orders_manifest_runs_newest_first_and_tolerates_v1(tmp_pat
         json.dumps({"status": "complete", "started_at": "2026-07-01T09:00:00"}),
         encoding="utf-8",
     )
-    (new_run / "direct_solve_manifest.json").write_text(
-        json.dumps(
-            {
-                "status": "failed",
-                "started_at": "2026-07-03T09:00:00",
-                "layout_version": 2,
-            }
-        ),
-        encoding="utf-8",
+    _write_manifest(
+        new_run,
+        "direct_solve_manifest.json",
+        {
+            "status": "failed",
+            "started_at": "2026-07-03T09:00:00",
+            "layout_version": 2,
+        },
     )
 
     index = renderer.render_index(tmp_path)

@@ -35,6 +35,7 @@ REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
 if ADDIN_DIR.is_dir() and str(ADDIN_DIR) not in sys.path:
     sys.path.insert(0, str(ADDIN_DIR))
 from fusion_pipeline_launch import (  # noqa: E402
+    RUN_MANIFESTS_DIR_NAME,
     build_source_specs,
     load_preset,
     mirror_axes_for_symmetry_planes,
@@ -289,7 +290,23 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _run_manifest_dir(out_dir: Path) -> Path:
+    return out_dir / RUN_MANIFESTS_DIR_NAME
+
+
+def _run_manifest_path(out_dir: Path, name: str) -> Path:
+    return _run_manifest_dir(out_dir) / name
+
+
+def _existing_run_manifest_path(out_dir: Path, name: str) -> Path:
+    preferred = _run_manifest_path(out_dir, name)
+    if preferred.exists():
+        return preferred
+    return out_dir / name
 
 
 def _mesh_frequency_status(prep_manifest: dict[str, Any]) -> str:
@@ -426,6 +443,7 @@ def _update_launch_metadata(*, status: str, returncode: int, error: str | None) 
         metadata["finished_at"] = datetime.now().isoformat(timespec="seconds")
         if error:
             metadata["error"] = error
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(metadata, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -438,7 +456,9 @@ def _finalize_run(args: argparse.Namespace, *, returncode: int, crash_error: str
     out_dir = args.out.expanduser().resolve()
     manifest: dict[str, Any] = {}
     try:
-        manifest = _read_json(out_dir / "fusion_wg_pipeline_manifest.json")
+        manifest = _read_json(
+            _existing_run_manifest_path(out_dir, "fusion_wg_pipeline_manifest.json")
+        )
     except Exception:
         pass
 
@@ -665,6 +685,7 @@ def _apply_preset_defaults(args: argparse.Namespace, argv: list[str]) -> None:
         ("plot_theme", "plot_theme", ("--plot-theme",), str),
         ("crossover_lf_mf_hz", "crossover_lf_mf_hz", ("--crossover-lf-mf-hz",), float),
         ("crossover_mf_hf_hz", "crossover_mf_hf_hz", ("--crossover-mf-hf-hz",), float),
+        ("crossover_lf_hf_hz", "crossover_lf_hf_hz", ("--crossover-lf-hf-hz",), float),
         ("drive_voltage", "drive_voltage", ("--drive-voltage",), float),
         ("rg_ohm", "rg_ohm", ("--rg-ohm",), float),
         (
@@ -889,6 +910,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Optional MF/HF LR4 crossover frequency for the solver crossover "
             "sum (see --crossover-lf-mf-hz)."
+        ),
+    )
+    parser.add_argument(
+        "--crossover-lf-hf-hz",
+        type=float,
+        default=None,
+        help=(
+            "Optional LF/HF LR4 crossover for a two-way with only LF and HF "
+            "solved (no MF). Names the LF->HF crossover directly and overrides "
+            "any leftover LF/MF or MF/HF value for the LF+HF pair."
         ),
     )
     parser.add_argument("--polar-distance-m", type=float, default=2.0)
@@ -1153,6 +1184,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     for flag, value in (
         ("--crossover-lf-mf-hz", args.crossover_lf_mf_hz),
         ("--crossover-mf-hf-hz", args.crossover_mf_hf_hz),
+        ("--crossover-lf-hf-hz", args.crossover_lf_hf_hz),
     ):
         if value is not None and value <= 0.0:
             raise SystemExit(f"{flag} must be positive")
@@ -1181,7 +1213,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     wg_dir = args.wg_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
+    mesh_dir = out_dir / "mesh"
+    manifests_dir = _run_manifest_dir(out_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    manifests_dir.mkdir(parents=True, exist_ok=True)
 
     prep_cmd = [
         str(Path(args.python).expanduser()),
@@ -1189,7 +1225,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "--step",
         str(step_path),
         "--out",
-        str(out_dir),
+        str(mesh_dir),
         "--transition-mm",
         str(args.transition_mm),
         "--quadrants",
@@ -1221,8 +1257,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         stdout_path=logs_dir / "prepare_step_for_wg_metal.stdout.log",
         stderr_path=logs_dir / "prepare_step_for_wg_metal.stderr.log",
     )
-    prep_manifest_path = out_dir / "manifest.json"
-    pipeline_manifest_path = out_dir / "fusion_wg_pipeline_manifest.json"
+    prep_manifest_path = mesh_dir / "manifest.json"
+    pipeline_manifest_path = _run_manifest_path(out_dir, "fusion_wg_pipeline_manifest.json")
+    final_summary_manifest_path = _run_manifest_path(out_dir, "final_summary_manifest.json")
 
     pipeline_manifest: dict[str, Any] = {
         "pipeline": "fusion_step_to_wg_metal",
@@ -1231,6 +1268,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "status": "failed" if prep_returncode else "prepared",
         "step": str(step_path),
         "output_dir": str(out_dir),
+        "mesh_dir": str(mesh_dir),
+        "manifests_dir": str(manifests_dir),
         "waveguide_generator_dir": str(wg_dir),
         "commands": {
             "prepare": prep_cmd,
@@ -1292,12 +1331,13 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         name, tag = _source_name_tag(source)
         diagnose_sources.extend(["--source", f"{name}:{tag}"])
 
-    diagnose_out = out_dir
+    tagged_mesh_path = mesh_dir / "tagged_sources.msh"
+    diagnose_out = mesh_dir
     diagnose_cmd = [
         str(Path(args.python).expanduser()),
         str(DIAGNOSE_SCRIPT),
         "--mesh",
-        str(out_dir / "tagged_sources.msh"),
+        str(tagged_mesh_path),
         "--out",
         str(diagnose_out),
         "--mirror-axes",
@@ -1337,7 +1377,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     orientation_report_path = diagnose_out / "orientation_report.json"
     orientation_report = _read_json(orientation_report_path)
     expanded_mesh = orientation_report.get("expanded_mesh", {})
-    solve_mesh_path = out_dir / "tagged_sources.msh"
+    solve_mesh_path = tagged_mesh_path
     solve_native_symmetry_plane = native_symmetry_plane
     if native_symmetry_plane is None and symmetry_planes:
         expanded_mesh_path = expanded_mesh.get("mesh")
@@ -1393,11 +1433,14 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "v": frame_v,
         }
     pipeline_manifest["waveguide_generator"] = {
-        "launch_command": f"cd {shlex.quote(str(wg_dir))} && WG_FUSION_PIPELINE_MANIFEST={shlex.quote(str(pipeline_manifest_path))} npm start",
+        "launch_command": (
+            f"cd {shlex.quote(str(wg_dir))} && "
+            f"WG_FUSION_PIPELINE_MANIFEST={shlex.quote(str(pipeline_manifest_path))} npm start"
+        ),
         "import_mesh": str(expanded_mesh.get("mesh") or solve_mesh_path),
         "per_source_meshes_m": wg_source_meshes_m,
     }
-    solve_manifest_path = out_dir / "direct_solve_manifest.json"
+    solve_manifest_path = _run_manifest_path(out_dir, "direct_solve_manifest.json")
     solve_returncode = 0
     solve_freq_max_hz = args.freq_max_hz
     solve_sources = _order_sources_for_direct_solve(sources)
@@ -1554,6 +1597,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             solve_cmd.extend(["--crossover-lf-mf-hz", str(args.crossover_lf_mf_hz)])
         if args.crossover_mf_hf_hz is not None:
             solve_cmd.extend(["--crossover-mf-hf-hz", str(args.crossover_mf_hf_hz)])
+        if args.crossover_lf_hf_hz is not None:
+            solve_cmd.extend(["--crossover-lf-hf-hz", str(args.crossover_lf_hf_hz)])
         _extend_option_value(solve_cmd, "--frame-axis", frame_axis)
         _extend_option_value(solve_cmd, "--frame-origin", frame_origin)
         _extend_option_value(solve_cmd, "--frame-u", frame_u)
@@ -1678,7 +1723,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     if not args.no_run_report:
         pipeline_manifest["report_html"] = str(out_dir / "report.html")
     _write_json(pipeline_manifest_path, pipeline_manifest)
-    _write_json(out_dir / "final_summary_manifest.json", pipeline_manifest)
+    _write_json(final_summary_manifest_path, pipeline_manifest)
 
     if not args.no_run_report:
         report_result = _render_run_report(out_dir, python=args.python)
@@ -1691,7 +1736,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 "status": "complete" if report_returncode == 0 else "failed",
             }
             _write_json(pipeline_manifest_path, pipeline_manifest)
-            _write_json(out_dir / "final_summary_manifest.json", pipeline_manifest)
+            _write_json(final_summary_manifest_path, pipeline_manifest)
 
     _open_requested_outputs(args, out_dir)
     if args.open_wg:

@@ -28,6 +28,10 @@ def _write_json(path: Path, payload: dict) -> str:
     return str(path)
 
 
+def _write_manifest(run: Path, name: str, payload: dict) -> str:
+    return _write_json(run / "manifests" / name, payload)
+
+
 def _write_basis(path: Path, name: str, gain: float) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     freqs = np.asarray([100.0, 200.0, 400.0])
@@ -162,8 +166,8 @@ def _make_layout2_run(root: Path) -> Path:
             "delays_ms": {"LF": 0.2, "HF": 0.0},
         },
     }
-    _write_json(run / "direct_solve_manifest.json", manifest)
-    _write_json(run / "final_summary_manifest.json", {"direct_solve": manifest})
+    _write_manifest(run, "direct_solve_manifest.json", manifest)
+    _write_manifest(run, "final_summary_manifest.json", {"direct_solve": manifest})
     return run
 
 

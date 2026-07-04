@@ -228,6 +228,34 @@ def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
         assert addin._input_by_id(top, input_id).isEnabled is True
 
 
+def test_driver_database_selection_populates_manual_ts_field(monkeypatch):
+    addin = _load_addin_with_fake_adsk()
+    addin._driver_database_payload_cache.clear()
+    monkeypatch.setattr(
+        addin,
+        "driver_database_payloads_by_label",
+        lambda *, source_name: {
+            "B&C 10CL51 (10 in, 8 ohm) - test": (
+                "Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=30.5,Cms=0.000252,Qms=3.5"
+            )
+        },
+    )
+    top = _Inputs(
+        [
+            _Input(
+                "mf_driver_database",
+                selected=_Selected("B&C 10CL51 (10 in, 8 ohm) - test"),
+            ),
+            _Input("mf_driver_lem", ""),
+        ]
+    )
+
+    assert addin._apply_driver_database_selection(top, "MF") is True
+    assert addin._input_value(top, "mf_driver_lem") == (
+        "Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=30.5,Cms=0.000252,Qms=3.5"
+    )
+
+
 def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch):
     addin = _load_addin_with_fake_adsk()
     settings_path = tmp_path / "settings.json"

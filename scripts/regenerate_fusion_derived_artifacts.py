@@ -16,6 +16,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOLVER_SCRIPT = REPO_ROOT / "scripts" / "solve_fusion_wg_metal.py"
+RUN_MANIFESTS_DIR_NAME = "manifests"
 
 DERIVED_MARKERS = (
     "driver_time_alignment.txt",
@@ -31,6 +32,13 @@ DERIVED_MARKERS = (
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_manifest_path(run_dir: Path, name: str) -> Path:
+    preferred = run_dir / RUN_MANIFESTS_DIR_NAME / name
+    if preferred.exists():
+        return preferred
+    return run_dir / name
 
 
 def _is_keyless_pressure_basis(path: Path) -> bool:
@@ -89,7 +97,7 @@ def _command_candidates(run_dir: Path, launch: dict[str, Any]) -> list[list[str]
         "final_summary_manifest.json",
         "fusion_wg_pipeline_manifest.json",
     ):
-        manifest_path = run_dir / manifest_name
+        manifest_path = _run_manifest_path(run_dir, manifest_name)
         if not manifest_path.exists():
             continue
         manifest = _read_json(manifest_path)
@@ -145,7 +153,7 @@ def _recover_mesh_path(run_dir: Path, argv: list[str]) -> Path | None:
         "final_summary_manifest.json",
         "direct_solve_manifest.json",
     ):
-        manifest_path = run_dir / manifest_name
+        manifest_path = _run_manifest_path(run_dir, manifest_name)
         if not manifest_path.exists():
             continue
         manifest = _read_json(manifest_path)
@@ -165,15 +173,20 @@ def _recover_mesh_path(run_dir: Path, argv: list[str]) -> Path | None:
         if path.exists():
             return path
 
-    tagged = run_dir / "tagged_sources.msh"
-    return tagged if tagged.exists() else None
+    for tagged in (
+        run_dir / "mesh" / "tagged_sources.msh",
+        run_dir / "tagged_sources.msh",
+    ):
+        if tagged.exists():
+            return tagged
+    return None
 
 
 def _recover_postprocess_command(run_dir: Path) -> tuple[list[str] | None, str | None]:
     # The launch json is the primary record but not required: the summary
     # manifests carry the same commands.solve argv (some early runs have
     # only those).
-    launch_path = run_dir / "fusion_addin_launch.json"
+    launch_path = _run_manifest_path(run_dir, "fusion_addin_launch.json")
     launch = _read_json(launch_path) if launch_path.exists() else {}
     for candidate in _command_candidates(run_dir, launch):
         script_idx = _script_index(candidate, "solve_fusion_wg_metal.py")
@@ -259,7 +272,7 @@ def _failure_detail(run_dir: Path, result: subprocess.CompletedProcess) -> str:
     prefer that over dumping raw output, and fall back to the last stderr
     line so the sweep summary stays scannable.
     """
-    manifest_path = run_dir / "direct_solve_manifest.json"
+    manifest_path = _run_manifest_path(run_dir, "direct_solve_manifest.json")
     if manifest_path.exists():
         try:
             error = _read_json(manifest_path).get("error")

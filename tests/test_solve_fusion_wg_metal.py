@@ -35,6 +35,12 @@ def _load_script():
     return module
 
 
+def _run_manifest_path(run_dir: Path, name: str) -> Path:
+    path = run_dir / "manifests" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _write_fake_solver_imports(workspace_root: Path, *, origin: str) -> None:
     sim_methods = workspace_root / "hornlab-sim" / "hornlab_sim" / "methods"
     sim_methods.mkdir(parents=True)
@@ -289,7 +295,10 @@ def test_dry_run_writes_manifest_for_current_smoke_mesh(tmp_path):
         ]
     )
     assert rc == 0
-    manifest = (tmp_path / "direct_solve_manifest.json").read_text(encoding="utf-8")
+    assert not (tmp_path / "direct_solve_manifest.json").exists()
+    manifest = _run_manifest_path(tmp_path, "direct_solve_manifest.json").read_text(
+        encoding="utf-8"
+    )
     assert '"native_symmetry_plane": "yz+xz"' in manifest
     assert '"native_check_open_edges": true' in manifest
     assert '"bem_formulation": "complex_k"' in manifest
@@ -327,7 +336,7 @@ def test_dry_run_orders_canonical_sources_hf_mf_lf(tmp_path):
 
     assert rc == 0
     manifest = json.loads(
-        (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+        _run_manifest_path(tmp_path / "out", "direct_solve_manifest.json").read_text(
             encoding="utf-8"
         )
     )
@@ -477,7 +486,7 @@ def test_plot_theme_parser_and_manifest_config(tmp_path):
         )
         assert rc == 0
         manifest = json.loads(
-            (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+            _run_manifest_path(tmp_path / "out", "direct_solve_manifest.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -760,7 +769,7 @@ def test_native_symmetry_xy_maps_to_solver_and_manifest(tmp_path):
     )
 
     assert rc == 0
-    manifest = (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+    manifest = _run_manifest_path(tmp_path / "out", "direct_solve_manifest.json").read_text(
         encoding="utf-8"
     )
     assert '"native_symmetry_plane": "xy"' in manifest
@@ -850,6 +859,66 @@ def test_solve_one_source_writes_per_source_frequency_response(tmp_path, monkeyp
     )
 
 
+def test_impulse_aligned_phase_removes_bulk_delay_for_plots():
+    module = _load_script()
+    freqs = np.linspace(100.0, 5000.0, 240)
+    delay_s = 2.0 / module.SPEED_OF_SOUND_M_S + 0.00035
+    pressure = np.exp(-1j * 2.0 * np.pi * freqs * delay_s)
+
+    raw_phase = module._phase_deg_from_pressure(pressure)
+    aligned_phase = module._phase_deg_from_pressure(
+        pressure,
+        frequencies_hz=freqs,
+        polar_distance_m=2.0,
+        impulse_aligned=True,
+    )
+
+    assert np.ptp(np.unwrap(np.radians(raw_phase))) > 5.0
+    assert np.max(np.abs(aligned_phase)) < 1.0e-6
+
+
+def test_phase_alignment_can_fit_only_operating_band_for_plots():
+    module = _load_script()
+    freqs = np.geomspace(80.0, 16000.0, 320)
+    omega = 2.0 * np.pi * freqs
+    pressure = np.exp(1j * (-omega * 0.0012 - 0.45 * np.log(freqs / freqs[0])))
+    operating_band = (1200.0, 9000.0)
+
+    full_band_phase = module._phase_deg_from_pressure(
+        pressure,
+        frequencies_hz=freqs,
+        polar_distance_m=0.0,
+        impulse_aligned=True,
+    )
+    operating_band_phase = module._phase_deg_from_pressure(
+        pressure,
+        frequencies_hz=freqs,
+        polar_distance_m=0.0,
+        impulse_aligned=True,
+        fit_frequency_range_hz=operating_band,
+    )
+
+    band = (freqs >= operating_band[0]) & (freqs <= operating_band[1])
+    full_band_slope = np.polyfit(
+        omega[band],
+        np.unwrap(np.radians(full_band_phase[band])),
+        1,
+    )[0]
+    operating_band_slope = np.polyfit(
+        omega[band],
+        np.unwrap(np.radians(operating_band_phase[band])),
+        1,
+    )[0]
+
+    assert abs(operating_band_slope) < abs(full_band_slope) * 0.05
+    assert module._source_phase_fit_band_hz(
+        "MF",
+        freqs,
+        lf_mf_hz=operating_band[0],
+        mf_hf_hz=operating_band[1],
+    ) == operating_band
+
+
 def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch):
     module = _load_script()
     mesh_path = tmp_path / "fake.msh"
@@ -871,7 +940,9 @@ def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch)
 
     def fake_solve(_mesh, _config):
         manifest = json.loads(
-            (out_dir / "direct_solve_manifest.json").read_text(encoding="utf-8")
+            _run_manifest_path(out_dir, "direct_solve_manifest.json").read_text(
+                encoding="utf-8"
+            )
         )
         captured["status"] = manifest["status"]
         captured["current_phase"] = manifest["current_phase"]
@@ -902,7 +973,9 @@ def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch)
     assert captured["current_source"] == {"name": "HF", "tag": 4}
     assert captured["sources"][0]["status"] == "running"
     final_manifest = json.loads(
-        (out_dir / "direct_solve_manifest.json").read_text(encoding="utf-8")
+        _run_manifest_path(out_dir, "direct_solve_manifest.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert final_manifest["status"] == "complete"
     assert final_manifest["layout_version"] == 2
@@ -996,7 +1069,7 @@ def test_skip_pressure_bases_keeps_internal_basis_private_for_derived_outputs(
         layout,
         args,
         manifest=manifest,
-        manifest_path=out_dir / "direct_solve_manifest.json",
+        manifest_path=_run_manifest_path(out_dir, "direct_solve_manifest.json"),
         source_results=[source_result],
         sources=[("HF", 4)],
         port_exit_apertures=[],
@@ -1084,7 +1157,7 @@ def test_post_solve_manifest_registers_driver_lem_impedance_png(
         layout,
         args,
         manifest=manifest,
-        manifest_path=out_dir / "direct_solve_manifest.json",
+        manifest_path=_run_manifest_path(out_dir, "direct_solve_manifest.json"),
         source_results=[source_result],
         sources=[("LF", 2)],
         port_exit_apertures=[],
@@ -1252,7 +1325,9 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
         for path in out_dir.rglob("*.npz")
         if path.name in npz_hashes
     } == npz_hashes
-    manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
+    manifest = json.loads(
+        _run_manifest_path(out_dir, "direct_solve_manifest.json").read_text()
+    )
     assert manifest["layout_version"] == 2
     assert manifest["postprocess_only"] is True
     assert manifest["status"] == "complete"
@@ -1344,7 +1419,9 @@ def test_postprocess_only_without_port_exit_mirrors_original_cardioid_skip(
         ),
     )
     assert module.main([*argv, "--postprocess-only"]) == 0
-    manifest = json.loads((out_dir / "direct_solve_manifest.json").read_text())
+    manifest = json.loads(
+        _run_manifest_path(out_dir, "direct_solve_manifest.json").read_text()
+    )
     assert manifest["status"] == "complete"
     combine = manifest["passive_cardioid"]
     assert combine["status"] == "skipped"
@@ -2210,7 +2287,7 @@ def test_passive_cardioid_dry_run_preserves_requested_polar_window(tmp_path):
     )
 
     assert rc == 0
-    manifest = (tmp_path / "out" / "direct_solve_manifest.json").read_text(
+    manifest = _run_manifest_path(tmp_path / "out", "direct_solve_manifest.json").read_text(
         encoding="utf-8"
     )
 
@@ -2391,12 +2468,24 @@ def test_crossover_chain_two_way_uses_natural_or_single_field():
     )
     assert chain == ["MF", "HF"]
     assert xos == [800.0]
-    # LF+HF with both fields filled is ambiguous.
+    # LF+HF with both 3-way fields filled and no LF/HF field is ambiguous.
     chain, reason = module._crossover_chain(
         ["LF", "HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
     )
     assert chain is None
     assert "ambiguous" in str(reason)
+    # The dedicated LF/HF field makes the two-way unambiguous...
+    chain, xos = module._crossover_chain(
+        ["LF", "HF"], lf_mf_hz=None, mf_hf_hz=None, lf_hf_hz=500.0
+    )
+    assert chain == ["LF", "HF"]
+    assert xos == [500.0]
+    # ...and overrides leftover LF/MF and MF/HF values for the LF+HF pair.
+    chain, xos = module._crossover_chain(
+        ["LF", "HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0, lf_hf_hz=500.0
+    )
+    assert chain == ["LF", "HF"]
+    assert xos == [500.0]
     # Fewer than two drivers cannot form a crossover sum.
     chain, reason = module._crossover_chain(
         ["HF"], lf_mf_hz=130.0, mf_hf_hz=1000.0
@@ -2467,6 +2556,89 @@ def test_two_way_crossover_combine_writes_outputs(tmp_path):
     report = Path(outputs["driver_time_alignment_txt"]).read_text(encoding="utf-8")
     assert "MF -> HF (2-way)" in report
     assert "MF/HF: LR4 at 1000.000 Hz" in report
+
+
+def test_two_way_lf_hf_crossover_uses_explicit_field(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 25)
+    angles = np.arange(0.0, 181.0, 15.0)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    pressure = np.full(
+        (freqs.size, planes.size, angles.size), 0.02 + 0.0j, dtype=np.complex128
+    )
+    lf_npz = tmp_path / "LF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        lf_npz, name="LF", tag=2, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+
+    # Leftover 3-way fields (130/1000) are present, but the dedicated LF/HF
+    # field resolves the LF+HF two-way unambiguously and takes precedence.
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(lf_npz, "LF", 2),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=130.0,
+        mf_hf_hz=1000.0,
+        lf_hf_hz=500.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    assert payload["members"] == ["LF", "HF"]
+    assert payload["crossovers_hz"] == [500.0]
+    report = Path(payload["outputs"]["driver_time_alignment_txt"]).read_text(
+        encoding="utf-8"
+    )
+    assert "LF -> HF (2-way)" in report
+    assert "LF/HF: LR4 at 500.000 Hz" in report
+
+
+def test_two_way_lf_hf_ambiguous_crossover_is_skipped(tmp_path):
+    module = _load_script()
+    freqs = np.geomspace(100.0, 10000.0, 12)
+    angles = np.arange(0.0, 181.0, 30.0)
+    planes = np.array(["horizontal"], dtype=str)
+    pressure = np.full(
+        (freqs.size, planes.size, angles.size), 0.02 + 0.0j, dtype=np.complex128
+    )
+    lf_npz = tmp_path / "LF_pressure_basis.npz"
+    hf_npz = tmp_path / "HF_pressure_basis.npz"
+    _write_synthetic_basis(
+        lf_npz, name="LF", tag=2, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+    _write_synthetic_basis(
+        hf_npz, name="HF", tag=4, freqs=freqs, angles=angles, planes=planes,
+        pressure=pressure,
+    )
+
+    # Both 3-way fields filled, no LF/HF field: refuse to guess, skip loudly.
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(lf_npz, "LF", 2),
+            _synthetic_source_result(hf_npz, "HF", 4),
+        ],
+        lf_mf_hz=130.0,
+        mf_hf_hz=1000.0,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "skipped"
+    assert "ambiguous" in payload["reason"]
+    assert "LF/HF" in payload["reason"]
 
 
 def test_crossover_combine_uses_active_driver_lem_basis_and_reports_trim(tmp_path):
@@ -2928,6 +3100,77 @@ def test_two_way_combine_is_coherent_across_band_not_only_at_fc(tmp_path):
     band = (freqs >= 0.8 * fc) & (freqs <= 1.2 * fc)
     np.testing.assert_allclose(np.abs(total[band]), amplitude, rtol=1.0e-6)
     # The pure-delay pair stays coherent over the full solved band too.
+    np.testing.assert_allclose(np.abs(total), amplitude, rtol=1.0e-6)
+
+
+def test_near_inphase_pair_gets_small_delay_not_full_period(tmp_path):
+    """A pair only a few degrees out at fc must get a near-zero delay.
+
+    The passive-cardioid port pulls the MF on-axis phase a little past the LF,
+    making the LF/MF phase difference slightly NEGATIVE (~-10 deg) at the
+    crossover. The old minimum-non-negative wrap turned that into a
+    near-full-period (~4.86 ms at 200 Hz) delay on LF -- coherent exactly at fc
+    but a deep cancellation notch just above it. Here LF arrives a hair after
+    MF to reproduce that negative phase; the aligned pair must stay coherent
+    across the band, i.e. the delay must be a small fraction of a period.
+    """
+    module = _load_script()
+    # Log-symmetric band around fc so the two channels' level-match gains match
+    # exactly (LP over [fc/5, fc] mirrors HP over [fc, fc*5]); this isolates the
+    # alignment, matching test_two_way_combine_is_coherent_across_band.
+    fc = 200.0
+    freqs = np.geomspace(fc / 5.0, fc * 5.0, 400)
+    angles = np.array([0.0, 30.0])
+    planes = np.array(["horizontal"], dtype=str)
+    amplitude = 0.02
+    # arg(LF/MF)|fc = -2*pi*fc*offset; 0.1389 ms -> about -10 deg, matching the
+    # PartyMEH passive-cardioid run's LF-MF raw phase difference.
+    arrivals = {"LF": 0.1389e-3, "MF": 0.0}
+    paths = {}
+    for name, tag in (("LF", 2), ("MF", 3)):
+        paths[name] = tmp_path / f"{name}_pressure_basis.npz"
+        _write_synthetic_basis(
+            paths[name], name=name, tag=tag, freqs=freqs, angles=angles,
+            planes=planes,
+            pressure=_delayed_pressure(
+                freqs, planes, angles, arrival_s=arrivals[name],
+                amplitude=amplitude,
+            ),
+        )
+
+    payload = module._write_crossover_alignment_outputs(
+        tmp_path,
+        [
+            _synthetic_source_result(paths["LF"], "LF", 2),
+            _synthetic_source_result(paths["MF"], "MF", 3),
+        ],
+        lf_mf_hz=fc,
+        mf_hf_hz=None,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert payload["status"] == "complete"
+    # The trigger: LF-MF is only a few degrees out at fc.
+    raw = payload["phase_checks"][0]["raw_phase_deg"]
+    assert -15.0 < raw < -5.0
+    # Regression: the relative delay must be a small fraction of the 5 ms
+    # period, NOT the old ~4.86 ms full-period wrap.
+    rel_ms = abs(payload["delays_ms"]["LF"] - payload["delays_ms"]["MF"])
+    assert rel_ms < 1.0
+    # And the aligned pure-delay pair sums allpass-flat across the whole band.
+    weights = module._crossover_weights(freqs, ["LF", "MF"], [fc])
+    total = np.zeros(freqs.size, dtype=np.complex128)
+    for name in ("LF", "MF"):
+        engineering = amplitude * np.exp(
+            -1j * 2.0 * np.pi * freqs * arrivals[name]
+        )
+        gain = 10.0 ** (payload["level_match"]["gains_db"][name] / 20.0)
+        delay = np.exp(
+            -1j * 2.0 * np.pi * freqs * payload["delays_ms"][name] * 1.0e-3
+        )
+        total += engineering * weights[name] * gain * delay
     np.testing.assert_allclose(np.abs(total), amplitude, rtol=1.0e-6)
 
 
@@ -3411,7 +3654,7 @@ def test_postprocess_only_vituixcad_skip_combined_regenerates_frd_without_vxp(
             planes=planes,
             pressure=_delayed_pressure(freqs, planes, angles, arrival_s=0.0),
         )
-    (tmp_path / "direct_solve_manifest.json").write_text(
+    _run_manifest_path(tmp_path, "direct_solve_manifest.json").write_text(
         json.dumps(
             {
                 "sources": [
@@ -3834,11 +4077,13 @@ def test_regenerate_driver_recovers_reference_style_solve_command(tmp_path):
         "8",
         "--dry-run",
     ]
-    (run_dir / "fusion_addin_launch.json").write_text(
+    manifests_dir = run_dir / "manifests"
+    manifests_dir.mkdir()
+    (manifests_dir / "fusion_addin_launch.json").write_text(
         json.dumps(launch),
         encoding="utf-8",
     )
-    (run_dir / "final_summary_manifest.json").write_text(
+    (manifests_dir / "final_summary_manifest.json").write_text(
         json.dumps({"commands": {"solve": solve_cmd}}),
         encoding="utf-8",
     )

@@ -97,7 +97,9 @@ Per-driver complex pressure over the full angle grid is already stored in
   on axis and for the aligned sum. The implementation uses the stored
   engineering `e^{+j omega t}` pressure; a synthetic `e^{-j omega tau}` delay
   reports `+tau`.
-- **Phase overlay** on frequency-response PNGs using wrapped engineering phase.
+- **Phase overlay** on frequency-response PNGs using wrapped engineering phase
+  after display-only phase flattening. LF/MF/HF overlays fit the display delay
+  over the crossover operating band when crossover fields are available.
 - **Renderer ownership:** the DI/power, beamwidth, group-delay, interference,
   and excursion PNG renderers are now canonical in `hornlab_plots.derived`;
   this repo keeps only the data derivation and artifact wiring.
@@ -112,13 +114,13 @@ grid — a solve-cost decision, not a post-processing one).
 
 ## 5. Output panel and structured run folders — DONE
 
-Run folders now keep solver outputs under category folders while manifests
-stay at the root:
+Run folders now keep solver outputs and run-level manifests under category
+folders:
 
-- `sources/`, `combined/`, `cardioid/`, `driver-lem/`, `derived/`,
-  `vituixcad/`, and `logs/`
-- `direct_solve_manifest.json` records `layout_version: 2` and all concrete
-  output paths under its `outputs` dictionary
+- `exports/`, `mesh/`, `sources/`, `combined/`, `cardioid/`, `driver-lem/`,
+  `derived/`, `vituixcad/`, `logs/`, and `manifests/`
+- `manifests/direct_solve_manifest.json` records `layout_version: 2` and all
+  concrete output paths under its `outputs` dictionary
 - `--postprocess-only` and `regenerate_fusion_derived_artifacts.py` still
   read flat layout-1 runs and regenerate beside those old flat artifacts
 - the Fusion dialog's **Outputs** group lists every artifact category with

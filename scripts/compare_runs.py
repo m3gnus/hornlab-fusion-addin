@@ -17,6 +17,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 P_REF = 2.0e-5
 PRESSURE_NPZ_PHASE_CONVENTION = "engineering_exp_plus_jwt"
+RUN_MANIFESTS_DIR_NAME = "manifests"
 
 for package_dir in reversed(
     (
@@ -76,6 +77,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _run_manifest_path(run_dir: Path, name: str) -> Path:
+    preferred = run_dir / RUN_MANIFESTS_DIR_NAME / name
+    if preferred.exists():
+        return preferred
+    return run_dir / name
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -122,8 +130,12 @@ class RunData:
     def __init__(self, run_dir: Path, *, label: str | None = None) -> None:
         self.run_dir = run_dir.expanduser().resolve()
         self.label = label or self.run_dir.name
-        self.final_manifest = _read_json(self.run_dir / "final_summary_manifest.json")
-        self.direct_manifest = _read_json(self.run_dir / "direct_solve_manifest.json")
+        self.final_manifest = _read_json(
+            _run_manifest_path(self.run_dir, "final_summary_manifest.json")
+        )
+        self.direct_manifest = _read_json(
+            _run_manifest_path(self.run_dir, "direct_solve_manifest.json")
+        )
         if not self.direct_manifest:
             direct = self.final_manifest.get("direct_solve")
             if isinstance(direct, dict):

@@ -71,14 +71,18 @@ The add-in is designed to not fail on configuration drift:
   first internal mode (~c/(2*max_dim), often mid-band), which real stuffing
   softens.
 - **Driver LEM coupling is optional per direct source.** The `Driver LEM
-  (optional)` group accepts one `LF/MF/HF driver T/S` string per source. Each
-  string may be pasted Hornresp-style `Key=Value` text or a path to a Hornresp
-  driver `.txt` file. Units follow Hornresp: `Sd` cm2, `Mmd`/`Mms` g, `Cms`
-  m/N, `Rms` kg/s, `Le`/`Le2` mH, `Re`/`Re2` ohm, `Xmax` mm, optional `N`
-  driver count. `Leb`, `Ke`, `Rss`, and `Vrc*` system keys are ignored with a
-  warning. Shared `Drive voltage V RMS` and `Generator Rg ohm` set the voltage
-  drive. For each coupled direct source the solver derives the BEM radiation
-  self-load from that source's surface-average pressure and patch area, runs
+  (optional)` group offers a local database selector, an import-file button,
+  and one editable `LF/MF/HF driver T/S` string per source. The selector reads
+  HornLab driver CSVs when that workspace is present plus user CSVs dropped in
+  `~/Library/Application Support/HornLab/WGMetalPipeline/driver-databases/`.
+  The editable string may be pasted Hornresp-style `Key=Value` text or a path
+  to a Hornresp driver `.txt` file. Units follow Hornresp: `Sd` cm2,
+  `Mmd`/`Mms` g, `Cms` m/N, `Rms` kg/s, `Le`/`Le2` mH, `Re`/`Re2` ohm,
+  `Xmax` mm, optional `N` driver count. `Leb`, `Ke`, `Rss`, and `Vrc*` system
+  keys are ignored with a warning. Shared `Drive voltage V RMS` and
+  `Generator Rg ohm` set the voltage drive. For each coupled direct source the
+  solver derives the BEM radiation self-load from that source's surface-average
+  pressure and patch area, runs
   `hornlab_sim.methods.driver_coupling.coupled_direct_radiator_response`, and
   scales the pressure basis for response plots, crossover input, and VituixCAD
   export. Outputs include `<NAME>_impedance.zma`,
@@ -139,8 +143,8 @@ The add-in is designed to not fail on configuration drift:
   `--frame-axis/--frame-origin/--frame-u/--frame-v` still override.
 - **Completion is announced.** The pipeline posts a macOS notification with
   the final status and the solved/skipped sources, and updates
-  `fusion_addin_launch.json` (`status`, `returncode`, `finished_at`, `error`)
-  so a run can never silently end as "running".
+  `manifests/fusion_addin_launch.json` (`status`, `returncode`,
+  `finished_at`, `error`) so a run can never silently end as "running".
 - **Stale installs warn.** If the add-in runs from a copied install instead
   of a repo symlink, the launch dialog shows a warning with the reinstall
   command. Install with:
@@ -163,18 +167,18 @@ Strict behavior remains available on the lower-level CLI with
 
 ## Outputs
 
-New solve runs use `direct_solve_manifest.json` `layout_version: 2`. Manifests
-stay at the run root and the manifest `outputs` dictionary is the authoritative
-map from logical artifact names to paths. Preparation/orientation artifacts
-still live at the root as before:
+New solve runs use `manifests/direct_solve_manifest.json` `layout_version: 2`.
+The manifest `outputs` dictionary is the authoritative map from logical
+artifact names to paths. Root clutter is kept down by grouping preparation
+artifacts and run-level manifests:
 
-- exported `.step` and native `.f3d` Fusion archive
-- `tagged_sources.msh`
-- one full-domain metre-unit `<source>_source_tag2_m.msh` per source
-- `orientation_report.json`
-- `expanded_*q_*.msh` plus preview PNG
-- `manifest.json`, `fusion_wg_pipeline_manifest.json`,
-  `final_summary_manifest.json`, and `fusion_addin_launch.json`
+- `exports/`: exported `.step` and native `.f3d` Fusion archive
+- `mesh/`: `tagged_sources.msh`, one full-domain metre-unit
+  `<source>_source_tag2_m.msh` per source, `orientation_report.json`,
+  `expanded_*q_*.msh` plus preview PNG, and mesh-prep `manifest.json`
+- `manifests/`: `fusion_wg_pipeline_manifest.json`,
+  `final_summary_manifest.json`, `direct_solve_manifest.json`, and
+  `fusion_addin_launch.json`
 
 Solver outputs are grouped by category:
 
@@ -192,7 +196,9 @@ Solver outputs are grouped by category:
 - `cardioid/`: passive-cardioid MF artifacts and coupled-cardioid sidecars.
 - `vituixcad/`: when **VituixCAD export** is checked, per-driver angle FRDs,
   copied ZMAs for coupled drivers, `README.txt`, and `HornLab_active_lr4.vxp`
-  when crossover alignment completed.
+  when crossover alignment completed. FRD phase is written from raw complex
+  pressure with only the shared time-of-flight reference removal; PNG
+  display-flattening is not applied.
 - `logs/`: command stdout/stderr logs.
 
 `report.html` is written at the run root when the HTML report output is enabled.

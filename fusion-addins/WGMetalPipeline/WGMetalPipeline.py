@@ -32,6 +32,8 @@ _HELPER_SPEC.loader.exec_module(_fusion_pipeline_launch)
 build_launch_metadata = _fusion_pipeline_launch.build_launch_metadata
 build_pipeline_command = _fusion_pipeline_launch.build_pipeline_command
 build_source_specs = _fusion_pipeline_launch.build_source_specs
+driver_database_payloads_by_label = _fusion_pipeline_launch.driver_database_payloads_by_label
+DRIVER_DATABASE_MANUAL_LABEL = _fusion_pipeline_launch.DRIVER_DATABASE_MANUAL_LABEL
 estimate_clamped_solve_band = _fusion_pipeline_launch.estimate_clamped_solve_band
 estimate_design_mesh_cost = _fusion_pipeline_launch.estimate_design_mesh_cost
 format_mesh_cost_summary = _fusion_pipeline_launch.format_mesh_cost_summary
@@ -99,6 +101,7 @@ DEFAULT_SETTINGS = {
     "freq_spacing": "log",
     "crossover_lf_mf_hz": "130",
     "crossover_mf_hf_hz": "1000",
+    "crossover_lf_hf_hz": "",
     "polar_distance_m": "2",
     "polar_angle_min_deg": "0",
     "polar_angle_max_deg": "180",
@@ -196,6 +199,7 @@ _LEGACY_PASSIVE_CARDIOID_DRIVER_FIELDS = (
 _handlers = []
 _control = None
 _command_definition = None
+_driver_database_payload_cache: dict[str, dict[str, str]] = {}
 
 
 def _ui():
@@ -478,6 +482,43 @@ def _refresh_preset_dropdown(inputs, selected_name: str = "") -> None:
         _select_dropdown_value(dropdown, selected)
 
 
+def _driver_database_payloads(source_name: str) -> dict[str, str]:
+    key = str(source_name).strip().upper()
+    if key not in _driver_database_payload_cache:
+        _driver_database_payload_cache[key] = driver_database_payloads_by_label(
+            source_name=key
+        )
+    return _driver_database_payload_cache[key]
+
+
+def _populate_driver_database_dropdown(dropdown, source_name: str) -> None:
+    try:
+        dropdown.listItems.add(DRIVER_DATABASE_MANUAL_LABEL, True)
+    except Exception:
+        return
+    for label in _driver_database_payloads(source_name):
+        try:
+            dropdown.listItems.add(label, False)
+        except Exception:
+            continue
+
+
+def _apply_driver_database_selection(inputs, source_name: str) -> bool:
+    source = str(source_name).strip().upper()
+    prefix = source.lower()
+    selected = _selected_dropdown_name(inputs, f"{prefix}_driver_database")
+    if not selected or selected == DRIVER_DATABASE_MANUAL_LABEL:
+        return False
+    payload = _driver_database_payloads(source).get(selected)
+    if payload is None:
+        return False
+    target = _input_by_id(inputs, f"{prefix}_driver_lem")
+    if target is None:
+        return False
+    target.value = payload
+    return True
+
+
 def _selected_preset_name(inputs) -> str:
     typed = str(_input_value(inputs, "preset_name") or "").strip()
     if typed:
@@ -737,9 +778,10 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 _setting_str(settings, "crossover_lf_mf_hz"),
             )
             xo_lf_mf_input.tooltip = (
-                "LR4 crossover for the combined-speaker outputs. A two-way "
-                "design (two of LF/MF/HF) needs just one crossover field; a "
-                "three-way needs both. Blank both to skip the combine."
+                "LR4 LF/MF crossover for the combined-speaker outputs. A "
+                "three-way (LF+MF+HF) needs this and MF/HF; an adjacent "
+                "two-way (LF+MF or MF+HF) needs just its one field. Blank all "
+                "to skip the combine."
             )
             xo_mf_hf_input = solve.addStringValueInput(
                 "crossover_mf_hf_hz",
@@ -747,8 +789,20 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 _setting_str(settings, "crossover_mf_hf_hz"),
             )
             xo_mf_hf_input.tooltip = (
-                "LR4 crossover between MF (or LF in a two-way without MF) "
-                "and HF. See LF/MF XO Hz."
+                "LR4 MF/HF crossover. Needed for a three-way and for an MF+HF "
+                "two-way. See LF/MF XO Hz."
+            )
+            xo_lf_hf_input = solve.addStringValueInput(
+                "crossover_lf_hf_hz",
+                "LF/HF XO Hz",
+                _setting_str(settings, "crossover_lf_hf_hz"),
+            )
+            xo_lf_hf_input.tooltip = (
+                "LR4 LF/HF crossover for a two-way with only LF and HF solved "
+                "(no MF). Set this to name the LF->HF crossover directly; it "
+                "overrides the LF/MF and MF/HF fields for the LF+HF pair, so "
+                "you can keep three-way values here and still solve LF+HF. "
+                "Leave blank for three-way or adjacent two-way designs."
             )
             solve.addStringValueInput("polar_distance_m", "Polar distance m", _setting_str(settings, "polar_distance_m"))
             solve.addStringValueInput("polar_angle_min_deg", "Polar angle min deg", _setting_str(settings, "polar_angle_min_deg"))
@@ -854,14 +908,36 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 ("MF", "mf_driver_lem", "mf_driver_rear_volume_l"),
                 ("HF", "hf_driver_lem", "hf_driver_rear_volume_l"),
             ):
+                database_input = driver_lem.addDropDownCommandInput(
+                    f"{source_name.lower()}_driver_database",
+                    f"{source_name} database",
+                    adsk.core.DropDownStyles.TextListDropDownStyle,
+                )
+                database_input.tooltip = (
+                    "Choose a local driver database row to fill the T/S field, "
+                    "or keep manual/import and type or import your own values."
+                )
+                _populate_driver_database_dropdown(database_input, source_name)
+                import_input = driver_lem.addBoolValueInput(
+                    f"{source_name.lower()}_driver_import",
+                    f"Import {source_name} driver file",
+                    False,
+                    "",
+                    False,
+                )
+                import_input.tooltip = (
+                    "Browse to a Hornresp-style driver text file. The selected "
+                    "path is written into the T/S field and parsed at launch."
+                )
                 ts_input = driver_lem.addStringValueInput(
                     ts_id,
                     f"{source_name} driver T/S",
                     _setting_str(settings, ts_id),
                 )
                 ts_input.tooltip = (
-                    "Paste Hornresp Key=Value text or enter a path to a Hornresp "
-                    "driver file. Blank leaves this source uncoupled."
+                    "Manual T/S entry. Paste Hornresp Key=Value text, use the "
+                    "database selector, or import a Hornresp driver file. Blank "
+                    "leaves this source uncoupled."
                 )
                 driver_lem.addStringValueInput(
                     volume_id,
@@ -1045,6 +1121,15 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             elif input_id == "browse_python_path":
                 _choose_file(inputs, "python_path", "Select Python executable")
                 changed.value = False
+            elif (source_name := _source_from_driver_database_input(input_id)) is not None:
+                _apply_driver_database_selection(inputs, source_name)
+            elif (source_name := _source_from_driver_import_input(input_id)) is not None:
+                _choose_file(
+                    inputs,
+                    f"{source_name.lower()}_driver_lem",
+                    f"Import {source_name} driver T/S file",
+                )
+                changed.value = False
             elif input_id in {"passive_cardioid_enabled", "passive_cardioid_coupled"}:
                 _sync_passive_cardioid_ui(inputs)
             elif input_id in _PREDICTION_INPUT_IDS:
@@ -1081,6 +1166,16 @@ def _choose_file(inputs, target_input_id: str, title: str) -> None:
     result = dialog.showOpen()
     if result == adsk.core.DialogResults.DialogOK and target:
         target.value = dialog.filename
+
+
+def _source_from_driver_database_input(input_id: str) -> str | None:
+    match = re.fullmatch(r"(lf|mf|hf)_driver_database", input_id)
+    return match.group(1).upper() if match else None
+
+
+def _source_from_driver_import_input(input_id: str) -> str | None:
+    match = re.fullmatch(r"(lf|mf|hf)_driver_import", input_id)
+    return match.group(1).upper() if match else None
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -1152,8 +1247,10 @@ def _launch_pipeline_background(
 ) -> int:
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    paths = expected_pipeline_paths(out_dir)
     started_at = _datetime.datetime.now().isoformat(timespec="seconds")
-    launch_metadata_path = out_dir / "fusion_addin_launch.json"
+    launch_metadata_path = Path(paths["launch_metadata"])
+    launch_metadata_path.parent.mkdir(parents=True, exist_ok=True)
     env = _subprocess_env()
     env["HORNLAB_FUSION_LAUNCH_METADATA"] = str(launch_metadata_path)
 
@@ -1235,6 +1332,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             ).strip()
             crossover_mf_hf_hz = str(
                 _input_value(inputs, "crossover_mf_hf_hz") or ""
+            ).strip()
+            crossover_lf_hf_hz = str(
+                _input_value(inputs, "crossover_lf_hf_hz") or ""
             ).strip()
             polar_distance_m = str(_input_value(inputs, "polar_distance_m") or "2").strip()
             polar_angle_min_deg = str(_input_value(inputs, "polar_angle_min_deg") or "0").strip()
@@ -1356,6 +1456,13 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 if crossover_mf_hf_hz
                 else None
             )
+            # Parsed for validation only; the LF/HF field is independent of the
+            # LF/MF < MF/HF ordering (it names the LF->HF two-way directly).
+            _lf_hf_xo = (
+                _parse_required_positive_float(crossover_lf_hf_hz, "LF/HF XO Hz")
+                if crossover_lf_hf_hz
+                else None
+            )
             if lf_mf_xo is not None and mf_hf_xo is not None and lf_mf_xo >= mf_hf_xo:
                 raise RuntimeError("LF/MF XO Hz must be below MF/HF XO Hz.")
             validate_output_options(
@@ -1363,6 +1470,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 output_combined_set=output_combined_set,
                 crossover_lf_mf_hz=crossover_lf_mf_hz,
                 crossover_mf_hf_hz=crossover_mf_hf_hz,
+                crossover_lf_hf_hz=crossover_lf_hf_hz,
             )
 
             _save_settings({
@@ -1380,6 +1488,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "freq_spacing": freq_spacing,
                 "crossover_lf_mf_hz": crossover_lf_mf_hz,
                 "crossover_mf_hf_hz": crossover_mf_hf_hz,
+                "crossover_lf_hf_hz": crossover_lf_hf_hz,
                 "polar_distance_m": polar_distance_m,
                 "polar_angle_min_deg": polar_angle_min_deg,
                 "polar_angle_max_deg": polar_angle_max_deg,
@@ -1427,8 +1536,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             design_name = _safe_name(_active_design_name(design))
             out_dir = output_root / f"{stamp}-{design_name}"
             out_dir.mkdir(parents=True, exist_ok=True)
-            step_path = out_dir / f"{design_name}.step"
-            fusion_archive_path = out_dir / f"{design_name}.f3d"
+            exports_dir = out_dir / "exports"
+            exports_dir.mkdir(parents=True, exist_ok=True)
+            step_path = exports_dir / f"{design_name}.step"
+            fusion_archive_path = exports_dir / f"{design_name}.f3d"
 
             _export_step(design, step_path)
             _export_fusion_archive(design, fusion_archive_path)
@@ -1451,6 +1562,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 freq_spacing=freq_spacing,
                 crossover_lf_mf_hz=crossover_lf_mf_hz,
                 crossover_mf_hf_hz=crossover_mf_hf_hz,
+                crossover_lf_hf_hz=crossover_lf_hf_hz,
                 polar_distance_m=polar_distance_m,
                 polar_angle_min_deg=polar_angle_min_deg,
                 polar_angle_max_deg=polar_angle_max_deg,
@@ -1512,7 +1624,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "ones are skipped. Symmetry planes are auto-detected unless "
                 "overridden under Advanced. A notification appears when the "
                 "pipeline finishes.\n\n"
-                f"Launch/status:\n{out_dir / 'fusion_addin_launch.json'}\n\n"
+                f"Launch/status:\n{paths['launch_metadata']}\n\n"
                 "Pipeline logs:\n"
                 f"{paths['launcher_stdout']}\n"
                 f"{paths['launcher_stderr']}\n\n"

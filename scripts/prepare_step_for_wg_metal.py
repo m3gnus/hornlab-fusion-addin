@@ -1538,7 +1538,7 @@ def _predict_mesh_size_cost(
     payload["formula"] = "N ~= 2.3 * sum(area_mm2 / size_mm^2) over the quarter model"
     payload["quarter_model"] = symmetry_planes not in ((), "auto") or bool(symmetry_planes)
     payload["region_count"] = len(regions)
-    payload["planned_radiating_size_mm"] = radiating_size
+    payload["planned_radiating_size_mm"] = float(finest_source_size)
     payload["planned_shadow_size_mm"] = float(shadow_res)
     payload["matrix_ram_gb"] = round(estimate.ram_gb, 3)
     payload["note"] = (

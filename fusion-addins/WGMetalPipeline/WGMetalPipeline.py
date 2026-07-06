@@ -44,6 +44,7 @@ mirror_axes_for_symmetry_planes = _fusion_pipeline_launch.mirror_axes_for_symmet
 preset_path = _fusion_pipeline_launch.preset_path
 quadrants_for_symmetry_planes = _fusion_pipeline_launch.quadrants_for_symmetry_planes
 save_preset = _fusion_pipeline_launch.save_preset
+source_motion_label = _fusion_pipeline_launch.source_motion_label
 symmetry_planes_for_mirror_plane = _fusion_pipeline_launch.symmetry_planes_for_mirror_plane
 validate_output_options = _fusion_pipeline_launch.validate_output_options
 write_launch_metadata = _fusion_pipeline_launch.write_launch_metadata
@@ -85,7 +86,7 @@ SETTINGS_PATH = (
     / "settings.json"
 )
 PRESETS_DIR = _fusion_pipeline_launch.DEFAULT_PRESETS_DIR
-SETTINGS_VERSION = 13
+SETTINGS_VERSION = 14
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
     "output_root": str(DEFAULT_OUTPUT_ROOT),
@@ -99,6 +100,7 @@ DEFAULT_SETTINGS = {
     "freq_max_hz": "20000",
     "freq_count": "60",
     "freq_spacing": "log",
+    "source_motion": _fusion_pipeline_launch.SOURCE_MOTION_AXIAL_LABEL,
     "crossover_lf_mf_hz": "130",
     "crossover_mf_hf_hz": "1000",
     "crossover_lf_hf_hz": "",
@@ -145,7 +147,7 @@ DEFAULT_SETTINGS = {
 _SETTING_INPUT_IDS = tuple(
     key for key in DEFAULT_SETTINGS.keys() if key != "settings_version"
 )
-_DROPDOWN_SETTING_IDS = frozenset({"freq_spacing", "mirror_plane"})
+_DROPDOWN_SETTING_IDS = frozenset({"freq_spacing", "mirror_plane", "source_motion"})
 _NO_PRESET_LABEL = "(none)"
 # Keys removed or redefined at a given settings version, mapped to the version
 # that made them stale. A stored key is dropped on load only when the file
@@ -330,6 +332,10 @@ def _load_settings() -> dict:
             loaded.pop(key, None)
     settings = dict(DEFAULT_SETTINGS)
     settings.update(loaded)
+    try:
+        settings["source_motion"] = source_motion_label(settings.get("source_motion"))
+    except ValueError:
+        settings["source_motion"] = DEFAULT_SETTINGS["source_motion"]
     if not str(settings.get("port_exit_mesh_mm", "")).strip():
         legacy_left = str(loaded.get("port_exit_l_mesh_mm", "")).strip()
         legacy_right = str(loaded.get("port_exit_r_mesh_mm", "")).strip()
@@ -399,6 +405,11 @@ def _set_input_from_setting(inputs, input_id: str, value) -> None:
     if item is None:
         return
     if input_id in _DROPDOWN_SETTING_IDS:
+        if input_id == "source_motion":
+            try:
+                value = source_motion_label(value)
+            except ValueError:
+                value = DEFAULT_SETTINGS[input_id]
         _select_dropdown_value(item, value)
         return
     try:
@@ -742,6 +753,23 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             )
             sources.addStringValueInput("rigid_res_mm", "Rigid body mesh mm", _setting_str(settings, "rigid_res_mm"))
             sources.addStringValueInput("transition_mm", "Transition mm", _setting_str(settings, "transition_mm"))
+            source_motion = sources.addDropDownCommandInput(
+                "source_motion",
+                "Source Motion",
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            selected_source_motion = source_motion_label(
+                _setting_str(settings, "source_motion")
+            )
+            for name in _fusion_pipeline_launch.SOURCE_MOTION_LABELS:
+                source_motion.listItems.add(name, selected_source_motion == name)
+            source_motion.tooltip = (
+                "Axial is the realistic rigid-piston wavefront for a dome or "
+                "cone: per-face v_n = U*(n_hat . axis). Normal drives each "
+                "face along its own outward normal. This overrides direct "
+                "driver-radiator sources only; passive-cardioid and aperture "
+                "sources keep their existing motion."
+            )
 
             sizing_group = inputs.addGroupCommandInput("grp_sizing", "Mesh sizing")
             sizing_group.isExpanded = True
@@ -1327,6 +1355,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             freq_max_hz = str(_input_value(inputs, "freq_max_hz") or "20000").strip()
             freq_count = str(_input_value(inputs, "freq_count") or "60").strip()
             freq_spacing = _selected_dropdown_name(inputs, "freq_spacing") or "log"
+            source_motion = _selected_dropdown_name(inputs, "source_motion") or (
+                DEFAULT_SETTINGS["source_motion"]
+            )
             crossover_lf_mf_hz = str(
                 _input_value(inputs, "crossover_lf_mf_hz") or ""
             ).strip()
@@ -1486,6 +1517,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "freq_max_hz": freq_max_hz,
                 "freq_count": freq_count,
                 "freq_spacing": freq_spacing,
+                "source_motion": source_motion,
                 "crossover_lf_mf_hz": crossover_lf_mf_hz,
                 "crossover_mf_hf_hz": crossover_mf_hf_hz,
                 "crossover_lf_hf_hz": crossover_lf_hf_hz,
@@ -1584,6 +1616,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 output_radiation_impedance=output_radiation_impedance,
                 output_pressure_bases=output_pressure_bases,
                 output_run_report=output_run_report,
+                source_motion=source_motion,
                 passive_cardioid_enabled=passive_cardioid_enabled,
                 passive_cardioid_rear_volume_l=passive_cardioid_rear_volume_l,
                 passive_cardioid_port_length_mm=passive_cardioid_port_length_mm,

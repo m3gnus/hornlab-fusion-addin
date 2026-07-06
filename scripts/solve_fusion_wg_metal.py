@@ -3917,7 +3917,7 @@ def _source_motion_for_source(args: argparse.Namespace, source_name: str) -> str
         _driver_spec_for_source(specs, source_name) is not None
         and not _source_owned_by_passive_cardioid(args, source_name)
     ):
-        return "axial"
+        return str(getattr(args, "source_motion", None) or "axial")
     return "normal"
 
 
@@ -6098,6 +6098,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--freq-max-hz", type=float, default=20_000.0)
     parser.add_argument("--freq-count", type=int, default=60)
     parser.add_argument("--freq-spacing", choices=("log", "linear"), default="log")
+    parser.add_argument(
+        "--source-motion",
+        choices=("normal", "axial"),
+        default=None,
+        help=(
+            "Override direct driver-radiator source motion. Passive-cardioid "
+            "and aperture sources keep their existing motion."
+        ),
+    )
     parser.add_argument(
         "--plot-theme",
         default="hornlab",

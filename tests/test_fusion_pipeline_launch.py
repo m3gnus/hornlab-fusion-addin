@@ -89,10 +89,16 @@ def test_pipeline_parses_and_forwards_every_coupled_flag_the_addin_emits():
     helper = _load_helper()
     pipeline = _load_pipeline()
 
-    cmd = _helper_command(helper, **_coupled_helper_overrides())
+    cmd = _helper_command(
+        helper,
+        source_motion=helper.SOURCE_MOTION_NORMAL_LABEL,
+        **_coupled_helper_overrides(),
+    )
     args = pipeline.parse_args(cmd[2:])
 
     assert args.plot_theme == "hornlab"
+    assert args.source_motion == "normal"
+    assert cmd[cmd.index("--source-motion") + 1] == "normal"
     assert args.passive_cardioid_coupled is True
     assert args.driver_lem == [
         "MF:Sd=320,Bl=11.6,Re=5.2,Le=0.8,Mms=29.4,Cms=0.000252,Qms=4.1,N=1"
@@ -226,9 +232,11 @@ def test_pipeline_parser_accepts_and_groups_new_driver_lem_flags():
             "--driver-rear-volume-l", "LF:4.5",
             "--drive-voltage", "4.0",
             "--rg-ohm", "0.2",
+            "--source-motion", "normal",
         ]
     )
 
+    assert args.source_motion == "normal"
     assert args.driver_lem == [
         "LF:Sd=320,Bl=11.6,Re=5.2,Mmd=26.2,Cms=2.52e-4,Rms=3.18"
     ]
@@ -806,6 +814,7 @@ def test_pipeline_preset_defaults_keep_explicit_cli_precedence(tmp_path):
                 "freq_max_hz": "12000",
                 "freq_count": "31",
                 "freq_spacing": "linear",
+                "source_motion": "Normal (breathing)",
                 "transition_mm": "160",
                 "crossover_mf_hf_hz": "950",
                 "clamp_to_mesh_limit": True,
@@ -842,6 +851,7 @@ def test_pipeline_preset_defaults_keep_explicit_cli_precedence(tmp_path):
     assert args.freq_max_hz == pytest.approx(12000.0)
     assert args.freq_count == 99
     assert args.freq_spacing == "linear"
+    assert args.source_motion == "normal"
     assert args.transition_mm == pytest.approx(160.0)
     assert args.crossover_mf_hf_hz == pytest.approx(950.0)
     assert args.underresolved_solve_policy == "clamp-per-source"
@@ -1426,6 +1436,8 @@ def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, mo
             "4.0",
             "--rg-ohm",
             "0.2",
+            "--source-motion",
+            "normal",
         ]
     )
 
@@ -1442,6 +1454,7 @@ def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, mo
     assert solve_cmd[solve_cmd.index("--driver-rear-volume-l") + 1] == "MF:4.5"
     assert solve_cmd[solve_cmd.index("--drive-voltage") + 1] == "4.0"
     assert solve_cmd[solve_cmd.index("--rg-ohm") + 1] == "0.2"
+    assert solve_cmd[solve_cmd.index("--source-motion") + 1] == "normal"
 
 
 def test_pipeline_default_warns_and_solves_underresolved_sources(tmp_path, monkeypatch):

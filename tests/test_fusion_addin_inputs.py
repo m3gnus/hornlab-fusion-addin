@@ -142,7 +142,8 @@ def test_passive_cardioid_sync_preserves_requested_polar_window():
 def test_driver_lem_defaults_present():
     addin = _load_addin_with_fake_adsk()
 
-    assert addin.SETTINGS_VERSION == 13
+    assert addin.SETTINGS_VERSION == 14
+    assert addin.DEFAULT_SETTINGS["source_motion"] == "Axial (rigid piston)"
     assert addin.DEFAULT_SETTINGS["passive_cardioid_coupled"] is False
     assert addin.DEFAULT_SETTINGS["lf_driver_lem"] == ""
     assert addin.DEFAULT_SETTINGS["mf_driver_lem"] == ""
@@ -450,6 +451,7 @@ def test_addin_named_preset_round_trip_applies_dialog_inputs(tmp_path, monkeypat
             _Input("preset_select", selected=_Selected("(none)")),
             _Input("freq_count", "64"),
             _Input("freq_spacing", selected=_Selected("linear")),
+            _Input("source_motion", selected=_Selected("Normal (breathing)")),
             _Input("mirror_plane", selected=_Selected("Top/Bottom")),
             _Input("output_run_report", False),
             _Input("passive_cardioid_enabled", False),
@@ -465,6 +467,7 @@ def test_addin_named_preset_round_trip_applies_dialog_inputs(tmp_path, monkeypat
     path = addin._save_named_preset_from_inputs(top)
     addin._input_by_id(top, "freq_count").value = "12"
     addin._input_by_id(top, "freq_spacing").selectedItem.name = "log"
+    addin._input_by_id(top, "source_motion").selectedItem.name = "Axial (rigid piston)"
     addin._input_by_id(top, "mirror_plane").selectedItem.name = "Auto detect"
     addin._input_by_id(top, "output_run_report").value = True
     addin._load_named_preset_into_inputs(top)
@@ -472,6 +475,7 @@ def test_addin_named_preset_round_trip_applies_dialog_inputs(tmp_path, monkeypat
     assert path == tmp_path / "nearfield.json"
     assert addin._input_value(top, "freq_count") == "64"
     assert addin._selected_dropdown_name(top, "freq_spacing") == "linear"
+    assert addin._selected_dropdown_name(top, "source_motion") == "Normal (breathing)"
     assert addin._selected_dropdown_name(top, "mirror_plane") == "Top/Bottom"
     assert addin._input_value(top, "output_run_report") is False
 

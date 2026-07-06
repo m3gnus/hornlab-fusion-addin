@@ -47,10 +47,40 @@ DEFAULT_DRIVER_DATABASE_FILENAMES = (
     "sb_audience_woofers_ts_params.csv",
 )
 DRIVER_DATABASE_MANUAL_LABEL = "(manual/import)"
+SOURCE_MOTION_AXIAL_LABEL = "Axial (rigid piston)"
+SOURCE_MOTION_NORMAL_LABEL = "Normal (breathing)"
+SOURCE_MOTION_LABELS = (
+    SOURCE_MOTION_AXIAL_LABEL,
+    SOURCE_MOTION_NORMAL_LABEL,
+)
+SOURCE_MOTION_DEFAULT = "axial"
+_SOURCE_MOTION_VALUE_BY_LABEL = {
+    SOURCE_MOTION_AXIAL_LABEL: "axial",
+    SOURCE_MOTION_NORMAL_LABEL: "normal",
+    "axial": "axial",
+    "normal": "normal",
+}
 
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
+
+
+def normalize_source_motion(value: str | None) -> str:
+    text = str(value or SOURCE_MOTION_DEFAULT).strip()
+    motion = _SOURCE_MOTION_VALUE_BY_LABEL.get(text, text.lower())
+    if motion not in {"normal", "axial"}:
+        raise ValueError(f"source motion must be 'normal' or 'axial': {value!r}")
+    return motion
+
+
+def source_motion_label(value: str | None) -> str:
+    motion = normalize_source_motion(value)
+    return (
+        SOURCE_MOTION_AXIAL_LABEL
+        if motion == "axial"
+        else SOURCE_MOTION_NORMAL_LABEL
+    )
 
 
 class DriverLemParseError(ValueError):
@@ -818,6 +848,7 @@ def build_pipeline_command(
     notify: bool = True,
     bem_formulation: str = "complex_k",
     complex_k_shift: str = "0.005",
+    source_motion: str | None = None,
     passive_cardioid_enabled: bool = False,
     passive_cardioid_rear_volume_l: str | None = None,
     passive_cardioid_port_length_mm: str | None = None,
@@ -909,6 +940,8 @@ def build_pipeline_command(
         cmd.extend(["--crossover-mf-hf-hz", str(crossover_mf_hf_hz).strip()])
     if crossover_lf_hf_hz and str(crossover_lf_hf_hz).strip():
         cmd.extend(["--crossover-lf-hf-hz", str(crossover_lf_hf_hz).strip()])
+    if source_motion is not None and str(source_motion).strip():
+        cmd.extend(["--source-motion", normalize_source_motion(source_motion)])
     if mesh_only:
         cmd.append("--mesh-only")
     else:

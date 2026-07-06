@@ -39,6 +39,7 @@ from fusion_pipeline_launch import (  # noqa: E402
     build_source_specs,
     load_preset,
     mirror_axes_for_symmetry_planes,
+    normalize_source_motion,
     quadrants_for_symmetry_planes,
     symmetry_planes_for_mirror_plane,
 )
@@ -686,6 +687,7 @@ def _apply_preset_defaults(args: argparse.Namespace, argv: list[str]) -> None:
         ("crossover_lf_mf_hz", "crossover_lf_mf_hz", ("--crossover-lf-mf-hz",), float),
         ("crossover_mf_hf_hz", "crossover_mf_hf_hz", ("--crossover-mf-hf-hz",), float),
         ("crossover_lf_hf_hz", "crossover_lf_hf_hz", ("--crossover-lf-hf-hz",), float),
+        ("source_motion", "source_motion", ("--source-motion",), normalize_source_motion),
         ("drive_voltage", "drive_voltage", ("--drive-voltage",), float),
         ("rg_ohm", "rg_ohm", ("--rg-ohm",), float),
         (
@@ -888,6 +890,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--freq-max-hz", type=float, default=20_000.0)
     parser.add_argument("--freq-count", type=int, default=60)
     parser.add_argument("--freq-spacing", choices=("log", "linear"), default="log")
+    parser.add_argument(
+        "--source-motion",
+        choices=("normal", "axial"),
+        default=None,
+        help=(
+            "Override direct driver-radiator source motion. Passive-cardioid "
+            "and aperture sources keep their existing motion."
+        ),
+    )
     parser.add_argument(
         "--plot-theme",
         default="hornlab",
@@ -1599,6 +1610,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             solve_cmd.extend(["--crossover-mf-hf-hz", str(args.crossover_mf_hf_hz)])
         if args.crossover_lf_hf_hz is not None:
             solve_cmd.extend(["--crossover-lf-hf-hz", str(args.crossover_lf_hf_hz)])
+        if args.source_motion is not None:
+            solve_cmd.extend(["--source-motion", str(args.source_motion)])
         _extend_option_value(solve_cmd, "--frame-axis", frame_axis)
         _extend_option_value(solve_cmd, "--frame-origin", frame_origin)
         _extend_option_value(solve_cmd, "--frame-u", frame_u)

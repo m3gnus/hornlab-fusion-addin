@@ -649,6 +649,35 @@ def test_driver_lem_source_motion_is_axial_except_passive_cardioid_owner(tmp_pat
     assert source_motion == "axial"
     assert cfg.source_motion == "axial"
 
+    for explicit_motion in ("normal", "axial"):
+        override_args = module.parse_args(
+            [
+                "--mesh",
+                str(tmp_path / "unused.msh"),
+                "--out",
+                str(tmp_path),
+                "--source",
+                "LF:2",
+                "--driver-lem",
+                "LF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+                "--source-motion",
+                explicit_motion,
+                "--dry-run",
+            ]
+        )
+        module._normalize_driver_lem_args(override_args)
+        override_frame = module._build_frame(override_args)
+        override_motion = module._source_motion_for_source(override_args, "LF")
+        override_cfg = module._build_config(
+            override_args,
+            source_tag=2,
+            frame=override_frame,
+            source_motion=override_motion,
+        )
+
+        assert override_motion == explicit_motion
+        assert override_cfg.source_motion == explicit_motion
+
     cardioid_args = module.parse_args(
         [
             "--mesh",
@@ -665,10 +694,27 @@ def test_driver_lem_source_motion_is_axial_except_passive_cardioid_owner(tmp_pat
             "--passive-cardioid-coupled",
             "--driver-lem",
             "MF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+            "--source-motion",
+            "axial",
         ]
     )
     module._normalize_driver_lem_args(cardioid_args)
     assert module._source_motion_for_source(cardioid_args, "MF") == "normal"
+
+    aperture_args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "unused.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "PORT_EXIT:10",
+            "--source-motion",
+            "axial",
+        ]
+    )
+    module._normalize_driver_lem_args(aperture_args)
+    assert module._source_motion_for_source(aperture_args, "PORT_EXIT") == "normal"
 
 
 def test_source_mesh_valid_hz_is_overlay_only_not_a_band_clamp(tmp_path):

@@ -35,6 +35,82 @@ def _load_script():
     return module
 
 
+def _write_mesh(path: Path, points: np.ndarray, triangles: np.ndarray, tag: int) -> None:
+    import meshio
+
+    tags = np.full(len(triangles), int(tag), dtype=np.int32)
+    meshio.write(
+        path,
+        meshio.Mesh(
+            points=np.asarray(points, dtype=np.float64),
+            cells=[("triangle", np.asarray(triangles, dtype=np.int64))],
+            cell_data={
+                "gmsh:physical": [tags],
+                "gmsh:geometrical": [tags],
+            },
+        ),
+        file_format="gmsh22",
+        binary=False,
+    )
+
+
+def _write_spherical_cap_mesh(
+    path: Path,
+    *,
+    throat_radius_m: float,
+    sphere_radius_m: float,
+    tag: int,
+    rings: int = 24,
+    segments: int = 192,
+) -> None:
+    theta_max = np.arcsin(throat_radius_m / sphere_radius_m)
+    center_z = -sphere_radius_m * np.cos(theta_max)
+    points = [[0.0, 0.0, center_z + sphere_radius_m]]
+    for ring in range(1, rings + 1):
+        theta = theta_max * ring / rings
+        radius = sphere_radius_m * np.sin(theta)
+        z = center_z + sphere_radius_m * np.cos(theta)
+        for segment in range(segments):
+            phi = 2.0 * np.pi * segment / segments
+            points.append([radius * np.cos(phi), radius * np.sin(phi), z])
+
+    triangles = []
+    first_ring = 1
+    for segment in range(segments):
+        triangles.append([
+            0,
+            first_ring + segment,
+            first_ring + ((segment + 1) % segments),
+        ])
+    for ring in range(1, rings):
+        inner = 1 + (ring - 1) * segments
+        outer = 1 + ring * segments
+        for segment in range(segments):
+            next_segment = (segment + 1) % segments
+            triangles.append([inner + segment, outer + segment, outer + next_segment])
+            triangles.append([inner + segment, outer + next_segment, inner + next_segment])
+
+    _write_mesh(path, np.asarray(points), np.asarray(triangles), tag)
+
+
+def _write_flat_disc_mesh(
+    path: Path,
+    *,
+    radius_m: float,
+    tag: int,
+    segments: int = 192,
+) -> None:
+    points = [[0.0, 0.0, 0.0]]
+    for segment in range(segments):
+        phi = 2.0 * np.pi * segment / segments
+        points.append([radius_m * np.cos(phi), radius_m * np.sin(phi), 0.0])
+    triangles = [
+        [0, 1 + segment, 1 + ((segment + 1) % segments)]
+        for segment in range(segments)
+    ]
+    _write_mesh(path, np.asarray(points), np.asarray(triangles), tag)
+
+
 def _run_manifest_path(run_dir: Path, name: str) -> Path:
     path = run_dir / "manifests" / name
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +309,146 @@ def test_solver_surface_avg_to_self_impedance_uses_solver_space_then_conjugates(
     np.testing.assert_allclose(z_self, expected)
 
 
+def test_projected_area_helper_spherical_cap_matches_throat_area(tmp_path):
+    module = _load_script()
+    tag = 7
+    throat_radius = 0.10
+    mesh_path = tmp_path / "spherical_cap.msh"
+    _write_spherical_cap_mesh(
+        mesh_path,
+        throat_radius_m=throat_radius,
+        sphere_radius_m=0.15,
+        tag=tag,
+    )
+
+    projected, surface, axis, curved = module._mesh_tag_projected_area_m2(
+        mesh_path,
+        tag,
+        mesh_scale=1.0,
+    )
+
+    expected_projected = np.pi * throat_radius**2
+    assert projected == pytest.approx(expected_projected, rel=2.0e-3)
+    assert surface > expected_projected * 1.05
+    assert curved is True
+    np.testing.assert_allclose(np.abs(axis), [0.0, 0.0, 1.0], atol=1.0e-12)
+
+
+def test_basis_self_impedance_uses_projected_area_for_axial_curved_cap(tmp_path):
+    module = _load_script()
+    tag = 7
+    mesh_path = tmp_path / "spherical_cap.msh"
+    _write_spherical_cap_mesh(
+        mesh_path,
+        throat_radius_m=0.10,
+        sphere_radius_m=0.15,
+        tag=tag,
+    )
+    surface_area = module._mesh_tag_area_m2(mesh_path, tag, mesh_scale=1.0)
+    projected_area, _surface, _axis, curved = module._mesh_tag_projected_area_m2(
+        mesh_path,
+        tag,
+        mesh_scale=1.0,
+    )
+    assert curved is True
+    freqs = np.array([100.0, 250.0], dtype=np.float64)
+    p_avg_solver = np.array([1.0 + 2.0j, -0.25 + 0.5j], dtype=np.complex128)
+    basis = module.PressureBasis(
+        source_name="LF",
+        source_tag=tag,
+        frequencies_hz=freqs,
+        observation_angles_deg=np.array([0.0]),
+        observation_planes=np.array(["horizontal"]),
+        pressure_complex=np.ones((2, 1, 1), dtype=np.complex128),
+        surface_pressure_avg_solver=p_avg_solver,
+        source_area_m2=surface_area,
+        source_motion="axial",
+    )
+
+    z_self, payload = module._basis_self_impedance(
+        mesh_path,
+        SimpleNamespace(mesh_scale=1.0),
+        {"name": "LF", "tag": tag, "source_area_m2": surface_area},
+        basis,
+    )
+
+    omega = 2.0 * np.pi * freqs
+    expected = np.conjugate(1j * omega * p_avg_solver) / projected_area
+    np.testing.assert_allclose(z_self, expected)
+    assert payload["source_area_kind"] == "projected"
+    assert payload["source_area_m2"] == pytest.approx(projected_area)
+    assert payload["surface_area_m2"] == pytest.approx(surface_area)
+    assert payload["formula"].endswith("/A_projected")
+
+
+def test_basis_self_impedance_keeps_surface_area_for_normal_and_flat_sources(tmp_path):
+    module = _load_script()
+    tag = 7
+    freqs = np.array([100.0, 250.0], dtype=np.float64)
+    p_avg_solver = np.array([1.0 + 2.0j, -0.25 + 0.5j], dtype=np.complex128)
+    args = SimpleNamespace(mesh_scale=1.0)
+
+    curved_mesh = tmp_path / "spherical_cap.msh"
+    _write_spherical_cap_mesh(
+        curved_mesh,
+        throat_radius_m=0.10,
+        sphere_radius_m=0.15,
+        tag=tag,
+    )
+    curved_surface = module._mesh_tag_area_m2(curved_mesh, tag, mesh_scale=1.0)
+    normal_basis = module.PressureBasis(
+        source_name="LF",
+        source_tag=tag,
+        frequencies_hz=freqs,
+        observation_angles_deg=np.array([0.0]),
+        observation_planes=np.array(["horizontal"]),
+        pressure_complex=np.ones((2, 1, 1), dtype=np.complex128),
+        surface_pressure_avg_solver=p_avg_solver,
+        source_area_m2=curved_surface,
+    )
+    normal_z, normal_payload = module._basis_self_impedance(
+        curved_mesh,
+        args,
+        {"name": "LF", "tag": tag, "source_area_m2": curved_surface},
+        normal_basis,
+    )
+    omega = 2.0 * np.pi * freqs
+    np.testing.assert_allclose(
+        normal_z,
+        np.conjugate(1j * omega * p_avg_solver) / curved_surface,
+    )
+    assert "source_area_kind" not in normal_payload
+    assert normal_payload["formula"].endswith("/S_tag")
+
+    flat_mesh = tmp_path / "flat_disc.msh"
+    _write_flat_disc_mesh(flat_mesh, radius_m=0.10, tag=tag)
+    flat_surface = module._mesh_tag_area_m2(flat_mesh, tag, mesh_scale=1.0)
+    axial_flat_basis = module.PressureBasis(
+        source_name="LF",
+        source_tag=tag,
+        frequencies_hz=freqs,
+        observation_angles_deg=np.array([0.0]),
+        observation_planes=np.array(["horizontal"]),
+        pressure_complex=np.ones((2, 1, 1), dtype=np.complex128),
+        surface_pressure_avg_solver=p_avg_solver,
+        source_area_m2=flat_surface,
+        source_motion="axial",
+    )
+    flat_z, flat_payload = module._basis_self_impedance(
+        flat_mesh,
+        args,
+        {"name": "LF", "tag": tag, "source_area_m2": flat_surface},
+        axial_flat_basis,
+    )
+    np.testing.assert_allclose(
+        flat_z,
+        np.conjugate(1j * omega * p_avg_solver) / flat_surface,
+    )
+    assert flat_payload["source_area_kind"] == "surface"
+    assert flat_payload["projected_area_used"] is False
+    assert flat_payload["formula"].endswith("/S_tag")
+
+
 def test_pressure_basis_npz_embeds_surface_avg_area_and_normalization(tmp_path):
     module = _load_script()
     freqs = np.array([100.0, 200.0])
@@ -403,6 +619,56 @@ def test_source_freq_max_overrides_band_for_that_source_only():
     )
     assert lf_cfg.freq_max_hz == 1475.5
     assert hf_cfg.freq_max_hz == 20000.0
+
+
+def test_driver_lem_source_motion_is_axial_except_passive_cardioid_owner(tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "unused.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "LF:2",
+            "--driver-lem",
+            "LF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+            "--dry-run",
+        ]
+    )
+    module._normalize_driver_lem_args(args)
+    frame = module._build_frame(args)
+    source_motion = module._source_motion_for_source(args, "LF")
+    cfg = module._build_config(
+        args,
+        source_tag=2,
+        frame=frame,
+        source_motion=source_motion,
+    )
+
+    assert source_motion == "axial"
+    assert cfg.source_motion == "axial"
+
+    cardioid_args = module.parse_args(
+        [
+            "--mesh",
+            str(tmp_path / "unused.msh"),
+            "--out",
+            str(tmp_path),
+            "--source",
+            "MF:3",
+            "--passive-cardioid-mf",
+            "--passive-cardioid-rear-volume-l",
+            "10",
+            "--passive-cardioid-port-length-mm",
+            "20",
+            "--passive-cardioid-coupled",
+            "--driver-lem",
+            "MF:Sd=200,Bl=8,Re=5.5,Mmd=18,Cms=6e-4,Rms=2.3",
+        ]
+    )
+    module._normalize_driver_lem_args(cardioid_args)
+    assert module._source_motion_for_source(cardioid_args, "MF") == "normal"
 
 
 def test_source_mesh_valid_hz_is_overlay_only_not_a_band_clamp(tmp_path):

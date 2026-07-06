@@ -323,6 +323,7 @@ class PressureBasis:
         source_normalization: str = "unit_normal_acceleration",
         surface_pressure_avg_solver: np.ndarray | None = None,
         source_area_m2: float | None = None,
+        source_motion: str = "normal",
     ) -> None:
         self.source_name = source_name
         self.source_tag = source_tag
@@ -333,6 +334,7 @@ class PressureBasis:
         self.source_normalization = source_normalization
         self.surface_pressure_avg_solver = surface_pressure_avg_solver
         self.source_area_m2 = source_area_m2
+        self.source_motion = str(source_motion or "normal")
 
 
 def _normalize_bem_formulation(raw: str) -> str:
@@ -689,6 +691,7 @@ def _write_pressure_basis_npz(
     source_name: str,
     source_tag: int,
     source_area_m2: float | None = None,
+    source_motion: str = "normal",
 ) -> None:
     arrays: dict[str, Any] = {
         "source_name": np.asarray(source_name),
@@ -705,6 +708,8 @@ def _write_pressure_basis_npz(
         "phase_convention": np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
         "source_normalization": np.asarray("unit_normal_acceleration"),
     }
+    if str(source_motion) != "normal":
+        arrays["source_motion"] = np.asarray(str(source_motion))
     surface_pressure_avg = _surface_pressure_avg_for_tag(result, source_tag)
     if surface_pressure_avg is not None:
         arrays["surface_pressure_avg_solver"] = surface_pressure_avg
@@ -722,6 +727,7 @@ def _pressure_basis_from_result(
     source_name: str,
     source_tag: int,
     source_area_m2: float | None = None,
+    source_motion: str = "normal",
 ) -> PressureBasis:
     return PressureBasis(
         source_name=source_name,
@@ -738,6 +744,7 @@ def _pressure_basis_from_result(
         source_normalization="unit_normal_acceleration",
         surface_pressure_avg_solver=_surface_pressure_avg_for_tag(result, source_tag),
         source_area_m2=source_area_m2,
+        source_motion=source_motion,
     )
 
 
@@ -765,6 +772,8 @@ def _write_active_pressure_npz(
     area = source_area_m2 if source_area_m2 is not None else basis.source_area_m2
     if area is not None:
         arrays["source_area_m2"] = np.asarray(float(area), dtype=np.float64)
+    if str(basis.source_motion) != "normal":
+        arrays["source_motion"] = np.asarray(str(basis.source_motion))
     np.savez_compressed(path, **arrays)
 
 
@@ -785,6 +794,7 @@ def _active_pressure_basis(
         source_normalization=source_normalization,
         surface_pressure_avg_solver=basis.surface_pressure_avg_solver,
         source_area_m2=source_area_m2 if source_area_m2 is not None else basis.source_area_m2,
+        source_motion=basis.source_motion,
     )
 
 
@@ -816,6 +826,9 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
         source_area_m2 = None
         if "source_area_m2" in data:
             source_area_m2 = float(np.asarray(data["source_area_m2"]).item())
+        source_motion = "normal"
+        if "source_motion" in data:
+            source_motion = str(np.asarray(data["source_motion"]).item())
         return PressureBasis(
             source_name=str(data["source_name"].item()),
             source_tag=int(data["source_tag"]),
@@ -829,6 +842,7 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
             source_normalization=source_normalization,
             surface_pressure_avg_solver=surface_pressure_avg,
             source_area_m2=source_area_m2,
+            source_motion=source_motion,
         )
 
 
@@ -3114,7 +3128,12 @@ def _directivity_payload_from_arrays(
     return payload
 
 
-def _mesh_tag_area_m2(mesh_path: Path, tag: int, *, mesh_scale: float) -> float:
+def _mesh_tag_area_vectors_m2(
+    mesh_path: Path,
+    tag: int,
+    *,
+    mesh_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
     try:
         import meshio  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover - environment dependent
@@ -3140,11 +3159,57 @@ def _mesh_tag_area_m2(mesh_path: Path, tag: int, *, mesh_scale: float) -> float:
     p0 = points[tri[:, 0]]
     p1 = points[tri[:, 1]]
     p2 = points[tri[:, 2]]
-    areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+    area_vectors = 0.5 * np.cross(p1 - p0, p2 - p0)
+    areas = np.linalg.norm(area_vectors, axis=1)
+    area = float(np.sum(areas))
+    if area <= 0.0 or not np.isfinite(area):
+        raise ValueError(f"physical tag {tag} has invalid area {area}")
+    return areas, area_vectors
+
+
+def _mesh_tag_area_m2(mesh_path: Path, tag: int, *, mesh_scale: float) -> float:
+    areas, _area_vectors = _mesh_tag_area_vectors_m2(
+        mesh_path,
+        tag,
+        mesh_scale=mesh_scale,
+    )
     area = float(np.sum(areas))
     if area <= 0.0 or not np.isfinite(area):
         raise ValueError(f"physical tag {tag} has invalid area {area}")
     return area
+
+
+def _projected_area_from_area_vectors_m2(
+    areas: np.ndarray,
+    area_vectors: np.ndarray,
+) -> tuple[float, float, np.ndarray, bool]:
+    surface_area = float(np.sum(np.asarray(areas, dtype=np.float64)))
+    if surface_area <= 0.0 or not np.isfinite(surface_area):
+        raise ValueError(f"source surface area must be positive, got {surface_area!r}")
+    vector_sum = np.sum(np.asarray(area_vectors, dtype=np.float64), axis=0)
+    vector_norm = float(np.linalg.norm(vector_sum))
+    if vector_norm <= 1.0e-12 or not np.isfinite(vector_norm):
+        raise ValueError("source projected area vector is degenerate")
+    axis = vector_sum / vector_norm
+    projected_area = abs(float(np.dot(axis, vector_sum)))
+    if projected_area <= 0.0 or not np.isfinite(projected_area):
+        raise ValueError(f"source projected area is invalid: {projected_area!r}")
+    curved = (surface_area - projected_area) > max(1.0e-8 * surface_area, 1.0e-12)
+    return projected_area, surface_area, axis, curved
+
+
+def _mesh_tag_projected_area_m2(
+    mesh_path: Path,
+    tag: int,
+    *,
+    mesh_scale: float,
+) -> tuple[float, float, np.ndarray, bool]:
+    areas, area_vectors = _mesh_tag_area_vectors_m2(
+        mesh_path,
+        tag,
+        mesh_scale=mesh_scale,
+    )
+    return _projected_area_from_area_vectors_m2(areas, area_vectors)
 
 
 def _load_port_exit_termination(
@@ -3846,6 +3911,67 @@ def _source_owned_by_passive_cardioid(args: argparse.Namespace, source_name: str
     )
 
 
+def _source_motion_for_source(args: argparse.Namespace, source_name: str) -> str:
+    specs: dict[str, DriverLemSpec] = getattr(args, "driver_lem_specs", {})
+    if (
+        _driver_spec_for_source(specs, source_name) is not None
+        and not _source_owned_by_passive_cardioid(args, source_name)
+    ):
+        return "axial"
+    return "normal"
+
+
+def _driver_coupling_source_area(
+    mesh_path: Path,
+    args: argparse.Namespace,
+    source_tag: int,
+    *,
+    source_motion: str,
+    surface_area_m2: float | None,
+    surface_area_provenance: str,
+) -> tuple[float, dict[str, Any]]:
+    source_motion = str(source_motion or "normal")
+    surface_area = None if surface_area_m2 is None else float(surface_area_m2)
+    if surface_area is None:
+        surface_area = _mesh_tag_area_m2(
+            mesh_path,
+            int(source_tag),
+            mesh_scale=float(args.mesh_scale),
+        )
+        surface_area_provenance = "mesh_tag_area"
+    if source_motion != "axial":
+        return surface_area, {
+            "source_area_kind": "surface",
+            "source_area_provenance": surface_area_provenance,
+        }
+
+    projected_area, geometric_surface_area, axis, curved = _mesh_tag_projected_area_m2(
+        mesh_path,
+        int(source_tag),
+        mesh_scale=float(args.mesh_scale),
+    )
+    if not curved:
+        return surface_area, {
+            "source_area_kind": "surface",
+            "source_area_provenance": surface_area_provenance,
+            "source_motion": source_motion,
+            "projected_area_m2": float(projected_area),
+            "projected_area_axis": axis,
+            "projected_area_used": False,
+            "projected_area_reason": "axial source tag is planar within tolerance",
+        }
+    return projected_area, {
+        "source_area_kind": "projected",
+        "source_area_provenance": "mesh_tag_projected_area",
+        "source_motion": source_motion,
+        "surface_area_m2": float(geometric_surface_area),
+        "surface_area_provenance": "mesh_tag_area",
+        "projected_area_m2": float(projected_area),
+        "projected_area_axis": axis,
+        "projected_area_used": True,
+    }
+
+
 def _pressure_basis_required_for_selected_outputs(args: argparse.Namespace) -> bool:
     return (
         bool(getattr(args, "driver_lem_specs", {}))
@@ -3881,25 +4007,55 @@ def _basis_self_impedance(
     area = basis.source_area_m2 or source_result.get("source_area_m2")
     area_provenance = "pressure_basis_npz"
     if area is None:
-        area = _mesh_tag_area_m2(
-            mesh_path,
-            int(source_result["tag"]),
-            mesh_scale=float(args.mesh_scale),
-        )
         area_provenance = "mesh_tag_area"
+    source_motion = str(
+        getattr(basis, "source_motion", None)
+        or source_result.get("source_motion")
+        or "normal"
+    )
+    if source_motion != "axial":
+        if area is None:
+            area = _mesh_tag_area_m2(
+                mesh_path,
+                int(source_result["tag"]),
+                mesh_scale=float(args.mesh_scale),
+            )
+        z_self = _solver_surface_avg_to_self_impedance(
+            basis.frequencies_hz,
+            surface,
+            source_area_m2=float(area),
+        )
+        return z_self, {
+            "surface_pressure_avg": provenance,
+            "surface_pressure_avg_phase_convention": SURFACE_PRESSURE_AVG_PHASE_CONVENTION,
+            "source_area_m2": float(area),
+            "source_area_provenance": area_provenance,
+            "formula": "z_dd_eng = conj(1j*omega*p_avg_solver)/S_tag",
+            "mutual_coupling": "driver-driver mutual coupling neglected; self-impedance only",
+        }
+    area, area_payload = _driver_coupling_source_area(
+        mesh_path,
+        args,
+        int(source_result["tag"]),
+        source_motion=source_motion,
+        surface_area_m2=None if area is None else float(area),
+        surface_area_provenance=area_provenance,
+    )
+    formula_area = "A_projected" if area_payload["source_area_kind"] == "projected" else "S_tag"
     z_self = _solver_surface_avg_to_self_impedance(
         basis.frequencies_hz,
         surface,
         source_area_m2=float(area),
     )
-    return z_self, {
+    payload = {
         "surface_pressure_avg": provenance,
         "surface_pressure_avg_phase_convention": SURFACE_PRESSURE_AVG_PHASE_CONVENTION,
         "source_area_m2": float(area),
-        "source_area_provenance": area_provenance,
-        "formula": "z_dd_eng = conj(1j*omega*p_avg_solver)/S_tag",
+        **area_payload,
+        "formula": f"z_dd_eng = conj(1j*omega*p_avg_solver)/{formula_area}",
         "mutual_coupling": "driver-driver mutual coupling neglected; self-impedance only",
     }
+    return z_self, payload
 
 
 def _apply_driver_lem_coupling(
@@ -4770,6 +4926,7 @@ def _build_config(
     source_tag: int,
     frame: ObservationFrame,
     freq_max_hz: float | None = None,
+    source_motion: str = "normal",
 ) -> SolveConfig:
     native_symmetry_plane = None if args.native_symmetry_plane == "none" else args.native_symmetry_plane
     return SolveConfig(
@@ -4793,6 +4950,7 @@ def _build_config(
         complex_k_shift=args.complex_k_shift,
         metal_native_assembly_mode=args.metal_native_assembly_mode,
         mesh_scale=args.mesh_scale,
+        source_motion=source_motion,
     )
 
 
@@ -4915,6 +5073,7 @@ def _write_one_source_outputs(
     freq_max_hz: float | None = None,
     mesh_valid_hz: float | None = None,
     mesh_valid_radiating_hz: float | None = None,
+    source_motion: str = "normal",
 ) -> dict[str, Any]:
     safe_name = _safe_stem(source_name)
     result_json = out_dir / f"{safe_name}_results.json"
@@ -4940,6 +5099,7 @@ def _write_one_source_outputs(
         source_name=source_name,
         source_tag=source_tag,
         source_area_m2=source_area_m2,
+        source_motion=source_motion,
     )
     if _write_pressure_basis_for_run(args):
         _write_pressure_basis_npz(
@@ -4948,6 +5108,7 @@ def _write_one_source_outputs(
             source_name=source_name,
             source_tag=source_tag,
             source_area_m2=source_area_m2,
+            source_motion=source_motion,
         )
     else:
         basis_npz = None
@@ -4987,7 +5148,7 @@ def _write_one_source_outputs(
                 )
             ],
         )
-    return {
+    payload = {
         "name": source_name,
         "tag": source_tag,
         "results_json": str(result_json),
@@ -5009,6 +5170,9 @@ def _write_one_source_outputs(
         "source_area_m2": source_area_m2,
         "_pressure_basis": pressure_basis,
     }
+    if str(source_motion) != "normal":
+        payload["source_motion"] = str(source_motion)
+    return payload
 
 
 def _write_one_source_derived_outputs_from_basis(
@@ -5113,7 +5277,7 @@ def _write_one_source_derived_outputs_from_basis(
                 )
             ],
         )
-    return {
+    payload = {
         "name": source_name,
         "tag": source_tag,
         "results_json": str(result_json),
@@ -5136,6 +5300,9 @@ def _write_one_source_derived_outputs_from_basis(
         "postprocess_only": True,
         "_pressure_basis": basis,
     }
+    if str(basis.source_motion) != "normal":
+        payload["source_motion"] = str(basis.source_motion)
+    return payload
 
 
 def _solve_one_source(
@@ -5149,8 +5316,15 @@ def _solve_one_source(
     freq_max_hz: float | None = None,
     mesh_valid_hz: float | None = None,
     mesh_valid_radiating_hz: float | None = None,
+    source_motion: str = "normal",
 ) -> dict[str, Any]:
-    config = _build_config(args, source_tag=source_tag, frame=frame, freq_max_hz=freq_max_hz)
+    config = _build_config(
+        args,
+        source_tag=source_tag,
+        frame=frame,
+        freq_max_hz=freq_max_hz,
+        source_motion=source_motion,
+    )
     result = solve(str(mesh_path), config)
     return _write_one_source_outputs(
         result,
@@ -5162,6 +5336,7 @@ def _solve_one_source(
         freq_max_hz=freq_max_hz,
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
+        source_motion=source_motion,
     )
 
 
@@ -5175,6 +5350,7 @@ def _solve_source_group(
     freq_max_hz: float | None = None,
     mesh_valid: dict[str, float] | None = None,
     aperture_valid: dict[str, float] | None = None,
+    source_motion: str = "normal",
 ) -> list[dict[str, Any]]:
     """Solve several sources sharing one frequency grid in ONE multi-RHS call.
 
@@ -5188,7 +5364,11 @@ def _solve_source_group(
     mesh_valid = mesh_valid or {}
     aperture_valid = aperture_valid or {}
     config = _build_config(
-        args, source_tag=group[0][1], frame=frame, freq_max_hz=freq_max_hz
+        args,
+        source_tag=group[0][1],
+        frame=frame,
+        freq_max_hz=freq_max_hz,
+        source_motion=source_motion,
     )
     group_start = time.time()
     results = solve_multi_source(
@@ -5209,6 +5389,7 @@ def _solve_source_group(
             freq_max_hz=freq_max_hz,
             mesh_valid_hz=mesh_valid.get(source_name),
             mesh_valid_radiating_hz=aperture_valid.get(source_name),
+            source_motion=source_motion,
         )
         source_result["multi_source_group"] = [name for name, _ in group]
         source_result["shared_solve_wall_s"] = shared_wall_s
@@ -6208,6 +6389,10 @@ def main(argv: list[str] | None = None) -> int:
     _validate_passive_cardioid_args(args)
 
     frame = _build_frame(args)
+    source_motion_by_name = {
+        name: _source_motion_for_source(args, name)
+        for name, _tag in sources
+    }
     started_at = datetime.now().isoformat(timespec="seconds")
     manifest: dict[str, Any] = {
         "pipeline": "solve_fusion_wg_metal",
@@ -6315,7 +6500,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         manifest["sources"] = [
-            {"name": name, "tag": tag}
+            {
+                "name": name,
+                "tag": tag,
+                **(
+                    {"source_motion": source_motion_by_name[name]}
+                    if source_motion_by_name[name] != "normal"
+                    else {}
+                ),
+            }
             for name, tag in sources
         ]
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -6374,7 +6567,16 @@ def main(argv: list[str] | None = None) -> int:
         return returncode
 
     source_progress: list[dict[str, Any]] = [
-        {"name": name, "tag": tag, "status": "pending"}
+        {
+            "name": name,
+            "tag": tag,
+            "status": "pending",
+            **(
+                {"source_motion": source_motion_by_name[name]}
+                if source_motion_by_name[name] != "normal"
+                else {}
+            ),
+        }
         for name, tag in sources
     ]
     manifest["sources"] = source_progress
@@ -6392,23 +6594,31 @@ def main(argv: list[str] | None = None) -> int:
         # frequency grid, so they can ride one multi-RHS native solve (one
         # assembly+factorization per frequency) instead of N full solves.
         source_index_by_name = {name: idx for idx, (name, _) in enumerate(sources)}
-        solve_groups: list[tuple[float, list[tuple[str, int]]]] = []
+        solve_groups: list[tuple[float, str, list[tuple[str, int]]]] = []
         for source_name, source_tag in sources:
             effective_fmax = float(source_freq_max.get(source_name, args.freq_max_hz))
-            for group_fmax, group in solve_groups:
-                if group_fmax == effective_fmax:
+            source_motion = source_motion_by_name[source_name]
+            for group_fmax, group_motion, group in solve_groups:
+                if group_fmax == effective_fmax and group_motion == source_motion:
                     group.append((source_name, source_tag))
                     break
             else:
-                solve_groups.append((effective_fmax, [(source_name, source_tag)]))
+                solve_groups.append(
+                    (effective_fmax, source_motion, [(source_name, source_tag)])
+                )
 
-        for group_fmax, group in solve_groups:
+        for group_fmax, group_motion, group in solve_groups:
             for source_name, source_tag in group:
                 source_progress[source_index_by_name[source_name]].update(
                     {
                         "status": "running",
                         "started_at": datetime.now().isoformat(timespec="seconds"),
                         "freq_max_hz": group_fmax,
+                        **(
+                            {"source_motion": group_motion}
+                            if group_motion != "normal"
+                            else {}
+                        ),
                     }
                 )
             _update_manifest(
@@ -6419,6 +6629,11 @@ def main(argv: list[str] | None = None) -> int:
                 current_source={
                     "name": group[0][0],
                     "tag": group[0][1],
+                    **(
+                        {"source_motion": group_motion}
+                        if group_motion != "normal"
+                        else {}
+                    ),
                     **(
                         {"group": [name for name, _ in group]}
                         if len(group) > 1
@@ -6440,6 +6655,7 @@ def main(argv: list[str] | None = None) -> int:
                         freq_max_hz=source_freq_max.get(source_name),
                         mesh_valid_hz=source_mesh_valid.get(source_name),
                         mesh_valid_radiating_hz=source_aperture_valid.get(source_name),
+                        source_motion=group_motion,
                     )
                 ]
             else:
@@ -6457,6 +6673,7 @@ def main(argv: list[str] | None = None) -> int:
                     freq_max_hz=group_fmax,
                     mesh_valid=source_mesh_valid,
                     aperture_valid=source_aperture_valid,
+                    source_motion=group_motion,
                 )
             for source_result in group_results:
                 source_name = str(source_result["name"])
@@ -6481,6 +6698,11 @@ def main(argv: list[str] | None = None) -> int:
                     "directivity_heatmap_png": source_result["directivity_heatmap_png"],
                     "frequency_response_png": source_result["frequency_response_png"],
                     "freq_max_hz": source_result["freq_max_hz"],
+                    **(
+                        {"source_motion": source_result["source_motion"]}
+                        if source_result.get("source_motion")
+                        else {}
+                    ),
                     "mesh_valid_freq_max_hz": source_result["mesh_valid_freq_max_hz"],
                     "aperture_valid_freq_max_hz": source_result[
                         "aperture_valid_freq_max_hz"

@@ -4,7 +4,7 @@ gmsh
 meshio
 
 # Direct BEM solves (Apple Silicon required)
-git+https://github.com/m3gnus/hornlab-metal-bem.git@723f22803b17c830650e8a9f2ce8f3c92a4e8211
+git+https://github.com/m3gnus/hornlab-metal-bem.git@06726228cc410296d4105f73a249b60b73681c9d
 
 # Plot rendering dependencies used through hornlab-plots
 matplotlib

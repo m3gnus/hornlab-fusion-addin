@@ -1318,6 +1318,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     pipeline_manifest["density"] = prep_manifest.get("density", {})
     pipeline_manifest["mesh_repair"] = prep_manifest.get("mesh_repair", {})
     pipeline_manifest["topology"] = prep_manifest.get("topology", {})
+    pipeline_manifest["geometry_healed"] = bool(prep_manifest.get("geometry_healed", False))
     pipeline_manifest["mesh_frequency_validation"] = prep_manifest.get(
         "mesh_frequency_validation",
         {},

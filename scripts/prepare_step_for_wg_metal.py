@@ -44,11 +44,16 @@ RIGID_TAG = 1
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
 DEFAULT_TOPOLOGY_TOL = 1e-5
+HEALED_SYMMETRY_BAND_MM = 1.0e-4
 GENERIC_PORT_EXIT_SOURCE = "PORT_EXIT"
 LEGACY_PORT_EXIT_SOURCES = frozenset({"PORT_EXIT_L", "PORT_EXIT_R"})
 
 WELD_TOLERANCE_MM = 5.0e-3  # 5 micrometres; closes near-duplicate OCC patch nodes
 DEGENERATE_MIN_QUALITY = 1.0e-4  # drops needle slivers that make dense solves singular
+ANCHOR_MAX_AREA_REL_DIFF = 0.02
+ANCHOR_MAX_CENTROID_DISTANCE_MM = 5.0
+
+SurfaceGeometry = tuple[tuple[float, float, float], float]
 
 
 @dataclass(frozen=True)
@@ -267,13 +272,15 @@ def _map_step_faces_to_gmsh_surfaces(
     source_specs: list[SourceSpec],
     *,
     skip_missing_sources: bool = False,
+    gmsh_surfaces: list[int] | None = None,
 ) -> dict[str, list[int]]:
     named_faces = _parse_named_shell_faces(step_path)
     styled_faces = _parse_styled_face_groups(step_path)
     face_order = _advanced_face_order(step_path)
     face_to_index = {face_id: index for index, face_id in enumerate(face_order)}
 
-    gmsh_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
+    if gmsh_surfaces is None:
+        gmsh_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
     if len(gmsh_surfaces) < len(face_order):
         raise RuntimeError(
             f"STEP has {len(face_order)} ADVANCED_FACE records but gmsh imported "
@@ -359,6 +366,102 @@ def _map_step_faces_to_gmsh_surfaces(
 
 def _gmsh_surface_tags() -> list[int]:
     return [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
+
+
+def _gmsh_surface_geometries(surface_tags: list[int]) -> list[SurfaceGeometry]:
+    return [
+        (
+            tuple(float(v) for v in gmsh.model.occ.getCenterOfMass(2, tag)),
+            float(gmsh.model.occ.getMass(2, tag)),
+        )
+        for tag in surface_tags
+    ]
+
+
+def _coerce_surface_geometry(geom: SurfaceGeometry) -> tuple[np.ndarray, float]:
+    center, area = geom
+    center_arr = np.asarray(center, dtype=np.float64)
+    if center_arr.shape != (3,):
+        raise RuntimeError(f"surface geometry center must have 3 coordinates, got {center!r}")
+    area_float = float(area)
+    if not np.all(np.isfinite(center_arr)) or not np.isfinite(area_float) or area_float <= 0.0:
+        raise RuntimeError(f"invalid surface geometry center={center!r} area={area!r}")
+    return center_arr, area_float
+
+
+def _anchor_surface_order(
+    healed_tags: list[int],
+    healed_geoms: list[SurfaceGeometry],
+    reference_geoms: list[SurfaceGeometry],
+) -> list[int]:
+    """Rebuild STEP face order after OCC healing reorders imported surfaces."""
+    if len(healed_tags) != len(healed_geoms):
+        raise RuntimeError(
+            "cannot anchor healed OCC surfaces: healed tag and geometry counts differ "
+            f"({len(healed_tags)} tags vs {len(healed_geoms)} geometries)"
+        )
+    if len(healed_tags) != len(reference_geoms):
+        raise RuntimeError(
+            "cannot anchor healed OCC surfaces: surface count mismatch "
+            f"({len(reference_geoms)} reference vs {len(healed_tags)} healed)"
+        )
+    if len(set(healed_tags)) != len(healed_tags):
+        raise RuntimeError("cannot anchor healed OCC surfaces: healed surface tags are not unique")
+    if not healed_tags:
+        return []
+
+    healed = [_coerce_surface_geometry(geom) for geom in healed_geoms]
+    reference = [_coerce_surface_geometry(geom) for geom in reference_geoms]
+
+    candidate_pairs: list[tuple[float, float, float, int, int]] = []
+    for ref_index, (ref_center, ref_area) in enumerate(reference):
+        for healed_index, (healed_center, healed_area) in enumerate(healed):
+            area_rel = abs(healed_area - ref_area) / max(ref_area, 1.0e-12)
+            centroid_distance = float(np.linalg.norm(healed_center - ref_center))
+            length_scale = max(float(np.sqrt(max(ref_area, healed_area))), 1.0)
+            cost = (10.0 * area_rel) + (centroid_distance / length_scale)
+            candidate_pairs.append((cost, area_rel, centroid_distance, ref_index, healed_index))
+
+    ordered: list[int | None] = [None] * len(reference)
+    residuals: dict[int, tuple[float, float, int]] = {}
+    used_reference: set[int] = set()
+    used_healed: set[int] = set()
+    for _cost, area_rel, centroid_distance, ref_index, healed_index in sorted(candidate_pairs):
+        if ref_index in used_reference or healed_index in used_healed:
+            continue
+        ordered[ref_index] = int(healed_tags[healed_index])
+        residuals[ref_index] = (area_rel, centroid_distance, healed_index)
+        used_reference.add(ref_index)
+        used_healed.add(healed_index)
+        if len(used_reference) == len(reference):
+            break
+
+    if any(tag is None for tag in ordered) or len(used_healed) != len(healed_tags):
+        raise RuntimeError(
+            "cannot anchor healed OCC surfaces: failed to build a one-to-one "
+            f"mapping ({len(used_reference)} reference, {len(used_healed)} healed matched)"
+        )
+
+    bad_matches = [
+        (ref_index, ordered[ref_index], area_rel, centroid_distance)
+        for ref_index, (area_rel, centroid_distance, _healed_index) in residuals.items()
+        if area_rel > ANCHOR_MAX_AREA_REL_DIFF
+        or centroid_distance > ANCHOR_MAX_CENTROID_DISTANCE_MM
+    ]
+    if bad_matches:
+        diagnostics = "; ".join(
+            (
+                f"ref[{ref_index}] -> surface {tag}: "
+                f"area_rel={area_rel:.4g}, centroid_mm={centroid_distance:.4g}"
+            )
+            for ref_index, tag, area_rel, centroid_distance in bad_matches[:5]
+        )
+        raise RuntimeError(
+            "cannot anchor healed OCC surfaces: implausible geometry residuals; "
+            f"{diagnostics}"
+        )
+
+    return [int(tag) for tag in ordered]
 
 
 def _named_shell_gmsh_surfaces(step_path: Path, gmsh_surfaces: list[int]) -> dict[str, list[int]]:
@@ -750,6 +853,19 @@ def _detect_symmetry_planes(
     return detected, detection
 
 
+def _snap_symmetry_plane_vertices(
+    points: np.ndarray,
+    *,
+    symmetry_planes: tuple[str, ...],
+    tolerance: float,
+) -> None:
+    axis_for_plane = {"x0": 0, "y0": 1, "z0": 2}
+    for plane in symmetry_planes:
+        axis = axis_for_plane[plane]
+        mask = np.abs(points[:, axis]) <= tolerance
+        points[mask, axis] = 0.0
+
+
 def _normalize_to_positive_side(
     points: np.ndarray,
     triangles: np.ndarray,
@@ -789,6 +905,7 @@ def _postprocess_mesh(
     *,
     symmetry_planes: tuple[str, ...] | str,
     tolerance: float,
+    symmetry_snap_tolerance: float | None = None,
 ) -> tuple[meshio.Mesh, dict[str, object], dict[str, object]]:
     points, triangles, tags = _mesh_triangle_data(mesh)
     before_edge_stats = _edge_direction_stats(triangles)
@@ -806,10 +923,21 @@ def _postprocess_mesh(
 
     symmetry_detection: dict[str, object] | None = None
     if symmetry_planes == "auto":
+        detection_tolerance = (
+            symmetry_snap_tolerance
+            if symmetry_snap_tolerance is not None
+            else tolerance
+        )
         symmetry_planes, symmetry_detection = _detect_symmetry_planes(
             points,
             repaired_triangles,
-            tolerance=tolerance,
+            tolerance=detection_tolerance,
+        )
+    if symmetry_snap_tolerance is not None:
+        _snap_symmetry_plane_vertices(
+            points,
+            symmetry_planes=symmetry_planes,
+            tolerance=symmetry_snap_tolerance,
         )
 
     points, repaired_triangles, axis_normalization = _normalize_to_positive_side(
@@ -1691,7 +1819,11 @@ def main(argv: list[str] | None = None) -> int:
     if rigid_res <= 0.0:
         raise SystemExit("--rigid-res-mm must be positive")
 
-    def _run_gmsh_attempt(*, heal_geometry: bool) -> dict[str, object]:
+    def _run_gmsh_attempt(
+        *,
+        heal_geometry: bool,
+        surface_order_reference: list[SurfaceGeometry] | None = None,
+    ) -> dict[str, object]:
         gmsh.initialize()
         try:
             gmsh.option.setNumber("General.Terminal", 1)
@@ -1703,17 +1835,28 @@ def main(argv: list[str] | None = None) -> int:
                 gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
             gmsh.open(str(step_path))
             gmsh.model.occ.synchronize()
+            sorted_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
+            surface_geoms = _gmsh_surface_geometries(sorted_surfaces)
+            if surface_order_reference is None:
+                ordered_surfaces = sorted_surfaces
+            else:
+                ordered_surfaces = _anchor_surface_order(
+                    sorted_surfaces,
+                    surface_geoms,
+                    surface_order_reference,
+                )
 
             source_surfaces = _map_step_faces_to_gmsh_surfaces(
                 step_path,
                 source_specs,
                 skip_missing_sources=args.skip_missing_sources,
+                gmsh_surfaces=ordered_surfaces,
             )
             active_source_specs = [
                 spec for spec in source_specs
                 if spec.name in source_surfaces
             ]
-            all_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
+            all_surfaces = ordered_surfaces
             source_surface_set = {
                 tag for tags_for_source in source_surfaces.values() for tag in tags_for_source
             }
@@ -1847,6 +1990,7 @@ def main(argv: list[str] | None = None) -> int:
                 return {
                     "mesh_generation_error": exc,
                     "mesh_generation_traceback": exc.__traceback__,
+                    "surface_geoms": surface_geoms,
                 }
             duplicate_node_stats = _remove_duplicate_nodes_for_current_gmsh_model()
             gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -1884,6 +2028,7 @@ def main(argv: list[str] | None = None) -> int:
                 "rigid_surface_count": len(rigid_surfaces),
             }
             return {
+                "surface_geoms": surface_geoms,
                 "source_surfaces": source_surfaces,
                 "active_source_specs": active_source_specs,
                 "rigid_surfaces": rigid_surfaces,
@@ -1908,6 +2053,12 @@ def main(argv: list[str] | None = None) -> int:
     if mesh_generation_error is not None:
         original_mesh_error = mesh_generation_error
         original_traceback = gmsh_state.get("mesh_generation_traceback")
+        surface_order_reference = gmsh_state.get("surface_geoms")
+        if not isinstance(surface_order_reference, list):
+            raise RuntimeError(
+                "unhealed gmsh attempt failed before surface geometry could be captured; "
+                "cannot safely run OCC healing fallback"
+            )
         assert isinstance(original_mesh_error, Exception)
         # Fusion STEP exports can carry sub-micron sliver edges on trimmed
         # spherical caps that make gmsh's periodic-surface 1D mesh
@@ -1919,8 +2070,17 @@ def main(argv: list[str] | None = None) -> int:
             f"fallback. Original gmsh error: {original_mesh_error}",
             file=sys.stderr,
         )
-        healed_state = _run_gmsh_attempt(heal_geometry=True)
-        if healed_state.get("mesh_generation_error") is not None:
+        healed_state = _run_gmsh_attempt(
+            heal_geometry=True,
+            surface_order_reference=surface_order_reference,
+        )
+        healed_mesh_error = healed_state.get("mesh_generation_error")
+        if healed_mesh_error is not None:
+            print(
+                "gmsh mesh generation still failed after OCC geometry healing. "
+                f"Healed gmsh error: {healed_mesh_error}",
+                file=sys.stderr,
+            )
             raise original_mesh_error.with_traceback(original_traceback)
         gmsh_state = healed_state
         geometry_healed = True
@@ -1940,18 +2100,15 @@ def main(argv: list[str] | None = None) -> int:
     refine_diag = gmsh_state["refine_diag"]
     role_classification = gmsh_state["role_classification"]
 
-    topology_tol = args.topology_tol
-    if geometry_healed:
-        # OCC healing can nudge origin-plane cut edges by a few 1e-5 mm; keep
-        # the relaxed tolerance below the existing duplicate-vertex weld band.
-        topology_tol = max(topology_tol, 1.0e-4)
-
     mesh = meshio.read(tagged_mesh_path)
     repaired_mesh, repair_stats, topology = _postprocess_mesh(
         mesh,
         active_source_specs,
         symmetry_planes=symmetry_planes,
-        tolerance=topology_tol,
+        tolerance=args.topology_tol,
+        symmetry_snap_tolerance=(
+            HEALED_SYMMETRY_BAND_MM if geometry_healed else None
+        ),
     )
     resolved_symmetry_planes = tuple(topology["expected_symmetry_planes"])
     meshio.write(tagged_mesh_path, repaired_mesh, file_format="gmsh22", binary=False)

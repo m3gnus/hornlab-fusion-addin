@@ -47,6 +47,48 @@ def _quarter_tube(angles_deg, z_values):
     return points, np.asarray(triangles, dtype=np.int64)
 
 
+def test_anchor_surface_order_recovers_permuted_healed_surfaces():
+    module = _load_script()
+    reference_geoms = [
+        ((0.0, 0.0, 0.0), 253.0),
+        ((10.0, 0.0, 0.0), 17_624.0),
+        ((0.0, 25.0, 0.0), 320_000.0),
+        ((-12.0, 8.0, 5.0), 8_000.0),
+    ]
+    tags_by_reference = [501, 502, 503, 504]
+    healed_by_reference = [
+        ((0.001, -0.002, 0.0005), 253.0 * 1.0005),
+        ((10.002, -0.001, 0.0), 17_624.0 * 0.9995),
+        ((-0.003, 25.001, 0.002), 320_000.0 * 1.0002),
+        ((-11.999, 8.003, 4.999), 8_000.0 * 0.9992),
+    ]
+    permutation = [2, 0, 3, 1]
+    healed_tags = [tags_by_reference[i] for i in permutation]
+    healed_geoms = [healed_by_reference[i] for i in permutation]
+
+    ordered = module._anchor_surface_order(healed_tags, healed_geoms, reference_geoms)
+
+    assert ordered == tags_by_reference
+
+
+def test_anchor_surface_order_fails_loudly_on_bad_input():
+    module = _load_script()
+
+    with pytest.raises(RuntimeError, match="surface count mismatch"):
+        module._anchor_surface_order(
+            [501],
+            [((0.0, 0.0, 0.0), 10.0)],
+            [((0.0, 0.0, 0.0), 10.0), ((1.0, 0.0, 0.0), 11.0)],
+        )
+
+    with pytest.raises(RuntimeError, match="implausible geometry residuals"):
+        module._anchor_surface_order(
+            [501],
+            [((100.0, 0.0, 0.0), 30.0)],
+            [((0.0, 0.0, 0.0), 10.0)],
+        )
+
+
 def test_detect_symmetry_planes_finds_quarter_cut_planes():
     module = _load_script()
     points, triangles = _quarter_tube(
@@ -158,6 +200,53 @@ def test_postprocess_auto_mode_records_detected_planes():
 
     assert topology["expected_symmetry_planes"] == ["x0", "y0"]
     assert topology["symmetry_plane_detection"]["detected_planes"] == ["x0", "y0"]
+
+
+def test_postprocess_healed_snap_zeroes_near_symmetry_plane_only():
+    module = _load_script()
+    points = np.asarray(
+        [
+            [0.0, 3.0e-5, 0.0],
+            [1.0, 5.0, 0.0],
+            [0.0, 5.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.asarray([[0, 1, 2]], dtype=np.int64)
+    tags = np.asarray([2], dtype=np.int32)
+
+    clean_mesh = meshio.Mesh(
+        points=points.copy(),
+        cells=[("triangle", triangles)],
+        cell_data={"gmsh:physical": [tags]},
+    )
+    clean_repaired, _, _ = module._postprocess_mesh(
+        clean_mesh,
+        [module.SourceSpec("LF", 30.0, 2)],
+        symmetry_planes=("y0",),
+        tolerance=1.0e-5,
+        symmetry_snap_tolerance=None,
+    )
+    clean_points, _, _ = module._mesh_triangle_data(clean_repaired)
+    assert np.array_equal(clean_points, points)
+
+    healed_mesh = meshio.Mesh(
+        points=points.copy(),
+        cells=[("triangle", triangles)],
+        cell_data={"gmsh:physical": [tags]},
+    )
+    healed_repaired, _, _ = module._postprocess_mesh(
+        healed_mesh,
+        [module.SourceSpec("LF", 30.0, 2)],
+        symmetry_planes=("y0",),
+        tolerance=1.0e-5,
+        symmetry_snap_tolerance=module.HEALED_SYMMETRY_BAND_MM,
+    )
+    healed_points, _, _ = module._mesh_triangle_data(healed_repaired)
+    assert healed_points[0, 1] == 0.0
+    assert healed_points[1, 1] == 5.0
+    assert healed_points[2, 1] == 5.0
+    assert healed_points[0, 0] == 0.0
 
 
 def test_topology_stats_tolerates_step_origin_noise():

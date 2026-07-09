@@ -1691,195 +1691,267 @@ def main(argv: list[str] | None = None) -> int:
     if rigid_res <= 0.0:
         raise SystemExit("--rigid-res-mm must be positive")
 
-    gmsh.initialize()
-    try:
-        gmsh.option.setNumber("General.Terminal", 1)
-        gmsh.option.setNumber("Geometry.OCCMakeSolids", 0)
-        gmsh.open(str(step_path))
-        gmsh.model.occ.synchronize()
+    def _run_gmsh_attempt(*, heal_geometry: bool) -> dict[str, object]:
+        gmsh.initialize()
+        try:
+            gmsh.option.setNumber("General.Terminal", 1)
+            gmsh.option.setNumber("Geometry.OCCMakeSolids", 0)
+            if heal_geometry:
+                gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
+                gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
+                gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
+                gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
+            gmsh.open(str(step_path))
+            gmsh.model.occ.synchronize()
 
-        source_surfaces = _map_step_faces_to_gmsh_surfaces(
-            step_path,
-            source_specs,
-            skip_missing_sources=args.skip_missing_sources,
-        )
-        active_source_specs = [
-            spec for spec in source_specs
-            if spec.name in source_surfaces
-        ]
-        all_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
-        source_surface_set = {
-            tag for tags_for_source in source_surfaces.values() for tag in tags_for_source
-        }
-        rigid_surfaces = [tag for tag in all_surfaces if tag not in source_surface_set]
-        if not rigid_surfaces:
-            raise RuntimeError("no rigid surfaces remain after source classification")
+            source_surfaces = _map_step_faces_to_gmsh_surfaces(
+                step_path,
+                source_specs,
+                skip_missing_sources=args.skip_missing_sources,
+            )
+            active_source_specs = [
+                spec for spec in source_specs
+                if spec.name in source_surfaces
+            ]
+            all_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
+            source_surface_set = {
+                tag for tags_for_source in source_surfaces.values() for tag in tags_for_source
+            }
+            rigid_surfaces = [tag for tag in all_surfaces if tag not in source_surface_set]
+            if not rigid_surfaces:
+                raise RuntimeError("no rigid surfaces remain after source classification")
 
-        gmsh.model.addPhysicalGroup(2, rigid_surfaces, tag=RIGID_TAG, name="rigid")
-        for spec in active_source_specs:
-            gmsh.model.addPhysicalGroup(
-                2,
-                source_surfaces[spec.name],
-                tag=spec.tag,
-                name=spec.name,
+            gmsh.model.addPhysicalGroup(2, rigid_surfaces, tag=RIGID_TAG, name="rigid")
+            for spec in active_source_specs:
+                gmsh.model.addPhysicalGroup(
+                    2,
+                    source_surfaces[spec.name],
+                    tag=spec.tag,
+                    name=spec.name,
+                )
+
+            # Resolve painted refine groups and auto-classify radiating (flare)
+            # surfaces from the STEP body/shell structure.
+            refine_surfaces, refine_origins = _map_refine_groups_to_gmsh_surfaces(
+                step_path, refine_specs, all_surfaces
+            )
+            shell_surfaces = _named_shell_gmsh_surfaces(step_path, all_surfaces)
+            auto_radiating = _auto_radiating_surfaces(shell_surfaces, source_surface_set)
+            refined_surface_set = {
+                tag for tags_for_group in refine_surfaces.values() for tag in tags_for_group
+            }
+            # Don't auto-grade surfaces the user explicitly painted.
+            auto_radiating -= refined_surface_set
+
+            density = _density_configuration(
+                active_source_specs,
+                rigid_res_mm=rigid_res,
+                transition_mm=args.transition_mm,
+                refine_specs=refine_specs,
+                refine_surfaces=refine_surfaces,
+                curvature_segments=args.curvature_segments,
             )
 
-        # Resolve painted refine groups and auto-classify radiating (flare)
-        # surfaces from the STEP body/shell structure.
-        refine_surfaces, refine_origins = _map_refine_groups_to_gmsh_surfaces(
-            step_path, refine_specs, all_surfaces
-        )
-        shell_surfaces = _named_shell_gmsh_surfaces(step_path, all_surfaces)
-        auto_radiating = _auto_radiating_surfaces(shell_surfaces, source_surface_set)
-        refined_surface_set = {
-            tag for tags_for_group in refine_surfaces.values() for tag in tags_for_group
-        }
-        # Don't auto-grade surfaces the user explicitly painted.
-        auto_radiating -= refined_surface_set
+            shadow_res = float(density["shadow_res_mm"])
+            # Finest planned size pins MeshSizeMin; the shadow background caps
+            # everything not pulled finer by a field.
+            planned_min = min(
+                [float(field["patch_size_mm"]) for field in density["source_fields"].values()]
+                + [float(field["size_min_mm"]) for field in density["source_fields"].values()]
+                + [float(f["size_mm"]) for f in density["refine_fields"].values()]
+            ) if density["source_fields"] or density["refine_fields"] else rigid_res
+            gmsh.option.setNumber("Mesh.MeshSizeMin", max(planned_min, 0.0))
+            gmsh.option.setNumber("Mesh.MeshSizeMax", shadow_res)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", density["mesh_size_from_curvature"])
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", density["mesh_size_extend_from_boundary"])
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", density["mesh_size_from_points"])
+            gmsh.option.setNumber("Mesh.Algorithm", density["mesh_algorithm"])
 
-        density = _density_configuration(
-            active_source_specs,
-            rigid_res_mm=rigid_res,
-            transition_mm=args.transition_mm,
-            refine_specs=refine_specs,
-            refine_surfaces=refine_surfaces,
-            curvature_segments=args.curvature_segments,
-        )
+            def _add_restrict_field(size_mm: float, surfaces: list[int]) -> int:
+                constant = gmsh.model.mesh.field.add("MathEval")
+                gmsh.model.mesh.field.setString(constant, "F", repr(float(size_mm)))
+                restrict = gmsh.model.mesh.field.add("Restrict")
+                gmsh.model.mesh.field.setNumber(restrict, "InField", constant)
+                for key in ("SurfacesList", "FacesList"):
+                    try:
+                        gmsh.model.mesh.field.setNumbers(restrict, key, surfaces)
+                    except Exception:
+                        continue
+                return restrict
 
-        shadow_res = float(density["shadow_res_mm"])
-        # Finest planned size pins MeshSizeMin; the shadow background caps
-        # everything not pulled finer by a field.
-        planned_min = min(
-            [float(field["patch_size_mm"]) for field in density["source_fields"].values()]
-            + [float(field["size_min_mm"]) for field in density["source_fields"].values()]
-            + [float(f["size_mm"]) for f in density["refine_fields"].values()]
-        ) if density["source_fields"] or density["refine_fields"] else rigid_res
-        gmsh.option.setNumber("Mesh.MeshSizeMin", max(planned_min, 0.0))
-        gmsh.option.setNumber("Mesh.MeshSizeMax", shadow_res)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", density["mesh_size_from_curvature"])
-        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", density["mesh_size_extend_from_boundary"])
-        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", density["mesh_size_from_points"])
-        gmsh.option.setNumber("Mesh.Algorithm", density["mesh_algorithm"])
+            fields: list[int] = []
+            for spec in active_source_specs:
+                field_cfg = density["source_fields"][spec.name]
+                patch_size = float(field_cfg["patch_size_mm"])
+                nearfield_min = float(field_cfg["size_min_mm"])
+                boundaries = []
+                for surface in source_surfaces[spec.name]:
+                    boundaries.extend(
+                        gmsh.model.getBoundary([(2, surface)], combined=False, recursive=True)
+                    )
+                gmsh.model.mesh.setSize(boundaries, min(patch_size, nearfield_min))
 
-        def _add_restrict_field(size_mm: float, surfaces: list[int]) -> int:
-            constant = gmsh.model.mesh.field.add("MathEval")
-            gmsh.model.mesh.field.setString(constant, "F", repr(float(size_mm)))
-            restrict = gmsh.model.mesh.field.add("Restrict")
-            gmsh.model.mesh.field.setNumber(restrict, "InField", constant)
-            for key in ("SurfacesList", "FacesList"):
+                distance = gmsh.model.mesh.field.add("Distance")
                 try:
-                    gmsh.model.mesh.field.setNumbers(restrict, key, surfaces)
+                    gmsh.model.mesh.field.setNumbers(distance, "FacesList", source_surfaces[spec.name])
                 except Exception:
+                    gmsh.model.mesh.field.setNumbers(distance, "SurfacesList", source_surfaces[spec.name])
+                gmsh.model.mesh.field.setNumber(distance, "Sampling", 100)
+
+                # Near-field/baffle fallback: grade from the radiating wall size out
+                # to the shadow background over the transition distance.
+                threshold = gmsh.model.mesh.field.add("Threshold")
+                gmsh.model.mesh.field.setNumber(threshold, "InField", distance)
+                gmsh.model.mesh.field.setNumber(threshold, "SizeMin", nearfield_min)
+                gmsh.model.mesh.field.setNumber(threshold, "SizeMax", shadow_res)
+                gmsh.model.mesh.field.setNumber(threshold, "DistMin", 0.0)
+                gmsh.model.mesh.field.setNumber(threshold, "DistMax", args.transition_mm)
+                fields.append(threshold)
+
+                # Pin the patch at its explicit per-source dial. gmsh's Distance
+                # field is sample-based, so the interior of a large source face
+                # would otherwise drift coarser than the dialled size.
+                fields.append(_add_restrict_field(patch_size, source_surfaces[spec.name]))
+
+            # Painted refine overrides.
+            for spec in refine_specs:
+                surfaces = refine_surfaces.get(spec.name)
+                if not surfaces:
                     continue
-            return restrict
+                fields.append(_add_restrict_field(spec.size_mm, surfaces))
 
-        fields: list[int] = []
-        for spec in active_source_specs:
-            field_cfg = density["source_fields"][spec.name]
-            patch_size = float(field_cfg["patch_size_mm"])
-            nearfield_min = float(field_cfg["size_min_mm"])
-            boundaries = []
-            for surface in source_surfaces[spec.name]:
-                boundaries.extend(
-                    gmsh.model.getBoundary([(2, surface)], combined=False, recursive=True)
-                )
-            gmsh.model.mesh.setSize(boundaries, min(patch_size, nearfield_min))
+            if len(fields) == 1:
+                gmsh.model.mesh.field.setAsBackgroundMesh(fields[0])
+            elif fields:
+                min_field = gmsh.model.mesh.field.add("Min")
+                gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", fields)
+                gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
 
-            distance = gmsh.model.mesh.field.add("Distance")
+            # Pre-mesh size/cost prediction from OCC face areas and the planned
+            # size field (no gmsh meshing yet).
+            mesh_size_prediction = _predict_mesh_size_cost(
+                source_surfaces=source_surfaces,
+                rigid_surfaces=rigid_surfaces,
+                refine_surfaces=refine_surfaces,
+                refine_specs=refine_specs,
+                active_source_specs=active_source_specs,
+                density=density,
+                transition_mm=args.transition_mm,
+                shadow_res=shadow_res,
+                symmetry_planes=symmetry_planes,
+            )
+
             try:
-                gmsh.model.mesh.field.setNumbers(distance, "FacesList", source_surfaces[spec.name])
-            except Exception:
-                gmsh.model.mesh.field.setNumbers(distance, "SurfacesList", source_surfaces[spec.name])
-            gmsh.model.mesh.field.setNumber(distance, "Sampling", 100)
+                gmsh.model.mesh.generate(2)
+            except Exception as exc:
+                return {
+                    "mesh_generation_error": exc,
+                    "mesh_generation_traceback": exc.__traceback__,
+                }
+            duplicate_node_stats = _remove_duplicate_nodes_for_current_gmsh_model()
+            gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+            gmsh.option.setNumber("Mesh.Binary", 0)
+            gmsh.write(str(tagged_mesh_path))
 
-            # Near-field/baffle fallback: grade from the radiating wall size out
-            # to the shadow background over the transition distance.
-            threshold = gmsh.model.mesh.field.add("Threshold")
-            gmsh.model.mesh.field.setNumber(threshold, "InField", distance)
-            gmsh.model.mesh.field.setNumber(threshold, "SizeMin", nearfield_min)
-            gmsh.model.mesh.field.setNumber(threshold, "SizeMax", shadow_res)
-            gmsh.model.mesh.field.setNumber(threshold, "DistMin", 0.0)
-            gmsh.model.mesh.field.setNumber(threshold, "DistMax", args.transition_mm)
-            fields.append(threshold)
+            source_diag = {
+                spec.name: {
+                    "tag": spec.tag,
+                    "resolution_mm": spec.resolution_mm,
+                    "classification_origin": getattr(
+                        _map_step_faces_to_gmsh_surfaces,
+                        "last_origins",
+                        {},
+                    ).get(spec.name, "unknown"),
+                    "surfaces": source_surfaces[spec.name],
+                    "surface_diagnostics": _surface_diagnostics(source_surfaces[spec.name]),
+                }
+                for spec in active_source_specs
+            }
+            skipped_sources = getattr(_map_step_faces_to_gmsh_surfaces, "last_missing", {})
+            refine_diag = {
+                spec.name: {
+                    "role": spec.role,
+                    "size_mm": spec.size_mm,
+                    "classification_origin": refine_origins.get(spec.name, "unmatched"),
+                    "matched": spec.name in refine_surfaces,
+                    "surfaces": refine_surfaces.get(spec.name, []),
+                }
+                for spec in refine_specs
+            }
+            role_classification = {
+                "auto_radiating_surfaces": sorted(int(s) for s in auto_radiating),
+                "named_shell_count": len(shell_surfaces),
+                "rigid_surface_count": len(rigid_surfaces),
+            }
+            return {
+                "source_surfaces": source_surfaces,
+                "active_source_specs": active_source_specs,
+                "rigid_surfaces": rigid_surfaces,
+                "density": density,
+                "mesh_size_prediction": mesh_size_prediction,
+                "refine_surfaces": refine_surfaces,
+                "refine_origins": refine_origins,
+                "auto_radiating": auto_radiating,
+                "shell_surfaces": shell_surfaces,
+                "duplicate_node_stats": duplicate_node_stats,
+                "source_diag": source_diag,
+                "skipped_sources": skipped_sources,
+                "refine_diag": refine_diag,
+                "role_classification": role_classification,
+            }
+        finally:
+            gmsh.finalize()
 
-            # Pin the patch at its explicit per-source dial. gmsh's Distance
-            # field is sample-based, so the interior of a large source face
-            # would otherwise drift coarser than the dialled size.
-            fields.append(_add_restrict_field(patch_size, source_surfaces[spec.name]))
-
-        # Painted refine overrides.
-        for spec in refine_specs:
-            surfaces = refine_surfaces.get(spec.name)
-            if not surfaces:
-                continue
-            fields.append(_add_restrict_field(spec.size_mm, surfaces))
-
-        if len(fields) == 1:
-            gmsh.model.mesh.field.setAsBackgroundMesh(fields[0])
-        elif fields:
-            min_field = gmsh.model.mesh.field.add("Min")
-            gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", fields)
-            gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
-
-        # Pre-mesh size/cost prediction from OCC face areas and the planned
-        # size field (no gmsh meshing yet).
-        mesh_size_prediction = _predict_mesh_size_cost(
-            source_surfaces=source_surfaces,
-            rigid_surfaces=rigid_surfaces,
-            refine_surfaces=refine_surfaces,
-            refine_specs=refine_specs,
-            active_source_specs=active_source_specs,
-            density=density,
-            transition_mm=args.transition_mm,
-            shadow_res=shadow_res,
-            symmetry_planes=symmetry_planes,
+    geometry_healed = False
+    gmsh_state = _run_gmsh_attempt(heal_geometry=False)
+    mesh_generation_error = gmsh_state.get("mesh_generation_error")
+    if mesh_generation_error is not None:
+        original_mesh_error = mesh_generation_error
+        original_traceback = gmsh_state.get("mesh_generation_traceback")
+        assert isinstance(original_mesh_error, Exception)
+        # Fusion STEP exports can carry sub-micron sliver edges on trimmed
+        # spherical caps that make gmsh's periodic-surface 1D mesh
+        # self-intersect; OCC small-edge/degenerate healing removes them, but
+        # it is fallback-only because it regresses some otherwise-clean exports.
+        print(
+            "gmsh mesh generation failed before healing; the STEP appears to "
+            "have degenerate/sliver edges, so applying OCC geometry healing "
+            f"fallback. Original gmsh error: {original_mesh_error}",
+            file=sys.stderr,
         )
+        healed_state = _run_gmsh_attempt(heal_geometry=True)
+        if healed_state.get("mesh_generation_error") is not None:
+            raise original_mesh_error.with_traceback(original_traceback)
+        gmsh_state = healed_state
+        geometry_healed = True
 
-        gmsh.model.mesh.generate(2)
-        duplicate_node_stats = _remove_duplicate_nodes_for_current_gmsh_model()
-        gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
-        gmsh.option.setNumber("Mesh.Binary", 0)
-        gmsh.write(str(tagged_mesh_path))
+    source_surfaces = gmsh_state["source_surfaces"]
+    active_source_specs = gmsh_state["active_source_specs"]
+    rigid_surfaces = gmsh_state["rigid_surfaces"]
+    density = gmsh_state["density"]
+    mesh_size_prediction = gmsh_state["mesh_size_prediction"]
+    refine_surfaces = gmsh_state["refine_surfaces"]
+    refine_origins = gmsh_state["refine_origins"]
+    auto_radiating = gmsh_state["auto_radiating"]
+    shell_surfaces = gmsh_state["shell_surfaces"]
+    duplicate_node_stats = gmsh_state["duplicate_node_stats"]
+    source_diag = gmsh_state["source_diag"]
+    skipped_sources = gmsh_state["skipped_sources"]
+    refine_diag = gmsh_state["refine_diag"]
+    role_classification = gmsh_state["role_classification"]
 
-        source_diag = {
-            spec.name: {
-                "tag": spec.tag,
-                "resolution_mm": spec.resolution_mm,
-                "classification_origin": getattr(
-                    _map_step_faces_to_gmsh_surfaces,
-                    "last_origins",
-                    {},
-                ).get(spec.name, "unknown"),
-                "surfaces": source_surfaces[spec.name],
-                "surface_diagnostics": _surface_diagnostics(source_surfaces[spec.name]),
-            }
-            for spec in active_source_specs
-        }
-        skipped_sources = getattr(_map_step_faces_to_gmsh_surfaces, "last_missing", {})
-        refine_diag = {
-            spec.name: {
-                "role": spec.role,
-                "size_mm": spec.size_mm,
-                "classification_origin": refine_origins.get(spec.name, "unmatched"),
-                "matched": spec.name in refine_surfaces,
-                "surfaces": refine_surfaces.get(spec.name, []),
-            }
-            for spec in refine_specs
-        }
-        role_classification = {
-            "auto_radiating_surfaces": sorted(int(s) for s in auto_radiating),
-            "named_shell_count": len(shell_surfaces),
-            "rigid_surface_count": len(rigid_surfaces),
-        }
-    finally:
-        gmsh.finalize()
+    topology_tol = args.topology_tol
+    if geometry_healed:
+        # OCC healing can nudge origin-plane cut edges by a few 1e-5 mm; keep
+        # the relaxed tolerance below the existing duplicate-vertex weld band.
+        topology_tol = max(topology_tol, 1.0e-4)
 
     mesh = meshio.read(tagged_mesh_path)
     repaired_mesh, repair_stats, topology = _postprocess_mesh(
         mesh,
         active_source_specs,
         symmetry_planes=symmetry_planes,
-        tolerance=args.topology_tol,
+        tolerance=topology_tol,
     )
     resolved_symmetry_planes = tuple(topology["expected_symmetry_planes"])
     meshio.write(tagged_mesh_path, repaired_mesh, file_format="gmsh22", binary=False)
@@ -1943,6 +2015,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = {
         "step": str(step_path),
         "tagged_mesh_step_units": str(tagged_mesh_path),
+        "geometry_healed": bool(geometry_healed),
         "wg_source_meshes_m": wg_meshes,
         "quadrants": args.quadrants,
         "symmetry_planes": list(resolved_symmetry_planes),

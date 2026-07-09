@@ -107,9 +107,10 @@ The add-in is designed to not fail on configuration drift:
   removal) so the dense solve cannot go singular.
 - **Symmetry planes are auto-detected.** The prepare step classifies mesh free
   edges against the `x=0`/`y=0`/`z=0` planes (3+ edges on a plane = cut plane)
-  and the pipeline derives mirror axes, quadrants, and the native Metal
-  symmetry mode from the detection. The `Mirror plane` dropdown under
-  Advanced can still force an explicit plane.
+  and confirms the whole mesh lies on one side of each candidate. The pipeline
+  then derives mirror axes, quadrants, and the native Metal symmetry mode from
+  the detection. The `Mirror plane` dropdown under Advanced can still force an
+  explicit plane.
 - **Solves run the requested band by default.** The dialog launches with
   `--underresolved-solve-policy warn`: mesh-valid ceilings remain visible in
   the launch dialog and pipeline manifest

@@ -54,6 +54,20 @@ ANCHOR_MAX_AREA_REL_DIFF = 0.02
 ANCHOR_MAX_CENTROID_DISTANCE_MM = 5.0
 
 SurfaceGeometry = tuple[tuple[float, float, float], float]
+OCC_HEALING_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Start with sewing: it resolves many Fusion periodic-face imports without
+    # removing small valid faces. The broader repair remains a last resort.
+    ("sew", ("Geometry.OCCSewFaces",)),
+    (
+        "full",
+        (
+            "Geometry.OCCFixDegenerated",
+            "Geometry.OCCFixSmallEdges",
+            "Geometry.OCCFixSmallFaces",
+            "Geometry.OCCSewFaces",
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -814,7 +828,10 @@ def _detect_symmetry_planes(
     z0 would misread an internal level as a cut plane. A true cut outline
     always has edges away from the other coordinate planes, so the exclusive
     count stays robust. ``min_edges_per_plane`` additionally keeps an
-    isolated leak vertex near the origin from masquerading as a plane.
+    isolated leak vertex near the origin from masquerading as a plane. A
+    candidate must also have the whole mesh on one side of it: stray free
+    edges along an internal origin plane cannot turn a full-span model into a
+    native symmetry-reduced solve.
     """
     edge_count: dict[tuple[int, int], int] = {}
     for tri in triangles:
@@ -837,14 +854,33 @@ def _detect_symmetry_planes(
         elif len(on_planes) > 1:
             shared_plane_edges += 1
 
+    plane_vertex_side_counts: dict[str, dict[str, int]] = {}
+    one_sided: dict[str, bool] = {}
+    for axis, plane in enumerate(("x0", "y0", "z0")):
+        coordinates = points[:, axis]
+        negative = int(np.count_nonzero(coordinates < -tolerance))
+        positive = int(np.count_nonzero(coordinates > tolerance))
+        plane_vertex_side_counts[plane] = {
+            "negative": negative,
+            "on_plane": int(len(coordinates) - negative - positive),
+            "positive": positive,
+        }
+        one_sided[plane] = not (negative and positive)
+
     detected = tuple(
         plane for plane in ("x0", "y0", "z0")
-        if plane_counts[plane] >= min_edges_per_plane
+        if plane_counts[plane] >= min_edges_per_plane and one_sided[plane]
     )
+    rejected_spanning_planes = [
+        plane for plane in ("x0", "y0", "z0")
+        if plane_counts[plane] >= min_edges_per_plane and not one_sided[plane]
+    ]
     detection = {
         "mode": "auto",
         "free_edges": int(len(free_edges)),
         "plane_free_edge_counts": {k: int(v) for k, v in plane_counts.items()},
+        "plane_vertex_side_counts": plane_vertex_side_counts,
+        "rejected_spanning_planes": rejected_spanning_planes,
         "shared_plane_free_edges": int(shared_plane_edges),
         "min_edges_per_plane": int(min_edges_per_plane),
         "tolerance": float(tolerance),
@@ -1821,18 +1857,15 @@ def main(argv: list[str] | None = None) -> int:
 
     def _run_gmsh_attempt(
         *,
-        heal_geometry: bool,
+        occ_healing_options: tuple[str, ...] = (),
         surface_order_reference: list[SurfaceGeometry] | None = None,
     ) -> dict[str, object]:
         gmsh.initialize()
         try:
             gmsh.option.setNumber("General.Terminal", 1)
             gmsh.option.setNumber("Geometry.OCCMakeSolids", 0)
-            if heal_geometry:
-                gmsh.option.setNumber("Geometry.OCCFixDegenerated", 1)
-                gmsh.option.setNumber("Geometry.OCCFixSmallEdges", 1)
-                gmsh.option.setNumber("Geometry.OCCFixSmallFaces", 1)
-                gmsh.option.setNumber("Geometry.OCCSewFaces", 1)
+            for option_name in occ_healing_options:
+                gmsh.option.setNumber(option_name, 1)
             gmsh.open(str(step_path))
             gmsh.model.occ.synchronize()
             sorted_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
@@ -2048,7 +2081,8 @@ def main(argv: list[str] | None = None) -> int:
             gmsh.finalize()
 
     geometry_healed = False
-    gmsh_state = _run_gmsh_attempt(heal_geometry=False)
+    geometry_healing_mode = "none"
+    gmsh_state = _run_gmsh_attempt()
     mesh_generation_error = gmsh_state.get("mesh_generation_error")
     if mesh_generation_error is not None:
         original_mesh_error = mesh_generation_error
@@ -2064,26 +2098,29 @@ def main(argv: list[str] | None = None) -> int:
         # spherical caps that make gmsh's periodic-surface 1D mesh
         # self-intersect; OCC small-edge/degenerate healing removes them, but
         # it is fallback-only because it regresses some otherwise-clean exports.
-        print(
-            "gmsh mesh generation failed before healing; the STEP appears to "
-            "have degenerate/sliver edges, so applying OCC geometry healing "
-            f"fallback. Original gmsh error: {original_mesh_error}",
-            file=sys.stderr,
-        )
-        healed_state = _run_gmsh_attempt(
-            heal_geometry=True,
-            surface_order_reference=surface_order_reference,
-        )
-        healed_mesh_error = healed_state.get("mesh_generation_error")
-        if healed_mesh_error is not None:
+        for healing_mode, occ_healing_options in OCC_HEALING_FALLBACKS:
             print(
-                "gmsh mesh generation still failed after OCC geometry healing. "
+                "gmsh mesh generation failed before healing; retrying with "
+                f"OCC {healing_mode} repair. Original gmsh error: {original_mesh_error}",
+                file=sys.stderr,
+            )
+            healed_state = _run_gmsh_attempt(
+                occ_healing_options=occ_healing_options,
+                surface_order_reference=surface_order_reference,
+            )
+            healed_mesh_error = healed_state.get("mesh_generation_error")
+            if healed_mesh_error is None:
+                gmsh_state = healed_state
+                geometry_healed = True
+                geometry_healing_mode = healing_mode
+                break
+            print(
+                f"gmsh mesh generation still failed after OCC {healing_mode} repair. "
                 f"Healed gmsh error: {healed_mesh_error}",
                 file=sys.stderr,
             )
+        else:
             raise original_mesh_error.with_traceback(original_traceback)
-        gmsh_state = healed_state
-        geometry_healed = True
 
     source_surfaces = gmsh_state["source_surfaces"]
     active_source_specs = gmsh_state["active_source_specs"]
@@ -2173,6 +2210,7 @@ def main(argv: list[str] | None = None) -> int:
         "step": str(step_path),
         "tagged_mesh_step_units": str(tagged_mesh_path),
         "geometry_healed": bool(geometry_healed),
+        "geometry_healing_mode": geometry_healing_mode,
         "wg_source_meshes_m": wg_meshes,
         "quadrants": args.quadrants,
         "symmetry_planes": list(resolved_symmetry_planes),

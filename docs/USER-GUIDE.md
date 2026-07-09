@@ -39,7 +39,8 @@ Fusion STEP exports are treated as millimetres by default
 and volumes use the units printed in the field labels: polar distance in m,
 rear chamber in L, port length in mm, port area in cm2.
 
-Symmetry is detected from free edges on the `x=0`, `y=0`, and `z=0` planes.
+Symmetry is detected from free edges on the `x=0`, `y=0`, and `z=0` planes,
+but a detected cut must also leave the entire mesh on one side of that plane.
 Leave Advanced > Mirror plane on Auto detect unless you need to force a half,
 quarter, or full model.
 

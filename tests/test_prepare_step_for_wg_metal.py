@@ -71,6 +71,23 @@ def test_anchor_surface_order_recovers_permuted_healed_surfaces():
     assert ordered == tags_by_reference
 
 
+def test_occ_healing_fallbacks_try_sewing_before_broad_repair():
+    module = _load_script()
+
+    assert module.OCC_HEALING_FALLBACKS == (
+        ("sew", ("Geometry.OCCSewFaces",)),
+        (
+            "full",
+            (
+                "Geometry.OCCFixDegenerated",
+                "Geometry.OCCFixSmallEdges",
+                "Geometry.OCCFixSmallFaces",
+                "Geometry.OCCSewFaces",
+            ),
+        ),
+    )
+
+
 def test_anchor_surface_order_fails_loudly_on_bad_input():
     module = _load_script()
 
@@ -148,6 +165,43 @@ def test_detect_symmetry_planes_ignores_sparse_origin_edges():
     assert planes == ()
     assert detection["plane_free_edge_counts"]["x0"] == 2
     assert detection["plane_free_edge_counts"]["y0"] == 2
+
+
+def test_detect_symmetry_planes_rejects_candidate_that_mesh_spans():
+    module = _load_script()
+    # Three free edges on each origin plane meet the edge-count threshold.
+    # However, y=0 is internal to the model: vertices exist on both sides, so
+    # it must not enable a native quarter-domain solve.
+    points = np.asarray(
+        [
+            [0.0, -1.0, 1.0],
+            [0.0, -2.0, 1.0],
+            [0.0, -1.0, 2.0],
+            [1.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [1.0, 0.0, 2.0],
+            [2.0, 1.0, 1.0],
+            [3.0, 1.0, 1.0],
+            [2.0, 1.0, 2.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.asarray([[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=np.int64)
+
+    planes, detection = module._detect_symmetry_planes(
+        points,
+        triangles,
+        tolerance=1e-9,
+    )
+
+    assert planes == ("x0",)
+    assert detection["plane_free_edge_counts"] == {"x0": 3, "y0": 3, "z0": 0}
+    assert detection["plane_vertex_side_counts"]["y0"] == {
+        "negative": 3,
+        "on_plane": 3,
+        "positive": 3,
+    }
+    assert detection["rejected_spanning_planes"] == ["y0"]
 
 
 def test_detect_symmetry_planes_returns_empty_for_closed_mesh():

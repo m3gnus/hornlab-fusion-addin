@@ -9,6 +9,11 @@ Status 2026-07-03: items 1, 2, 4, 5, and 6 DONE. Item 2 followed the accepted pl
 Item 3's N-driver table is DEFERRED by owner decision (three fixed slots are
 enough for now); its T/S + Hornresp-import half moved into item 2.
 
+Status 2026-07-09: reduced multiport MF chamber FEM is implemented as an
+opt-in path: separate Fusion air-volume export, tetrahedral Helmholtz solve,
+entry-wise BEM loading, synthesized MF pressure basis, and driver-load
+feedback. Full trace-space and thermoviscous FEM remain later fidelity tiers.
+
 ## 1. Remove the `frequency-role` sizing mode (simplification) — DONE
 
 `manual-mm` has been the default and the recommended mode since settings

@@ -142,7 +142,7 @@ def test_passive_cardioid_sync_preserves_requested_polar_window():
 def test_driver_lem_defaults_present():
     addin = _load_addin_with_fake_adsk()
 
-    assert addin.SETTINGS_VERSION == 14
+    assert addin.SETTINGS_VERSION == 15
     assert addin.DEFAULT_SETTINGS["source_motion"] == "Axial (rigid piston)"
     assert addin.DEFAULT_SETTINGS["passive_cardioid_coupled"] is False
     assert addin.DEFAULT_SETTINGS["lf_driver_lem"] == ""
@@ -163,6 +163,35 @@ def test_driver_lem_defaults_present():
     assert addin.DEFAULT_SETTINGS["output_radiation_impedance"] is True
     assert addin.DEFAULT_SETTINGS["output_pressure_bases"] is True
     assert addin.DEFAULT_SETTINGS["output_run_report"] is True
+    assert addin.DEFAULT_SETTINGS["fem_mf_enabled"] is False
+    assert addin.DEFAULT_SETTINGS["fem_component_name"] == "FEM_MF_AIR"
+    assert addin.DEFAULT_SETTINGS["fem_driver_boundary"] == "FEM_DRIVER"
+    assert addin.DEFAULT_SETTINGS["fem_entry_prefix"] == "MF_ENTRY_"
+
+
+def test_fem_boundary_names_require_driver_and_sort_entries():
+    addin = _load_addin_with_fake_adsk()
+
+    class _Appearance:
+        def __init__(self, name):
+            self.name = name
+
+    class _Face:
+        def __init__(self, name):
+            self.appearance = _Appearance(name)
+
+    class _Body:
+        isSolid = True
+
+        def __init__(self):
+            self.faces = [_Face("MF_ENTRY_2"), _Face("FEM_DRIVER"), _Face("MF_ENTRY_1")]
+
+    component = type("Component", (), {"bRepBodies": [_Body()]})()
+    assert addin._fem_boundary_names(
+        component,
+        driver_boundary="FEM_DRIVER",
+        entry_prefix="MF_ENTRY_",
+    ) == ["MF_ENTRY_1", "MF_ENTRY_2"]
     assert "passive_cardioid_driver_sd_cm2" not in addin.DEFAULT_SETTINGS
     assert "passive_cardioid_drive_voltage" not in addin.DEFAULT_SETTINGS
 

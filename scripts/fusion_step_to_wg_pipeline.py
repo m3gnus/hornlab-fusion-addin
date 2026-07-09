@@ -29,6 +29,7 @@ DEFAULT_WG_DIR = REPO_ROOT.parent / "Waveguide Generator"
 DEFAULT_TOPOLOGY_TOL = 1e-5
 ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
 PREP_SCRIPT = REPO_ROOT / "scripts" / "prepare_step_for_wg_metal.py"
+PREP_FEM_SCRIPT = REPO_ROOT / "scripts" / "prepare_fem_chamber.py"
 DIAGNOSE_SCRIPT = REPO_ROOT / "scripts" / "diagnose_wg_metal_orientation.py"
 SOLVE_SCRIPT = REPO_ROOT / "scripts" / "solve_fusion_wg_metal.py"
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
@@ -801,6 +802,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--step", type=Path, required=True, help="STEP file exported from Fusion")
     parser.add_argument("--out", type=Path, required=True, help="Output folder for all generated artifacts")
     parser.add_argument(
+        "--fem-chamber-step",
+        type=Path,
+        default=None,
+        help="Separate STEP export containing one watertight chamber air volume.",
+    )
+    parser.add_argument("--fem-driver-boundary", default="FEM_DRIVER")
+    parser.add_argument(
+        "--fem-entry",
+        action="append",
+        default=[],
+        help="Shared FEM boundary and exterior BEM source name. Repeatable.",
+    )
+    parser.add_argument("--fem-output-source", default="MF")
+    parser.add_argument("--fem-output-tag", type=int, default=3)
+    parser.add_argument("--fem-resolution-mm", type=float, default=8.0)
+    parser.add_argument("--fem-loss-factor", type=float, default=0.002)
+    parser.add_argument("--fem-area-tolerance", type=float, default=0.05)
+    parser.add_argument(
         "--source",
         action="append",
         default=[],
@@ -1218,6 +1237,29 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    fem_entries = [str(name).strip() for name in args.fem_entry if str(name).strip()]
+    if args.fem_chamber_step is None and fem_entries:
+        raise SystemExit("--fem-entry requires --fem-chamber-step")
+    if args.fem_chamber_step is not None:
+        if not fem_entries:
+            raise SystemExit("--fem-chamber-step requires at least one --fem-entry")
+        source_names = {_source_name_tag(source)[0] for source in sources}
+        missing = [name for name in fem_entries if name not in source_names]
+        if missing:
+            raise SystemExit(
+                "--fem-entry names not present in --source/--sources: "
+                + ", ".join(missing)
+            )
+        if args.fem_output_source in source_names:
+            raise SystemExit(
+                "--fem-output-source must not also be a direct BEM source"
+            )
+        if args.fem_resolution_mm <= 0.0:
+            raise SystemExit("--fem-resolution-mm must be positive")
+        if args.fem_loss_factor < 0.0:
+            raise SystemExit("--fem-loss-factor must be non-negative")
+        if not (0.0 <= args.fem_area_tolerance < 1.0):
+            raise SystemExit("--fem-area-tolerance must be in [0, 1)")
 
     step_path = args.step.expanduser().resolve()
     out_dir = args.out.expanduser().resolve()
@@ -1258,6 +1300,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         prep_cmd.append("--allow-leaks")
     if args.skip_missing_sources:
         prep_cmd.append("--skip-missing-sources")
+    if args.fem_chamber_step is not None:
+        prep_cmd.append("--exclude-solid-breps")
     for source in sources:
         prep_cmd.extend(["--source", source])
 
@@ -1303,6 +1347,65 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         _write_json(pipeline_manifest_path, pipeline_manifest)
         _open_requested_outputs(args, out_dir)
         return prep_returncode
+
+    fem_mesh_path: Path | None = None
+    if args.fem_chamber_step is not None:
+        fem_step_path = args.fem_chamber_step.expanduser().resolve()
+        fem_dir = out_dir / "fem"
+        fem_dir.mkdir(parents=True, exist_ok=True)
+        fem_cmd = [
+            str(Path(args.python).expanduser()),
+            str(PREP_FEM_SCRIPT),
+            "--step",
+            str(fem_step_path),
+            "--out",
+            str(fem_dir),
+            "--resolution-mm",
+            str(args.fem_resolution_mm),
+            "--unit-scale-to-m",
+            str(args.unit_scale_to_m),
+            "--boundary",
+            str(args.fem_driver_boundary),
+        ]
+        for name in fem_entries:
+            fem_cmd.extend(["--boundary", name])
+        fem_returncode = _run_logged(
+            fem_cmd,
+            cwd=REPO_ROOT,
+            stdout_path=logs_dir / "prepare_fem_chamber.stdout.log",
+            stderr_path=logs_dir / "prepare_fem_chamber.stderr.log",
+        )
+        pipeline_manifest["commands"]["prepare_fem_chamber"] = fem_cmd
+        pipeline_manifest["logs"].update(
+            {
+                "prepare_fem_chamber_stdout": str(
+                    logs_dir / "prepare_fem_chamber.stdout.log"
+                ),
+                "prepare_fem_chamber_stderr": str(
+                    logs_dir / "prepare_fem_chamber.stderr.log"
+                ),
+            }
+        )
+        if fem_returncode != 0:
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = "prepare_fem_chamber.py failed"
+            pipeline_manifest["returncode"] = fem_returncode
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return fem_returncode
+        fem_mesh_path = fem_dir / "fem_chamber.msh"
+        fem_manifest_path = fem_dir / "fem_chamber_mesh_manifest.json"
+        pipeline_manifest["fem_chamber"] = {
+            "status": "prepared",
+            "step": str(fem_step_path),
+            "mesh": str(fem_mesh_path),
+            "manifest": str(fem_manifest_path),
+            "driver_boundary": str(args.fem_driver_boundary),
+            "entry_boundaries": list(fem_entries),
+            "output_source": str(args.fem_output_source),
+            "output_tag": int(args.fem_output_tag),
+            "loss_factor": float(args.fem_loss_factor),
+        }
 
     prep_manifest = _read_json(prep_manifest_path)
     try:
@@ -1673,6 +1776,25 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     value = getattr(args, attr)
                     if value is not None:
                         solve_cmd.extend([option, str(value)])
+        if fem_mesh_path is not None:
+            solve_cmd.extend(
+                [
+                    "--fem-chamber-mesh",
+                    str(fem_mesh_path),
+                    "--fem-driver-boundary",
+                    str(args.fem_driver_boundary),
+                    "--fem-output-source",
+                    str(args.fem_output_source),
+                    "--fem-output-tag",
+                    str(args.fem_output_tag),
+                    "--fem-loss-factor",
+                    str(args.fem_loss_factor),
+                    "--fem-area-tolerance",
+                    str(args.fem_area_tolerance),
+                ]
+            )
+            for name in fem_entries:
+                solve_cmd.extend(["--fem-entry", name])
         for source in solve_sources:
             solve_cmd.extend(["--source", source])
         for name, freq_max_hz in solve_source_freq_max.items():

@@ -3810,7 +3810,12 @@ def _solver_surface_avg_to_self_impedance(
     *,
     source_area_m2: float,
 ) -> np.ndarray:
-    """Convert unit-acceleration solver p_avg into engineering z_self."""
+    """Convert unit-acceleration solver p_avg into engineering z_self.
+
+    metal-bem's acceleration drive is v = a/(-i*omega) under e^{-i omega t}
+    (2026-07-09 sign fix, ABEC-validated), so z = p_avg/v = -i*omega*p_avg/a
+    before the engineering conjugation.
+    """
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
     p_avg = np.asarray(surface_pressure_avg_solver, dtype=np.complex128).reshape(-1)
     if p_avg.shape != freqs.shape:
@@ -3822,7 +3827,7 @@ def _solver_surface_avg_to_self_impedance(
     if area <= 0.0 or not np.isfinite(area):
         raise ValueError(f"source_area_m2 must be positive, got {source_area_m2!r}")
     omega = 2.0 * np.pi * freqs
-    return np.conjugate(1j * omega * p_avg) / area
+    return np.conjugate(-1j * omega * p_avg) / area
 
 
 def _driver_lem_spec_driver(spec: DriverLemSpec) -> bandpass.Driver:
@@ -4030,7 +4035,7 @@ def _basis_self_impedance(
             "surface_pressure_avg_phase_convention": SURFACE_PRESSURE_AVG_PHASE_CONVENTION,
             "source_area_m2": float(area),
             "source_area_provenance": area_provenance,
-            "formula": "z_dd_eng = conj(1j*omega*p_avg_solver)/S_tag",
+            "formula": "z_dd_eng = conj(-1j*omega*p_avg_solver)/S_tag",
             "mutual_coupling": "driver-driver mutual coupling neglected; self-impedance only",
         }
     area, area_payload = _driver_coupling_source_area(
@@ -4052,10 +4057,38 @@ def _basis_self_impedance(
         "surface_pressure_avg_phase_convention": SURFACE_PRESSURE_AVG_PHASE_CONVENTION,
         "source_area_m2": float(area),
         **area_payload,
-        "formula": f"z_dd_eng = conj(1j*omega*p_avg_solver)/{formula_area}",
+        "formula": f"z_dd_eng = conj(-1j*omega*p_avg_solver)/{formula_area}",
         "mutual_coupling": "driver-driver mutual coupling neglected; self-impedance only",
     }
     return z_self, payload
+
+
+def _source_acoustic_load(
+    mesh_path: Path,
+    args: argparse.Namespace,
+    source_result: dict[str, Any],
+    basis: PressureBasis,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Return a direct BEM self-load or an explicit reduced-model override."""
+    override = source_result.get("_acoustic_load_override")
+    if override is None:
+        return _basis_self_impedance(mesh_path, args, source_result, basis)
+    values = np.asarray(override, dtype=np.complex128).reshape(-1)
+    if values.shape != basis.frequencies_hz.shape:
+        raise RuntimeError(
+            f"{source_result['name']} acoustic-load override shape {values.shape} "
+            f"does not match frequencies {basis.frequencies_hz.shape}"
+        )
+    payload = dict(source_result.get("_acoustic_load_override_payload") or {})
+    area = basis.source_area_m2 or source_result.get("source_area_m2")
+    if area is None or float(area) <= 0.0:
+        raise RuntimeError(
+            f"{source_result['name']} reduced acoustic load has no driver area"
+        )
+    payload.setdefault("source_area_m2", float(area))
+    payload.setdefault("source_area_provenance", "fem_driver_boundary")
+    payload.setdefault("formula", "condensed FEM interior + exterior BEM load")
+    return values, payload
 
 
 def _apply_driver_lem_coupling(
@@ -4099,7 +4132,7 @@ def _apply_driver_lem_coupling(
 
         try:
             basis = _source_unit_basis(source_result)
-            z_self, z_self_payload = _basis_self_impedance(
+            z_self, z_self_payload = _source_acoustic_load(
                 mesh_path,
                 args,
                 source_result,
@@ -4264,9 +4297,10 @@ def _apply_driver_lem_coupling(
             ),
             "z_in_elec_min_ohm": float(np.min(z_abs)),
             "z_in_elec_max_ohm": float(np.max(z_abs)),
-            "coupling_assumption": (
+            "coupling_assumption": z_self_payload.get(
+                "coupling_assumption",
                 "driver-driver mutual coupling is neglected; each driver uses "
-                "its own BEM self-impedance only"
+                "its own BEM self-impedance only",
             ),
             "outputs": {
                 **(
@@ -5169,6 +5203,10 @@ def _write_one_source_outputs(
         "timings": result.timings,
         "source_area_m2": source_area_m2,
         "_pressure_basis": pressure_basis,
+        "_surface_pressure_avg_by_tag_solver": {
+            int(tag): np.asarray(values, dtype=np.complex128)
+            for tag, values in (result.surface_pressure_avg or {}).items()
+        },
     }
     if str(source_motion) != "normal":
         payload["source_motion"] = str(source_motion)
@@ -5395,6 +5433,257 @@ def _solve_source_group(
         source_result["shared_solve_wall_s"] = shared_wall_s
         source_results.append(source_result)
     return source_results
+
+
+def _apply_fem_chamber_coupling(
+    out_dir: Path,
+    args: argparse.Namespace,
+    *,
+    source_results: list[dict[str, Any]],
+    sources: list[tuple[str, int]],
+    source_mesh_valid: dict[str, float],
+    source_aperture_valid: dict[str, float],
+) -> tuple[
+    list[dict[str, Any]],
+    list[tuple[str, int]],
+    dict[str, Any] | None,
+]:
+    """Replace raw FEM entry bases with one synthesized driver source."""
+    from hornlab_sim.methods import acoustic_fem  # noqa: PLC0415
+
+    fem_mesh_value = getattr(args, "fem_chamber_mesh", None)
+    if fem_mesh_value is None:
+        return source_results, sources, None
+    fem_mesh = Path(fem_mesh_value).expanduser().resolve()
+    if not fem_mesh.is_file():
+        raise RuntimeError(f"FEM chamber mesh not found: {fem_mesh}")
+    entry_names = tuple(str(name).strip() for name in args.fem_entry if str(name).strip())
+    if not entry_names:
+        raise RuntimeError("--fem-chamber-mesh requires at least one --fem-entry")
+    if len({name.casefold() for name in entry_names}) != len(entry_names):
+        raise RuntimeError("--fem-entry names must be unique")
+    output_name = str(args.fem_output_source).strip()
+    if not output_name:
+        raise RuntimeError("--fem-output-source must not be blank")
+    output_tag = int(args.fem_output_tag)
+    entry_keys = {name.casefold() for name in entry_names}
+    if any(name.casefold() == output_name.casefold() for name, _ in sources):
+        raise RuntimeError(
+            f"FEM output source {output_name!r} must not also be a direct BEM source"
+        )
+
+    by_name = {str(result["name"]).casefold(): result for result in source_results}
+    missing = [name for name in entry_names if name.casefold() not in by_name]
+    if missing:
+        raise RuntimeError(
+            "FEM entry sources were not solved by BEM: " + ", ".join(missing)
+        )
+    entry_results = [by_name[name.casefold()] for name in entry_names]
+    entry_bases = [_source_unit_basis(result) for result in entry_results]
+    reference = entry_bases[0]
+    for name, basis in zip(entry_names[1:], entry_bases[1:]):
+        if not np.array_equal(basis.frequencies_hz, reference.frequencies_hz):
+            raise RuntimeError(f"FEM entry {name} uses a different frequency grid")
+        if not np.array_equal(basis.observation_angles_deg, reference.observation_angles_deg):
+            raise RuntimeError(f"FEM entry {name} uses a different observation grid")
+        if not np.array_equal(basis.observation_planes, reference.observation_planes):
+            raise RuntimeError(f"FEM entry {name} uses different observation planes")
+
+    entry_tags = [int(result["tag"]) for result in entry_results]
+    entry_areas = np.asarray(
+        [float(result["source_area_m2"]) for result in entry_results],
+        dtype=np.float64,
+    )
+    if np.any(~np.isfinite(entry_areas)) or np.any(entry_areas <= 0.0):
+        raise RuntimeError("FEM BEM-entry areas must be positive and finite")
+    exterior = np.empty(
+        (reference.frequencies_hz.size, len(entry_names), len(entry_names)),
+        dtype=np.complex128,
+    )
+    for source_index, (source_result, source_area) in enumerate(
+        zip(entry_results, entry_areas)
+    ):
+        surface_map = source_result.get("_surface_pressure_avg_by_tag_solver") or {}
+        for receiver_index, receiver_tag in enumerate(entry_tags):
+            values = surface_map.get(receiver_tag)
+            if values is None:
+                raise RuntimeError(
+                    "FEM entry BEM bases must share one multi-RHS solve so cross-"
+                    f"surface pressure is available; missing receiver tag {receiver_tag} "
+                    f"from source {source_result['name']}"
+                )
+            exterior[:, receiver_index, source_index] = (
+                _solver_surface_avg_to_self_impedance(
+                    reference.frequencies_hz,
+                    values,
+                    source_area_m2=float(source_area),
+                )
+            )
+
+    fem_mesh_data = acoustic_fem.load_gmsh_mesh(
+        fem_mesh,
+        scale_to_m=float(args.mesh_scale),
+    )
+    boundary_names = [str(args.fem_driver_boundary), *entry_names]
+    system = acoustic_fem.assemble_system(fem_mesh_data, boundary_names)
+    interior = acoustic_fem.solve_multiport(
+        system,
+        reference.frequencies_hz,
+        loss_factor=float(args.fem_loss_factor),
+    )
+    for name, bem_area in zip(entry_names, entry_areas):
+        fem_area = float(interior.boundary_areas_m2[name])
+        relative = abs(fem_area - bem_area) / max(fem_area, bem_area)
+        if relative > float(args.fem_area_tolerance):
+            raise RuntimeError(
+                f"FEM/BEM area mismatch for {name}: FEM {fem_area:.6g} m2, "
+                f"BEM {bem_area:.6g} m2 ({relative:.1%}); the two interface "
+                "faces must describe the same opening"
+            )
+    coupled = acoustic_fem.couple_exterior_impedance(
+        interior,
+        exterior,
+        driver_boundary=str(args.fem_driver_boundary),
+        entry_boundaries=entry_names,
+    )
+    driver_area = float(interior.boundary_areas_m2[str(args.fem_driver_boundary)])
+    acceleration_weights = (
+        coupled.entry_to_driver_volume_velocity
+        * driver_area
+        / entry_areas[None, :]
+    )
+    pressure = np.zeros_like(reference.pressure_complex, dtype=np.complex128)
+    for entry_index, basis in enumerate(entry_bases):
+        pressure += (
+            acceleration_weights[:, entry_index, None, None]
+            * basis.pressure_complex
+        )
+    synthetic_basis = PressureBasis(
+        source_name=output_name,
+        source_tag=output_tag,
+        frequencies_hz=np.array(reference.frequencies_hz, copy=True),
+        observation_angles_deg=np.array(reference.observation_angles_deg, copy=True),
+        observation_planes=np.array(reference.observation_planes, copy=True),
+        pressure_complex=pressure,
+        source_normalization="unit_driver_normal_acceleration_fem_bem",
+        source_area_m2=driver_area,
+        source_motion="normal",
+    )
+    fem_dir = out_dir / "fem"
+    fem_dir.mkdir(parents=True, exist_ok=True)
+    basis_path = fem_dir / f"{_safe_stem(output_name)}_fem_bem_pressure_basis.npz"
+    matrix_path = fem_dir / f"{_safe_stem(output_name)}_fem_bem_matrices.npz"
+    summary_path = fem_dir / f"{_safe_stem(output_name)}_fem_bem_summary.json"
+    _write_active_pressure_npz(
+        basis_path,
+        synthetic_basis,
+        synthetic_basis.pressure_complex,
+        source_normalization=synthetic_basis.source_normalization,
+        source_area_m2=driver_area,
+    )
+    mesh_valid_values = [source_mesh_valid[name] for name in entry_names if name in source_mesh_valid]
+    aperture_valid_values = [
+        source_aperture_valid[name]
+        for name in entry_names
+        if name in source_aperture_valid
+    ]
+    synthetic = _write_one_source_derived_outputs_from_basis(
+        basis_path,
+        out_dir / "sources",
+        args,
+        source_name=output_name,
+        source_tag=output_tag,
+        mesh_valid_hz=min(mesh_valid_values) if mesh_valid_values else None,
+        mesh_valid_radiating_hz=(
+            min(aperture_valid_values) if aperture_valid_values else None
+        ),
+    )
+    synthetic.pop("postprocess_only", None)
+    synthetic["_pressure_basis"] = synthetic_basis
+    synthetic["_acoustic_load_override"] = coupled.driver_acoustic_load
+    synthetic["_acoustic_load_override_payload"] = {
+        "type": "fem_interior_bem_exterior",
+        "source_area_m2": driver_area,
+        "source_area_provenance": "fem_driver_boundary",
+        "formula": "FEM multiport condensed against exterior BEM entry matrix",
+        "coupling_assumption": (
+            "uniform volume-velocity basis per driver/entry; full chamber "
+            "pressure field retained by tetrahedral FEM"
+        ),
+    }
+    np.savez_compressed(
+        matrix_path,
+        frequencies_hz=interior.frequencies_hz,
+        boundary_names=np.asarray(interior.boundary_names),
+        boundary_areas_m2=np.asarray(
+            [interior.boundary_areas_m2[name] for name in interior.boundary_names],
+            dtype=np.float64,
+        ),
+        interior_impedance_matrix=interior.impedance_matrix,
+        exterior_entry_impedance_matrix=exterior,
+        entry_names=np.asarray(entry_names),
+        entry_bem_areas_m2=entry_areas,
+        entry_to_driver_volume_velocity=coupled.entry_to_driver_volume_velocity,
+        entry_acceleration_weights=acceleration_weights,
+        driver_acoustic_load=coupled.driver_acoustic_load,
+        driver_area_m2=np.asarray(driver_area, dtype=np.float64),
+        volume_m3=np.asarray(interior.volume_m3, dtype=np.float64),
+        loss_factor=np.asarray(interior.loss_factor, dtype=np.float64),
+    )
+    payload = {
+        "status": "complete",
+        "type": "reduced_multiport_fem_bem",
+        "mesh": str(fem_mesh),
+        "driver_boundary": str(args.fem_driver_boundary),
+        "entry_boundaries": list(entry_names),
+        "output_source": {"name": output_name, "tag": output_tag},
+        "volume_m3": float(interior.volume_m3),
+        "driver_area_m2": driver_area,
+        "entry_fem_areas_m2": {
+            name: float(interior.boundary_areas_m2[name]) for name in entry_names
+        },
+        "entry_bem_areas_m2": {
+            name: float(area) for name, area in zip(entry_names, entry_areas)
+        },
+        "loss_factor": float(interior.loss_factor),
+        "basis_model": "one uniform volume-velocity basis per interface",
+        "outputs": {
+            "pressure_basis_npz": str(basis_path),
+            "matrices_npz": str(matrix_path),
+            "summary_json": str(summary_path),
+        },
+        "raw_entry_sources": [
+            {
+                "name": result["name"],
+                "tag": int(result["tag"]),
+                "pressure_basis_npz": result.get("pressure_basis_npz"),
+                "results_json": result.get("results_json"),
+            }
+            for result in entry_results
+        ],
+    }
+    synthetic["fem_hybrid"] = payload
+    result_json_path = Path(str(synthetic["results_json"]))
+    result_payload = json.loads(result_json_path.read_text(encoding="utf-8"))
+    result_payload["postprocess_only_regenerated"] = False
+    result_payload["fem_hybrid"] = payload
+    _write_json(result_json_path, result_payload)
+    _write_json(summary_path, payload)
+
+    first_entry_index = min(
+        index for index, (name, _tag) in enumerate(sources) if name.casefold() in entry_keys
+    )
+    new_sources = [
+        (name, tag) for name, tag in sources if name.casefold() not in entry_keys
+    ]
+    new_sources.insert(first_entry_index, (output_name, output_tag))
+    new_results = [
+        result
+        for result in source_results
+        if str(result["name"]).casefold() not in entry_keys
+    ]
+    new_results.append(synthetic)
+    return new_results, new_sources, payload
 
 
 _RADIATION_PAYLOAD_FROM_SOLVER = object()
@@ -6059,6 +6348,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mesh", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
+        "--fem-chamber-mesh",
+        type=Path,
+        default=None,
+        help="Tagged tetrahedral chamber mesh produced by prepare_fem_chamber.py.",
+    )
+    parser.add_argument(
+        "--fem-driver-boundary",
+        default="FEM_DRIVER",
+        help="FEM physical-surface name for the driver diaphragm.",
+    )
+    parser.add_argument(
+        "--fem-entry",
+        action="append",
+        default=[],
+        help="FEM boundary/BEM source name for one chamber entry. Repeatable.",
+    )
+    parser.add_argument("--fem-output-source", default="MF")
+    parser.add_argument("--fem-output-tag", type=int, default=3)
+    parser.add_argument("--fem-loss-factor", type=float, default=0.002)
+    parser.add_argument(
+        "--fem-area-tolerance",
+        type=float,
+        default=0.05,
+        help="Maximum relative FEM/BEM interface-area mismatch.",
+    )
+    parser.add_argument(
         "--source",
         action="append",
         default=[],
@@ -6394,6 +6709,25 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--polar-angle-count must be positive")
     if args.complex_k_shift < 0.0:
         raise SystemExit("--complex-k-shift must be non-negative")
+    if args.fem_loss_factor < 0.0:
+        raise SystemExit("--fem-loss-factor must be non-negative")
+    if not (0.0 <= args.fem_area_tolerance < 1.0):
+        raise SystemExit("--fem-area-tolerance must be in [0, 1)")
+    if args.fem_chamber_mesh is not None:
+        fem_entries = [str(name).strip() for name in args.fem_entry if str(name).strip()]
+        if not fem_entries:
+            raise SystemExit("--fem-chamber-mesh requires at least one --fem-entry")
+        missing_fem_sources = [name for name in fem_entries if name not in source_names]
+        if missing_fem_sources:
+            raise SystemExit(
+                "--fem-entry names not in --source list: "
+                + ", ".join(missing_fem_sources)
+            )
+        if args.postprocess_only:
+            raise SystemExit(
+                "postprocess-only uses the stored synthesized FEM pressure basis; "
+                "omit --fem-chamber-mesh"
+            )
     _normalize_driver_lem_args(args)
     _validate_passive_cardioid_args(args)
 
@@ -6462,6 +6796,20 @@ def main(argv: list[str] | None = None) -> int:
                     name: value
                     for name, value in args.driver_rear_volume_l_by_name.items()
                 },
+            },
+            "fem_chamber": {
+                "enabled": args.fem_chamber_mesh is not None,
+                "mesh": (
+                    None
+                    if args.fem_chamber_mesh is None
+                    else str(args.fem_chamber_mesh.expanduser().resolve())
+                ),
+                "driver_boundary": args.fem_driver_boundary,
+                "entry_boundaries": list(args.fem_entry),
+                "output_source": args.fem_output_source,
+                "output_tag": args.fem_output_tag,
+                "loss_factor": args.fem_loss_factor,
+                "area_tolerance": args.fem_area_tolerance,
             },
             "outputs": {
                 "per_driver_plots": not bool(args.skip_per_driver_plots),
@@ -6725,6 +7073,33 @@ def main(argv: list[str] | None = None) -> int:
                     current_source={"name": source_name, "tag": source_tag},
                 )
                 print(f"Completed source {source_name} (tag {source_tag}).", flush=True)
+        source_results, sources, fem_payload = _apply_fem_chamber_coupling(
+            out_dir,
+            args,
+            source_results=source_results,
+            sources=sources,
+            source_mesh_valid=source_mesh_valid,
+            source_aperture_valid=source_aperture_valid,
+        )
+        if fem_payload is not None:
+            manifest["fem_chamber"] = fem_payload
+            manifest["outputs"]["fem_chamber_pressure_basis_npz"] = fem_payload[
+                "outputs"
+            ]["pressure_basis_npz"]
+            manifest["outputs"]["fem_chamber_matrices_npz"] = fem_payload[
+                "outputs"
+            ]["matrices_npz"]
+            manifest["outputs"]["fem_chamber_summary_json"] = fem_payload[
+                "outputs"
+            ]["summary_json"]
+            entry_names = {
+                str(name) for name in fem_payload["entry_boundaries"]
+            }
+            output_name = str(fem_payload["output_source"]["name"])
+            for mapping in (source_freq_max, source_mesh_valid, source_aperture_valid):
+                entry_values = [mapping.pop(name) for name in list(mapping) if name in entry_names]
+                if entry_values:
+                    mapping[output_name] = min(entry_values)
         _apply_post_solve_derived_outputs(
             mesh_path,
             out_dir,

@@ -1,5 +1,6 @@
 # Mesh preparation and orientation diagnostics (prepare/diagnose steps)
 numpy
+scipy
 gmsh
 meshio
 

@@ -64,6 +64,7 @@ _SOURCE_MOTION_VALUE_BY_LABEL = {
 # Mirror the conservative mesh-validity rule in prepare_step_for_wg_metal.py.
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
+FIRST_FEM_ENTRY_TAG = 20
 
 
 def normalize_source_motion(value: str | None) -> str:
@@ -777,16 +778,31 @@ def build_source_specs(
     port_exit_mesh_mm: str = "",
     port_exit_l_mesh_mm: str = "",
     port_exit_r_mesh_mm: str = "",
+    fem_entry_names: list[str] | tuple[str, ...] | None = None,
 ) -> str:
+    fem_entries = [str(name).strip() for name in (fem_entry_names or ()) if str(name).strip()]
+    if len({name.casefold() for name in fem_entries}) != len(fem_entries):
+        raise ValueError("FEM entry names must be unique")
+    for name in fem_entries:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", name):
+            raise ValueError(f"invalid FEM entry source name: {name!r}")
+        if name.upper() in {"LF", "MF", "HF", "PORT_EXIT", "PORT_EXIT_L", "PORT_EXIT_R"}:
+            raise ValueError(f"FEM entry name conflicts with a canonical source: {name}")
     sources = []
     for name, value in (
         ("LF", lf_mesh_mm),
-        ("MF", mf_mesh_mm),
+        ("MF", "" if fem_entries else mf_mesh_mm),
         ("HF", hf_mesh_mm),
     ):
         resolution = value.strip()
         if resolution:
             sources.append(f"{name}:{resolution}")
+    if fem_entries:
+        resolution = mf_mesh_mm.strip()
+        if not resolution:
+            raise ValueError("MF mesh mm is required for FEM entry sources")
+        for index, name in enumerate(fem_entries):
+            sources.append(f"{name}:{resolution}:{FIRST_FEM_ENTRY_TAG + index}")
     port_exit_resolution = port_exit_mesh_mm.strip()
     if port_exit_resolution:
         if port_exit_l_mesh_mm.strip() or port_exit_r_mesh_mm.strip():
@@ -875,6 +891,13 @@ def build_pipeline_command(
     hf_driver_rear_volume_l: str | None = None,
     drive_voltage: str | None = None,
     rg_ohm: str | None = None,
+    fem_chamber_step: Path | None = None,
+    fem_driver_boundary: str = "FEM_DRIVER",
+    fem_entry_names: list[str] | tuple[str, ...] | None = None,
+    fem_output_source: str = "MF",
+    fem_output_tag: int = 3,
+    fem_resolution_mm: str | None = None,
+    fem_loss_factor: str | None = None,
 ) -> list[str]:
     validate_output_options(
         export_vituixcad=export_vituixcad,
@@ -896,6 +919,26 @@ def build_pipeline_command(
         "--transition-mm",
         transition_mm,
     ]
+    if fem_chamber_step is not None:
+        entries = [str(name).strip() for name in (fem_entry_names or ()) if str(name).strip()]
+        if not entries:
+            raise ValueError("fem_chamber_step requires at least one FEM entry")
+        cmd.extend(
+            [
+                "--fem-chamber-step",
+                str(fem_chamber_step),
+                "--fem-driver-boundary",
+                str(fem_driver_boundary).strip() or "FEM_DRIVER",
+                "--fem-output-source",
+                str(fem_output_source).strip() or "MF",
+                "--fem-output-tag",
+                str(int(fem_output_tag)),
+            ]
+        )
+        for name in entries:
+            cmd.extend(["--fem-entry", name])
+        _append_optional_cli_value(cmd, "--fem-resolution-mm", fem_resolution_mm)
+        _append_optional_cli_value(cmd, "--fem-loss-factor", fem_loss_factor)
     if rigid_res_mm and rigid_res_mm.strip():
         cmd.extend(["--rigid-res-mm", rigid_res_mm.strip()])
     for entry in refine or []:

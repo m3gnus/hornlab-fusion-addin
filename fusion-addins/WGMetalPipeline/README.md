@@ -11,6 +11,11 @@ The background process runs:
 2. `scripts/diagnose_wg_metal_orientation.py`
 3. `scripts/solve_fusion_wg_metal.py` (unless "Mesh only" is checked)
 
+When **MF chamber FEM** is enabled it also runs
+`scripts/prepare_fem_chamber.py` between steps 1 and 2, then condenses the
+interior FEM multiport matrix against the exterior BEM entry matrix before
+normal source post-processing.
+
 ## Automation
 
 The add-in is designed to not fail on configuration drift:
@@ -90,6 +95,16 @@ The add-in is designed to not fail on configuration drift:
   block with normalized parameter echo, Mmd/Mms provenance, self-impedance
   provenance, excursion maximum, impedance range, and the explicit note that
   driver-driver mutual coupling is neglected.
+- **MF chamber FEM is optional.** A component named `FEM_MF_AIR` (configurable)
+  must contain exactly one watertight solid representing the acoustic air
+  volume. Paint its diaphragm face `FEM_DRIVER` and its exits `MF_ENTRY_1`,
+  `MF_ENTRY_2`, and so on. Apply those same entry appearances to the matching
+  exterior BEM source patches. The add-in replaces direct `MF` with the entry
+  bases, tetrahedrally meshes the volume, solves a pressure-Helmholtz multiport
+  matrix, and synthesizes one `MF` response from the complex entry flows. This
+  first implementation uses one uniform volume-velocity basis per interface;
+  the chamber pressure field remains fully 3D. Passive-cardioid MF and MF
+  chamber FEM are intentionally mutually exclusive for now.
 - **Elements use explicit millimetre sizing.** Source patches use their source
   mesh mm values, rigid/shadow surfaces use `Rigid body mesh mm`, and the
   near-field baffle grades from each source's own size out to the background
@@ -177,6 +192,8 @@ artifacts and run-level manifests:
 - `mesh/`: `tagged_sources.msh`, one full-domain metre-unit
   `<source>_source_tag2_m.msh` per source, `orientation_report.json`,
   `expanded_*q_*.msh` plus preview PNG, and mesh-prep `manifest.json`
+- `fem/`: tetrahedral chamber mesh, interior/exterior impedance matrices,
+  entry flow ratios, condensed driver load, synthesized MF basis, and summary
 - `manifests/`: `fusion_wg_pipeline_manifest.json`,
   `final_summary_manifest.json`, `direct_solve_manifest.json`, and
   `fusion_addin_launch.json`
@@ -233,7 +250,9 @@ distance), **Mesh sizing** (refine overrides and the live Estimate readout),
 mesh-valid plot-marker toggle), **Passive cardioid MF** (optional MF plus
 `PORT_EXIT` postprocess combine), **Driver LEM (optional)** (per-source T/S
 text or Hornresp driver-file path, rear volumes, shared drive voltage and
-source resistance), **Outputs** (output root, open folder, open report, and
+source resistance), **MF chamber FEM (optional)** (air-volume component,
+boundary appearance contract, tetrahedron size, and loss factor), **Outputs**
+(output root, open folder, open report, and
 per-category checkboxes for per-driver plots, combined/crossover,
 passive-cardioid, Driver LEM, derived acoustics, VituixCAD, radiation
 impedance, pressure bases, and HTML report), and **Advanced** (mirror plane

@@ -4,6 +4,9 @@ A Fusion 360 add-in plus background pipeline for simulating loudspeaker
 designs directly from CAD: export the active design to STEP, mesh it with
 acoustic source tags (gmsh), and run native Apple Metal BEM solves with
 crossover summing, passive-cardioid post-processing, and VituixCAD export.
+An opt-in MF chamber path exports a separate watertight air volume, solves its
+3D pressure field with tetrahedral FEM, and couples its individual entry flows
+to the existing exterior Metal BEM bases.
 
 The add-in lives in `fusion-addins/WGMetalPipeline/`; it launches the
 pipeline in `scripts/` as a background process so Fusion stays usable while
@@ -35,7 +38,7 @@ under Advanced > Python (default: `<repo>/.venv/bin/python` when present).
 
 ## Dependencies
 
-- Meshing/diagnostics need `numpy`, `gmsh`, `meshio`.
+- Meshing/diagnostics and chamber FEM need `numpy`, `scipy`, `gmsh`, `meshio`.
 - Direct solves need [hornlab-metal-bem](https://github.com/m3gnus/hornlab-metal-bem)
   (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages. The
   latter two are not yet published standalone. Discovery order is top-level

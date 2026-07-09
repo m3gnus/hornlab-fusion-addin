@@ -85,6 +85,18 @@ to a readable driver file. Supported Hornresp units are `Sd` cm2,
 are warned and ignored. Coupling changes that driver's pressure basis from unit
 acceleration to SPL at the chosen drive voltage.
 
+MF chamber FEM: create a component named `FEM_MF_AIR` containing exactly one
+watertight **solid body representing the chamber air**, including necks/slots
+up to the horn entry planes. Paint the diaphragm face `FEM_DRIVER`. Paint each
+exit `MF_ENTRY_1`, `MF_ENTRY_2`, etc., and apply the same entry appearance to
+the matching exterior BEM source face. Keep `MF mesh mm` filled: it controls
+the entry source mesh after direct `MF` is replaced. Enabling this group exports
+the air component separately, builds a tetrahedral pressure-FEM model, couples
+the entry matrix to exterior Metal BEM, and synthesizes the normal `MF` basis.
+The tetrahedron-size manifest reports an eight-elements-per-wavelength ceiling.
+The default loss factor is a small resonance regularizer, not a thermoviscous
+model. Passive cardioid MF cannot be enabled in the same run yet.
+
 Outputs: choose the output root, whether to open the folder, whether to open
 the generated report, and which artifact categories to write. The category
 checkboxes cover per-driver plots, combined/crossover outputs, passive
@@ -103,6 +115,8 @@ exports, mesh-prep files, and solver artifacts are grouped by category:
 - `exports/`: Fusion STEP and native `.f3d` archive
 - `mesh/`: prepared tagged mesh, per-source WG meshes, orientation report,
   expanded full-domain mesh previews, and mesh-prep `manifest.json`
+- `fem/`: tetrahedral chamber mesh, FEM/BEM matrices, entry flow ratios,
+  condensed driver load, synthesized MF basis, and summary
 - `sources/`: per-source result JSON, pressure bases, direct source plots, and
   port-exit radiation-impedance matrices
 - `combined/`: combined response plots, crossover/alignment plots, off-axis

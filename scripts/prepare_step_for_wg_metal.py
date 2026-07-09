@@ -200,6 +200,32 @@ def _parse_named_shell_faces(step_path: Path) -> dict[str, list[int]]:
     return out
 
 
+def _parse_solid_brep_faces(step_path: Path) -> set[int]:
+    """Return ADVANCED_FACE ids owned by STEP solid BReps.
+
+    Fusion FEM air volumes are exported as ``MANIFOLD_SOLID_BREP`` while the
+    exterior BEM acoustic model is normally an open shell.  The main mesher can
+    therefore exclude the solid volume from the exterior surface mesh without
+    relying on Fusion visibility state or body-name preservation.
+    """
+    records = _step_records(step_path.read_text(encoding="ascii", errors="replace"))
+    shell_faces: dict[int, set[int]] = {}
+    for rec_id, record in records.items():
+        if record.startswith("CLOSED_SHELL"):
+            shell_faces[rec_id] = {
+                ref
+                for ref in _step_refs(record)
+                if records.get(ref, "").startswith("ADVANCED_FACE")
+            }
+    faces: set[int] = set()
+    for record in records.values():
+        if not record.startswith(("MANIFOLD_SOLID_BREP", "BREP_WITH_VOIDS")):
+            continue
+        for ref in _step_refs(record):
+            faces.update(shell_faces.get(ref, set()))
+    return faces
+
+
 def _parse_styled_face_groups(step_path: Path) -> dict[str, list[int]]:
     """Return STEP presentation/appearance label -> ADVANCED_FACE ids.
 
@@ -1804,6 +1830,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "At least one requested source must still be found."
         ),
     )
+    parser.add_argument(
+        "--exclude-solid-breps",
+        action="store_true",
+        help=(
+            "Exclude every MANIFOLD_SOLID_BREP/BREP_WITH_VOIDS face from the "
+            "exterior BEM mesh. Used when the root Fusion export also contains "
+            "a separate FEM air-volume component."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1885,11 +1920,32 @@ def main(argv: list[str] | None = None) -> int:
                 skip_missing_sources=args.skip_missing_sources,
                 gmsh_surfaces=ordered_surfaces,
             )
+            excluded_surfaces: set[int] = set()
+            if args.exclude_solid_breps:
+                face_order = _advanced_face_order(step_path)
+                face_to_surface = dict(zip(face_order, ordered_surfaces))
+                excluded_surfaces = {
+                    face_to_surface[face_id]
+                    for face_id in _parse_solid_brep_faces(step_path)
+                    if face_id in face_to_surface
+                }
+                source_surfaces = {
+                    name: [surface for surface in surfaces if surface not in excluded_surfaces]
+                    for name, surfaces in source_surfaces.items()
+                }
+                emptied = [name for name, surfaces in source_surfaces.items() if not surfaces]
+                if emptied:
+                    raise RuntimeError(
+                        "requested sources exist only on excluded FEM solid BReps: "
+                        + ", ".join(emptied)
+                    )
             active_source_specs = [
                 spec for spec in source_specs
                 if spec.name in source_surfaces
             ]
-            all_surfaces = ordered_surfaces
+            all_surfaces = [
+                surface for surface in ordered_surfaces if surface not in excluded_surfaces
+            ]
             source_surface_set = {
                 tag for tags_for_source in source_surfaces.values() for tag in tags_for_source
             }
@@ -1909,9 +1965,20 @@ def main(argv: list[str] | None = None) -> int:
             # Resolve painted refine groups and auto-classify radiating (flare)
             # surfaces from the STEP body/shell structure.
             refine_surfaces, refine_origins = _map_refine_groups_to_gmsh_surfaces(
-                step_path, refine_specs, all_surfaces
+                step_path, refine_specs, ordered_surfaces
             )
-            shell_surfaces = _named_shell_gmsh_surfaces(step_path, all_surfaces)
+            refine_surfaces = {
+                name: [surface for surface in surfaces if surface not in excluded_surfaces]
+                for name, surfaces in refine_surfaces.items()
+            }
+            refine_surfaces = {
+                name: surfaces for name, surfaces in refine_surfaces.items() if surfaces
+            }
+            shell_surfaces = _named_shell_gmsh_surfaces(step_path, ordered_surfaces)
+            shell_surfaces = {
+                name: [surface for surface in surfaces if surface not in excluded_surfaces]
+                for name, surfaces in shell_surfaces.items()
+            }
             auto_radiating = _auto_radiating_surfaces(shell_surfaces, source_surface_set)
             refined_surface_set = {
                 tag for tags_for_group in refine_surfaces.values() for tag in tags_for_group
@@ -2059,6 +2126,7 @@ def main(argv: list[str] | None = None) -> int:
                 "auto_radiating_surfaces": sorted(int(s) for s in auto_radiating),
                 "named_shell_count": len(shell_surfaces),
                 "rigid_surface_count": len(rigid_surfaces),
+                "excluded_solid_brep_surface_count": len(excluded_surfaces),
             }
             return {
                 "surface_geoms": surface_geoms,

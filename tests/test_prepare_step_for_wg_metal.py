@@ -47,6 +47,27 @@ def _quarter_tube(angles_deg, z_values):
     return points, np.asarray(triangles, dtype=np.int64)
 
 
+def test_parse_solid_brep_faces_excludes_only_closed_solid_shell(tmp_path):
+    module = _load_script()
+    step = tmp_path / "mixed.step"
+    step.write_text(
+        "\n".join(
+            [
+                "#10=ADVANCED_FACE('',(),$,.T.);",
+                "#11=ADVANCED_FACE('',(),$,.T.);",
+                "#12=ADVANCED_FACE('',(),$,.T.);",
+                "#20=CLOSED_SHELL('',(#10,#11));",
+                "#21=OPEN_SHELL('',(#12));",
+                "#30=MANIFOLD_SOLID_BREP('FEM_AIR',#20);",
+                "#31=SHELL_BASED_SURFACE_MODEL('EXTERIOR',(#21));",
+            ]
+        )
+        + "\n",
+        encoding="ascii",
+    )
+    assert module._parse_solid_brep_faces(step) == {10, 11}
+
+
 def test_anchor_surface_order_recovers_permuted_healed_surfaces():
     module = _load_script()
     reference_geoms = [

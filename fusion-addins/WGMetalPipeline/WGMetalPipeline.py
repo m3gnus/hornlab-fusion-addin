@@ -86,7 +86,7 @@ SETTINGS_PATH = (
     / "settings.json"
 )
 PRESETS_DIR = _fusion_pipeline_launch.DEFAULT_PRESETS_DIR
-SETTINGS_VERSION = 14
+SETTINGS_VERSION = 15
 DEFAULT_SETTINGS = {
     "settings_version": SETTINGS_VERSION,
     "output_root": str(DEFAULT_OUTPUT_ROOT),
@@ -143,6 +143,12 @@ DEFAULT_SETTINGS = {
     "hf_driver_rear_volume_l": "",
     "drive_voltage": "2.83",
     "rg_ohm": "0",
+    "fem_mf_enabled": False,
+    "fem_component_name": "FEM_MF_AIR",
+    "fem_driver_boundary": "FEM_DRIVER",
+    "fem_entry_prefix": "MF_ENTRY_",
+    "fem_resolution_mm": "8",
+    "fem_loss_factor": "0.002",
 }
 _SETTING_INPUT_IDS = tuple(
     key for key in DEFAULT_SETTINGS.keys() if key != "settings_version"
@@ -428,6 +434,7 @@ def _apply_settings_to_inputs(inputs, loaded: dict) -> dict:
     for input_id in _SETTING_INPUT_IDS:
         _set_input_from_setting(inputs, input_id, settings.get(input_id))
     _sync_passive_cardioid_ui(inputs)
+    _sync_fem_ui(inputs)
     _update_size_prediction(inputs)
     return settings
 
@@ -570,12 +577,85 @@ def _active_design_name(design) -> str:
     return root.name if root and root.name else "fusion_design"
 
 
-def _export_step(design, step_path: Path) -> None:
+def _export_step(design, step_path: Path, geometry=None) -> None:
     export_manager = design.exportManager
-    options = export_manager.createSTEPExportOptions(str(step_path))
+    options = (
+        export_manager.createSTEPExportOptions(str(step_path))
+        if geometry is None
+        else export_manager.createSTEPExportOptions(str(step_path), geometry)
+    )
     ok = export_manager.execute(options)
     if not ok:
         raise RuntimeError(f"Fusion STEP export failed: {step_path}")
+
+
+def _face_appearance_name(face) -> str:
+    try:
+        appearance = face.appearance
+        return str(appearance.name).strip() if appearance is not None else ""
+    except Exception:
+        return ""
+
+
+def _find_fem_air_component(design, component_name: str):
+    wanted = str(component_name).strip()
+    if not wanted:
+        raise RuntimeError("FEM air component name must not be blank.")
+    components = []
+    root = design.rootComponent
+    if str(root.name).strip().casefold() == wanted.casefold():
+        components.append(root)
+    try:
+        for occurrence in root.allOccurrences:
+            component = occurrence.component
+            if (
+                component is not None
+                and str(component.name).strip().casefold() == wanted.casefold()
+                and component not in components
+            ):
+                components.append(component)
+    except Exception:
+        pass
+    if not components:
+        raise RuntimeError(f"FEM air component not found: {wanted}")
+    if len(components) != 1:
+        raise RuntimeError(f"FEM air component name is ambiguous: {wanted}")
+    component = components[0]
+    solid_bodies = [body for body in component.bRepBodies if bool(body.isSolid)]
+    if len(solid_bodies) != 1:
+        raise RuntimeError(
+            f"FEM component {wanted!r} must contain exactly one solid air body; "
+            f"found {len(solid_bodies)}"
+        )
+    return component
+
+
+def _fem_boundary_names(component, *, driver_boundary: str, entry_prefix: str) -> list[str]:
+    driver = str(driver_boundary).strip()
+    prefix = str(entry_prefix).strip()
+    if not driver:
+        raise RuntimeError("FEM driver boundary must not be blank.")
+    if not prefix:
+        raise RuntimeError("FEM entry prefix must not be blank.")
+    appearances = {
+        _face_appearance_name(face)
+        for body in component.bRepBodies
+        for face in body.faces
+    }
+    appearances.discard("")
+    if not any(name.casefold() == driver.casefold() for name in appearances):
+        raise RuntimeError(
+            f"FEM component has no face painted with appearance {driver!r}."
+        )
+    entries = sorted(
+        (name for name in appearances if name.casefold().startswith(prefix.casefold())),
+        key=lambda name: name.casefold(),
+    )
+    if not entries:
+        raise RuntimeError(
+            f"FEM component has no entry faces whose appearance starts with {prefix!r}."
+        )
+    return entries
 
 
 def _export_fusion_archive(design, archive_path: Path) -> None:
@@ -709,6 +789,20 @@ def _sync_passive_cardioid_ui(inputs) -> None:
         "passive_cardioid_foam_resistance_pa_s_m3",
         "passive_cardioid_invert_port",
         "passive_cardioid_coupled",
+    ):
+        item = _input_by_id(inputs, input_id)
+        if item is not None:
+            item.isEnabled = enabled
+
+
+def _sync_fem_ui(inputs) -> None:
+    enabled = bool(_input_value(inputs, "fem_mf_enabled"))
+    for input_id in (
+        "fem_component_name",
+        "fem_driver_boundary",
+        "fem_entry_prefix",
+        "fem_resolution_mm",
+        "fem_loss_factor",
     ):
         item = _input_by_id(inputs, input_id)
         if item is not None:
@@ -983,6 +1077,49 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 _setting_str(settings, "rg_ohm"),
             )
 
+            fem_group = inputs.addGroupCommandInput(
+                "grp_fem_chamber",
+                "MF chamber FEM (optional)",
+            )
+            fem_group.isExpanded = False
+            fem = fem_group.children
+            fem_enabled = fem.addBoolValueInput(
+                "fem_mf_enabled",
+                "Use FEM chamber",
+                True,
+                "",
+                _setting_bool(settings, "fem_mf_enabled"),
+            )
+            fem_enabled.tooltip = (
+                "Export one watertight air-volume component, solve its 3D "
+                "pressure field, and couple separate MF entry bases to Metal BEM."
+            )
+            fem.addStringValueInput(
+                "fem_component_name",
+                "Air-volume component",
+                _setting_str(settings, "fem_component_name"),
+            )
+            fem.addStringValueInput(
+                "fem_driver_boundary",
+                "Driver face appearance",
+                _setting_str(settings, "fem_driver_boundary"),
+            )
+            fem.addStringValueInput(
+                "fem_entry_prefix",
+                "Entry appearance prefix",
+                _setting_str(settings, "fem_entry_prefix"),
+            )
+            fem.addStringValueInput(
+                "fem_resolution_mm",
+                "Tetrahedron size mm",
+                _setting_str(settings, "fem_resolution_mm"),
+            )
+            fem.addStringValueInput(
+                "fem_loss_factor",
+                "Interior loss factor",
+                _setting_str(settings, "fem_loss_factor"),
+            )
+
             output_group = inputs.addGroupCommandInput("grp_output", "Outputs")
             output_group.isExpanded = True
             output = output_group.children
@@ -1100,6 +1237,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             _handlers.append(execute_handler)
 
             _sync_passive_cardioid_ui(inputs)
+            _sync_fem_ui(inputs)
             _update_size_prediction(inputs)
         except Exception:
             _show_message(traceback.format_exc())
@@ -1160,6 +1298,8 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 changed.value = False
             elif input_id in {"passive_cardioid_enabled", "passive_cardioid_coupled"}:
                 _sync_passive_cardioid_ui(inputs)
+            elif input_id == "fem_mf_enabled":
+                _sync_fem_ui(inputs)
             elif input_id in _PREDICTION_INPUT_IDS:
                 _update_size_prediction(inputs)
         except Exception:
@@ -1345,11 +1485,37 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             port_exit_mesh_mm = str(
                 _input_value(inputs, "port_exit_mesh_mm") or ""
             ).strip()
+            fem_mf_enabled = bool(_input_value(inputs, "fem_mf_enabled"))
+            fem_component_name = str(
+                _input_value(inputs, "fem_component_name") or ""
+            ).strip()
+            fem_driver_boundary = str(
+                _input_value(inputs, "fem_driver_boundary") or "FEM_DRIVER"
+            ).strip()
+            fem_entry_prefix = str(
+                _input_value(inputs, "fem_entry_prefix") or "MF_ENTRY_"
+            ).strip()
+            fem_resolution_mm = str(
+                _input_value(inputs, "fem_resolution_mm") or "8"
+            ).strip()
+            fem_loss_factor = str(
+                _input_value(inputs, "fem_loss_factor") or "0.002"
+            ).strip()
+            fem_component = None
+            fem_entry_names: list[str] = []
+            if fem_mf_enabled:
+                fem_component = _find_fem_air_component(design, fem_component_name)
+                fem_entry_names = _fem_boundary_names(
+                    fem_component,
+                    driver_boundary=fem_driver_boundary,
+                    entry_prefix=fem_entry_prefix,
+                )
             sources = build_source_specs(
                 lf_mesh_mm=lf_mesh_mm,
                 mf_mesh_mm=mf_mesh_mm,
                 hf_mesh_mm=hf_mesh_mm,
                 port_exit_mesh_mm=port_exit_mesh_mm,
+                fem_entry_names=fem_entry_names,
             )
             freq_min_hz = str(_input_value(inputs, "freq_min_hz") or "50").strip()
             freq_max_hz = str(_input_value(inputs, "freq_max_hz") or "20000").strip()
@@ -1466,6 +1632,20 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 raise RuntimeError(
                     "Passive cardioid coupled mode requires MF driver T/S in Driver LEM."
                 )
+            if fem_mf_enabled:
+                _parse_required_positive_float(
+                    fem_resolution_mm,
+                    "FEM tetrahedron size mm",
+                )
+                _parse_required_nonnegative_float(
+                    fem_loss_factor,
+                    "FEM interior loss factor",
+                )
+                if passive_cardioid_enabled:
+                    raise RuntimeError(
+                        "MF chamber FEM and Passive cardioid MF cannot yet be "
+                        "enabled in the same run."
+                    )
             for label, raw in (
                 ("LF rear chamber L", lf_driver_rear_volume_l),
                 ("MF rear chamber L", mf_driver_rear_volume_l),
@@ -1562,6 +1742,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "hf_driver_rear_volume_l": hf_driver_rear_volume_l,
                 "drive_voltage": drive_voltage,
                 "rg_ohm": rg_ohm,
+                "fem_mf_enabled": fem_mf_enabled,
+                "fem_component_name": fem_component_name,
+                "fem_driver_boundary": fem_driver_boundary,
+                "fem_entry_prefix": fem_entry_prefix,
+                "fem_resolution_mm": fem_resolution_mm,
+                "fem_loss_factor": fem_loss_factor,
             })
 
             stamp = _datetime.datetime.now().strftime("%y%m%d-%H%M%S")
@@ -1571,9 +1757,16 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             exports_dir = out_dir / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
             step_path = exports_dir / f"{design_name}.step"
+            fem_step_path = (
+                exports_dir / f"{design_name}_fem_air.step"
+                if fem_mf_enabled
+                else None
+            )
             fusion_archive_path = exports_dir / f"{design_name}.f3d"
 
             _export_step(design, step_path)
+            if fem_step_path is not None:
+                _export_step(design, fem_step_path, fem_component)
             _export_fusion_archive(design, fusion_archive_path)
 
             cmd = build_pipeline_command(
@@ -1634,6 +1827,13 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 hf_driver_rear_volume_l=hf_driver_rear_volume_l,
                 drive_voltage=drive_voltage,
                 rg_ohm=rg_ohm,
+                fem_chamber_step=fem_step_path,
+                fem_driver_boundary=fem_driver_boundary,
+                fem_entry_names=fem_entry_names,
+                fem_output_source="MF",
+                fem_output_tag=3,
+                fem_resolution_mm=fem_resolution_mm,
+                fem_loss_factor=fem_loss_factor,
             )
             pid = _launch_pipeline_background(
                 cmd,

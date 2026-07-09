@@ -305,8 +305,125 @@ def test_solver_surface_avg_to_self_impedance_uses_solver_space_then_conjugates(
     )
 
     omega = 2.0 * np.pi * freqs
-    expected = np.conjugate(1j * omega * p_avg_solver) / 0.02
+    # v = a/(-i*omega) under e^{-i omega t} (metal-bem 2026-07-09 sign fix),
+    # so z = -i*omega*p_avg before the engineering conjugation.
+    expected = np.conjugate(-1j * omega * p_avg_solver) / 0.02
     np.testing.assert_allclose(z_self, expected)
+
+
+def test_fem_chamber_coupling_synthesizes_entry_pressure_basis(tmp_path):
+    module = _load_script()
+    from types import SimpleNamespace
+    import meshio
+
+    length = 0.1
+    points = length * np.asarray(
+        [
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+        ],
+        dtype=np.float64,
+    )
+    tetra = np.asarray(
+        [
+            [0, 1, 2, 6], [0, 2, 3, 6], [0, 3, 7, 6],
+            [0, 7, 4, 6], [0, 4, 5, 6], [0, 5, 1, 6],
+        ],
+        dtype=np.int64,
+    )
+    face_counts = {}
+    face_values = {}
+    for cell in tetra:
+        for face in (
+            (cell[0], cell[1], cell[2]), (cell[0], cell[1], cell[3]),
+            (cell[0], cell[2], cell[3]), (cell[1], cell[2], cell[3]),
+        ):
+            key = tuple(sorted(int(value) for value in face))
+            face_counts[key] = face_counts.get(key, 0) + 1
+            face_values[key] = face
+    triangles = np.asarray(
+        [face_values[key] for key, count in face_counts.items() if count == 1],
+        dtype=np.int64,
+    )
+    centroids = np.mean(points[triangles], axis=1)
+    triangle_tags = np.full(triangles.shape[0], 1, dtype=np.int32)
+    triangle_tags[np.isclose(centroids[:, 0], 0.0)] = 100
+    triangle_tags[np.isclose(centroids[:, 0], length)] = 101
+    fem_mesh = tmp_path / "fem.msh"
+    meshio.write(
+        fem_mesh,
+        meshio.Mesh(
+            points=points,
+            cells=[("tetra", tetra), ("triangle", triangles)],
+            cell_data={
+                "gmsh:physical": [
+                    np.full(tetra.shape[0], 1000, dtype=np.int32),
+                    triangle_tags,
+                ],
+                "gmsh:geometrical": [
+                    np.full(tetra.shape[0], 1000, dtype=np.int32),
+                    triangle_tags,
+                ],
+            },
+            field_data={
+                "air": np.asarray([1000, 3], dtype=np.int32),
+                "rigid": np.asarray([1, 2], dtype=np.int32),
+                "FEM_DRIVER": np.asarray([100, 2], dtype=np.int32),
+                "MF_ENTRY_1": np.asarray([101, 2], dtype=np.int32),
+            },
+        ),
+        file_format="gmsh22",
+        binary=False,
+    )
+    frequencies = np.asarray([10.0, 20.0])
+    entry_basis = module.PressureBasis(
+        source_name="MF_ENTRY_1",
+        source_tag=20,
+        frequencies_hz=frequencies,
+        observation_angles_deg=np.asarray([0.0]),
+        observation_planes=np.asarray(["horizontal"]),
+        pressure_complex=np.ones((2, 1, 1), dtype=np.complex128),
+        source_area_m2=0.01,
+    )
+    source_result = {
+        "name": "MF_ENTRY_1",
+        "tag": 20,
+        "source_area_m2": 0.01,
+        "pressure_basis_npz": None,
+        "results_json": None,
+        "_pressure_basis": entry_basis,
+        "_surface_pressure_avg_by_tag_solver": {
+            20: np.zeros(2, dtype=np.complex128),
+        },
+    }
+    (tmp_path / "sources").mkdir()
+    args = SimpleNamespace(
+        fem_chamber_mesh=fem_mesh,
+        fem_entry=["MF_ENTRY_1"],
+        fem_output_source="MF",
+        fem_output_tag=3,
+        fem_driver_boundary="FEM_DRIVER",
+        fem_loss_factor=0.0,
+        fem_area_tolerance=0.05,
+        mesh_scale=1.0,
+        skip_per_driver_plots=True,
+        polar_distance_m=2.0,
+    )
+    results, sources, payload = module._apply_fem_chamber_coupling(
+        tmp_path,
+        args,
+        source_results=[source_result],
+        sources=[("MF_ENTRY_1", 20)],
+        source_mesh_valid={},
+        source_aperture_valid={},
+    )
+    assert sources == [("MF", 3)]
+    assert payload is not None and payload["status"] == "complete"
+    assert results[0]["name"] == "MF"
+    assert results[0]["_pressure_basis"].pressure_complex[:, 0, 0] == pytest.approx(
+        np.ones(2), rel=0.02
+    )
+    assert np.max(np.abs(results[0]["_acoustic_load_override"])) < 1.0e4
 
 
 def test_projected_area_helper_spherical_cap_matches_throat_area(tmp_path):
@@ -373,7 +490,7 @@ def test_basis_self_impedance_uses_projected_area_for_axial_curved_cap(tmp_path)
     )
 
     omega = 2.0 * np.pi * freqs
-    expected = np.conjugate(1j * omega * p_avg_solver) / projected_area
+    expected = np.conjugate(-1j * omega * p_avg_solver) / projected_area
     np.testing.assert_allclose(z_self, expected)
     assert payload["source_area_kind"] == "projected"
     assert payload["source_area_m2"] == pytest.approx(projected_area)
@@ -415,7 +532,7 @@ def test_basis_self_impedance_keeps_surface_area_for_normal_and_flat_sources(tmp
     omega = 2.0 * np.pi * freqs
     np.testing.assert_allclose(
         normal_z,
-        np.conjugate(1j * omega * p_avg_solver) / curved_surface,
+        np.conjugate(-1j * omega * p_avg_solver) / curved_surface,
     )
     assert "source_area_kind" not in normal_payload
     assert normal_payload["formula"].endswith("/S_tag")
@@ -442,7 +559,7 @@ def test_basis_self_impedance_keeps_surface_area_for_normal_and_flat_sources(tmp
     )
     np.testing.assert_allclose(
         flat_z,
-        np.conjugate(1j * omega * p_avg_solver) / flat_surface,
+        np.conjugate(-1j * omega * p_avg_solver) / flat_surface,
     )
     assert flat_payload["source_area_kind"] == "surface"
     assert flat_payload["projected_area_used"] is False
@@ -2364,7 +2481,7 @@ def test_postprocess_driver_lem_uses_results_json_surface_avg_once(
 
     assert payload["sources"]["LF"]["status"] == "complete"
     omega = 2.0 * np.pi * freqs
-    expected_z_self = np.conjugate(1j * omega * p_avg_solver) / 0.02
+    expected_z_self = np.conjugate(-1j * omega * p_avg_solver) / 0.02
     np.testing.assert_allclose(captured["z_self"], expected_z_self)
     rows = [
         line.split()

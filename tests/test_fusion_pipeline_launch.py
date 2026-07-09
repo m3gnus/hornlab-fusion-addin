@@ -362,6 +362,25 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--no-run-report" not in cmd
 
 
+def test_build_pipeline_command_forwards_fem_chamber_contract():
+    helper = _load_helper()
+    cmd = _helper_command(
+        helper,
+        sources="LF:20,HF:5,MF_ENTRY_1:8:20,MF_ENTRY_2:8:21",
+        fem_chamber_step=Path("/out/fem.step"),
+        fem_entry_names=["MF_ENTRY_1", "MF_ENTRY_2"],
+        fem_resolution_mm="6",
+        fem_loss_factor="0.004",
+    )
+    assert cmd[cmd.index("--fem-chamber-step") + 1] == "/out/fem.step"
+    assert [cmd[index + 1] for index, item in enumerate(cmd) if item == "--fem-entry"] == [
+        "MF_ENTRY_1",
+        "MF_ENTRY_2",
+    ]
+    assert cmd[cmd.index("--fem-resolution-mm") + 1] == "6"
+    assert cmd[cmd.index("--fem-loss-factor") + 1] == "0.004"
+
+
 def test_build_pipeline_command_forwards_output_skip_flags():
     helper = _load_helper()
     pipeline = _load_pipeline()
@@ -767,6 +786,28 @@ def test_build_source_specs_adds_generic_port_exit_tag_when_requested():
     )
 
     assert sources == "HF:5,PORT_EXIT:8:10"
+
+
+def test_build_source_specs_replaces_direct_mf_with_fem_entry_bases():
+    helper = _load_helper()
+    sources = helper.build_source_specs(
+        lf_mesh_mm="30",
+        mf_mesh_mm="8",
+        hf_mesh_mm="3",
+        fem_entry_names=["MF_ENTRY_1", "MF_ENTRY_2"],
+    )
+    assert sources == "LF:30,HF:3,MF_ENTRY_1:8:20,MF_ENTRY_2:8:21"
+
+
+def test_build_source_specs_fem_entries_require_mf_resolution():
+    helper = _load_helper()
+    with pytest.raises(ValueError, match="MF mesh mm"):
+        helper.build_source_specs(
+            lf_mesh_mm="",
+            mf_mesh_mm="",
+            hf_mesh_mm="3",
+            fem_entry_names=["MF_ENTRY_1"],
+        )
 
 
 def test_build_source_specs_rejects_generic_and_side_port_exits_together():

@@ -262,7 +262,14 @@ def main(argv: list[str] | None = None) -> int:
     print("Summary:")
     for status, run_dir, detail in summary:
         print(f"{status.upper()} {run_dir}: {detail}")
-    return 1 if any(status == "failed" for status, _run_dir, _detail in summary) else 0
+    return (
+        1
+        if any(
+            status in {"failed", "skipped"}
+            for status, _run_dir, _detail in summary
+        )
+        else 0
+    )
 
 
 def _failure_detail(run_dir: Path, result: subprocess.CompletedProcess) -> str:

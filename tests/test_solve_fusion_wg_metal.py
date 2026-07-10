@@ -4580,7 +4580,7 @@ def test_regenerate_driver_reports_skip_without_recoverable_launch(
     rc = driver.main([str(recoverable), str(unrecoverable), "--dry-run"])
 
     captured = capsys.readouterr()
-    assert rc == 0
+    assert rc == 1
     # Manifest commands are recoverable without the launch json.
     assert f"DRY-RUN {recoverable}" in captured.out
     assert f"SKIPPED {unrecoverable}" in captured.out

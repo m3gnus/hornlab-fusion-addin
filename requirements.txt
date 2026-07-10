@@ -4,8 +4,9 @@ scipy
 gmsh
 meshio
 
-# Direct BEM solves (Apple Silicon required)
-git+https://github.com/m3gnus/hornlab-metal-bem.git@06726228cc410296d4105f73a249b60b73681c9d
+# Direct BEM solves (Apple Silicon required). This revision includes the
+# corrected acceleration-drive sign used by absolute-phase exports.
+git+https://github.com/m3gnus/hornlab-metal-bem.git@09f3b0b0e99b23936cac31531b1f82c6e369ea44
 
 # Plot rendering dependencies used through hornlab-plots
 matplotlib
@@ -15,8 +16,9 @@ Pillow
 # which the solve step imports at module level). Discovery order is
 # top-level workspace siblings, legacy HornLab-internal fallbacks, then the
 # installed environment (see scripts/solve_fusion_wg_metal.py).
-git+https://github.com/m3gnus/hornlab-sim.git@218eabea11e8c6e7705857164e90dac551ba526a
-git+https://github.com/m3gnus/hornlab-plots.git@8585babaea27e0b8a687aa2cd8c01be96017a6c8
+# Includes hornlab_sim.methods.acoustic_fem for the optional MF chamber path.
+git+https://github.com/m3gnus/hornlab-sim.git@764e94fc49619193c8737da83c35b684a5ccfec6
+git+https://github.com/m3gnus/hornlab-plots.git@916ed784bb026838f47a380c542638da32080fa3
 
 # Tests
 pytest

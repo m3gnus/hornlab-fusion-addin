@@ -2328,6 +2328,42 @@ def test_pipeline_explicit_frame_bypasses_auto(tmp_path, monkeypatch):
     assert solve_cmd[solve_cmd.index("--frame-origin") + 1] == "0,0,0.42"
 
 
+def test_pipeline_validation_failure_finalizes_launch_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline = _load_pipeline()
+    launch_metadata = tmp_path / "fusion_addin_launch.json"
+    launch_metadata.write_text(
+        json.dumps({"status": "running"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "HORNLAB_FUSION_LAUNCH_METADATA",
+        str(launch_metadata),
+    )
+
+    with pytest.raises(SystemExit, match="complex-k-shift must be non-negative"):
+        pipeline.main(
+            [
+                "--step",
+                str(tmp_path / "design.step"),
+                "--out",
+                str(tmp_path / "out"),
+                "--source",
+                "HF:5",
+                "--complex-k-shift",
+                "-1",
+            ]
+        )
+
+    metadata = json.loads(launch_metadata.read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert metadata["returncode"] == 1
+    assert metadata["error"] == "--complex-k-shift must be non-negative"
+    assert metadata["finished_at"]
+
+
 def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     helper = _load_helper()
 

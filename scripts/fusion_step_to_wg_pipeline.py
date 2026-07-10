@@ -1890,7 +1890,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         returncode = _run_pipeline(args)
-    except SystemExit:
+    except SystemExit as exc:
+        returncode = exc.code if isinstance(exc.code, int) else 1
+        error = None if returncode == 0 else str(exc.code or "pipeline validation failed")
+        _finalize_run(
+            args,
+            returncode=returncode,
+            crash_error=error,
+        )
         raise
     except Exception as exc:
         _finalize_run(

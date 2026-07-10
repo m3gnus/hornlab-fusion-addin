@@ -75,6 +75,10 @@ To refresh postprocess artifacts from an existing run folder without re-solving:
   runs/fusion360/<run-folder>
 ```
 
+The command exits nonzero if a requested run cannot be reconstructed and is
+skipped, so shell scripts and CI do not mistake an incomplete regeneration for
+success.
+
 Then rebuild the per-run report and the output-root index:
 
 ```bash

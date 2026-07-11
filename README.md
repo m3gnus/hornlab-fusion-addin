@@ -40,12 +40,13 @@ under Advanced > Python (default: `<repo>/.venv/bin/python` when present).
 
 - Meshing/diagnostics and chamber FEM need `numpy`, `scipy`, `gmsh`, `meshio`.
 - Direct solves need [hornlab-metal-bem](https://github.com/m3gnus/hornlab-metal-bem)
-  (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages. The
-  latter two are not yet published standalone. Discovery order is top-level
-  workspace siblings next to this repo (`../hornlab-sim`, `../hornlab-plots`,
-  `../hornlab-metal-bem`), then legacy `../HornLab/*` checkouts, then packages
-  installed in the active environment. Without them the mesh-only path
-  (`Mesh only` in the dialog) still works.
+  (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages.
+  `requirements.txt` installs all three from their standalone GitHub
+  repositories. Discovery prefers top-level workspace siblings next to this
+  repo (`../hornlab-sim`, `../hornlab-plots`, `../hornlab-metal-bem`) when
+  present, then packages installed in the active environment; no legacy
+  monorepo checkout is probed. Without them the mesh-only path (`Mesh only` in
+  the dialog) still works.
 
 ## Tests
 

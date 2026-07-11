@@ -546,8 +546,12 @@ def test_fem_chamber_coupling_matches_loaded_tube_transfer_matrix(tmp_path):
         height_m=height_m,
     )
 
-    rho_air = 1.2
-    speed_of_sound_m_s = 343.0
+    # Derive the reference from the SAME constants the FEM interior uses so
+    # the oracle tracks the solver's medium (rho changed 1.2 -> 1.2041 once).
+    from hornlab_sim.methods import acoustic_fem as _fem_constants
+
+    rho_air = _fem_constants.RHO_AIR
+    speed_of_sound_m_s = _fem_constants.C_AIR
     k_length = np.asarray([0.12, 0.35, 0.65, 0.95, 1.25, 1.50])
     frequencies_hz = k_length * speed_of_sound_m_s / (2.0 * np.pi * length_m)
     omega = 2.0 * np.pi * frequencies_hz

@@ -22,7 +22,6 @@ RUN_MANIFESTS_DIR_NAME = "manifests"
 for package_dir in reversed(
     (
         REPO_ROOT.parent / "hornlab-plots",
-        REPO_ROOT.parent / "HornLab" / "hornlab-plots",
     )
 ):
     if package_dir.is_dir() and str(package_dir) not in sys.path:

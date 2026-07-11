@@ -45,17 +45,13 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
-# Workspace checkouts win over installed packages when present. The HornLab
-# helper packages may be checked out as top-level siblings or inside a sibling
-# HornLab repo; elsewhere imports resolve from the active environment.
+# Top-level workspace checkouts win over installed packages when present;
+# elsewhere imports resolve from the active environment.
 _WORKSPACE_PACKAGE_CANDIDATES = (
     REPO_ROOT / "fusion-addins" / "WGMetalPipeline",
     REPO_ROOT.parent / "hornlab-metal-bem",
     REPO_ROOT.parent / "hornlab-plots",
     REPO_ROOT.parent / "hornlab-sim",
-    REPO_ROOT.parent / "HornLab" / "hornlab-metal-bem",
-    REPO_ROOT.parent / "HornLab" / "hornlab-plots",
-    REPO_ROOT.parent / "HornLab" / "hornlab-sim",
 )
 for package_dir in reversed(_WORKSPACE_PACKAGE_CANDIDATES):
     if package_dir.is_dir() and str(package_dir) not in sys.path:

@@ -1896,9 +1896,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                             "to push the trustworthy band higher."
                         )
                     message = f"{note}\n\n{message}"
-            stale_warning = _stale_install_warning()
-            if stale_warning:
-                message = f"{stale_warning}\n\n{message}"
             _show_message(message)
         except Exception:
             _show_message(traceback.format_exc())

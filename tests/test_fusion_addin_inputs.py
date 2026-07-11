@@ -212,6 +212,16 @@ def test_stale_install_warning_points_to_symlink_reinstall(tmp_path, monkeypatch
     assert "--symlink --replace" in warning
 
 
+def test_execute_handler_checks_stale_install_only_before_launch():
+    source = ADDIN.read_text(encoding="utf-8")
+    start = source.index("class CommandExecuteHandler")
+    end = source.index("\ndef _find_addins_panel", start)
+    handler_source = source[start:end]
+
+    assert handler_source.count("_stale_install_warning()") == 1
+    assert "raise RuntimeError(stale_warning)" in handler_source
+
+
 def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
     addin = _load_addin_with_fake_adsk()
     driver_ids = [

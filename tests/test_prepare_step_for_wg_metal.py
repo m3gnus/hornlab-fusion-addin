@@ -109,6 +109,70 @@ def test_occ_healing_fallbacks_try_sewing_before_broad_repair():
     )
 
 
+def test_occ_healing_fallback_retries_after_anchor_rejection(capsys):
+    module = _load_script()
+    attempts = []
+    expected_state = {"source_surfaces": {"HF": [101]}}
+
+    def run_attempt(*, occ_healing_options, surface_order_reference):
+        attempts.append((occ_healing_options, surface_order_reference))
+        if occ_healing_options == module.OCC_HEALING_FALLBACKS[0][1]:
+            raise RuntimeError(
+                "cannot anchor healed OCC surfaces: surface count mismatch"
+            )
+        return expected_state
+
+    state, mode = module._run_occ_healing_fallbacks(
+        run_attempt,
+        original_mesh_error=RuntimeError("unhealed gmsh meshing failed"),
+        original_traceback=None,
+        surface_order_reference=[((0.0, 0.0, 0.0), 1.0)],
+    )
+
+    assert state is expected_state
+    assert mode == "full"
+    assert [attempt[0] for attempt in attempts] == [
+        mode_options for _mode, mode_options in module.OCC_HEALING_FALLBACKS
+    ]
+    assert "OCC sew repair rejected before meshing" in capsys.readouterr().err
+
+
+def test_occ_healing_fallback_reraises_original_with_rejection_reasons(capsys):
+    module = _load_script()
+    original_error = RuntimeError("unhealed gmsh meshing failed")
+    attempts = []
+
+    def run_attempt(*, occ_healing_options, surface_order_reference):
+        attempts.append(occ_healing_options)
+        if occ_healing_options == module.OCC_HEALING_FALLBACKS[0][1]:
+            raise RuntimeError(
+                "cannot anchor healed OCC surfaces: surface count mismatch"
+            )
+        return {"mesh_generation_error": RuntimeError("full repair did not mesh")}
+
+    with pytest.raises(RuntimeError, match="unhealed gmsh meshing failed") as raised:
+        module._run_occ_healing_fallbacks(
+            run_attempt,
+            original_mesh_error=original_error,
+            original_traceback=None,
+            surface_order_reference=[((0.0, 0.0, 0.0), 1.0)],
+        )
+
+    assert raised.value is original_error
+    assert attempts == [
+        mode_options for _mode, mode_options in module.OCC_HEALING_FALLBACKS
+    ]
+    stderr = capsys.readouterr().err
+    assert "OCC sew repair rejected before meshing" in stderr
+    assert "OCC full repair mesh generation failed" in stderr
+    assert "Original gmsh error: unhealed gmsh meshing failed" in stderr
+    if hasattr(original_error, "add_note"):
+        assert any(
+            "OCC healing fallback rejection reasons" in note
+            for note in original_error.__notes__
+        )
+
+
 def test_anchor_surface_order_fails_loudly_on_bad_input():
     module = _load_script()
 

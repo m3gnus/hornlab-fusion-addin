@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -322,28 +323,37 @@ def _mesh_frequency_status(prep_manifest: dict[str, Any]) -> str:
 def _per_source_max_valid_hz(
     prep_manifest: dict[str, Any],
     sources: list[str],
+    *,
+    additional_max_valid_hz: dict[str, float] | None = None,
 ) -> dict[str, float]:
     validation = prep_manifest.get("mesh_frequency_validation", {})
-    if not isinstance(validation, dict):
-        return {}
-    per_source = validation.get("per_source", {})
+    per_source = validation.get("per_source", {}) if isinstance(validation, dict) else {}
     if not isinstance(per_source, dict):
-        return {}
+        per_source = {}
     limits: dict[str, float] = {}
     for source in sources:
         name, _ = _source_name_tag(source)
         source_validation = per_source.get(name)
-        if not isinstance(source_validation, dict):
-            continue
-        raw_limit = source_validation.get(
-            "effective_max_valid_frequency_hz",
-            source_validation.get("max_valid_frequency_hz"),
-        )
-        try:
-            max_valid = float(raw_limit)
-        except (TypeError, ValueError):
-            continue
-        if max_valid > 0.0:
+        max_valid: float | None = None
+        if isinstance(source_validation, dict):
+            raw_limit = source_validation.get(
+                "effective_max_valid_frequency_hz",
+                source_validation.get("max_valid_frequency_hz"),
+            )
+            try:
+                candidate = float(raw_limit)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if math.isfinite(candidate) and candidate > 0.0:
+                max_valid = candidate
+        if additional_max_valid_hz is not None:
+            try:
+                additional = float(additional_max_valid_hz[name])
+            except (KeyError, TypeError, ValueError):
+                additional = 0.0
+            if math.isfinite(additional) and additional > 0.0:
+                max_valid = additional if max_valid is None else min(max_valid, additional)
+        if max_valid is not None:
             limits[name] = max_valid
     return limits
 
@@ -380,8 +390,14 @@ def _per_source_radiating_valid_hz(
 def _clamped_solve_max_frequency_hz(
     prep_manifest: dict[str, Any],
     sources: list[str],
+    *,
+    additional_max_valid_hz: dict[str, float] | None = None,
 ) -> float | None:
-    limits = _per_source_max_valid_hz(prep_manifest, sources)
+    limits = _per_source_max_valid_hz(
+        prep_manifest,
+        sources,
+        additional_max_valid_hz=additional_max_valid_hz,
+    )
     if limits:
         return min(limits.values())
 
@@ -393,6 +409,157 @@ def _clamped_solve_max_frequency_hz(
     except (KeyError, TypeError, ValueError):
         return None
     return max_valid if max_valid > 0.0 else None
+
+
+def _positive_finite_manifest_value(
+    raw: object,
+    *,
+    description: str,
+) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{description} must be a positive finite number") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{description} must be a positive finite number")
+    return value
+
+
+def _fem_manifest_max_valid_frequency_hz(fem_manifest: dict[str, Any]) -> float:
+    return _positive_finite_manifest_value(
+        fem_manifest.get("max_valid_frequency_hz"),
+        description="FEM chamber manifest max_valid_frequency_hz",
+    )
+
+
+def _fem_interface_areas_m2(
+    fem_manifest: dict[str, Any],
+    fem_entries: list[str],
+) -> dict[str, float]:
+    physical_groups = fem_manifest.get("physical_groups", {})
+    if not isinstance(physical_groups, dict):
+        raise ValueError("FEM chamber manifest has invalid physical_groups payload")
+    interfaces = physical_groups.get("interfaces", [])
+    if not isinstance(interfaces, list):
+        raise ValueError("FEM chamber manifest has invalid physical_groups.interfaces payload")
+
+    wanted = {name.casefold(): name for name in fem_entries}
+    areas: dict[str, float] = {}
+    for interface in interfaces:
+        if not isinstance(interface, dict):
+            continue
+        name = str(interface.get("name", "")).strip()
+        requested_name = wanted.get(name.casefold())
+        if requested_name is None:
+            continue
+        if requested_name in areas:
+            raise ValueError(
+                f"FEM chamber manifest lists interface {requested_name!r} more than once"
+            )
+        areas[requested_name] = _positive_finite_manifest_value(
+            interface.get("area_m2"),
+            description=f"FEM chamber interface {requested_name!r} area_m2",
+        )
+
+    missing = [name for name in fem_entries if name not in areas]
+    if missing:
+        raise ValueError(
+            "FEM chamber manifest is missing requested interface(s): "
+            + ", ".join(missing)
+        )
+    return areas
+
+
+def _bem_prep_interface_areas_m2(
+    prep_manifest: dict[str, Any],
+    fem_entries: list[str],
+    *,
+    default_unit_scale_to_m: float,
+) -> tuple[dict[str, float], float, dict[str, int]]:
+    sources = prep_manifest.get("sources", {})
+    if not isinstance(sources, dict):
+        raise ValueError("prepare manifest has invalid sources payload")
+    unit_scale_to_m = _positive_finite_manifest_value(
+        prep_manifest.get("unit_scale_to_m", default_unit_scale_to_m),
+        description="prepare manifest unit_scale_to_m",
+    )
+
+    areas: dict[str, float] = {}
+    tags: dict[str, int] = {}
+    for name in fem_entries:
+        source = sources.get(name)
+        if not isinstance(source, dict):
+            raise ValueError(
+                f"prepare manifest has no source diagnostics for FEM entry {name!r}"
+            )
+        diagnostics = source.get("surface_diagnostics")
+        if not isinstance(diagnostics, list) or not diagnostics:
+            raise ValueError(
+                "prepare manifest has no surface diagnostics for FEM entry "
+                f"{name!r}; cannot preflight its FEM/BEM interface area"
+            )
+        try:
+            tags[name] = int(source["tag"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"prepare manifest has invalid physical tag for FEM entry {name!r}"
+            ) from exc
+        area_step_units2 = 0.0
+        for index, diagnostic in enumerate(diagnostics, start=1):
+            if not isinstance(diagnostic, dict):
+                raise ValueError(
+                    "prepare manifest has invalid surface diagnostics for FEM entry "
+                    f"{name!r} (row {index})"
+                )
+            area_step_units2 += _positive_finite_manifest_value(
+                diagnostic.get("area_step_units2"),
+                description=(
+                    "prepare manifest surface diagnostic area_step_units2 for FEM "
+                    f"entry {name!r} (row {index})"
+                ),
+            )
+        areas[name] = area_step_units2 * unit_scale_to_m**2
+    return areas, unit_scale_to_m, tags
+
+
+def _fem_bem_interface_area_preflight(
+    fem_manifest: dict[str, Any],
+    prep_manifest: dict[str, Any],
+    fem_entries: list[str],
+    *,
+    area_tolerance: float,
+    default_unit_scale_to_m: float,
+) -> dict[str, Any]:
+    fem_areas = _fem_interface_areas_m2(fem_manifest, fem_entries)
+    bem_areas, bem_unit_scale_to_m, bem_tags = _bem_prep_interface_areas_m2(
+        prep_manifest,
+        fem_entries,
+        default_unit_scale_to_m=default_unit_scale_to_m,
+    )
+    entries: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    for name in fem_entries:
+        fem_area = fem_areas[name]
+        bem_area = bem_areas[name]
+        relative_difference = abs(fem_area - bem_area) / max(fem_area, bem_area)
+        entry = {
+            "name": name,
+            "bem_tag": bem_tags[name],
+            "fem_area_m2": fem_area,
+            "bem_area_m2": bem_area,
+            "relative_difference": relative_difference,
+        }
+        entries.append(entry)
+        if relative_difference > area_tolerance:
+            mismatches.append(entry)
+    return {
+        "status": "failed" if mismatches else "passed",
+        "area_tolerance": float(area_tolerance),
+        "bem_unit_scale_to_m": bem_unit_scale_to_m,
+        "bem_area_provenance": "prepare manifest sources.*.surface_diagnostics",
+        "entries": entries,
+        "mismatches": mismatches,
+    }
 
 
 def _open_output_folder(path: Path) -> None:
@@ -501,6 +668,18 @@ def _finalize_run(args: argparse.Namespace, *, returncode: int, crash_error: str
                     for name, freq_max_hz in sorted(mesh_valid.items())
                 )
                 detail += f" (full band; mesh-valid to {limits})"
+        fem_chamber = manifest.get("fem_chamber", {})
+        fem_limit = (
+            fem_chamber.get("max_valid_frequency_hz")
+            if isinstance(fem_chamber, dict)
+            else None
+        )
+        try:
+            fem_limit_hz = float(fem_limit)
+        except (TypeError, ValueError):
+            fem_limit_hz = 0.0
+        if math.isfinite(fem_limit_hz) and fem_limit_hz > 0.0:
+            detail += f" (FEM chamber valid to {fem_limit_hz:.0f} Hz)"
         skipped = adjustment.get("skipped_sources")
         if skipped:
             names = ", ".join(str(item.get("name")) for item in skipped)
@@ -672,6 +851,19 @@ def _apply_preset_defaults(args: argparse.Namespace, argv: list[str]) -> None:
         return
     settings = load_preset(args.preset)
     args.preset_path = str(args.preset)
+    if _preset_bool(settings, "fem_mf_enabled"):
+        if not _argv_has_option(argv, "--fem-chamber-step"):
+            raise SystemExit(
+                "preset enables MF chamber FEM, but the chamber STEP export is not "
+                "stored in presets; pass --fem-chamber-step PATH plus the matching "
+                "--fem-entry option(s)"
+            )
+        if not _argv_has_option(argv, "--source", "--sources"):
+            raise SystemExit(
+                "preset enables MF chamber FEM, but concrete FEM entry source names "
+                "are not stored in presets; pass --sources with each MF_ENTRY source "
+                "and its tag, plus matching --fem-entry option(s)"
+            )
     _apply_preset_sources(args, argv, settings)
     for key, dest, options, caster in (
         ("transition_mm", "transition_mm", ("--transition-mm",), float),
@@ -1349,6 +1541,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         return prep_returncode
 
     fem_mesh_path: Path | None = None
+    fem_manifest_path: Path | None = None
+    fem_entry_max_valid_hz: dict[str, float] = {}
     if args.fem_chamber_step is not None:
         fem_step_path = args.fem_chamber_step.expanduser().resolve()
         fem_dir = out_dir / "fem"
@@ -1407,7 +1601,56 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "loss_factor": float(args.fem_loss_factor),
         }
 
-    prep_manifest = _read_json(prep_manifest_path)
+    try:
+        prep_manifest = _read_json(prep_manifest_path)
+        if not isinstance(prep_manifest, dict):
+            raise ValueError("prepare manifest root must be a JSON object")
+    except (OSError, ValueError) as exc:
+        pipeline_manifest["status"] = "failed"
+        pipeline_manifest["error"] = f"could not read prepare manifest: {exc}"
+        _write_json(pipeline_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
+        return 1
+
+    manifest_sources = prep_manifest.get("sources", {})
+    if not isinstance(manifest_sources, dict):
+        pipeline_manifest["status"] = "failed"
+        pipeline_manifest["error"] = "prepare manifest has invalid sources payload"
+        _write_json(pipeline_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
+        return 1
+    skipped_sources = prep_manifest.get("skipped_sources", {})
+    pipeline_manifest["skipped_sources"] = skipped_sources
+    if fem_mesh_path is not None:
+        missing_fem_entries = [name for name in fem_entries if name not in manifest_sources]
+        if missing_fem_entries:
+            skipped_records = skipped_sources if isinstance(skipped_sources, dict) else {}
+            missing_records = []
+            for name in missing_fem_entries:
+                record = skipped_records.get(name)
+                reason = record.get("reason") if isinstance(record, dict) else None
+                missing_records.append(
+                    {
+                        "name": name,
+                        "reason": str(reason or "not present in prepare manifest"),
+                    }
+                )
+            pipeline_manifest["fem_chamber"]["entry_source_validation"] = {
+                "status": "failed",
+                "missing_entries": missing_records,
+            }
+            details = "; ".join(
+                f"{entry['name']}: {entry['reason']}" for entry in missing_records
+            )
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = (
+                "FEM entry source(s) were omitted from the prepared exterior BEM mesh: "
+                f"{details}. Paint each matching exterior BEM face with the same "
+                "--fem-entry name and rerun; do not proceed with a missing FEM entry."
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 1
     try:
         sources = _sources_present_in_manifest(sources, prep_manifest)
     except ValueError as exc:
@@ -1417,7 +1660,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         _open_requested_outputs(args, out_dir)
         return 1
     pipeline_manifest["sources"] = sources
-    pipeline_manifest["skipped_sources"] = prep_manifest.get("skipped_sources", {})
     pipeline_manifest["density"] = prep_manifest.get("density", {})
     pipeline_manifest["mesh_repair"] = prep_manifest.get("mesh_repair", {})
     pipeline_manifest["topology"] = prep_manifest.get("topology", {})
@@ -1435,6 +1677,69 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         symmetry_planes = tuple(prep_manifest.get("symmetry_planes") or ())
         pipeline_manifest["symmetry_planes"] = list(symmetry_planes)
         pipeline_manifest["quadrants"] = _quadrants_for_planes(symmetry_planes)
+
+    if fem_mesh_path is not None:
+        assert fem_manifest_path is not None
+        try:
+            fem_manifest = _read_json(fem_manifest_path)
+            if not isinstance(fem_manifest, dict):
+                raise ValueError("FEM chamber manifest root must be a JSON object")
+            fem_max_valid_hz = _fem_manifest_max_valid_frequency_hz(fem_manifest)
+            area_preflight = _fem_bem_interface_area_preflight(
+                fem_manifest,
+                prep_manifest,
+                fem_entries,
+                area_tolerance=float(args.fem_area_tolerance),
+                default_unit_scale_to_m=float(args.unit_scale_to_m),
+            )
+        except (OSError, ValueError) as exc:
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = (
+                "could not validate FEM chamber manifest and BEM entry interfaces: "
+                f"{exc}"
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 1
+        fem_entry_max_valid_hz = {name: fem_max_valid_hz for name in fem_entries}
+        pipeline_manifest["fem_chamber"].update(
+            {
+                "max_valid_frequency_hz": fem_max_valid_hz,
+                "entry_mesh_valid_frequency_hz": dict(fem_entry_max_valid_hz),
+                "entry_source_validation": {
+                    "status": "passed",
+                    "entries": list(fem_entries),
+                },
+                "interface_area_preflight": area_preflight,
+            }
+        )
+        if area_preflight["status"] != "passed":
+            mismatch_text = "; ".join(
+                (
+                    f"{entry['name']}: FEM {entry['fem_area_m2']:.6g} m2 vs "
+                    f"BEM {entry['bem_area_m2']:.6g} m2 "
+                    f"({entry['relative_difference']:.1%})"
+                )
+                for entry in area_preflight["mismatches"]
+            )
+            symmetry_text = (
+                "The exterior BEM model is symmetry-reduced on "
+                f"{', '.join(symmetry_planes)}; "
+                if symmetry_planes
+                else "With symmetry-reduced exterior BEM runs, "
+            )
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = (
+                f"FEM/BEM interface area preflight failed: {mismatch_text}. "
+                f"{symmetry_text}each FEM entry must lie entirely within the "
+                "modeled symmetry domain; do not let an entry straddle a symmetry "
+                "cut plane. Repaint/export the matching exterior BEM face instead "
+                "of raising --fem-area-tolerance."
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 2
+
     mirror_axes = _mirror_axes_for_symmetry_planes(symmetry_planes)
     if args.mirror_axes and args.mirror_axes != "auto":
         mirror_axes = args.mirror_axes
@@ -1564,16 +1869,32 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     solve_freq_max_hz = args.freq_max_hz
     solve_sources = _order_sources_for_direct_solve(sources)
     solve_source_freq_max: dict[str, float] = {}
+    effective_source_limits = _per_source_max_valid_hz(
+        prep_manifest,
+        sources,
+        additional_max_valid_hz=fem_entry_max_valid_hz,
+    )
+    has_underresolved_limit = any(
+        limit < args.freq_max_hz for limit in effective_source_limits.values()
+    )
+    validation_cause = (
+        "active source or FEM chamber mesh frequency validation"
+        if fem_entry_max_valid_hz
+        else "active source mesh frequency validation"
+    )
     if run_solves:
         if (
             not args.allow_underresolved_solve
-            and _mesh_frequency_status(prep_manifest) == "invalid"
+            and (
+                _mesh_frequency_status(prep_manifest) == "invalid"
+                or has_underresolved_limit
+            )
         ):
             pipeline_manifest["underresolved_solve_policy"] = args.underresolved_solve_policy
             if args.underresolved_solve_policy == "fail":
                 pipeline_manifest["status"] = "failed"
                 pipeline_manifest["error"] = (
-                    "active source mesh frequency validation failed; rerun with finer source mesh, "
+                    f"{validation_cause} failed; rerun with finer source/FEM mesh, "
                     "lower --freq-max-hz, use --underresolved-solve-policy clamp-per-source/warn/clamp, "
                     "or pass --allow-underresolved-solve for debugging"
                 )
@@ -1582,7 +1903,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 return 2
 
             if args.underresolved_solve_policy == "warn":
-                limits = _per_source_max_valid_hz(prep_manifest, sources)
+                limits = effective_source_limits
                 pipeline_manifest["solve_frequency_adjustment"] = {
                     "policy": "warn",
                     "requested_freq_min_hz": float(args.freq_min_hz),
@@ -1592,10 +1913,38 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                         for name, limit in limits.items()
                         if limit < args.freq_max_hz
                     },
-                    "reason": "active source mesh frequency validation failed but policy is warning-only",
+                    "reason": f"{validation_cause} failed but policy is warning-only",
                 }
             elif args.underresolved_solve_policy == "clamp-per-source":
-                limits = _per_source_max_valid_hz(prep_manifest, sources)
+                limits = effective_source_limits
+                blocked_fem_entries = [
+                    {
+                        "name": name,
+                        "max_valid_frequency_hz": float(limits[name]),
+                    }
+                    for name in fem_entries
+                    if name in limits and limits[name] < args.freq_min_hz
+                ]
+                if blocked_fem_entries:
+                    details = ", ".join(
+                        f"{entry['name']} ({entry['max_valid_frequency_hz']:.6g} Hz)"
+                        for entry in blocked_fem_entries
+                    )
+                    pipeline_manifest["status"] = "failed"
+                    pipeline_manifest["error"] = (
+                        "clamp-per-source cannot drop FEM entry source(s) below "
+                        f"--freq-min-hz: {details}. These entries are one FEM/BEM "
+                        "coupling group; lower --freq-min-hz or use finer FEM/BEM meshes."
+                    )
+                    pipeline_manifest["solve_frequency_adjustment"] = {
+                        "policy": "clamp-per-source",
+                        "requested_freq_min_hz": float(args.freq_min_hz),
+                        "requested_freq_max_hz": float(args.freq_max_hz),
+                        "blocked_fem_entries": blocked_fem_entries,
+                    }
+                    _write_json(pipeline_manifest_path, pipeline_manifest)
+                    _open_requested_outputs(args, out_dir)
+                    return 2
                 kept_sources: list[str] = []
                 skipped_solve_sources: list[dict[str, Any]] = []
                 for source in sources:
@@ -1637,12 +1986,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     "per_source_freq_max_hz": dict(solve_source_freq_max),
                     "skipped_sources": skipped_solve_sources,
                     "reason": (
-                        "active source mesh frequency validation failed; each source "
+                        f"{validation_cause} failed; each source "
                         "solves up to its own conservative mesh-valid limit"
                     ),
                 }
             else:
-                clamped_freq_max_hz = _clamped_solve_max_frequency_hz(prep_manifest, sources)
+                clamped_freq_max_hz = _clamped_solve_max_frequency_hz(
+                    prep_manifest,
+                    sources,
+                    additional_max_valid_hz=fem_entry_max_valid_hz,
+                )
                 if clamped_freq_max_hz is None:
                     pipeline_manifest["status"] = "failed"
                     pipeline_manifest["error"] = "could not determine a mesh-valid solve frequency limit"
@@ -1670,7 +2023,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     "requested_freq_min_hz": float(args.freq_min_hz),
                     "requested_freq_max_hz": float(args.freq_max_hz),
                     "clamped_freq_max_hz": float(solve_freq_max_hz),
-                    "reason": "active source mesh frequency validation failed",
+                    "reason": f"{validation_cause} failed",
                 }
         elif args.allow_underresolved_solve:
             pipeline_manifest["underresolved_solve_policy"] = "allow"
@@ -1680,6 +2033,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             str(SOLVE_SCRIPT),
             "--mesh",
             str(solve_mesh_path),
+            "--mesh-scale",
+            str(args.unit_scale_to_m),
             "--out",
             str(out_dir),
             "--freq-min-hz",
@@ -1807,7 +2162,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         # mesh-valid marker overlay (--no-mesh-valid-markers); the solve band
         # and the authoritative mesh-valid records above are unaffected.
         if args.mesh_valid_markers:
-            effective_valid = _per_source_max_valid_hz(prep_manifest, solve_sources)
+            effective_valid = _per_source_max_valid_hz(
+                prep_manifest,
+                solve_sources,
+                additional_max_valid_hz=fem_entry_max_valid_hz,
+            )
             radiating_valid = _per_source_radiating_valid_hz(prep_manifest, solve_sources)
             solve_overlay: dict[str, float] = {}
             solve_overlay_aperture: dict[str, float] = {}

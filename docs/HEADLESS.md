@@ -45,6 +45,34 @@ Without a preset, provide the source mesh settings explicitly:
   --skip-missing-sources
 ```
 
+## FEM Chamber Runs
+
+A FEM-enabled preset retains its dialog settings but not the separate chamber
+STEP export. Supply that export explicitly on every headless replay; the
+wrapper stops with an actionable error if a FEM-enabled preset omits it.
+
+```bash
+.venv/bin/python scripts/fusion_step_to_wg_pipeline.py \
+  --step exports/design.step \
+  --out runs/fusion360/fem-headless \
+  --preset fem-baseline \
+  --fem-chamber-step exports/FEM_MF_AIR.step \
+  --sources MF_ENTRY_1:8:20,MF_ENTRY_2:8:21 \
+  --fem-entry MF_ENTRY_1 \
+  --fem-entry MF_ENTRY_2 \
+  --run-solves \
+  --skip-missing-sources
+```
+
+`--fem-entry` is repeatable and each name must be present both on the chamber
+STEP boundary and on its matching exterior BEM source face. The explicit
+`--sources` list must replace direct `MF` with those entry sources; use tags
+starting at 20, as shown. The remaining FEM flags are optional when their
+defaults fit the run: `--fem-driver-boundary`, `--fem-output-source`,
+`--fem-output-tag`, `--fem-resolution-mm`, `--fem-loss-factor`, and
+`--fem-area-tolerance`. With symmetry reduction, keep each entry entirely
+inside the modeled BEM symmetry domain.
+
 ## Sweep A Parameter
 
 When overriding sources, provide the full source set because `--sources`

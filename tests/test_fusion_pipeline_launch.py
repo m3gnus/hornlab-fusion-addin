@@ -902,6 +902,69 @@ def test_pipeline_preset_defaults_keep_explicit_cli_precedence(tmp_path):
     assert args.mesh_only is False
 
 
+def test_pipeline_rejects_fem_enabled_preset_without_chamber_step(tmp_path):
+    pipeline = _load_pipeline()
+    preset = tmp_path / "fem-headless.json"
+    preset.write_text(
+        json.dumps(
+            {
+                "settings_version": 13,
+                "fem_mf_enabled": True,
+                "mf_mesh_mm": "8",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="fem-chamber-step"):
+        pipeline.parse_args(
+            [
+                "--step",
+                "/tmp/design.step",
+                "--out",
+                "/tmp/out",
+                "--preset",
+                str(preset),
+                "--source",
+                "MF_ENTRY_1:8:20",
+            ]
+        )
+
+    with pytest.raises(SystemExit, match="concrete FEM entry source names"):
+        pipeline.parse_args(
+            [
+                "--step",
+                "/tmp/design.step",
+                "--out",
+                "/tmp/out",
+                "--preset",
+                str(preset),
+                "--fem-chamber-step",
+                "/tmp/fem.step",
+                "--fem-entry",
+                "MF_ENTRY_1",
+            ]
+        )
+
+    args = pipeline.parse_args(
+        [
+            "--step",
+            "/tmp/design.step",
+            "--out",
+            "/tmp/out",
+            "--preset",
+            str(preset),
+            "--source",
+            "MF_ENTRY_1:8:20",
+            "--fem-chamber-step",
+            "/tmp/fem.step",
+            "--fem-entry",
+            "MF_ENTRY_1",
+        ]
+    )
+    assert args.fem_chamber_step == Path("/tmp/fem.step")
+
+
 def test_pipeline_normalizes_explicit_port_exit_source_tags():
     pipeline = _load_pipeline()
 
@@ -1031,6 +1094,7 @@ def _fake_run_logged(
     calls,
     *,
     prep_manifest_payload,
+    fem_manifest_payload=None,
     solve_manifest_payload=None,
     frame_inference=None,
 ):
@@ -1041,6 +1105,13 @@ def _fake_run_logged(
         if script_name == "prepare_step_for_wg_metal.py":
             (out_dir / "manifest.json").write_text(
                 json.dumps(prep_manifest_payload) + "\n",
+                encoding="utf-8",
+            )
+        elif script_name == "prepare_fem_chamber.py":
+            if fem_manifest_payload is None:
+                raise AssertionError("unexpected FEM chamber preparation")
+            (out_dir / "fem_chamber_mesh_manifest.json").write_text(
+                json.dumps(fem_manifest_payload) + "\n",
                 encoding="utf-8",
             )
         elif script_name == "diagnose_wg_metal_orientation.py":
@@ -1099,6 +1170,322 @@ def _underresolved_prep_manifest():
             "warnings": ["underresolved"],
         },
     }
+
+
+def _fem_ready_prep_manifest(
+    *,
+    entry_name="MF_ENTRY_1",
+    entry_tag=20,
+    entry_area_step_units2=10_000.0,
+    entry_max_valid_hz=25_000.0,
+):
+    return {
+        "sources": {
+            entry_name: {
+                "tag": entry_tag,
+                "surface_diagnostics": [
+                    {"area_step_units2": entry_area_step_units2},
+                ],
+            },
+        },
+        "skipped_sources": {},
+        "unit_scale_to_m": 0.001,
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "wg_source_meshes_m": {},
+        "solver_ready": True,
+        "symmetry_planes": ["x0", "y0"],
+        "mesh_frequency_validation": {
+            "status": "valid",
+            "requested_max_frequency_hz": 20_000.0,
+            "max_valid_frequency_hz": entry_max_valid_hz,
+            "per_source": {
+                entry_name: {
+                    "max_valid_frequency_hz": entry_max_valid_hz,
+                    "status": "valid",
+                },
+            },
+            "warnings": [],
+        },
+    }
+
+
+def _fem_chamber_manifest(
+    *,
+    entry_name="MF_ENTRY_1",
+    entry_area_m2=0.01,
+    max_valid_frequency_hz=5_400.0,
+):
+    return {
+        "max_valid_frequency_hz": max_valid_frequency_hz,
+        "physical_groups": {
+            "interfaces": [
+                {"name": "FEM_DRIVER", "area_m2": 0.02},
+                {"name": entry_name, "area_m2": entry_area_m2},
+            ],
+        },
+    }
+
+
+def test_pipeline_applies_fem_mesh_limit_to_entry_policy_and_overlay(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    notifications = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_fem_ready_prep_manifest(),
+            fem_manifest_payload=_fem_chamber_manifest(),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_notify",
+        lambda title, message: notifications.append((title, message)),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "MF_ENTRY_1:8:20",
+            "--fem-chamber-step",
+            str(tmp_path / "fem.step"),
+            "--fem-entry",
+            "MF_ENTRY_1",
+            "--run-solves",
+            "--notify",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 0
+    assert [name for name, _cmd in calls] == [
+        "prepare_step_for_wg_metal.py",
+        "prepare_fem_chamber.py",
+        "diagnose_wg_metal_orientation.py",
+        "solve_fusion_wg_metal.py",
+    ]
+    solve_cmd = calls[-1][1]
+    assert _option_values(solve_cmd, "--source-mesh-valid-hz") == [
+        "MF_ENTRY_1:5400.0",
+    ]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["fem_chamber"]["max_valid_frequency_hz"] == pytest.approx(5400.0)
+    assert manifest["fem_chamber"]["entry_mesh_valid_frequency_hz"] == {
+        "MF_ENTRY_1": 5400.0,
+    }
+    assert manifest["solve_frequency_adjustment"]["policy"] == "warn"
+    assert manifest["solve_frequency_adjustment"]["mesh_valid_freq_max_hz"] == {
+        "MF_ENTRY_1": 5400.0,
+    }
+    assert "FEM chamber valid to 5400 Hz" in notifications[-1][1]
+
+
+def test_pipeline_fails_fem_area_preflight_before_diagnostic(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_fem_ready_prep_manifest(
+                entry_area_step_units2=5_000.0,
+            ),
+            fem_manifest_payload=_fem_chamber_manifest(entry_area_m2=0.01),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "MF_ENTRY_1:8:20",
+            "--fem-chamber-step",
+            str(tmp_path / "fem.step"),
+            "--fem-entry",
+            "MF_ENTRY_1",
+            "--run-solves",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 2
+    assert [name for name, _cmd in calls] == [
+        "prepare_step_for_wg_metal.py",
+        "prepare_fem_chamber.py",
+    ]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    preflight = manifest["fem_chamber"]["interface_area_preflight"]
+    assert preflight["status"] == "failed"
+    assert preflight["entries"][0]["bem_area_m2"] == pytest.approx(0.005)
+    assert "symmetry" in manifest["error"]
+    assert "straddle" in manifest["error"]
+
+
+def test_pipeline_reports_skipped_fem_entry_before_diagnostic(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = _fem_ready_prep_manifest()
+    prep_manifest["sources"] = {
+        "HF": {
+            "tag": 4,
+            "surface_diagnostics": [{"area_step_units2": 1_000.0}],
+        },
+    }
+    prep_manifest["skipped_sources"] = {
+        "MF_ENTRY_1": {
+            "tag": 20,
+            "reason": "no exterior face was painted MF_ENTRY_1",
+        },
+    }
+    prep_manifest["mesh_frequency_validation"]["per_source"] = {
+        "HF": {"max_valid_frequency_hz": 25_000.0, "status": "valid"},
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=prep_manifest,
+            fem_manifest_payload=_fem_chamber_manifest(),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "MF_ENTRY_1:8:20",
+            "--source",
+            "HF:5:4",
+            "--fem-chamber-step",
+            str(tmp_path / "fem.step"),
+            "--fem-entry",
+            "MF_ENTRY_1",
+            "--run-solves",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 1
+    assert [name for name, _cmd in calls] == [
+        "prepare_step_for_wg_metal.py",
+        "prepare_fem_chamber.py",
+    ]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "MF_ENTRY_1" in manifest["error"]
+    assert "no exterior face was painted" in manifest["error"]
+    assert manifest["fem_chamber"]["entry_source_validation"]["status"] == "failed"
+
+
+def test_pipeline_clamp_per_source_refuses_to_drop_fem_entry(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_fem_ready_prep_manifest(),
+            fem_manifest_payload=_fem_chamber_manifest(max_valid_frequency_hz=400.0),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "MF_ENTRY_1:8:20",
+            "--fem-chamber-step",
+            str(tmp_path / "fem.step"),
+            "--fem-entry",
+            "MF_ENTRY_1",
+            "--freq-min-hz",
+            "500",
+            "--run-solves",
+            "--underresolved-solve-policy",
+            "clamp-per-source",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 2
+    assert [name for name, _cmd in calls] == [
+        "prepare_step_for_wg_metal.py",
+        "prepare_fem_chamber.py",
+        "diagnose_wg_metal_orientation.py",
+    ]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "cannot drop FEM entry" in manifest["error"]
+    assert manifest["solve_frequency_adjustment"]["blocked_fem_entries"] == [
+        {"name": "MF_ENTRY_1", "max_valid_frequency_hz": 400.0},
+    ]
+
+
+def test_pipeline_forwards_unit_scale_to_direct_solve(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_fem_ready_prep_manifest(
+                entry_name="HF",
+                entry_tag=4,
+            ),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5:4",
+            "--unit-scale-to-m",
+            "0.01",
+            "--run-solves",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 0
+    solve_cmd = calls[-1][1]
+    assert solve_cmd[solve_cmd.index("--mesh-scale") + 1] == "0.01"
 
 
 def test_pipeline_orders_direct_solve_sources_hf_mf_lf(tmp_path, monkeypatch):

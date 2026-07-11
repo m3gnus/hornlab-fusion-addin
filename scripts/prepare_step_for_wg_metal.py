@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import re
 import sys
 from pathlib import Path
+from types import TracebackType
 from typing import Iterable
 
 import gmsh
@@ -1842,6 +1844,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _run_occ_healing_fallbacks(
+    run_attempt: Callable[..., dict[str, object]],
+    *,
+    original_mesh_error: Exception,
+    original_traceback: TracebackType | None,
+    surface_order_reference: list[SurfaceGeometry],
+) -> tuple[dict[str, object], str]:
+    """Try OCC repairs without hiding the original unhealed mesh failure."""
+    rejection_reasons: list[str] = []
+    for healing_mode, occ_healing_options in OCC_HEALING_FALLBACKS:
+        print(
+            "gmsh mesh generation failed before healing; retrying with "
+            f"OCC {healing_mode} repair. Original gmsh error: {original_mesh_error}",
+            file=sys.stderr,
+        )
+        try:
+            healed_state = run_attempt(
+                occ_healing_options=occ_healing_options,
+                surface_order_reference=surface_order_reference,
+            )
+        except RuntimeError as exc:
+            reason = (
+                f"OCC {healing_mode} repair rejected before meshing "
+                f"({type(exc).__name__}): {exc}"
+            )
+            rejection_reasons.append(reason)
+            print(f"{reason}; trying the next healing mode.", file=sys.stderr)
+            continue
+
+        healed_mesh_error = healed_state.get("mesh_generation_error")
+        if healed_mesh_error is None:
+            return healed_state, healing_mode
+        reason = (
+            f"OCC {healing_mode} repair mesh generation failed "
+            f"({type(healed_mesh_error).__name__}): {healed_mesh_error}"
+        )
+        rejection_reasons.append(reason)
+        print(
+            f"gmsh mesh generation still failed after OCC {healing_mode} repair. "
+            f"Healed gmsh error: {healed_mesh_error}",
+            file=sys.stderr,
+        )
+
+    rejection_summary = "; ".join(rejection_reasons)
+    note = f"OCC healing fallback rejection reasons: {rejection_summary}"
+    print(
+        "gmsh mesh generation failed after all OCC healing fallbacks. "
+        f"Original gmsh error: {original_mesh_error}. {note}",
+        file=sys.stderr,
+    )
+    add_note = getattr(original_mesh_error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+    raise original_mesh_error.with_traceback(original_traceback)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not args.source:
@@ -2166,29 +2224,13 @@ def main(argv: list[str] | None = None) -> int:
         # spherical caps that make gmsh's periodic-surface 1D mesh
         # self-intersect; OCC small-edge/degenerate healing removes them, but
         # it is fallback-only because it regresses some otherwise-clean exports.
-        for healing_mode, occ_healing_options in OCC_HEALING_FALLBACKS:
-            print(
-                "gmsh mesh generation failed before healing; retrying with "
-                f"OCC {healing_mode} repair. Original gmsh error: {original_mesh_error}",
-                file=sys.stderr,
-            )
-            healed_state = _run_gmsh_attempt(
-                occ_healing_options=occ_healing_options,
-                surface_order_reference=surface_order_reference,
-            )
-            healed_mesh_error = healed_state.get("mesh_generation_error")
-            if healed_mesh_error is None:
-                gmsh_state = healed_state
-                geometry_healed = True
-                geometry_healing_mode = healing_mode
-                break
-            print(
-                f"gmsh mesh generation still failed after OCC {healing_mode} repair. "
-                f"Healed gmsh error: {healed_mesh_error}",
-                file=sys.stderr,
-            )
-        else:
-            raise original_mesh_error.with_traceback(original_traceback)
+        gmsh_state, geometry_healing_mode = _run_occ_healing_fallbacks(
+            _run_gmsh_attempt,
+            original_mesh_error=original_mesh_error,
+            original_traceback=original_traceback,
+            surface_order_reference=surface_order_reference,
+        )
+        geometry_healed = True
 
     source_surfaces = gmsh_state["source_surfaces"]
     active_source_specs = gmsh_state["active_source_specs"]

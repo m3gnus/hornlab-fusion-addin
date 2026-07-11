@@ -54,6 +54,104 @@ def _write_mesh(path: Path, points: np.ndarray, triangles: np.ndarray, tag: int)
     )
 
 
+def _write_uniform_tube_fem_mesh(
+    path: Path,
+    *,
+    length_m: float,
+    width_m: float,
+    height_m: float,
+    axial_cells: int = 24,
+    transverse_cells: int = 2,
+) -> None:
+    """Write a plane-wave-resolved rectangular tube for FEM/TMM regression."""
+    import meshio
+
+    nx = int(axial_cells)
+    ny = nz = int(transverse_cells)
+
+    def node_index(i: int, j: int, k: int) -> int:
+        return (i * (ny + 1) + j) * (nz + 1) + k
+
+    points = np.asarray(
+        [
+            [length_m * i / nx, width_m * j / ny, height_m * k / nz]
+            for i in range(nx + 1)
+            for j in range(ny + 1)
+            for k in range(nz + 1)
+        ],
+        dtype=np.float64,
+    )
+    tetrahedra = []
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                v000 = node_index(i, j, k)
+                v100 = node_index(i + 1, j, k)
+                v110 = node_index(i + 1, j + 1, k)
+                v010 = node_index(i, j + 1, k)
+                v001 = node_index(i, j, k + 1)
+                v101 = node_index(i + 1, j, k + 1)
+                v111 = node_index(i + 1, j + 1, k + 1)
+                v011 = node_index(i, j + 1, k + 1)
+                tetrahedra.extend(
+                    (
+                        (v000, v100, v110, v111),
+                        (v000, v110, v010, v111),
+                        (v000, v010, v011, v111),
+                        (v000, v011, v001, v111),
+                        (v000, v001, v101, v111),
+                        (v000, v101, v100, v111),
+                    )
+                )
+    tetra = np.asarray(tetrahedra, dtype=np.int64)
+
+    face_counts: dict[tuple[int, int, int], int] = {}
+    face_values: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    for cell in tetra:
+        for face in (
+            (cell[0], cell[1], cell[2]),
+            (cell[0], cell[1], cell[3]),
+            (cell[0], cell[2], cell[3]),
+            (cell[1], cell[2], cell[3]),
+        ):
+            key = tuple(sorted(int(value) for value in face))
+            face_counts[key] = face_counts.get(key, 0) + 1
+            face_values[key] = tuple(int(value) for value in face)
+    triangles = np.asarray(
+        [face_values[key] for key, count in face_counts.items() if count == 1],
+        dtype=np.int64,
+    )
+    centroids = np.mean(points[triangles], axis=1)
+    triangle_tags = np.full(triangles.shape[0], 1, dtype=np.int32)
+    triangle_tags[np.isclose(centroids[:, 0], 0.0)] = 100
+    triangle_tags[np.isclose(centroids[:, 0], length_m)] = 101
+    meshio.write(
+        path,
+        meshio.Mesh(
+            points=points,
+            cells=[("tetra", tetra), ("triangle", triangles)],
+            cell_data={
+                "gmsh:physical": [
+                    np.full(tetra.shape[0], 1000, dtype=np.int32),
+                    triangle_tags,
+                ],
+                "gmsh:geometrical": [
+                    np.full(tetra.shape[0], 1000, dtype=np.int32),
+                    triangle_tags,
+                ],
+            },
+            field_data={
+                "air": np.asarray([1000, 3], dtype=np.int32),
+                "rigid": np.asarray([1, 2], dtype=np.int32),
+                "FEM_DRIVER": np.asarray([100, 2], dtype=np.int32),
+                "MF_ENTRY_1": np.asarray([101, 2], dtype=np.int32),
+            },
+        ),
+        file_format="gmsh22",
+        binary=False,
+    )
+
+
 def _write_spherical_cap_mesh(
     path: Path,
     *,
@@ -424,6 +522,122 @@ def test_fem_chamber_coupling_synthesizes_entry_pressure_basis(tmp_path):
         np.ones(2), rel=0.02
     )
     assert np.max(np.abs(results[0]["_acoustic_load_override"])) < 1.0e4
+
+
+def test_fem_chamber_coupling_matches_loaded_tube_transfer_matrix(tmp_path):
+    """A nonzero BEM load must preserve the TMM response magnitude and phase.
+
+    The rectangular chamber is plane-wave-resolved over kL=0.12--1.5.  Its
+    entry is loaded with the low-ka baffled-piston impedance, encoded as the
+    raw solver-convention surface pressure that a unit-acceleration BEM basis
+    would provide.  This covers the solver-to-engineering conversion and the
+    FEM/BEM entry synthesis path together.
+    """
+    module = _load_script()
+
+    length_m = 0.30
+    width_m = height_m = 0.040
+    area_m2 = width_m * height_m
+    fem_mesh = tmp_path / "uniform_tube.msh"
+    _write_uniform_tube_fem_mesh(
+        fem_mesh,
+        length_m=length_m,
+        width_m=width_m,
+        height_m=height_m,
+    )
+
+    rho_air = 1.2
+    speed_of_sound_m_s = 343.0
+    k_length = np.asarray([0.12, 0.35, 0.65, 0.95, 1.25, 1.50])
+    frequencies_hz = k_length * speed_of_sound_m_s / (2.0 * np.pi * length_m)
+    omega = 2.0 * np.pi * frequencies_hz
+    piston_radius_m = np.sqrt(area_m2 / np.pi)
+    ka = omega * piston_radius_m / speed_of_sound_m_s
+    assert np.max(ka) < 0.12  # low-ka piston reference remains applicable.
+    piston_load = (rho_air * speed_of_sound_m_s / area_m2) * (
+        0.5 * ka**2 + 1j * (8.0 / (3.0 * np.pi)) * ka
+    )
+
+    # The BEM records surface pressure in e^-jwt for a unit normal
+    # acceleration.  Feeding this through the production conversion must
+    # recover the known e^+jwt piston load exactly.
+    entry_surface_pressure_solver = (
+        1j * area_m2 * np.conjugate(piston_load) / omega
+    )
+    np.testing.assert_allclose(
+        module._solver_surface_avg_to_self_impedance(
+            frequencies_hz,
+            entry_surface_pressure_solver,
+            source_area_m2=area_m2,
+        ),
+        piston_load,
+    )
+    # At the virtual observation point on the piston face, the engineering
+    # pressure from a unit entry acceleration is Z_piston * U, where
+    # U = -j*S/omega.
+    entry_pressure_per_unit_acceleration = -1j * area_m2 * piston_load / omega
+    entry_basis = module.PressureBasis(
+        source_name="MF_ENTRY_1",
+        source_tag=20,
+        frequencies_hz=frequencies_hz,
+        observation_angles_deg=np.asarray([0.0]),
+        observation_planes=np.asarray(["horizontal"]),
+        pressure_complex=entry_pressure_per_unit_acceleration[:, None, None],
+        source_area_m2=area_m2,
+    )
+    source_result = {
+        "name": "MF_ENTRY_1",
+        "tag": 20,
+        "source_area_m2": area_m2,
+        "pressure_basis_npz": None,
+        "results_json": None,
+        "_pressure_basis": entry_basis,
+        "_surface_pressure_avg_by_tag_solver": {
+            20: entry_surface_pressure_solver,
+        },
+    }
+    (tmp_path / "sources").mkdir()
+    args = SimpleNamespace(
+        fem_chamber_mesh=fem_mesh,
+        fem_entry=["MF_ENTRY_1"],
+        fem_output_source="MF",
+        fem_output_tag=3,
+        fem_driver_boundary="FEM_DRIVER",
+        fem_loss_factor=0.0,
+        fem_area_tolerance=0.01,
+        mesh_scale=1.0,
+        skip_per_driver_plots=True,
+        polar_distance_m=2.0,
+    )
+    results, sources, payload = module._apply_fem_chamber_coupling(
+        tmp_path,
+        args,
+        source_results=[source_result],
+        sources=[("MF_ENTRY_1", 20)],
+        source_mesh_valid={},
+        source_aperture_valid={},
+    )
+
+    # For the e^+jwt lossless two-port, [p_d, U_d] = T [p_e, U_e] and
+    # p_e = Z_piston U_e, so U_e/U_d = 1 / (T10*Z_piston + T11).
+    characteristic_impedance = rho_air * speed_of_sound_m_s / area_m2
+    t10 = 1j * np.sin(k_length) / characteristic_impedance
+    t11 = np.cos(k_length)
+    expected_entry_pressure = piston_load * (-1j * area_m2 / omega) / (
+        t10 * piston_load + t11
+    )
+    actual_entry_pressure = results[0]["_pressure_basis"].pressure_complex[:, 0, 0]
+
+    assert sources == [("MF", 3)]
+    assert payload is not None and payload["status"] == "complete"
+    np.testing.assert_allclose(
+        np.abs(actual_entry_pressure),
+        np.abs(expected_entry_pressure),
+        rtol=0.015,
+    )
+    assert np.max(np.abs(np.angle(actual_entry_pressure / expected_entry_pressure))) < (
+        np.pi / 720.0
+    )
 
 
 def test_projected_area_helper_spherical_cap_matches_throat_area(tmp_path):

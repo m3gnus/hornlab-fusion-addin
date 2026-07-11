@@ -29,6 +29,24 @@ DERIVED_MARKERS = (
     "MF_passive_cardioid_coupled_results.npz",
 )
 
+_FEM_RUNTIME_FLAGS_WITH_VALUES = frozenset(
+    {
+        "--fem-chamber-mesh",
+        "--fem-driver-boundary",
+        "--fem-entry",
+        "--fem-loss-factor",
+        "--fem-area-tolerance",
+    }
+)
+_HYBRID_SOURCE_FLAGS_WITH_VALUES = frozenset(
+    {
+        "--source",
+        "--source-freq-max",
+        "--source-mesh-valid-hz",
+        "--source-aperture-valid-hz",
+    }
+)
+
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -108,11 +126,47 @@ def _command_candidates(run_dir: Path, launch: dict[str, Any]) -> list[list[str]
 
 
 def _strip_runtime_flags(argv: list[str]) -> list[str]:
+    """Drop solve-time-only options before reconstructing a postprocess run.
+
+    A completed FEM hybrid run stores its synthesized output basis in the
+    direct-solve manifest.  Its original source and per-source-limit options
+    name the temporary exterior entry bases, so omit those too and let the
+    solver recover the completed source list from that manifest.
+    """
+    is_fem_hybrid = any(
+        item.split("=", 1)[0] == "--fem-chamber-mesh" for item in argv
+    )
     stripped: list[str] = []
-    for item in argv:
-        if item in {"--postprocess-only", "--dry-run"}:
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        option = item.split("=", 1)[0]
+        if option in {"--postprocess-only", "--dry-run"}:
+            index += 1
+            continue
+        is_fem_runtime_flag = (
+            option in _FEM_RUNTIME_FLAGS_WITH_VALUES
+            or option.startswith("--fem-output-")
+        )
+        is_hybrid_source_flag = (
+            is_fem_hybrid and option in _HYBRID_SOURCE_FLAGS_WITH_VALUES
+        )
+        if is_fem_runtime_flag or is_hybrid_source_flag:
+            # argparse accepts both ``--flag value`` and ``--flag=value``.
+            # Do not swallow the next option if the recovered argv was
+            # malformed and has no value for this flag.
+            has_paired_value = (
+                "=" not in item
+                and index + 1 < len(argv)
+                and not argv[index + 1].startswith("--")
+            )
+            if has_paired_value:
+                index += 2
+            else:
+                index += 1
             continue
         stripped.append(item)
+        index += 1
     return stripped
 
 

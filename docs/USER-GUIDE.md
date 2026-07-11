@@ -93,7 +93,12 @@ the matching exterior BEM source face. Keep `MF mesh mm` filled: it controls
 the entry source mesh after direct `MF` is replaced. Enabling this group exports
 the air component separately, builds a tetrahedral pressure-FEM model, couples
 the entry matrix to exterior Metal BEM, and synthesizes the normal `MF` basis.
-The tetrahedron-size manifest reports an eight-elements-per-wavelength ceiling.
+With a symmetry-reduced exterior BEM model, every FEM entry must lie entirely
+inside the modeled symmetry domain; do not let an entry straddle a mirror cut
+plane. The pipeline checks the FEM and BEM interface areas before direct solves,
+so do not use a larger area tolerance to bypass that error. The tetrahedron-size
+manifest reports an eight-elements-per-wavelength ceiling; the pipeline applies
+the lower FEM/BEM limit to the entry sources and synthesized `MF` basis.
 The default loss factor is a small resonance regularizer, not a thermoviscous
 model. Passive cardioid MF cannot be enabled in the same run yet.
 

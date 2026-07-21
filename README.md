@@ -42,11 +42,9 @@ under Advanced > Python (default: `<repo>/.venv/bin/python` when present).
 - Direct solves need [hornlab-metal-bem](https://github.com/m3gnus/hornlab-metal-bem)
   (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages.
   `requirements.txt` installs all three from their standalone GitHub
-  repositories. Discovery prefers top-level workspace siblings next to this
-  repo (`../hornlab-sim`, `../hornlab-plots`, `../hornlab-metal-bem`) when
-  present, then packages installed in the active environment; no legacy
-  monorepo checkout is probed. Without them the mesh-only path (`Mesh only` in
-  the dialog) still works.
+  repositories. Runtime imports use those packages from the active environment
+  and do not depend on a sibling or legacy monorepo checkout. Without them the
+  mesh-only path (`Mesh only` in the dialog) still works.
 
 ## Tests
 

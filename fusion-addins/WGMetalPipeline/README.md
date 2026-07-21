@@ -331,11 +331,10 @@ Named presets are stored separately and can be passed to headless runs with
 ~/Library/Application Support/HornLab/WGMetalPipeline/presets/<name>.json
 ```
 
-Direct solves use the canonical `hornlab_metal_bem` package — from the
-`hornlab-metal-bem` sibling checkout when present, otherwise from the active
+Direct solves use the canonical `hornlab_metal_bem` package from the active
 Python environment (native Metal dense assembly with an Accelerate `cgesv`
-direct solve) — not the Waveguide Generator server and not any legacy
-in-tree solver copy. The observation frame is auto-derived (see
+direct solve), not a sibling checkout, the Waveguide Generator server, or any
+legacy in-tree solver copy. The observation frame is auto-derived (see
 above); the explicit fallback frame remains:
 
 ```text

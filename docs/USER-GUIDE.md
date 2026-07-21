@@ -18,9 +18,8 @@ The dialog's Advanced > Python field defaults to `<repo>/.venv/bin/python` when
 that interpreter exists. Direct solves also need the HornLab solver packages:
 `hornlab-metal-bem`, `hornlab_sim`, and `hornlab_plots`; `requirements.txt`
 installs all three from their standalone GitHub repositories. Discovery
-prefers top-level workspace siblings next to this repo (`../hornlab-sim`,
-`../hornlab-plots`, `../hornlab-metal-bem`) when present, then packages
-installed in the active environment. No legacy monorepo checkout is probed.
+uses packages installed in the active environment and does not probe sibling
+or legacy monorepo checkouts.
 
 ## 2. Preparing Your Fusion Design
 

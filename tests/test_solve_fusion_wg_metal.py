@@ -295,7 +295,7 @@ def _write_fake_solver_imports(workspace_root: Path, *, origin: str) -> None:
     )
 
 
-def test_workspace_sibling_path_precedence_prefers_top_level_packages(
+def test_active_environment_packages_win_over_workspace_siblings(
     tmp_path,
     monkeypatch,
 ):
@@ -325,8 +325,16 @@ def test_workspace_sibling_path_precedence_prefers_top_level_packages(
     _write_fake_solver_imports(tmp_path, origin="top")
     legacy_root = tmp_path / "HornLab"
     _write_fake_solver_imports(legacy_root, origin="legacy")
+    installed_root = tmp_path / "site-packages"
+    _write_fake_solver_imports(installed_root, origin="installed")
 
     monkeypatch.setattr(sys, "path", list(sys.path))
+    for package_root in (
+        installed_root / "hornlab-sim",
+        installed_root / "hornlab-plots",
+        installed_root / "hornlab-metal-bem",
+    ):
+        monkeypatch.syspath_prepend(str(package_root))
     for name in list(sys.modules):
         if name == "fusion_pipeline_launch" or name.startswith(
             ("hornlab_sim", "hornlab_plots", "hornlab_metal_bem")
@@ -343,15 +351,15 @@ def test_workspace_sibling_path_precedence_prefers_top_level_packages(
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        assert module.bandpass == "top-bandpass"
+        assert module.bandpass == "installed-bandpass"
         assert module.HORNLAB_SIM_DIR == (
-            tmp_path / "hornlab-sim" / "hornlab_sim"
+            installed_root / "hornlab-sim" / "hornlab_sim"
         ).resolve()
         assert module.HORNLAB_PLOTS_DIR == (
-            tmp_path / "hornlab-plots" / "hornlab_plots"
+            installed_root / "hornlab-plots" / "hornlab_plots"
         ).resolve()
         assert module.METAL_BEM_DIR == (
-            tmp_path / "hornlab-metal-bem" / "hornlab_metal_bem"
+            installed_root / "hornlab-metal-bem" / "hornlab_metal_bem"
         ).resolve()
     finally:
         for name in list(sys.modules):

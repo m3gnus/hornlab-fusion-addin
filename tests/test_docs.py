@@ -6,13 +6,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_dependency_docs_match_workspace_discovery_order():
+def test_dependency_docs_require_active_environment_packages():
     for rel_path in ("README.md", "docs/USER-GUIDE.md", "requirements.txt"):
         text = (ROOT / rel_path).read_text(encoding="utf-8")
         normalized = " ".join(text.split())
-        assert "top-level workspace siblings" in normalized
-        assert "legacy" in normalized
-        assert "installed" in normalized
+        assert "active environment" in normalized
+        assert "sibling" in normalized
+        assert "../hornlab-" not in normalized
 
 
 def test_dependency_pins_cover_required_solver_contracts():

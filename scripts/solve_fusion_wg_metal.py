@@ -45,17 +45,12 @@ import numpy as np
 LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
-# Top-level workspace checkouts win over installed packages when present;
-# elsewhere imports resolve from the active environment.
-_WORKSPACE_PACKAGE_CANDIDATES = (
-    REPO_ROOT / "fusion-addins" / "WGMetalPipeline",
-    REPO_ROOT.parent / "hornlab-metal-bem",
-    REPO_ROOT.parent / "hornlab-plots",
-    REPO_ROOT.parent / "hornlab-sim",
-)
-for package_dir in reversed(_WORKSPACE_PACKAGE_CANDIDATES):
-    if package_dir.is_dir() and str(package_dir) not in sys.path:
-        sys.path.insert(0, str(package_dir))
+# The Fusion launcher helper lives in this repository and is not a standalone
+# package. HornLab dependencies themselves always resolve from the active
+# environment populated by requirements.txt.
+PIPELINE_ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
+if str(PIPELINE_ADDIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_ADDIN_DIR))
 
 from hornlab_sim.methods import bandpass, driver_coupling, radiation_impedance  # noqa: E402
 from fusion_pipeline_launch import (  # noqa: E402

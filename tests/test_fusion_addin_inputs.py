@@ -288,6 +288,47 @@ def test_background_launch_does_not_overwrite_fast_child_failure(
     assert metadata["pid"] == 4321
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda path: path.unlink(), id="missing"),
+        pytest.param(
+            lambda path: path.write_text("null", encoding="utf-8"), id="non-object"
+        ),
+        pytest.param(lambda path: path.write_text("{}", encoding="utf-8"), id="no-status"),
+    ],
+)
+def test_background_launch_rebuilds_metadata_when_record_is_unusable(
+    tmp_path,
+    monkeypatch,
+    corrupt,
+):
+    addin = _load_addin_with_fake_adsk()
+    out_dir = tmp_path / "run"
+    step_path = out_dir / "exports" / "design.step"
+    archive_path = out_dir / "exports" / "design.f3d"
+
+    def fake_popen(cmd, *, env, **kwargs):
+        corrupt(Path(env["HORNLAB_FUSION_LAUNCH_METADATA"]))
+        return types.SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(addin.subprocess, "Popen", fake_popen)
+
+    addin._launch_pipeline_background(
+        ["python", "pipeline.py"],
+        out_dir,
+        step_path,
+        archive_path,
+    )
+
+    metadata_path = out_dir / "manifests" / "fusion_addin_launch.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "running"
+    assert metadata["pid"] == 4321
+    assert metadata["command"] == ["python", "pipeline.py"]
+    assert metadata["output_dir"] == str(out_dir)
+
+
 def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
     addin = _load_addin_with_fake_adsk()
     driver_ids = [

@@ -1476,8 +1476,15 @@ def _launch_pipeline_background(
     try:
         current_metadata = json.loads(launch_metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        current_metadata = {}
-    if current_metadata.get("status") not in {"launching", "running"}:
+        current_metadata = None
+    # Only a child that already recorded a terminal status may keep its own
+    # record. Anything else (missing file, non-object JSON, a record without a
+    # status) is unusable, so fall back to the freshly built running record
+    # rather than writing a stub that has lost the command and output paths.
+    current_status = (
+        current_metadata.get("status") if isinstance(current_metadata, dict) else None
+    )
+    if current_status and current_status not in {"launching", "running"}:
         current_metadata["pid"] = int(process.pid)
         running_metadata = current_metadata
     write_launch_metadata(launch_metadata_path, running_metadata)

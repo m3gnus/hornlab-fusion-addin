@@ -176,6 +176,11 @@ def test_wg_source_mesh_export_uses_expanded_full_domain(tmp_path):
     out_tags = mesh.cell_data_dict["gmsh:physical"]["triangle"]
     assert len(module._free_edges(out_tris)) == 0
     assert set(out_tags.tolist()) == {1, 2}
+    np.testing.assert_array_equal(
+        mesh.cell_data_dict["gmsh:geometrical"]["triangle"],
+        out_tags,
+    )
+    assert set(mesh.field_data) == {"LF", "rigid"}
     assert float(mesh.points.max()) <= 0.001
 
 

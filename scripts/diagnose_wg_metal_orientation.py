@@ -99,26 +99,38 @@ def _mesh_orientation_sign(
 
 
 def _plane_free_edge_counts(points: np.ndarray, free_edges: Iterable[tuple[int, int]], tol: float) -> list[dict]:
-    free_edges = list(free_edges)
+    midpoints = [
+        0.5 * (points[edge[0]] + points[edge[1]])
+        for edge in free_edges
+    ]
     mins = points.min(axis=0)
     maxs = points.max(axis=0)
     rows = []
     for axis, axis_name in enumerate(("x", "y", "z")):
         for kind, value in (("min", mins[axis]), ("zero", 0.0), ("max", maxs[axis])):
-            matching = []
-            for edge in free_edges:
-                midpoint = 0.5 * (points[edge[0]] + points[edge[1]])
-                if abs(float(midpoint[axis] - value)) <= tol:
-                    matching.append(edge)
+            matching = sum(
+                abs(float(midpoint[axis] - value)) <= tol
+                for midpoint in midpoints
+            )
             if matching:
                 rows.append({
                     "axis": axis_name,
                     "kind": kind,
                     "value": float(value),
-                    "free_edges": int(len(matching)),
+                    "free_edges": matching,
                 })
     rows.sort(key=lambda item: (-int(item["free_edges"]), str(item["axis"]), str(item["kind"])))
     return rows
+
+
+def _mouth_center(
+    points: np.ndarray,
+    projections: np.ndarray,
+    *,
+    span: float,
+) -> np.ndarray:
+    threshold = float(projections.max() - 0.02 * span)
+    return points[projections >= threshold].mean(axis=0)
 
 
 def _principal_axis_mouth_centers(points: np.ndarray) -> dict[str, list[float]]:
@@ -132,12 +144,10 @@ def _principal_axis_mouth_centers(points: np.ndarray) -> dict[str, list[float]]:
     for axis_index, axis_name in enumerate(("x", "y", "z")):
         proj = points[:, axis_index]
         span = float(proj.max() - proj.min())
-        window = 0.02 * span if span > 0.0 else 0.0
         for sign, sign_name in ((1.0, "+"), (-1.0, "-")):
             signed = sign * proj
-            mouth_points = points[signed >= signed.max() - window]
             centers[f"{sign_name}{axis_name}"] = [
-                float(v) for v in mouth_points.mean(axis=0)
+                float(v) for v in _mouth_center(points, signed, span=span)
             ]
     return centers
 
@@ -209,8 +219,9 @@ def _source_frame(
                 reason = "source near max projection; flip normal"
 
     proj_axis = points @ axis
-    mouth_threshold = float(proj_axis.max() - 0.02 * (proj_axis.max() - proj_axis.min()))
-    mouth_center = points[proj_axis >= mouth_threshold].mean(axis=0)
+    proj_min = float(proj_axis.min())
+    proj_max = float(proj_axis.max())
+    mouth_center = _mouth_center(points, proj_axis, span=proj_max - proj_min)
     return {
         "name": source.name,
         "tag": int(source.tag),
@@ -220,7 +231,7 @@ def _source_frame(
         "inferred_forward_axis": [float(v) for v in axis],
         "inference_reason": reason,
         "mouth_center_for_inferred_axis": [float(v) for v in mouth_center],
-        "projection_span": [float(proj_axis.min()), float(proj_axis.max())],
+        "projection_span": [proj_min, proj_max],
     }
 
 
@@ -278,22 +289,34 @@ def _mirror_domain(
     )
 
 
-def _write_mesh(path: Path, points: np.ndarray, triangles: np.ndarray, tags: np.ndarray) -> None:
-    used_tags = sorted({int(v) for v in tags.tolist()})
-    field_data = {
-        ("rigid" if tag == 1 else f"source_{tag}"): np.array([tag, 2], dtype=np.int32)
-        for tag in used_tags
-    }
-    mesh = meshio.Mesh(
-        points=points,
-        cells=[("triangle", triangles)],
-        cell_data={
-            "gmsh:physical": [tags],
-            "gmsh:geometrical": [tags],
-        },
-        field_data=field_data,
+def _write_mesh(
+    path: Path,
+    points: np.ndarray,
+    triangles: np.ndarray,
+    tags: np.ndarray,
+    *,
+    field_data: dict[str, np.ndarray] | None = None,
+) -> None:
+    if field_data is None:
+        used_tags = sorted({int(v) for v in tags.tolist()})
+        field_data = {
+            ("rigid" if tag == RIGID_TAG else f"source_{tag}"): np.array([tag, 2], dtype=np.int32)
+            for tag in used_tags
+        }
+    meshio.write(
+        path,
+        meshio.Mesh(
+            points=points,
+            cells=[("triangle", triangles)],
+            cell_data={
+                "gmsh:physical": [tags],
+                "gmsh:geometrical": [tags],
+            },
+            field_data=field_data,
+        ),
+        file_format="gmsh22",
+        binary=False,
     )
-    meshio.write(path, mesh, file_format="gmsh22", binary=False)
 
 
 def _safe_stem(value: str) -> str:
@@ -317,19 +340,16 @@ def _write_wg_source_meshes(
         remapped[tags == source.tag] = SOURCE_TAG_BASE
         safe_name = _safe_stem(source.name)
         out_path = out_dir / f"{safe_name}_source_tag2_m.msh"
-        mesh = meshio.Mesh(
+        _write_mesh(
+            out_path,
             points=points * unit_scale_to_m,
-            cells=[("triangle", triangles)],
-            cell_data={
-                "gmsh:physical": [remapped],
-                "gmsh:geometrical": [remapped],
-            },
+            triangles=triangles,
+            tags=remapped,
             field_data={
                 "rigid": np.array([RIGID_TAG, 2], dtype=np.int32),
                 safe_name: np.array([SOURCE_TAG_BASE, 2], dtype=np.int32),
             },
         )
-        meshio.write(out_path, mesh, file_format="gmsh22", binary=False)
         outputs[source.name] = str(out_path)
     return outputs
 
@@ -363,7 +383,7 @@ def _write_preview(path: Path, points: np.ndarray, triangles: np.ndarray, tags: 
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.view_init(elev=24, azim=-55)
-    ax.set_title("Expanded 4-quarter tagged mesh")
+    ax.set_title("Expanded tagged mesh")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)

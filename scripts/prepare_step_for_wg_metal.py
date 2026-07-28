@@ -753,11 +753,47 @@ def _source_normal_projections(
     return projections
 
 
+def _edge_on_expected_plane(
+    points: np.ndarray,
+    edge: tuple[int, int],
+    planes: Iterable[str],
+    tol: float,
+) -> bool:
+    for plane in planes:
+        axis = {"x0": 0, "y0": 1, "z0": 2}[plane]
+        if all(abs(float(points[vertex, axis])) <= tol for vertex in edge):
+            return True
+    return False
+
+
+def _free_edges_on_expected_planes(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    symmetry_planes: tuple[str, ...],
+    tolerance: float,
+) -> bool:
+    """True when every free edge lies wholly on a declared symmetry plane."""
+    edge_count: dict[tuple[int, int], int] = {}
+    for tri in triangles:
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            edge = tuple(sorted((int(a), int(b))))
+            edge_count[edge] = edge_count.get(edge, 0) + 1
+    return all(
+        _edge_on_expected_plane(points, edge, symmetry_planes, tolerance)
+        for edge, count in edge_count.items()
+        if count == 1
+    )
+
+
 def _repair_triangle_winding(
     points: np.ndarray,
     triangles: np.ndarray,
+    *,
+    symmetry_planes: tuple[str, ...] = (),
+    tolerance: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Repair manifold edge winding; only flip globally when the mesh is closed."""
+    """Repair manifold winding and orient each closed or cut component outward."""
     repaired = triangles.copy()
     stats = {
         "flipped_consistency": 0,
@@ -789,13 +825,16 @@ def _repair_triangle_winding(
 
     flip = np.zeros(len(repaired), dtype=bool)
     seen = np.zeros(len(repaired), dtype=bool)
+    components: list[np.ndarray] = []
     for seed in range(len(repaired)):
         if seen[seed]:
             continue
         seen[seed] = True
         queue: deque[int] = deque([seed])
+        component: list[int] = []
         while queue:
             tri_idx = queue.popleft()
+            component.append(tri_idx)
             for other, must_differ in neighbours[tri_idx]:
                 required = bool(flip[tri_idx]) ^ bool(must_differ)
                 if seen[other]:
@@ -803,42 +842,38 @@ def _repair_triangle_winding(
                 flip[other] = required
                 seen[other] = True
                 queue.append(other)
+        components.append(np.asarray(component, dtype=np.int64))
 
     if np.any(flip):
         repaired[flip] = repaired[flip][:, [0, 2, 1]]
         stats["flipped_consistency"] = int(np.count_nonzero(flip))
 
-    edge_stats = _edge_direction_stats(repaired)
-    if (
-        edge_stats["boundary_edges"] == 0
-        and edge_stats["nonmanifold_edges"] == 0
-        and _signed_volume(points, repaired) < 0.0
-    ):
-        repaired[:, [1, 2]] = repaired[:, [2, 1]]
-        stats["flipped_global"] = int(len(repaired))
+    for component in components:
+        component_triangles = repaired[component]
+        edge_stats = _edge_direction_stats(component_triangles)
+        closed = (
+            edge_stats["boundary_edges"] == 0
+            and edge_stats["nonmanifold_edges"] == 0
+        )
+        symmetry_reduced = (
+            edge_stats["boundary_edges"] > 0
+            and edge_stats["nonmanifold_edges"] == 0
+            and _free_edges_on_expected_planes(
+                points,
+                component_triangles,
+                symmetry_planes=symmetry_planes,
+                tolerance=tolerance,
+            )
+        )
+        if (
+            (closed or symmetry_reduced)
+            and edge_stats["inconsistent_edges"] == 0
+            and _signed_volume(points, component_triangles) < 0.0
+        ):
+            repaired[component] = component_triangles[:, [0, 2, 1]]
+            stats["flipped_global"] += int(len(component))
 
     return repaired, stats
-
-
-def _free_edges_on_origin_planes(
-    points: np.ndarray,
-    triangles: np.ndarray,
-    *,
-    tolerance: float,
-) -> bool:
-    """True when every free edge lies on a coordinate plane through the origin."""
-    edge_count: dict[tuple[int, int], int] = {}
-    for tri in triangles:
-        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
-            edge = tuple(sorted((int(a), int(b))))
-            edge_count[edge] = edge_count.get(edge, 0) + 1
-    for edge, count in edge_count.items():
-        if count != 1:
-            continue
-        midpoint = 0.5 * (points[edge[0]] + points[edge[1]])
-        if not any(abs(float(midpoint[axis])) <= tolerance for axis in range(3)):
-            return False
-    return True
 
 
 def _detect_symmetry_planes(
@@ -871,11 +906,13 @@ def _detect_symmetry_planes(
     plane_counts = {"x0": 0, "y0": 0, "z0": 0}
     shared_plane_edges = 0
     for edge in free_edges:
-        midpoint = 0.5 * (points[edge[0]] + points[edge[1]])
         on_planes = [
             plane
             for axis, plane in enumerate(("x0", "y0", "z0"))
-            if abs(float(midpoint[axis])) <= tolerance
+            if all(
+                abs(float(points[vertex, axis])) <= tolerance
+                for vertex in edge
+            )
         ]
         if len(on_planes) == 1:
             plane_counts[on_planes[0]] += 1
@@ -980,23 +1017,27 @@ def _postprocess_mesh(
     triangles, tags, degenerate_removed = _remove_degenerate_triangles(
         points, triangles, tags, min_quality=DEGENERATE_MIN_QUALITY
     )
-    repaired_triangles, repair_stats = _repair_triangle_winding(points, triangles)
-    repair_stats["welded_vertices"] = int(welded_vertices)
-    after_edge_stats = _edge_direction_stats(repaired_triangles)
-    after_signed_volume = _signed_volume(points, repaired_triangles)
 
     symmetry_detection: dict[str, object] | None = None
+    symmetry_tolerance = (
+        symmetry_snap_tolerance
+        if symmetry_snap_tolerance is not None
+        else tolerance
+    )
     if symmetry_planes == "auto":
-        detection_tolerance = (
-            symmetry_snap_tolerance
-            if symmetry_snap_tolerance is not None
-            else tolerance
-        )
         symmetry_planes, symmetry_detection = _detect_symmetry_planes(
             points,
-            repaired_triangles,
-            tolerance=detection_tolerance,
+            triangles,
+            tolerance=symmetry_tolerance,
         )
+    repaired_triangles, repair_stats = _repair_triangle_winding(
+        points,
+        triangles,
+        symmetry_planes=symmetry_planes,
+        tolerance=symmetry_tolerance,
+    )
+    repair_stats["welded_vertices"] = int(welded_vertices)
+    after_edge_stats = _edge_direction_stats(repaired_triangles)
     if symmetry_snap_tolerance is not None:
         _snap_symmetry_plane_vertices(
             points,
@@ -1010,23 +1051,10 @@ def _postprocess_mesh(
         symmetry_planes=symmetry_planes,
     )
 
-    # _repair_triangle_winding only enforces global outward orientation for
-    # closed meshes. A reduced mesh whose free edges all lie on origin cut
-    # planes has an equally well-defined signed volume (the missing cap faces
-    # contribute nothing to it), so enforce outward orientation for those too;
-    # the solver and the orientation diagnostic both rely on it.
-    if (
-        after_edge_stats["boundary_edges"] > 0
-        and after_signed_volume < 0.0
-        and _free_edges_on_origin_planes(points, repaired_triangles, tolerance=tolerance)
-    ):
-        repaired_triangles = repaired_triangles[:, [0, 2, 1]]
-        repair_stats["flipped_global"] = int(len(repaired_triangles))
-        after_signed_volume = -after_signed_volume
-
     # Drop vertices orphaned by welding/degenerate removal so the written node
     # count matches the live mesh the solver assembles.
     points, repaired_triangles = _compact_unused_vertices(points, repaired_triangles)
+    after_signed_volume = _signed_volume(points, repaired_triangles)
 
     repaired_mesh = meshio.Mesh(
         points=points,
@@ -1376,21 +1404,6 @@ def _parse_symmetry_planes(raw: str | None, *, quadrants: int) -> tuple[str, ...
     return tuple(ordered)
 
 
-def _edge_on_expected_plane(
-    midpoint: np.ndarray,
-    planes: Iterable[str],
-    tol: float,
-) -> bool:
-    for plane in planes:
-        if plane == "x0" and abs(float(midpoint[0])) <= tol:
-            return True
-        if plane == "y0" and abs(float(midpoint[1])) <= tol:
-            return True
-        if plane == "z0" and abs(float(midpoint[2])) <= tol:
-            return True
-    return False
-
-
 def _topology_stats(
     points: np.ndarray,
     triangles: np.ndarray,
@@ -1411,7 +1424,12 @@ def _topology_stats(
     samples = []
     for edge in free_edges:
         midpoint = 0.5 * (points[edge[0]] + points[edge[1]])
-        if not _edge_on_expected_plane(midpoint, symmetry_planes, tolerance):
+        if not _edge_on_expected_plane(
+            points,
+            edge,
+            symmetry_planes,
+            tolerance,
+        ):
             unexpected.append(edge)
             if len(samples) < 20:
                 samples.append([float(v) for v in midpoint])

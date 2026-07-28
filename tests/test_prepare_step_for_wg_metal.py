@@ -213,8 +213,8 @@ def test_detect_symmetry_planes_finds_quarter_cut_planes():
 
 def test_detect_symmetry_planes_ignores_internal_z_level_crossed_by_cut_rims():
     module = _load_script()
-    # Cut rims span z=-2..2, so one rim edge per cut plane sits exactly on
-    # z=0 (shared with x0/y0). z0 must not be detected as a cut plane.
+    # Cut rims span z=-2..2, so one rim edge per cut plane crosses z=0 without
+    # lying in it. z0 must not be detected as a cut plane.
     points, triangles = _quarter_tube(
         angles_deg=(0.0, 30.0, 60.0, 90.0),
         z_values=(-2.0, -1.5, -0.5, 0.5, 1.5, 2.0),
@@ -227,10 +227,10 @@ def test_detect_symmetry_planes_ignores_internal_z_level_crossed_by_cut_rims():
     )
 
     assert planes == ("x0", "y0")
-    assert detection["plane_free_edge_counts"]["x0"] == 4
-    assert detection["plane_free_edge_counts"]["y0"] == 4
+    assert detection["plane_free_edge_counts"]["x0"] == 5
+    assert detection["plane_free_edge_counts"]["y0"] == 5
     assert detection["plane_free_edge_counts"]["z0"] == 0
-    assert detection["shared_plane_free_edges"] == 2
+    assert detection["shared_plane_free_edges"] == 0
 
 
 def test_detect_symmetry_planes_ignores_sparse_origin_edges():
@@ -410,6 +410,30 @@ def test_topology_stats_tolerates_step_origin_noise():
     assert topology["unexpected_free_edges"] == 0
 
 
+def test_topology_stats_rejects_edges_that_only_cross_symmetry_plane():
+    module = _load_script()
+    points = np.asarray(
+        [
+            [1.0, 0.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [-1.0, 3.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+
+    topology = module._topology_stats(
+        points,
+        triangles,
+        symmetry_planes=("x0",),
+        tolerance=1e-9,
+    )
+
+    assert topology["free_edges"] == 4
+    assert topology["unexpected_free_edges"] == 4
+
+
 def test_postprocess_auto_mode_reflects_negative_quadrant_to_positive():
     module = _load_script()
     # Quarter modeled in the +x/-y quadrant, like a Fusion export cut to the
@@ -529,6 +553,37 @@ def test_closed_negative_volume_mesh_flips_globally():
     assert module._edge_direction_stats(repaired)["inconsistent_edges"] == 0
 
 
+def test_disconnected_closed_components_orient_outward_independently():
+    module = _load_script()
+    base_points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    inward = np.asarray(
+        [
+            [0, 1, 2],
+            [0, 3, 1],
+            [0, 2, 3],
+            [1, 3, 2],
+        ],
+        dtype=np.int64,
+    )
+    points = np.vstack([base_points, base_points + np.asarray([3.0, 0.0, 0.0])])
+    triangles = np.vstack([inward, inward[:, [0, 2, 1]] + 4])
+
+    repaired, stats = module._repair_triangle_winding(points, triangles)
+
+    assert stats["flipped_global"] == 4
+    assert module._signed_volume(points, repaired[:4]) > 0.0
+    assert module._signed_volume(points, repaired[4:]) > 0.0
+    assert module._edge_direction_stats(repaired)["inconsistent_edges"] == 0
+
+
 def _open_unit_box(*, inward: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Unit box missing its x=0 and y=0 faces; free edges on origin planes."""
     points = np.asarray(
@@ -604,6 +659,27 @@ def test_open_mesh_with_off_plane_free_edges_keeps_winding():
 
     assert repair["flipped_global"] == 0
     assert repair["after"]["inconsistent_edges"] == 0
+
+
+def test_open_origin_edges_do_not_flip_without_declared_symmetry():
+    module = _load_script()
+    points, triangles, tags = _open_unit_box(inward=True)
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[("triangle", triangles)],
+        cell_data={"gmsh:physical": [tags]},
+    )
+
+    _, repair, topology = module._postprocess_mesh(
+        mesh,
+        [module.SourceSpec("LF", 20.0, 2)],
+        symmetry_planes=(),
+        tolerance=1e-9,
+    )
+
+    assert repair["flipped_global"] == 0
+    assert topology["signed_volume_step_units3"] < 0.0
+    assert topology["unexpected_free_edges"] > 0
 
 
 def test_mesh_frequency_validation_warns_for_coarse_global_edge_far_from_source():

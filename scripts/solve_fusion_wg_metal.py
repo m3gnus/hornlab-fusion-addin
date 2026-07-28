@@ -2849,42 +2849,57 @@ def _beamwidth_minus6_db_by_plane(
     widths: dict[str, np.ndarray] = {}
     limited: dict[str, np.ndarray] = {}
     assumed_symmetric: dict[str, np.ndarray] = {}
+    frequency_indices = np.arange(pressure.shape[0])
 
-    def _edge(rel_db: np.ndarray, start: int, step: int) -> tuple[float, bool]:
-        idx = start
-        next_idx = idx + step
-        while 0 <= next_idx < rel_db.size and rel_db[next_idx] >= threshold_db:
-            idx = next_idx
-            next_idx = idx + step
-        if not (0 <= next_idx < rel_db.size):
-            return float(sorted_angles[idx]), True
-        v0 = float(rel_db[idx])
-        v1 = float(rel_db[next_idx])
-        a0 = float(sorted_angles[idx])
-        a1 = float(sorted_angles[next_idx])
-        if abs(v1 - v0) <= 1.0e-12:
-            return a1, False
-        frac = (threshold_db - v0) / (v1 - v0)
-        return a0 + frac * (a1 - a0), False
+    def _edges(rel_db: np.ndarray, step: int) -> tuple[np.ndarray, np.ndarray]:
+        stop = rel_db.shape[1] if step > 0 else -1
+        candidates = np.arange(on_axis_sorted_idx + step, stop, step)
+        if candidates.size == 0:
+            return (
+                np.full(pressure.shape[0], sorted_angles[on_axis_sorted_idx]),
+                np.ones(pressure.shape[0], dtype=bool),
+            )
+
+        above_threshold = rel_db[:, candidates] >= threshold_db
+        side_limited = np.all(above_threshold, axis=1)
+        crossing_indices = candidates[np.argmax(~above_threshold, axis=1)]
+        inside_indices = crossing_indices - step
+        v0 = rel_db[frequency_indices, inside_indices]
+        v1 = rel_db[frequency_indices, crossing_indices]
+        a0 = sorted_angles[inside_indices]
+        a1 = sorted_angles[crossing_indices]
+        delta = v1 - v0
+        flat = np.abs(delta) <= 1.0e-12
+        fractions = np.zeros(pressure.shape[0], dtype=np.float64)
+        np.divide(threshold_db - v0, delta, out=fractions, where=~flat)
+        edges = np.where(flat, a1, a0 + fractions * (a1 - a0))
+        edges[side_limited] = sorted_angles[candidates[-1]]
+        return edges, side_limited
 
     for plane_index, plane in enumerate(planes):
-        plane_widths = np.zeros(pressure.shape[0], dtype=np.float64)
-        plane_limited = np.zeros(pressure.shape[0], dtype=bool)
-        for freq_index in range(pressure.shape[0]):
-            values = pressure[freq_index, plane_index, order]
-            ref = max(float(np.abs(values[on_axis_sorted_idx])), 1.0e-30)
-            rel_db = 20.0 * np.log10(np.maximum(np.abs(values), 1.0e-30) / ref)
-            left_edge, left_limited = _edge(rel_db, on_axis_sorted_idx, -1)
-            right_edge, right_limited = _edge(rel_db, on_axis_sorted_idx, 1)
-            if one_sided_positive:
-                plane_widths[freq_index] = min(
-                    360.0,
-                    2.0 * max(0.0, right_edge - float(sorted_angles[on_axis_sorted_idx])),
-                )
-                plane_limited[freq_index] = right_limited
-            else:
-                plane_widths[freq_index] = max(0.0, right_edge - left_edge)
-                plane_limited[freq_index] = left_limited or right_limited
+        magnitudes = np.abs(pressure[:, plane_index, order])
+        references = np.maximum(
+            magnitudes[:, on_axis_sorted_idx],
+            1.0e-30,
+        )[:, None]
+        rel_db = 20.0 * np.log10(
+            np.maximum(magnitudes, 1.0e-30) / references
+        )
+        left_edges, left_limited = _edges(rel_db, -1)
+        right_edges, right_limited = _edges(rel_db, 1)
+        if one_sided_positive:
+            plane_widths = np.minimum(
+                360.0,
+                2.0
+                * np.maximum(
+                    0.0,
+                    right_edges - sorted_angles[on_axis_sorted_idx],
+                ),
+            )
+            plane_limited = right_limited
+        else:
+            plane_widths = np.maximum(0.0, right_edges - left_edges)
+            plane_limited = left_limited | right_limited
         widths[str(plane)] = plane_widths
         limited[str(plane)] = plane_limited
         assumed_symmetric[str(plane)] = np.full(

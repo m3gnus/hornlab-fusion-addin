@@ -3535,6 +3535,37 @@ def test_beamwidth_minus6_db_synthetic_beam_per_plane():
     assert not np.any(assumed_symmetric["vertical"])
 
 
+def test_beamwidth_varies_by_frequency_on_unsorted_angle_grid():
+    module = _load_script()
+    angles = np.array([60.0, -90.0, 0.0, 90.0, -30.0, 30.0, -60.0])
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    half_widths = np.array(
+        [
+            [30.0, 60.0],
+            [60.0, 30.0],
+            [120.0, 120.0],
+        ],
+        dtype=np.float64,
+    )
+    pressure_db = -6.0 * (
+        angles[None, None, :] / half_widths[:, :, None]
+    ) ** 2
+    pressure = 10.0 ** (pressure_db / 20.0)
+
+    widths, limited, assumed_symmetric = module._beamwidth_minus6_db_by_plane(
+        pressure.astype(np.complex128),
+        angles,
+        planes,
+    )
+
+    np.testing.assert_allclose(widths["horizontal"], [60.0, 120.0, 180.0])
+    np.testing.assert_allclose(widths["vertical"], [120.0, 60.0, 180.0])
+    np.testing.assert_array_equal(limited["horizontal"], [False, False, True])
+    np.testing.assert_array_equal(limited["vertical"], [False, False, True])
+    assert not np.any(assumed_symmetric["horizontal"])
+    assert not np.any(assumed_symmetric["vertical"])
+
+
 def test_beamwidth_flags_one_sided_symmetry_assumption_in_artifacts(tmp_path):
     module = _load_script()
     freqs = np.array([500.0, 1000.0], dtype=np.float64)

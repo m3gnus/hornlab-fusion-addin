@@ -580,6 +580,20 @@ def load_preset(
     return payload
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def save_preset(
     name: str,
     settings: dict[str, Any],
@@ -589,11 +603,7 @@ def save_preset(
     if not isinstance(settings, dict):
         raise ValueError("Preset settings must be a dictionary.")
     path = Path(presets_dir).expanduser() / f"{sanitize_preset_name(name)}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(settings, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(path, settings)
     return path
 
 
@@ -1255,14 +1265,4 @@ def build_launch_metadata(
 
 
 def write_launch_metadata(path: Path, metadata: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary_path.write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary_path, path)
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
+    write_json_atomic(path, metadata)

@@ -47,6 +47,7 @@ save_preset = _fusion_pipeline_launch.save_preset
 source_motion_label = _fusion_pipeline_launch.source_motion_label
 symmetry_planes_for_mirror_plane = _fusion_pipeline_launch.symmetry_planes_for_mirror_plane
 validate_output_options = _fusion_pipeline_launch.validate_output_options
+write_json_atomic = _fusion_pipeline_launch.write_json_atomic
 write_launch_metadata = _fusion_pipeline_launch.write_launch_metadata
 
 
@@ -354,11 +355,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_PATH.write_text(
-        json.dumps(settings, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json_atomic(SETTINGS_PATH, settings)
 
 
 def _bool_from_value(value) -> bool:

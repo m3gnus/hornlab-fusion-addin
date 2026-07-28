@@ -547,6 +547,24 @@ def test_settings_migration_scopes_stale_keys_per_version(tmp_path, monkeypatch)
     assert settings["export_vituixcad"] is True
 
 
+def test_settings_save_uses_atomic_json_writer(tmp_path, monkeypatch):
+    addin = _load_addin_with_fake_adsk()
+    settings_path = tmp_path / "settings.json"
+    settings = {"settings_version": addin.SETTINGS_VERSION, "freq_count": "47"}
+    observed = {}
+    monkeypatch.setattr(addin, "SETTINGS_PATH", settings_path)
+
+    def capture_write(path, payload):
+        observed["path"] = path
+        observed["payload"] = payload
+
+    monkeypatch.setattr(addin, "write_json_atomic", capture_write)
+
+    addin._save_settings(settings)
+
+    assert observed == {"path": settings_path, "payload": settings}
+
+
 def test_addin_named_preset_round_trip_applies_dialog_inputs(tmp_path, monkeypatch):
     addin = _load_addin_with_fake_adsk()
     monkeypatch.setattr(addin, "PRESETS_DIR", tmp_path)

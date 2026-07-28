@@ -841,6 +841,27 @@ def test_named_preset_round_trip_through_launch_helper(tmp_path):
     assert loaded == settings
 
 
+def test_named_preset_failed_replace_preserves_existing_file(tmp_path, monkeypatch):
+    helper = _load_helper()
+    preset_path = tmp_path / "Sweep_A.json"
+    existing = {"settings_version": 13, "freq_count": "47"}
+    replacement = {"settings_version": 15, "freq_count": "61"}
+    preset_path.write_text(json.dumps(existing), encoding="utf-8")
+
+    def fail_replace(temporary_path, destination_path):
+        assert Path(destination_path) == preset_path
+        assert json.loads(Path(temporary_path).read_text(encoding="utf-8")) == replacement
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(helper.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replace failure"):
+        helper.save_preset("Sweep A", replacement, presets_dir=tmp_path)
+
+    assert json.loads(preset_path.read_text(encoding="utf-8")) == existing
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
 def test_pipeline_preset_defaults_keep_explicit_cli_precedence(tmp_path):
     pipeline = _load_pipeline()
     preset = tmp_path / "headless.json"

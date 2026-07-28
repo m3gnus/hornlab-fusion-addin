@@ -640,6 +640,27 @@ def test_mesh_frequency_validation_warns_for_coarse_global_edge_far_from_source(
     assert validation["warnings"]
 
 
+def test_triangle_edge_lengths_deduplicates_reversed_shared_edges():
+    module = _load_script()
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles = np.asarray([[0, 1, 2], [2, 1, 3]], dtype=np.int64)
+
+    lengths = module._triangle_edge_lengths(points, triangles)
+
+    np.testing.assert_array_equal(
+        lengths,
+        np.asarray([2.0, np.sqrt(5.0), 1.0, 1.0, 2.0]),
+    )
+
+
 def test_mesh_frequency_validation_limits_source_by_nearby_coarse_walls():
     """BIGMEH_v4 regression: a fine HF patch next to coarse rigid horn walls
     must not validate to the patch limit, because the wave the patch launches

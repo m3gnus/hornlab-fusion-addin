@@ -1069,16 +1069,17 @@ def _postprocess_mesh(
 
 
 def _triangle_edge_lengths(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
-    lengths: list[float] = []
-    seen: set[tuple[int, int]] = set()
-    for tri in triangles:
-        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
-            edge = tuple(sorted((int(a), int(b))))
-            if edge in seen:
-                continue
-            seen.add(edge)
-            lengths.append(float(np.linalg.norm(points[edge[0]] - points[edge[1]])))
-    return np.asarray(lengths, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int64)
+    if len(triangles) == 0:
+        return np.empty(0, dtype=np.float64)
+    edges = triangles[:, [[0, 1], [1, 2], [2, 0]]].reshape(-1, 2)
+    edges.sort(axis=1)
+    _unique_edges, first_indices = np.unique(edges, axis=0, return_index=True)
+    unique_edges = edges[np.sort(first_indices)]
+    return np.linalg.norm(
+        points[unique_edges[:, 0]] - points[unique_edges[:, 1]],
+        axis=1,
+    )
 
 
 def _edge_frequency_stats(

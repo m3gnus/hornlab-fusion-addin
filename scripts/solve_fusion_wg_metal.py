@@ -44,14 +44,20 @@ import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = Path(__file__).resolve().parent
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
 # The Fusion launcher helper lives in this repository and is not a standalone
 # package. HornLab dependencies themselves always resolve from the active
 # environment populated by requirements.txt.
 PIPELINE_ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 if str(PIPELINE_ADDIN_DIR) not in sys.path:
     sys.path.insert(0, str(PIPELINE_ADDIN_DIR))
 
+from fusion_wg_metal_crossover import (  # noqa: E402
+    crossover_weights as _crossover_weights,
+)
 from hornlab_sim.methods import bandpass, driver_coupling, radiation_impedance  # noqa: E402
 from fusion_pipeline_launch import (  # noqa: E402
     DriverLemParseError,
@@ -843,16 +849,6 @@ def _interp_complex(freqs: np.ndarray, values: np.ndarray, target_hz: float) -> 
     return complex(mag * np.exp(1j * phase))
 
 
-def _lr4_lowpass(freqs: np.ndarray, fc_hz: float) -> np.ndarray:
-    s = 1j * np.asarray(freqs, dtype=np.float64) / float(fc_hz)
-    return 1.0 / (s * s + np.sqrt(2.0) * s + 1.0) ** 2
-
-
-def _lr4_highpass(freqs: np.ndarray, fc_hz: float) -> np.ndarray:
-    s = 1j * np.asarray(freqs, dtype=np.float64) / float(fc_hz)
-    return (s * s) ** 2 / (s * s + np.sqrt(2.0) * s + 1.0) ** 2
-
-
 def _spl_db_from_pressure(pressure: np.ndarray) -> np.ndarray:
     return 20.0 * np.log10(np.maximum(np.abs(pressure), 1.0e-30) / P_REF)
 
@@ -982,23 +978,6 @@ def _crossover_chain(
         f"ambiguous crossover for the {pair[0]}/{pair[1]} pair: "
         "fill exactly one crossover frequency field"
     )
-
-
-def _crossover_weights(
-    freqs: np.ndarray,
-    members: list[str],
-    crossovers_hz: list[float],
-) -> dict[str, np.ndarray]:
-    """LR4 weights along an ordered driver chain: LP, BP..., HP."""
-    weights: dict[str, np.ndarray] = {}
-    for index, name in enumerate(members):
-        weight = np.ones(np.asarray(freqs).shape, dtype=np.complex128)
-        if index > 0:
-            weight = weight * _lr4_highpass(freqs, crossovers_hz[index - 1])
-        if index < len(crossovers_hz):
-            weight = weight * _lr4_lowpass(freqs, crossovers_hz[index])
-        weights[name] = weight
-    return weights
 
 
 def _member_filter_label(

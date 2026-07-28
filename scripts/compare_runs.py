@@ -15,9 +15,17 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = Path(__file__).resolve().parent
 P_REF = 2.0e-5
 PRESSURE_NPZ_PHASE_CONVENTION = "engineering_exp_plus_jwt"
 RUN_MANIFESTS_DIR_NAME = "manifests"
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from fusion_wg_metal_crossover import (  # noqa: E402
+    crossover_weights as _crossover_weights,
+)
 
 for package_dir in reversed(
     (
@@ -97,32 +105,6 @@ def _array(value: Any) -> np.ndarray:
 
 def _spl_db(pressure: np.ndarray) -> np.ndarray:
     return 20.0 * np.log10(np.maximum(np.abs(pressure), 1.0e-30) / P_REF)
-
-
-def _lr4_lowpass(freqs: np.ndarray, fc_hz: float) -> np.ndarray:
-    s = 1j * np.asarray(freqs, dtype=np.float64) / float(fc_hz)
-    return 1.0 / (s * s + np.sqrt(2.0) * s + 1.0) ** 2
-
-
-def _lr4_highpass(freqs: np.ndarray, fc_hz: float) -> np.ndarray:
-    s = 1j * np.asarray(freqs, dtype=np.float64) / float(fc_hz)
-    return (s * s) ** 2 / (s * s + np.sqrt(2.0) * s + 1.0) ** 2
-
-
-def _crossover_weights(
-    freqs: np.ndarray,
-    members: list[str],
-    crossovers_hz: list[float],
-) -> dict[str, np.ndarray]:
-    weights: dict[str, np.ndarray] = {}
-    for index, name in enumerate(members):
-        weight = np.ones(np.asarray(freqs).shape, dtype=np.complex128)
-        if index > 0:
-            weight = weight * _lr4_highpass(freqs, crossovers_hz[index - 1])
-        if index < len(crossovers_hz):
-            weight = weight * _lr4_lowpass(freqs, crossovers_hz[index])
-        weights[name] = weight
-    return weights
 
 
 class RunData:

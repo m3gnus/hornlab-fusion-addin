@@ -9,7 +9,7 @@ import html
 import json
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -19,6 +19,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 P_REF = 2.0e-5
 PRESSURE_NPZ_PHASE_CONVENTION = "engineering_exp_plus_jwt"
 RUN_MANIFESTS_DIR_NAME = "manifests"
+DERIVED_JSON_SUFFIXES = {
+    "directivity_power": "directivity_index_power_response",
+    "beamwidth": "beamwidth",
+    "group_delay": "group_delay",
+}
 
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
@@ -123,98 +128,65 @@ class RunData:
                 self.direct_manifest = direct
         if not self.direct_manifest and not self.final_manifest:
             raise SystemExit(f"no run manifest found in {self.run_dir}")
-
-    @property
-    def outputs(self) -> dict[str, Any]:
-        return _as_dict(self.direct_manifest.get("outputs"))
-
-    @property
-    def config(self) -> dict[str, Any]:
-        return _as_dict(self.direct_manifest.get("config"))
-
-    def resolve(self, value: Any) -> Path | None:
-        if not value:
-            return None
-        path = Path(str(value)).expanduser()
-        if not path.is_absolute():
-            path = self.run_dir / path
-        if path.exists():
-            return path
-        local = self.run_dir / Path(str(value)).name
-        if local.exists():
-            return local
-        return path
-
-    def first_existing(self, *values: Any) -> Path | None:
-        for value in values:
-            path = self.resolve(value)
-            if path is not None and path.exists():
-                return path
-        return None
-
-    def source_names(self) -> list[str]:
-        names = [
-            str(entry.get("name"))
-            for entry in _as_list(self.direct_manifest.get("sources"))
-            if isinstance(entry, dict) and entry.get("name")
-        ]
+        self.outputs = _as_dict(self.direct_manifest.get("outputs"))
+        self.config = _as_dict(self.direct_manifest.get("config"))
+        self.sources: dict[str, dict[str, Any]] = {}
+        for entry in _as_list(self.direct_manifest.get("sources")):
+            if isinstance(entry, dict) and entry.get("name"):
+                self.sources.setdefault(str(entry["name"]), entry)
         for key in (
             "source_results_jsons",
             "source_pressure_basis_npzs",
             "source_active_pressure_basis_npzs",
         ):
             for name in _as_dict(self.outputs.get(key)):
-                if str(name) not in names:
-                    names.append(str(name))
-        return names
+                self.sources.setdefault(str(name), {})
 
-    def source_entry(self, name: str) -> dict[str, Any]:
-        for entry in _as_list(self.direct_manifest.get("sources")):
-            if isinstance(entry, dict) and str(entry.get("name")) == name:
-                return entry
-        return {}
-
-    def output_map_path(self, key: str, name: str) -> Path | None:
-        return self.resolve(_as_dict(self.outputs.get(key)).get(name))
+    def first_existing(self, *values: Any) -> Path | None:
+        for value in values:
+            if not value:
+                continue
+            raw_path = Path(str(value)).expanduser()
+            path = raw_path if raw_path.is_absolute() else self.run_dir / raw_path
+            if path.exists():
+                return path
+            local = self.run_dir / raw_path.name
+            if local.exists():
+                return local
+        return None
 
     def source_result_json(self, name: str) -> Path | None:
-        entry = self.source_entry(name)
+        entry = self.sources.get(name, {})
         return self.first_existing(
-            self.output_map_path("source_results_jsons", name),
+            _as_dict(self.outputs.get("source_results_jsons")).get(name),
             entry.get("results_json"),
             self.run_dir / "sources" / f"{name}_results.json",
             self.run_dir / f"{name}_results.json",
         )
 
     def source_basis_npz(self, name: str) -> Path | None:
-        entry = self.source_entry(name)
+        entry = self.sources.get(name, {})
         return self.first_existing(
-            self.output_map_path("source_active_pressure_basis_npzs", name),
+            _as_dict(self.outputs.get("source_active_pressure_basis_npzs")).get(name),
             entry.get("active_pressure_basis_npz"),
-            self.output_map_path("source_pressure_basis_npzs", name),
+            _as_dict(self.outputs.get("source_pressure_basis_npzs")).get(name),
             entry.get("pressure_basis_npz"),
             self.run_dir / "sources" / f"{name}_pressure_basis.npz",
             self.run_dir / f"{name}_pressure_basis.npz",
         )
 
-    def source_derived_json(
-        self,
-        map_key: str,
-        entry_key: str,
-        fallback_filename: str,
-        name: str,
-    ) -> Path | None:
-        entry = self.source_entry(name)
+    def derived_json(self, kind: str, name: str | None = None) -> Path | None:
+        stem = name if name is not None else "combined_time_aligned"
+        filename = f"{stem}_{DERIVED_JSON_SUFFIXES[kind]}.json"
+        if name is None:
+            manifest_paths = (self.outputs.get(f"combined_time_aligned_{kind}_json"),)
+        else:
+            manifest_paths = (
+                _as_dict(self.outputs.get(f"source_{kind}_jsons")).get(name),
+                self.sources.get(name, {}).get(f"{kind}_json"),
+            )
         return self.first_existing(
-            self.output_map_path(map_key, name),
-            entry.get(entry_key),
-            self.run_dir / "derived" / fallback_filename,
-            self.run_dir / fallback_filename,
-        )
-
-    def combined_json(self, key: str, filename: str) -> Path | None:
-        return self.first_existing(
-            self.outputs.get(key),
+            *manifest_paths,
             self.run_dir / "derived" / filename,
             self.run_dir / filename,
         )
@@ -242,7 +214,7 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
 
 def _result_curve(run: RunData, source_name: str) -> Curve | None:
     result_path = run.source_result_json(source_name)
-    if result_path and result_path.exists():
+    if result_path is not None:
         payload = _read_json(result_path)
         if "frequencies_hz" in payload and "on_axis_spl_db" in payload:
             return Curve(
@@ -251,7 +223,7 @@ def _result_curve(run: RunData, source_name: str) -> Curve | None:
                 f"{run.label} {source_name}",
             )
     basis_path = run.source_basis_npz(source_name)
-    if basis_path is None or not basis_path.exists():
+    if basis_path is None:
         return None
     basis = _load_pressure_basis(basis_path)
     on_axis = int(np.argmin(np.abs(basis.angles_deg)))
@@ -273,7 +245,7 @@ def _aligned_sum_curve(run: RunData) -> Curve | None:
     bases: dict[str, PressureBasis] = {}
     for member in members:
         path = run.source_basis_npz(member)
-        if path is None or not path.exists():
+        if path is None:
             return None
         bases[member] = _load_pressure_basis(path)
     first = bases[members[0]]
@@ -306,75 +278,57 @@ def on_axis_curves(run: RunData) -> list[Curve]:
     if aligned is not None:
         return [aligned]
     curves = []
-    for name in run.source_names():
+    for name in run.sources:
         curve = _result_curve(run, name)
         if curve is not None:
             curves.append(curve)
     return curves
 
 
-def _json_curve(path: Path | None, key: str, label: str) -> Curve | None:
-    if path is None or not path.exists():
-        return None
+def _directivity_curves_from_json(path: Path | None, label: str) -> list[Curve]:
+    if path is None:
+        return []
     payload = _read_json(path)
-    if "frequencies_hz" not in payload or key not in payload:
-        return None
-    return Curve(_array(payload["frequencies_hz"]), _array(payload[key]), label)
+    if "frequencies_hz" not in payload or "directivity_index_db" not in payload:
+        return []
+    return [
+        Curve(
+            _array(payload["frequencies_hz"]),
+            _array(payload["directivity_index_db"]),
+            label,
+        )
+    ]
+
+
+def _derived_curves(
+    run: RunData,
+    kind: str,
+    loader: Callable[[Path | None, str], list[Curve]],
+) -> list[Curve]:
+    combined = loader(run.derived_json(kind), f"{run.label} aligned sum")
+    if combined:
+        return combined
+    return [
+        curve
+        for name in run.sources
+        for curve in loader(run.derived_json(kind, name), f"{run.label} {name}")
+    ]
 
 
 def directivity_curves(run: RunData) -> list[Curve]:
-    combined = _json_curve(
-        run.combined_json(
-            "combined_time_aligned_directivity_power_json",
-            "combined_time_aligned_directivity_index_power_response.json",
-        ),
-        "directivity_index_db",
-        f"{run.label} aligned sum",
+    return _derived_curves(
+        run,
+        "directivity_power",
+        _directivity_curves_from_json,
     )
-    if combined is not None:
-        return [combined]
-    curves = []
-    for name in run.source_names():
-        curve = _json_curve(
-            run.source_derived_json(
-                "source_directivity_power_jsons",
-                "directivity_power_json",
-                f"{name}_directivity_index_power_response.json",
-                name,
-            ),
-            "directivity_index_db",
-            f"{run.label} {name}",
-        )
-        if curve is not None:
-            curves.append(curve)
-    return curves
 
 
 def beamwidth_curves(run: RunData) -> list[Curve]:
-    combined_path = run.combined_json(
-        "combined_time_aligned_beamwidth_json",
-        "combined_time_aligned_beamwidth.json",
-    )
-    if combined_path and combined_path.exists():
-        return _beamwidth_curves_from_json(combined_path, f"{run.label} aligned sum")
-    curves = []
-    for name in run.source_names():
-        curves.extend(
-            _beamwidth_curves_from_json(
-                run.source_derived_json(
-                    "source_beamwidth_jsons",
-                    "beamwidth_json",
-                    f"{name}_beamwidth.json",
-                    name,
-                ),
-                f"{run.label} {name}",
-            )
-        )
-    return curves
+    return _derived_curves(run, "beamwidth", _beamwidth_curves_from_json)
 
 
 def _beamwidth_curves_from_json(path: Path | None, label: str) -> list[Curve]:
-    if path is None or not path.exists():
+    if path is None:
         return []
     payload = _read_json(path)
     freqs = _array(payload.get("frequencies_hz", []))
@@ -386,44 +340,22 @@ def _beamwidth_curves_from_json(path: Path | None, label: str) -> list[Curve]:
 
 
 def group_delay_curves(run: RunData) -> list[Curve]:
-    combined = _group_delay_curve(
-        run.combined_json(
-            "combined_time_aligned_group_delay_json",
-            "combined_time_aligned_group_delay.json",
-        ),
-        f"{run.label} aligned sum",
-    )
-    if combined is not None:
-        return [combined]
-    curves = []
-    for name in run.source_names():
-        curve = _group_delay_curve(
-            run.source_derived_json(
-                "source_group_delay_jsons",
-                "group_delay_json",
-                f"{name}_group_delay.json",
-                name,
-            ),
-            f"{run.label} {name}",
-        )
-        if curve is not None:
-            curves.append(curve)
-    return curves
+    return _derived_curves(run, "group_delay", _group_delay_curves_from_json)
 
 
-def _group_delay_curve(path: Path | None, label: str) -> Curve | None:
-    if path is None or not path.exists():
-        return None
+def _group_delay_curves_from_json(path: Path | None, label: str) -> list[Curve]:
+    if path is None:
+        return []
     payload = _read_json(path)
     if "frequencies_hz" not in payload:
-        return None
+        return []
     if "group_delay_ms" in payload:
         values = _array(payload["group_delay_ms"])
     elif "group_delay_s" in payload:
         values = _array(payload["group_delay_s"]) * 1000.0
     else:
-        return None
-    return Curve(_array(payload["frequencies_hz"]), values, label)
+        return []
+    return [Curve(_array(payload["frequencies_hz"]), values, label)]
 
 
 def _activate_theme(name: str):

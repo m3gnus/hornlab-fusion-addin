@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 from datetime import datetime
+from functools import lru_cache
 import json
 import logging
 import math
@@ -606,22 +607,11 @@ def _radiation_impedance_payload(
 
 
 def _result_directivity_payload(result) -> dict[str, list[list[list[float]]]]:
-    payload: dict[str, list[list[list[float]]]] = {}
-    for plane_index, plane in enumerate(result.observation_planes):
-        patterns = []
-        for freq_index in range(len(result.frequencies_hz)):
-            patterns.append(
-                [
-                    [float(angle), float(db)]
-                    for angle, db in zip(
-                        result.observation_angles_deg,
-                        result.directivity_db[freq_index, plane_index, :],
-                        strict=True,
-                    )
-                ]
-            )
-        payload[str(plane)] = patterns
-    return payload
+    return _directivity_payload_from_arrays(
+        result.observation_angles_deg,
+        result.observation_planes,
+        result.directivity_db,
+    )
 
 
 def _on_axis_spl_db(result) -> np.ndarray:
@@ -1133,13 +1123,10 @@ def _directivity_payload_from_pressure(
             1.0e-30,
         )
         values_db = 20.0 * np.log10(np.maximum(np.abs(plane_pressure), 1.0e-30) / reference)
-        payload[str(plane)] = [
-            [
-                [float(angle), float(db)]
-                for angle, db in zip(angles_deg, values_db[freq_index, :], strict=True)
-            ]
-            for freq_index in range(values_db.shape[0])
-        ]
+        payload[str(plane)] = _directivity_patterns_from_arrays(
+            angles_deg,
+            values_db,
+        )
     return payload
 
 
@@ -3120,30 +3107,46 @@ def _directivity_payload_from_arrays(
     planes: np.ndarray,
     directivity_db: np.ndarray,
 ) -> dict[str, list[list[list[float]]]]:
-    payload: dict[str, list[list[list[float]]]] = {}
-    for plane_index, plane in enumerate(planes):
-        patterns = []
-        for freq_index in range(directivity_db.shape[0]):
-            patterns.append(
-                [
-                    [float(angle), float(db)]
-                    for angle, db in zip(
-                        angles_deg,
-                        directivity_db[freq_index, plane_index, :],
-                        strict=True,
-                    )
-                ]
-            )
-        payload[str(plane)] = patterns
-    return payload
+    directivity = np.asarray(directivity_db, dtype=np.float64)
+    return {
+        str(plane): _directivity_patterns_from_arrays(
+            angles_deg,
+            directivity[:, plane_index, :],
+        )
+        for plane_index, plane in enumerate(planes)
+    }
 
 
-def _mesh_tag_area_vectors_m2(
+def _directivity_patterns_from_arrays(
+    angles_deg: np.ndarray,
+    directivity_db: np.ndarray,
+) -> list[list[list[float]]]:
+    values = np.asarray(directivity_db, dtype=np.float64)
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    angle_rows = np.broadcast_to(angles, values.shape)
+    return np.stack((angle_rows, values), axis=-1).tolist()
+
+
+def _mesh_triangle_data(
     mesh_path: Path,
-    tag: int,
-    *,
     mesh_scale: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mesh_stat = mesh_path.stat()
+    return _read_mesh_triangle_data(
+        mesh_path,
+        float(mesh_scale),
+        mesh_stat.st_mtime_ns,
+        mesh_stat.st_size,
+    )
+
+
+@lru_cache(maxsize=1)
+def _read_mesh_triangle_data(
+    mesh_path: Path,
+    mesh_scale: float,
+    _mtime_ns: int,
+    _size_bytes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     try:
         import meshio  # noqa: PLC0415
     except ImportError as exc:  # pragma: no cover - environment dependent
@@ -3155,13 +3158,23 @@ def _mesh_tag_area_vectors_m2(
         raise ValueError(f"mesh has no triangle cells: {mesh_path}")
     triangles = np.asarray(mesh.cells_dict[tri_key], dtype=np.int64)
     points = np.asarray(mesh.points, dtype=np.float64) * float(mesh_scale)
-    physical = None
     for key, by_type in mesh.cell_data_dict.items():
         if "physical" in key and tri_key in by_type:
             physical = np.asarray(by_type[tri_key], dtype=np.int32)
-            break
-    if physical is None:
-        raise ValueError(f"mesh has no triangle physical tags: {mesh_path}")
+            return triangles, points, physical
+    raise ValueError(f"mesh has no triangle physical tags: {mesh_path}")
+
+
+def _mesh_tag_area_vectors_m2(
+    mesh_path: Path,
+    tag: int,
+    *,
+    mesh_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    triangles, points, physical = _mesh_triangle_data(
+        mesh_path,
+        float(mesh_scale),
+    )
     mask = physical == int(tag)
     if not np.any(mask):
         raise ValueError(f"physical tag {tag} is absent from mesh {mesh_path}")

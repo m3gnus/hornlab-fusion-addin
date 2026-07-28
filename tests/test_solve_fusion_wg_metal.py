@@ -677,6 +677,33 @@ def test_projected_area_helper_spherical_cap_matches_throat_area(tmp_path):
     np.testing.assert_allclose(np.abs(axis), [0.0, 0.0, 1.0], atol=1.0e-12)
 
 
+def test_mesh_area_helpers_decode_shared_mesh_once(tmp_path, monkeypatch):
+    import meshio
+
+    module = _load_script()
+    tag = 7
+    mesh_path = tmp_path / "flat_disc.msh"
+    _write_flat_disc_mesh(mesh_path, radius_m=0.10, tag=tag)
+    real_read = meshio.read
+    read_paths = []
+
+    def counted_read(path):
+        read_paths.append(Path(path))
+        return real_read(path)
+
+    monkeypatch.setattr(meshio, "read", counted_read)
+
+    surface_area = module._mesh_tag_area_m2(mesh_path, tag, mesh_scale=1.0)
+    projected_area, projected_surface_area, _axis, curved = (
+        module._mesh_tag_projected_area_m2(mesh_path, tag, mesh_scale=1.0)
+    )
+
+    assert read_paths == [mesh_path]
+    assert projected_area == pytest.approx(surface_area)
+    assert projected_surface_area == pytest.approx(surface_area)
+    assert curved is False
+
+
 def test_basis_self_impedance_uses_projected_area_for_axial_curved_cap(tmp_path):
     module = _load_script()
     tag = 7
@@ -3497,6 +3524,49 @@ def test_harmonize_bases_removes_common_delay_before_phase_interpolation():
         atol=1.0e-12,
     )
     assert np.all(grids["LF"][~inside] == 0.0)
+
+
+def test_directivity_payload_serializers_preserve_frequency_angle_pairs():
+    module = _load_script()
+    angles = np.array([45.0, 0.0, -90.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    directivity = np.array(
+        [
+            [[-1.25, 0.0, -8.5], [-2.0, 0.0, -12.0]],
+            [[-3.0, 0.0, -15.0], [-4.5, 0.0, -20.0]],
+        ],
+        dtype=np.float64,
+    )
+    expected = {
+        str(plane): [
+            [
+                [float(angle), float(db)]
+                for angle, db in zip(
+                    angles,
+                    directivity[freq_index, plane_index, :],
+                    strict=True,
+                )
+            ]
+            for freq_index in range(directivity.shape[0])
+        ]
+        for plane_index, plane in enumerate(planes)
+    }
+    result = SimpleNamespace(
+        frequencies_hz=np.array([100.0, 200.0]),
+        observation_angles_deg=angles,
+        observation_planes=planes,
+        directivity_db=directivity,
+    )
+
+    assert module._directivity_payload_from_arrays(angles, planes, directivity) == expected
+    assert module._result_directivity_payload(result) == expected
+
+    pressure = 10.0 ** (directivity / 20.0)
+    assert module._directivity_payload_from_pressure(
+        pressure.astype(np.complex128),
+        angles_deg=angles,
+        planes=planes,
+    ) == expected
 
 
 def test_directivity_power_integration_monopole_and_dipole():

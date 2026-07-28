@@ -366,20 +366,8 @@ def _db_float(row: dict[str, str], *names: str) -> float | None:
     match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", cleaned)
     if match is None:
         return None
-    try:
-        value = float(match.group(0))
-    except ValueError:
-        return None
+    value = float(match.group(0))
     return value if math.isfinite(value) else None
-
-
-def _append_db_value(
-    pieces: list[tuple[str, float | int]],
-    label: str,
-    value: float | int | None,
-) -> None:
-    if value is not None:
-        pieces.append((label, value))
 
 
 def _driver_database_payload_from_row(row: dict[str, str]) -> str | None:
@@ -418,15 +406,19 @@ def _driver_database_payload_from_row(row: dict[str, str]) -> str | None:
     elif cms_mm_per_n is not None:
         pieces.append(("Cms", cms_mm_per_n * 1.0e-3))
     else:
-        _append_db_value(pieces, "Vas", vas_l)
-        _append_db_value(pieces, "Fs", fs_hz)
+        if vas_l is not None:
+            pieces.append(("Vas", vas_l))
+        if fs_hz is not None:
+            pieces.append(("Fs", fs_hz))
     rms = _db_float(row, "Rms_kg_per_s", "Rms")
     qms = _db_float(row, "Qms")
     if rms is not None:
         pieces.append(("Rms", rms))
     elif qms is not None:
         pieces.append(("Qms", qms))
-    _append_db_value(pieces, "Xmax", _db_float(row, "Xmax_mm", "Xmax"))
+    xmax = _db_float(row, "Xmax_mm", "Xmax")
+    if xmax is not None:
+        pieces.append(("Xmax", xmax))
     return ",".join(f"{key}={value:g}" for key, value in pieces)
 
 
@@ -467,7 +459,7 @@ def load_driver_database_entries(
     database_paths: list[Path] | tuple[Path, ...] | None = None,
 ) -> list[DriverDatabaseEntry]:
     """Load local driver database rows that can produce Driver LEM payloads."""
-    paths = list(database_paths) if database_paths is not None else _driver_database_candidate_paths()
+    paths = database_paths if database_paths is not None else _driver_database_candidate_paths()
     entries: list[DriverDatabaseEntry] = []
     seen_payloads: set[str] = set()
     used_labels: dict[str, int] = {}
@@ -484,9 +476,7 @@ def load_driver_database_entries(
             if not _driver_database_matches_source(row, source_name):
                 continue
             payload = _driver_database_payload_from_row(row)
-            if payload is None:
-                continue
-            if payload in seen_payloads:
+            if payload is None or payload in seen_payloads:
                 continue
             label = _driver_database_label(row, path)
             duplicate_count = used_labels.get(label, 0)
@@ -500,7 +490,7 @@ def load_driver_database_entries(
                     payload=payload,
                     source_path=path,
                     row_index=row_index,
-                    row=dict(row),
+                    row=row,
                 )
             )
     entries.sort(key=lambda entry: entry.label.lower())

@@ -222,6 +222,72 @@ def test_execute_handler_checks_stale_install_only_before_launch():
     assert "raise RuntimeError(stale_warning)" in handler_source
 
 
+def test_background_launch_writes_metadata_before_starting_child(
+    tmp_path,
+    monkeypatch,
+):
+    addin = _load_addin_with_fake_adsk()
+    out_dir = tmp_path / "run"
+    step_path = out_dir / "exports" / "design.step"
+    archive_path = out_dir / "exports" / "design.f3d"
+    observed = {}
+
+    def fake_popen(cmd, *, env, **kwargs):
+        metadata_path = Path(env["HORNLAB_FUSION_LAUNCH_METADATA"])
+        observed.update(json.loads(metadata_path.read_text(encoding="utf-8")))
+        return types.SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(addin.subprocess, "Popen", fake_popen)
+
+    pid = addin._launch_pipeline_background(
+        ["python", "pipeline.py"],
+        out_dir,
+        step_path,
+        archive_path,
+    )
+
+    metadata_path = out_dir / "manifests" / "fusion_addin_launch.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert observed["status"] == "launching"
+    assert observed["pid"] is None
+    assert pid == 4321
+    assert metadata["status"] == "running"
+    assert metadata["pid"] == 4321
+
+
+def test_background_launch_does_not_overwrite_fast_child_failure(
+    tmp_path,
+    monkeypatch,
+):
+    addin = _load_addin_with_fake_adsk()
+    out_dir = tmp_path / "run"
+    step_path = out_dir / "exports" / "design.step"
+    archive_path = out_dir / "exports" / "design.f3d"
+
+    def fake_popen(cmd, *, env, **kwargs):
+        metadata_path = Path(env["HORNLAB_FUSION_LAUNCH_METADATA"])
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.update(status="failed", returncode=2, error="bad arguments")
+        addin.write_launch_metadata(metadata_path, metadata)
+        return types.SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(addin.subprocess, "Popen", fake_popen)
+
+    addin._launch_pipeline_background(
+        ["python", "pipeline.py"],
+        out_dir,
+        step_path,
+        archive_path,
+    )
+
+    metadata_path = out_dir / "manifests" / "fusion_addin_launch.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert metadata["returncode"] == 2
+    assert metadata["error"] == "bad arguments"
+    assert metadata["pid"] == 4321
+
+
 def test_passive_cardioid_sync_leaves_driver_lem_fields_enabled():
     addin = _load_addin_with_fake_adsk()
     driver_ids = [

@@ -22,6 +22,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -44,6 +45,7 @@ from fusion_pipeline_launch import (  # noqa: E402
     normalize_source_motion,
     quadrants_for_symmetry_planes,
     symmetry_planes_for_mirror_plane,
+    write_launch_metadata,
 )
 CANONICAL_SOURCE_TAGS = {
     "LF": 2,
@@ -612,13 +614,28 @@ def _update_launch_metadata(*, status: str, returncode: int, error: str | None) 
         metadata["finished_at"] = datetime.now().isoformat(timespec="seconds")
         if error:
             metadata["error"] = error
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_launch_metadata(path, metadata)
     except Exception:
         pass
+
+
+def _wait_for_launch_metadata() -> None:
+    """Let the Fusion parent record the child PID before pipeline work starts."""
+    raw_path = os.environ.get("HORNLAB_FUSION_LAUNCH_METADATA")
+    if not raw_path:
+        return
+    path = Path(raw_path)
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        if metadata.get("status") != "launching":
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
 
 
 def _finalize_run(args: argparse.Namespace, *, returncode: int, crash_error: str | None) -> None:
@@ -2246,7 +2263,24 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    _wait_for_launch_metadata()
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        returncode = exc.code if isinstance(exc.code, int) else 1
+        error = None
+        if returncode:
+            error = (
+                str(exc.code)
+                if not isinstance(exc.code, int)
+                else "pipeline argument parsing failed"
+            )
+        _update_launch_metadata(
+            status="complete" if returncode == 0 else "failed",
+            returncode=returncode,
+            error=error,
+        )
+        raise
     try:
         returncode = _run_pipeline(args)
     except SystemExit as exc:

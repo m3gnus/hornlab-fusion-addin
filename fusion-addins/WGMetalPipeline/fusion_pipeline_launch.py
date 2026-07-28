@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -1255,4 +1256,13 @@ def build_launch_metadata(
 
 def write_launch_metadata(path: Path, metadata: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()

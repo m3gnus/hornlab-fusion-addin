@@ -1421,6 +1421,19 @@ def _launch_pipeline_background(
     launch_metadata_path.parent.mkdir(parents=True, exist_ok=True)
     env = _subprocess_env()
     env["HORNLAB_FUSION_LAUNCH_METADATA"] = str(launch_metadata_path)
+    write_launch_metadata(
+        launch_metadata_path,
+        build_launch_metadata(
+            command=cmd,
+            pid=None,
+            started_at=started_at,
+            output_dir=out_dir,
+            step_path=step_path,
+            fusion_archive_path=fusion_archive_path,
+            cwd=REPO_ROOT,
+            status="launching",
+        ),
+    )
 
     stdout_path = logs_dir / "fusion_step_to_wg_pipeline.stdout.log"
     stderr_path = logs_dir / "fusion_step_to_wg_pipeline.stderr.log"
@@ -1453,19 +1466,24 @@ def _launch_pipeline_background(
         )
         raise
 
-    write_launch_metadata(
-        launch_metadata_path,
-        build_launch_metadata(
-            command=cmd,
-            pid=int(process.pid),
-            started_at=started_at,
-            output_dir=out_dir,
-            step_path=step_path,
-            fusion_archive_path=fusion_archive_path,
-            cwd=REPO_ROOT,
-            status="running",
-        ),
+    running_metadata = build_launch_metadata(
+        command=cmd,
+        pid=int(process.pid),
+        started_at=started_at,
+        output_dir=out_dir,
+        step_path=step_path,
+        fusion_archive_path=fusion_archive_path,
+        cwd=REPO_ROOT,
+        status="running",
     )
+    try:
+        current_metadata = json.loads(launch_metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        current_metadata = {}
+    if current_metadata.get("status") not in {"launching", "running"}:
+        current_metadata["pid"] = int(process.pid)
+        running_metadata = current_metadata
+    write_launch_metadata(launch_metadata_path, running_metadata)
     return int(process.pid)
 
 

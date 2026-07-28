@@ -2751,6 +2751,32 @@ def test_pipeline_validation_failure_finalizes_launch_metadata(
     assert metadata["finished_at"]
 
 
+def test_pipeline_argument_failure_finalizes_launch_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    pipeline = _load_pipeline()
+    launch_metadata = tmp_path / "fusion_addin_launch.json"
+    launch_metadata.write_text(
+        json.dumps({"status": "running"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "HORNLAB_FUSION_LAUNCH_METADATA",
+        str(launch_metadata),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        pipeline.main(["--not-a-pipeline-option"])
+
+    assert exc_info.value.code == 2
+    metadata = json.loads(launch_metadata.read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert metadata["returncode"] == 2
+    assert metadata["error"] == "pipeline argument parsing failed"
+    assert metadata["finished_at"]
+
+
 def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     helper = _load_helper()
 

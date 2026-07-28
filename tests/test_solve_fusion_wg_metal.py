@@ -3462,6 +3462,43 @@ def test_harmonize_bases_zeroes_clamped_source_above_its_band():
     np.testing.assert_allclose(np.abs(grids["HF"]), 0.02)
 
 
+def test_harmonize_bases_removes_common_delay_before_phase_interpolation():
+    module = _load_script()
+    full = np.geomspace(20.0, 20000.0, 60)
+    clamped = np.geomspace(20.0, 5000.0, 24)
+    angles = np.array([0.0])
+    planes = np.array(["horizontal"], dtype=str)
+    common_delay_s = 2.0 / module.SPEED_OF_SOUND_M_S
+    residual_delay_s = 0.00015
+    total_delay_s = common_delay_s + residual_delay_s
+
+    def make(freqs):
+        pressure = np.exp(-1j * 2.0 * np.pi * freqs * total_delay_s)
+        return module.PressureBasis(
+            source_name="X",
+            source_tag=1,
+            frequencies_hz=freqs,
+            observation_angles_deg=angles,
+            observation_planes=planes,
+            pressure_complex=pressure[:, None, None],
+        )
+
+    freqs, grids, _solved_top = module._harmonize_bases(
+        {"LF": make(clamped), "HF": make(full)},
+        common_delay_s=common_delay_s,
+    )
+
+    inside = freqs <= clamped[-1] * (1.0 + 1.0e-9)
+    expected = np.exp(-1j * 2.0 * np.pi * freqs[inside] * total_delay_s)
+    np.testing.assert_allclose(
+        grids["LF"][inside, 0, 0],
+        expected,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    assert np.all(grids["LF"][~inside] == 0.0)
+
+
 def test_directivity_power_integration_monopole_and_dipole():
     module = _load_script()
     freqs = np.array([100.0, 500.0], dtype=np.float64)

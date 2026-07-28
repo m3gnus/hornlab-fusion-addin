@@ -1047,39 +1047,56 @@ def _interp_pressure_grid(
     freqs_src: np.ndarray,
     pressure: np.ndarray,
     freqs_dst: np.ndarray,
+    *,
+    common_delay_s: float = 0.0,
 ) -> np.ndarray:
     """Interpolate a ``(nf, n_plane, n_angle)`` complex grid onto ``freqs_dst``.
 
-    Magnitude and unwrapped phase are interpolated separately. Frequencies
-    above the source grid's top are zeroed rather than extrapolated, so a
-    per-source clamped solve contributes nothing beyond its solved band
-    (where its crossover filter weight is negligible anyway).
+    Magnitude and unwrapped residual phase are interpolated separately after
+    removing the shared propagation delay. Frequencies above the source
+    grid's top are zeroed rather than extrapolated, so a per-source clamped
+    solve contributes nothing beyond its solved band (where its crossover
+    filter weight is negligible anyway).
     """
     nf, n_planes, n_angles = pressure.shape
     out = np.zeros((freqs_dst.size, n_planes, n_angles), dtype=np.complex128)
     inside = freqs_dst <= float(freqs_src[-1]) * (1.0 + 1.0e-9)
     if not np.any(inside):
         return out
+    delay_removed = np.exp(
+        1j * 2.0 * np.pi * freqs_src * float(common_delay_s)
+    )
+    delay_restored = np.exp(
+        -1j * 2.0 * np.pi * freqs_dst[inside] * float(common_delay_s)
+    )
     for plane in range(n_planes):
         for angle in range(n_angles):
             values = pressure[:, plane, angle]
             mag = np.interp(freqs_dst[inside], freqs_src, np.abs(values))
             phase = np.interp(
-                freqs_dst[inside], freqs_src, np.unwrap(np.angle(values))
+                freqs_dst[inside],
+                freqs_src,
+                np.unwrap(np.angle(values * delay_removed)),
             )
-            out[inside, plane, angle] = mag * np.exp(1j * phase)
+            out[inside, plane, angle] = (
+                mag * np.exp(1j * phase) * delay_restored
+            )
     return out
 
 
 def _harmonize_bases(
     bases: dict[str, PressureBasis],
+    *,
+    common_delay_s: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, float]]:
     """Bring pressure bases onto one frequency grid for complex summation.
 
     Angle and plane grids must match exactly. Frequency grids may differ when
     per-source clamping trimmed a solve band; those bases are interpolated
-    onto the widest grid and zeroed above their own solved top. Returns
-    ``(freqs, pressure_grids, solved_top_hz)``.
+    onto the widest grid and zeroed above their own solved top. The caller
+    supplies the shared observation-distance delay so interpolation unwraps
+    only the residual acoustic phase. Returns ``(freqs, pressure_grids,
+    solved_top_hz)``.
     """
     names = list(bases)
     reference = bases[names[0]]
@@ -1113,7 +1130,12 @@ def _harmonize_bases(
         ):
             grids[name] = pressure
         else:
-            grids[name] = _interp_pressure_grid(freqs, pressure, master)
+            grids[name] = _interp_pressure_grid(
+                freqs,
+                pressure,
+                master,
+                common_delay_s=common_delay_s,
+            )
     return master, grids, solved_top
 
 
@@ -2126,7 +2148,10 @@ def _write_crossover_alignment_outputs(
             )
         mf_basis_kind = mf_override_kind
     try:
-        freqs, grids, solved_top_hz = _harmonize_bases(bases)
+        freqs, grids, solved_top_hz = _harmonize_bases(
+            bases,
+            common_delay_s=float(polar_distance_m) / SPEED_OF_SOUND_M_S,
+        )
     except ValueError as exc:
         return {
             "status": "skipped",

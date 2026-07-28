@@ -30,10 +30,6 @@ def _run_manifest_path(run_dir: Path, name: str) -> Path:
     return run_dir / name
 
 
-def _has_run_manifest(run_dir: Path, name: str) -> bool:
-    return (run_dir / RUN_MANIFESTS_DIR_NAME / name).exists() or (run_dir / name).exists()
-
-
 def _run_manifests(run_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     final_manifest = _read_json(_run_manifest_path(run_dir, "final_summary_manifest.json"))
     direct_manifest = _read_json(_run_manifest_path(run_dir, "direct_solve_manifest.json"))
@@ -73,6 +69,11 @@ def _link(run_dir: Path, value: Any, label: str | None = None) -> str:
     if not rel:
         return ""
     return f'<a href="{_html(rel)}">{_html(label or Path(rel).name)}</a>'
+
+
+def _links(items: list[str]) -> str:
+    body = " ".join(filter(None, items))
+    return f'<p class="links">{body}</p>' if body else ""
 
 
 def _image(run_dir: Path, value: Any, caption: str) -> str:
@@ -135,14 +136,12 @@ def _per_driver_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
             _image(run_dir, response_by_source.get(name) or source.get("frequency_response_png"), f"{name} frequency response"),
             _image(run_dir, heatmap_by_source.get(name) or source.get("directivity_heatmap_png"), f"{name} directivity heatmap"),
         ]
-        links = []
-        if basis_by_source.get(name) or source.get("pressure_basis_npz"):
-            links.append(_link(run_dir, basis_by_source.get(name) or source.get("pressure_basis_npz"), "pressure basis"))
-        if result_by_source.get(name) or source.get("results_json"):
-            links.append(_link(run_dir, result_by_source.get(name) or source.get("results_json"), "results JSON"))
+        links = [
+            _link(run_dir, basis_by_source.get(name) or source.get("pressure_basis_npz"), "pressure basis"),
+            _link(run_dir, result_by_source.get(name) or source.get("results_json"), "results JSON"),
+        ]
         body = "".join(item for item in figures if item)
-        if links:
-            body += '<p class="links">' + " ".join(links) + "</p>"
+        body += _links(links)
         chunks.append(f"<h3>{_html(name)}</h3>{body}")
     return "".join(chunks)
 
@@ -170,8 +169,9 @@ def _combined_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
         _image(run_dir, value, f"Off-axis response {plane}")
         for plane, value in sorted(off_axis.items())
     )
-    if outputs.get("driver_time_alignment_txt"):
-        body += '<p class="links">' + _link(run_dir, outputs["driver_time_alignment_txt"], "driver time alignment") + "</p>"
+    body += _links(
+        [_link(run_dir, outputs.get("driver_time_alignment_txt"), "driver time alignment")]
+    )
     return body
 
 
@@ -205,13 +205,13 @@ def _driver_lem_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
     for name, zma in sorted(_as_dict(outputs.get("driver_lem_impedance_zmas")).items()):
         impedance = _as_dict(outputs.get("driver_lem_impedance_pngs")).get(name)
         excursion = _as_dict(outputs.get("driver_lem_excursion_pngs")).get(name)
-        links = [_link(run_dir, zma, f"{name} ZMA")]
-        results = _as_dict(outputs.get("driver_lem_results_npzs")).get(name)
-        if results:
-            links.append(_link(run_dir, results, "results NPZ"))
+        links = [
+            _link(run_dir, zma, f"{name} ZMA"),
+            _link(run_dir, _as_dict(outputs.get("driver_lem_results_npzs")).get(name), "results NPZ"),
+        ]
         body = _image(run_dir, impedance, f"{name} impedance")
         body += _image(run_dir, excursion, f"{name} excursion")
-        body += '<p class="links">' + " ".join(links) + "</p>"
+        body += _links(links)
         chunks.append(f"<h3>{_html(name)}</h3>{body}")
     return "".join(chunks)
 
@@ -232,9 +232,7 @@ def _cardioid_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
         _link(run_dir, outputs.get("passive_cardioid_coupled_results_npz"), "coupled results NPZ"),
         _link(run_dir, outputs.get("passive_cardioid_impedance_zma"), "impedance ZMA"),
     ]
-    links = [item for item in links if item]
-    if links:
-        body += '<p class="links">' + " ".join(links) + "</p>"
+    body += _links(links)
     return body
 
 
@@ -252,8 +250,7 @@ def _radiation_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
             "radiation impedance summary JSON",
         ),
     ]
-    links = [item for item in links if item]
-    return '<p class="links">' + " ".join(links) + "</p>" if links else ""
+    return _links(links)
 
 
 def _vituixcad_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
@@ -276,23 +273,16 @@ def _vituixcad_section(run_dir: Path, direct_manifest: dict[str, Any]) -> str:
                 "MF cardioid ZMA",
             )
         )
-    links = [item for item in links if item]
-    return '<p class="links">' + " ".join(links) + "</p>" if links else ""
+    return _links(links)
 
 
 def _logs_section(run_dir: Path, final_manifest: dict[str, Any]) -> str:
-    links: list[str] = []
-    for value in _as_dict(final_manifest.get("logs")).values():
-        link = _link(run_dir, value)
-        if link:
-            links.append(link)
+    values = list(_as_dict(final_manifest.get("logs")).values())
     logs_dir = run_dir / "logs"
     if logs_dir.is_dir():
-        for path in sorted(logs_dir.glob("*.log")):
-            link = _link(run_dir, path)
-            if link not in links:
-                links.append(link)
-    return '<p class="links">' + " ".join(links) + "</p>" if links else ""
+        values.extend(sorted(logs_dir.glob("*.log")))
+    links = list(dict.fromkeys(_link(run_dir, value) for value in values))
+    return _links(links)
 
 
 def render_run(run_dir: Path) -> Path:
@@ -360,9 +350,9 @@ def render_index(output_root: Path) -> Path:
         path
         for path in output_root.iterdir()
         if path.is_dir()
-        and (
-            _has_run_manifest(path, "direct_solve_manifest.json")
-            or _has_run_manifest(path, "final_summary_manifest.json")
+        and any(
+            _run_manifest_path(path, name).exists()
+            for name in ("direct_solve_manifest.json", "final_summary_manifest.json")
         )
     ]
     runs.sort(key=_manifest_sort_key, reverse=True)

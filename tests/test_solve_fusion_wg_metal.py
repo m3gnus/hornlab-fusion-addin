@@ -3688,6 +3688,25 @@ def test_beamwidth_varies_by_frequency_on_unsorted_angle_grid():
     assert not np.any(assumed_symmetric["vertical"])
 
 
+def test_beamwidth_is_nan_when_pressure_row_is_partially_nan():
+    module = _load_script()
+    angles = np.linspace(0.0, 90.0, 7)
+    planes = np.array(["horizontal"], dtype=str)
+    pressure = (
+        10.0 ** ((-6.0 * (angles / 30.0) ** 2) / 20.0)
+    )[None, None, :].astype(np.complex128)
+    pressure[0, 0, -1] = np.nan
+
+    widths, limited, _ = module._beamwidth_minus6_db_by_plane(
+        pressure,
+        angles,
+        planes,
+    )
+
+    assert np.isnan(widths["horizontal"][0])
+    assert not limited["horizontal"][0]
+
+
 def test_beamwidth_flags_one_sided_symmetry_assumption_in_artifacts(tmp_path):
     module = _load_script()
     freqs = np.array([500.0, 1000.0], dtype=np.float64)

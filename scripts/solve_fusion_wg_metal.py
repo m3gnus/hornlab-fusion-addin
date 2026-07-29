@@ -2876,6 +2876,7 @@ def _beamwidth_minus6_db_by_plane(
 
     for plane_index, plane in enumerate(planes):
         magnitudes = np.abs(pressure[:, plane_index, order])
+        incomplete_rows = ~np.all(np.isfinite(magnitudes), axis=1)
         references = np.maximum(
             magnitudes[:, on_axis_sorted_idx],
             1.0e-30,
@@ -2898,6 +2899,11 @@ def _beamwidth_minus6_db_by_plane(
         else:
             plane_widths = np.maximum(0.0, right_edges - left_edges)
             plane_limited = left_limited | right_limited
+        # A missing angular sample can hide the first threshold crossing.
+        # Preserve the existing all-NaN contract for every incomplete row
+        # instead of returning a plausible width from the remaining samples.
+        plane_widths[incomplete_rows] = np.nan
+        plane_limited[incomplete_rows] = False
         widths[str(plane)] = plane_widths
         limited[str(plane)] = plane_limited
         assumed_symmetric[str(plane)] = np.full(

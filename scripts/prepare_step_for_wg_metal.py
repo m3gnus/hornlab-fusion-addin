@@ -787,21 +787,90 @@ def _free_edges_on_expected_planes(
     )
 
 
+def _symmetry_source_normal_projection(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    tags: np.ndarray,
+    *,
+    source_tags: set[int],
+    symmetry_planes: tuple[str, ...],
+) -> float | None:
+    """Project a reduced component's source-cap normal onto its open axis.
+
+    Two orthogonal symmetry cuts leave one principal axis unconstrained. The
+    positive direction of that remaining axis is the source/aperture winding
+    contract used by the Metal solve. The source cap's net area vector is a
+    local orientation anchor: it changes sign when the component is flipped,
+    but is independent of translation and of any origin chosen for a volume
+    sum. A proper rotation that carries the cut planes and remaining axis with
+    the mesh preserves the projection.
+
+    ``None`` means the component cannot be judged without guessing: it has no
+    tagged source cap, does not have exactly two distinct principal cut
+    planes, or its cap has no resolvable projection on the remaining axis.
+    """
+    if len(triangles) == 0 or len(tags) != len(triangles):
+        return None
+
+    cut_axes = {
+        {"x0": 0, "y0": 1, "z0": 2}[plane]
+        for plane in symmetry_planes
+    }
+    open_axes = sorted({0, 1, 2} - cut_axes)
+    if len(cut_axes) != 2 or len(open_axes) != 1:
+        return None
+
+    source_mask = np.isin(tags, tuple(source_tags))
+    if not np.any(source_mask):
+        return None
+
+    source_triangles = triangles[source_mask]
+    p0 = points[source_triangles[:, 0]]
+    p1 = points[source_triangles[:, 1]]
+    p2 = points[source_triangles[:, 2]]
+    area_vectors = np.cross(p1 - p0, p2 - p0)
+    total_area_vector = np.sum(area_vectors, axis=0)
+    total_area = float(np.sum(np.linalg.norm(area_vectors, axis=1)))
+    projection = float(total_area_vector[open_axes[0]])
+    if total_area <= 0.0 or abs(projection) <= 1.0e-12 * total_area:
+        return None
+    return projection
+
+
 def _repair_triangle_winding(
     points: np.ndarray,
     triangles: np.ndarray,
     *,
+    tags: np.ndarray | None = None,
+    source_tags: set[int] | None = None,
     symmetry_planes: tuple[str, ...] = (),
     tolerance: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Repair manifold winding and orient each closed or cut component outward."""
+    """Repair manifold winding and orient components with a valid anchor.
+
+    Watertight components retain the signed-volume outwardness contract.
+    Symmetry-reduced open components instead use their tagged source cap:
+    positive source-normal projection on the one non-cut principal axis is the
+    Metal aperture contract. Reduced components without a usable source anchor
+    are deliberately left unjudged and counted rather than guessed.
+    """
     repaired = triangles.copy()
     stats = {
         "flipped_consistency": 0,
         "flipped_global": 0,
+        "unjudged_symmetry_components": 0,
+        "unjudged_symmetry_no_source": 0,
     }
     if len(repaired) == 0:
         return repaired, stats
+    component_tags = (
+        np.asarray(tags, dtype=np.int32)
+        if tags is not None
+        else np.full(len(repaired), RIGID_TAG, dtype=np.int32)
+    )
+    if len(component_tags) != len(repaired):
+        raise ValueError("triangle and physical-tag counts differ")
+    declared_source_tags = set(source_tags or ())
 
     edge_to_triangles: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
     for tri_idx, tri in enumerate(repaired):
@@ -866,11 +935,29 @@ def _repair_triangle_winding(
                 tolerance=tolerance,
             )
         )
-        if (
-            (closed or symmetry_reduced)
-            and edge_stats["inconsistent_edges"] == 0
-            and _signed_volume(points, component_triangles) < 0.0
-        ):
+        if edge_stats["inconsistent_edges"] != 0:
+            continue
+        if closed:
+            if _signed_volume(points, component_triangles) < 0.0:
+                repaired[component] = component_triangles[:, [0, 2, 1]]
+                stats["flipped_global"] += int(len(component))
+            continue
+        if not symmetry_reduced:
+            continue
+
+        projection = _symmetry_source_normal_projection(
+            points,
+            component_triangles,
+            component_tags[component],
+            source_tags=declared_source_tags,
+            symmetry_planes=symmetry_planes,
+        )
+        if projection is None:
+            stats["unjudged_symmetry_components"] += 1
+            if not np.any(np.isin(component_tags[component], tuple(declared_source_tags))):
+                stats["unjudged_symmetry_no_source"] += 1
+            continue
+        if projection < 0.0:
             repaired[component] = component_triangles[:, [0, 2, 1]]
             stats["flipped_global"] += int(len(component))
 
@@ -1034,6 +1121,8 @@ def _postprocess_mesh(
     repaired_triangles, repair_stats = _repair_triangle_winding(
         points,
         triangles,
+        tags=tags,
+        source_tags={spec.tag for spec in source_specs},
         symmetry_planes=symmetry_planes,
         tolerance=symmetry_tolerance,
     )

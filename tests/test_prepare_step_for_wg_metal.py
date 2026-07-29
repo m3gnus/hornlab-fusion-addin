@@ -713,6 +713,86 @@ def test_open_origin_cut_inward_mesh_flips_globally():
     assert topology["source_normal_projections"]["LF"]["projection_z_step_units2"] > 0.0
 
 
+def test_symmetry_reduced_source_anchor_wins_when_signed_volume_disagrees():
+    module = _load_script()
+    points, triangles, _ = _open_unit_box(inward=True)
+    # This is the rollback-like acoustic-domain winding: the wall normals face
+    # into the bore and the source at z=0 fires +z. Its open-shell signed
+    # volume is negative, so the former volume oracle inverted every normal.
+    tags = np.asarray([1, 1, 1, 1, 2, 2, 1, 1], dtype=np.int32)
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[("triangle", triangles)],
+        cell_data={"gmsh:physical": [tags]},
+    )
+
+    _, repair, topology = module._postprocess_mesh(
+        mesh,
+        [module.SourceSpec("LF", 20.0, 2)],
+        symmetry_planes=("x0", "y0"),
+        tolerance=1e-9,
+    )
+
+    assert repair["before"]["signed_volume_step_units3"] < 0.0
+    assert repair["flipped_global"] == 0
+    assert topology["signed_volume_step_units3"] < 0.0
+    assert topology["source_normal_projections"]["LF"]["projection_z_step_units2"] > 0.0
+
+
+def test_symmetry_source_anchor_is_translation_and_rotation_invariant():
+    module = _load_script()
+    points, triangles, _ = _open_unit_box(inward=True)
+    tags = np.asarray([1, 1, 1, 1, 2, 2, 1, 1], dtype=np.int32)
+    baseline = module._symmetry_source_normal_projection(
+        points,
+        triangles,
+        tags,
+        source_tags={2},
+        symmetry_planes=("x0", "y0"),
+    )
+
+    translated = points + np.asarray([17.0, -31.0, 43.0])
+    rotated = points[:, [2, 0, 1]]
+    translated_projection = module._symmetry_source_normal_projection(
+        translated,
+        triangles,
+        tags,
+        source_tags={2},
+        symmetry_planes=("x0", "y0"),
+    )
+    rotated_projection = module._symmetry_source_normal_projection(
+        rotated,
+        triangles,
+        tags,
+        source_tags={2},
+        symmetry_planes=("y0", "z0"),
+    )
+
+    assert baseline is not None and baseline > 0.0
+    assert translated_projection == pytest.approx(baseline)
+    assert rotated_projection == pytest.approx(baseline)
+
+
+def test_symmetry_reduced_component_without_source_is_left_unjudged():
+    module = _load_script()
+    points, triangles, _ = _open_unit_box(inward=True)
+    tags = np.full(len(triangles), 1, dtype=np.int32)
+
+    repaired, stats = module._repair_triangle_winding(
+        points,
+        triangles,
+        tags=tags,
+        source_tags={2},
+        symmetry_planes=("x0", "y0"),
+        tolerance=1e-9,
+    )
+
+    np.testing.assert_array_equal(repaired, triangles)
+    assert stats["flipped_global"] == 0
+    assert stats["unjudged_symmetry_components"] == 1
+    assert stats["unjudged_symmetry_no_source"] == 1
+
+
 def test_open_mesh_with_off_plane_free_edges_keeps_winding():
     module = _load_script()
     points, triangles, tags = _open_unit_box(inward=True)

@@ -34,7 +34,10 @@ The add-in is designed to not fail on configuration drift:
   contains both `solver_impedance_matrix` and
   `engineering_impedance_matrix = conj(Z_solver)`, matching the validated
   2026-06-11 LEM/TMM insertion convention for Helmholtz chamber
-  back-loading.
+  back-loading. Its diagnostics preserve the raw full-matrix
+  `passivity_min_eig` and separately report
+  `passivity_min_eig_reciprocal`; `passivity_ok` evaluates the reciprocal
+  projection so non-reciprocity does not masquerade as active behavior.
 - **Passive-cardioid MF combine is optional.** The `Passive cardioid MF`
   group can combine solved `MF` and `PORT_EXIT` pressure bases after the
   direct solve. The network is: rear chamber compliance `C = V/(rho*c^2)` in

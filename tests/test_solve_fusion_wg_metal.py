@@ -1334,7 +1334,8 @@ def test_port_exit_radiation_impedance_matrix_writes_conjugated_artifact(
     fake_diagnostics = module.radiation_impedance.RadiationMatrixDiagnostics(
         reciprocity_max_abs=np.array([0.0]),
         reciprocity_max_rel=np.array([0.0]),
-        passivity_min_eig=np.array([7.0]),
+        passivity_min_eig=np.array([-2.0]),
+        passivity_min_eig_reciprocal=np.array([7.0]),
         passivity_ok=np.array([True]),
         low_ka_self_impedance={},
         low_ka_self_impedance_rel_error={},
@@ -1408,7 +1409,20 @@ def test_port_exit_radiation_impedance_matrix_writes_conjugated_artifact(
         matrix_npz["engineering_impedance_matrix"],
         np.conjugate(solver_matrix),
     )
-    assert (tmp_path / "port_exit_radiation_impedance_matrix.summary.json").exists()
+    np.testing.assert_allclose(matrix_npz["passivity_min_eig"], [-2.0])
+    np.testing.assert_allclose(
+        matrix_npz["passivity_min_eig_reciprocal"],
+        [7.0],
+    )
+    summary_path = tmp_path / "port_exit_radiation_impedance_matrix.summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["diagnostics"]["passivity_min_eig"] == [-2.0]
+    assert summary["diagnostics"]["passivity_min_eig_reciprocal"] == [7.0]
+    assert (
+        summary["diagnostics"]["passivity_ok_basis"]
+        == "passivity_min_eig_reciprocal"
+    )
+    assert summary["diagnostics"]["passivity_all_ok"] is True
 
 
 def test_native_symmetry_none_maps_to_solver_none():
@@ -1915,6 +1929,7 @@ def test_postprocess_only_regenerates_derived_artifacts_without_rewriting_npzs(
             reciprocity_max_abs=np.zeros(nfreq),
             reciprocity_max_rel=np.zeros(nfreq),
             passivity_min_eig=np.ones(nfreq),
+            passivity_min_eig_reciprocal=np.ones(nfreq),
             passivity_ok=np.ones(nfreq, dtype=bool),
             low_ka_self_impedance={},
             low_ka_self_impedance_rel_error={},

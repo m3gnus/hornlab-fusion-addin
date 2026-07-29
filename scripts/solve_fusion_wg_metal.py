@@ -596,7 +596,14 @@ def _radiation_impedance_payload(
             ),
             "passivity_min_eig": diagnostics.passivity_min_eig,
             "passivity_min_eig_min": float(np.min(diagnostics.passivity_min_eig)),
+            "passivity_min_eig_reciprocal": (
+                diagnostics.passivity_min_eig_reciprocal
+            ),
+            "passivity_min_eig_reciprocal_min": float(
+                np.min(diagnostics.passivity_min_eig_reciprocal)
+            ),
             "passivity_ok": diagnostics.passivity_ok,
+            "passivity_ok_basis": "passivity_min_eig_reciprocal",
             "passivity_all_ok": bool(np.all(diagnostics.passivity_ok)),
         },
         "in_phase_termination_load": {
@@ -5104,6 +5111,9 @@ def _solve_port_exit_radiation_impedance_matrix(
         in_phase_aperture_names=np.asarray(in_phase_names),
         reciprocity_max_rel=diagnostics.reciprocity_max_rel,
         passivity_min_eig=diagnostics.passivity_min_eig,
+        passivity_min_eig_reciprocal=(
+            diagnostics.passivity_min_eig_reciprocal
+        ),
         passivity_ok=diagnostics.passivity_ok,
     )
     payload = _radiation_impedance_payload(

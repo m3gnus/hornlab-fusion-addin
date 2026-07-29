@@ -1831,8 +1831,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         solve_mesh_path = Path(str(expanded_mesh_path))
         solve_native_symmetry_plane = None
     pipeline_manifest["orientation_report"] = str(orientation_report_path)
+    # Readers of the 12 historical pre-expanded_mesh artifacts should use
+    # d.get("expanded_mesh") or d.get("expanded_4quarter") or {}.
     pipeline_manifest["expanded_mesh"] = expanded_mesh
-    pipeline_manifest["expanded_4quarter"] = orientation_report.get("expanded_4quarter", {})
     wg_source_meshes_m = (
         orientation_report.get("wg_source_meshes_m")
         or prep_manifest.get("wg_source_meshes_m", {})

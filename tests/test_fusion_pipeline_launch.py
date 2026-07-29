@@ -1140,7 +1140,6 @@ def _fake_run_logged(
                 json.dumps(
                     {
                         "expanded_mesh": {},
-                        "expanded_4quarter": {},
                         "source_frame_inference": (
                             DEFAULT_FRAME_INFERENCE
                             if frame_inference is None
@@ -1712,7 +1711,6 @@ def test_pipeline_writes_solving_manifest_before_direct_solve_returns(
                 json.dumps(
                     {
                         "expanded_mesh": {},
-                        "expanded_4quarter": {},
                         "source_frame_inference": DEFAULT_FRAME_INFERENCE,
                     }
                 )
@@ -1791,7 +1789,6 @@ def test_pipeline_opens_output_folder_after_solve_failure(tmp_path, monkeypatch)
                 json.dumps(
                     {
                         "expanded_mesh": {},
-                        "expanded_4quarter": {},
                         "source_frame_inference": DEFAULT_FRAME_INFERENCE,
                     }
                 )
@@ -2414,7 +2411,6 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
                 json.dumps(
                     {
                         "expanded_mesh": {"mesh": expanded_mesh},
-                        "expanded_4quarter": {},
                         "wg_source_meshes_m": {"HF": expanded_source},
                         "source_frame_inference": DEFAULT_FRAME_INFERENCE,
                     }
@@ -2459,6 +2455,7 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
         "HF": expanded_source
     }
     assert manifest["wg_source_meshes_m"] == {"HF": expanded_source}
+    assert "expanded_4quarter" not in manifest
 
 
 def test_pipeline_auto_frame_follows_inferred_horn_axis(tmp_path, monkeypatch):
@@ -2576,7 +2573,6 @@ def test_pipeline_auto_frame_constrains_axis_to_cut_planes_for_meh(tmp_path, mon
                 json.dumps(
                     {
                         "expanded_mesh": {},
-                        "expanded_4quarter": {},
                         "source_frame_inference": inference,
                         "principal_axis_mouth_centers": {
                             "+z": [188.0, 112.0, 298.0],

@@ -496,8 +496,6 @@ def main() -> int:
         },
         "wg_source_meshes_m": wg_source_meshes,
     }
-    if mirror_axes == ("x", "y"):
-        report["expanded_4quarter"] = report["expanded_mesh"]
     report_path = out_dir / "orientation_report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))

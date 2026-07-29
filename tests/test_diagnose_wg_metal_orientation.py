@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -182,6 +183,39 @@ def test_wg_source_mesh_export_uses_expanded_full_domain(tmp_path):
     )
     assert set(mesh.field_data) == {"LF", "rigid"}
     assert float(mesh.points.max()) <= 0.001
+
+
+def test_main_omits_legacy_expanded_4quarter_alias(tmp_path, monkeypatch, capsys):
+    module = _load_script()
+    points, triangles, tags = _open_unit_box_with_top_source()
+    mesh_path = tmp_path / "tagged_sources.msh"
+    out_dir = tmp_path / "out"
+    module._write_mesh(mesh_path, points, triangles, tags)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT),
+            "--mesh",
+            str(mesh_path),
+            "--out",
+            str(out_dir),
+            "--source",
+            "LF:2",
+            "--mirror-axes",
+            "x,y",
+            "--no-preview",
+        ],
+    )
+
+    assert module.main() == 0
+
+    report = json.loads(
+        (out_dir / "orientation_report.json").read_text(encoding="utf-8")
+    )
+    assert report["expanded_mesh"]["mirror_axes"] == ["x", "y"]
+    assert "expanded_4quarter" not in report
+    capsys.readouterr()
 
 
 def test_front_baffle_source_corrected_for_inward_wound_mesh():

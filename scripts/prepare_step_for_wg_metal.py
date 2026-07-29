@@ -11,7 +11,8 @@ The expected CAD pattern is:
 The script writes:
 
 * ``tagged_sources.msh`` in the STEP units, carrying all named sources,
-* one WG-compatible metre-unit ``<source>_source_tag2_m.msh`` per source,
+* by default, one WG-compatible metre-unit
+  ``<source>_source_tag2_m.msh`` per source,
 * ``manifest.json`` with topology and source mapping diagnostics.
 
 It intentionally refuses to report solver-ready output when the mesh has free
@@ -1479,6 +1480,24 @@ def _write_wg_source_meshes(
     return outputs
 
 
+def _maybe_write_wg_source_meshes(
+    tagged_mesh_path: Path,
+    out_dir: Path,
+    source_specs: list[SourceSpec],
+    *,
+    unit_scale_to_m: float,
+    skip_export: bool,
+) -> dict[str, str]:
+    if skip_export:
+        return {}
+    return _write_wg_source_meshes(
+        tagged_mesh_path,
+        out_dir,
+        source_specs,
+        unit_scale_to_m=unit_scale_to_m,
+    )
+
+
 def _surface_diagnostics(surface_tags: list[int]) -> list[dict]:
     rows = []
     for tag in surface_tags:
@@ -1798,6 +1817,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.001,
         help="Scale from STEP units to metres for WG output meshes. Fusion STEP is usually mm -> 0.001.",
+    )
+    parser.add_argument(
+        "--skip-source-mesh-export",
+        action="store_true",
+        help=(
+            "Skip per-source metre-unit mesh export. The top-level pipeline uses "
+            "this because orientation diagnosis writes full-domain counterparts "
+            "to the same output filenames."
+        ),
     )
     parser.add_argument("--topology-tol", type=float, default=DEFAULT_TOPOLOGY_TOL)
     parser.add_argument(
@@ -2323,11 +2351,12 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
-    wg_meshes = _write_wg_source_meshes(
+    wg_meshes = _maybe_write_wg_source_meshes(
         tagged_mesh_path,
         out_dir,
         active_source_specs,
         unit_scale_to_m=args.unit_scale_to_m,
+        skip_export=args.skip_source_mesh_export,
     )
 
     solver_ready = (

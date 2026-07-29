@@ -47,6 +47,79 @@ def _quarter_tube(angles_deg, z_values):
     return points, np.asarray(triangles, dtype=np.int64)
 
 
+def test_source_mesh_export_is_enabled_by_default(monkeypatch, tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--step",
+            str(tmp_path / "model.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+        ]
+    )
+    expected = {"HF": str(tmp_path / "out" / "HF_source_tag2_m.msh")}
+    calls = []
+
+    def fake_write(tagged_mesh_path, out_dir, source_specs, *, unit_scale_to_m):
+        calls.append((tagged_mesh_path, out_dir, source_specs, unit_scale_to_m))
+        return expected
+
+    monkeypatch.setattr(module, "_write_wg_source_meshes", fake_write)
+    source_specs = [module.SourceSpec("HF", 5.0, 4)]
+
+    outputs = module._maybe_write_wg_source_meshes(
+        tmp_path / "tagged_sources.msh",
+        tmp_path / "out",
+        source_specs,
+        unit_scale_to_m=0.001,
+        skip_export=args.skip_source_mesh_export,
+    )
+
+    assert args.skip_source_mesh_export is False
+    assert outputs == expected
+    assert calls == [
+        (
+            tmp_path / "tagged_sources.msh",
+            tmp_path / "out",
+            source_specs,
+            0.001,
+        )
+    ]
+
+
+def test_source_mesh_export_can_be_skipped(monkeypatch, tmp_path):
+    module = _load_script()
+    args = module.parse_args(
+        [
+            "--step",
+            str(tmp_path / "model.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--skip-source-mesh-export",
+        ]
+    )
+
+    def fail_write(*_args, **_kwargs):
+        pytest.fail("source meshes must not be written when export is skipped")
+
+    monkeypatch.setattr(module, "_write_wg_source_meshes", fail_write)
+
+    outputs = module._maybe_write_wg_source_meshes(
+        tmp_path / "tagged_sources.msh",
+        tmp_path / "out",
+        [module.SourceSpec("HF", 5.0, 4)],
+        unit_scale_to_m=0.001,
+        skip_export=args.skip_source_mesh_export,
+    )
+
+    assert args.skip_source_mesh_export is True
+    assert outputs == {}
+
+
 def test_parse_solid_brep_faces_excludes_only_closed_solid_shell(tmp_path):
     module = _load_script()
     step = tmp_path / "mixed.step"

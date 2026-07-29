@@ -2382,7 +2382,7 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {"HF": "reduced_HF_source_tag2_m.msh"},
+        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "symmetry_planes_mode": "auto",
@@ -2444,6 +2444,8 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
     )
 
     assert rc == 0
+    prep_cmd = calls[0][1]
+    assert "--skip-source-mesh-export" in prep_cmd
     manifest = json.loads(
         _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"

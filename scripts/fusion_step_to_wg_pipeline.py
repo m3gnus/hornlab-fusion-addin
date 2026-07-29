@@ -1496,6 +1496,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "auto" if symmetry_auto else (",".join(symmetry_planes) if symmetry_planes else "none"),
         "--unit-scale-to-m",
         str(args.unit_scale_to_m),
+        "--skip-source-mesh-export",
         "--topology-tol",
         str(args.topology_tol),
         "--requested-max-frequency-hz",

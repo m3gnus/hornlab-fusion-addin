@@ -76,7 +76,6 @@ def _default_python() -> Path:
 
 
 DEFAULT_PYTHON = _default_python()
-DEFAULT_WG_DIR = REPO_ROOT.parent / "Waveguide Generator"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "runs" / "fusion360"
 SETTINGS_PATH = (
     Path.home()
@@ -112,9 +111,7 @@ DEFAULT_SETTINGS = {
     "transition_mm": "200",
     "mirror_plane": "Auto detect",
     "python_path": str(DEFAULT_PYTHON),
-    "wg_dir": str(DEFAULT_WG_DIR),
     "mesh_only": False,
-    "open_wg": False,
     "open_output": True,
     "open_report": False,
     "output_per_driver_plots": True,
@@ -1220,10 +1217,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 mirror_plane.listItems.add(name, selected_mirror_plane == name)
             advanced.addStringValueInput("python_path", "Python", _setting_str(settings, "python_path"))
             advanced.addBoolValueInput("browse_python_path", "Browse Python", False, "", False)
-            advanced.addStringValueInput("wg_dir", "WG folder", _setting_str(settings, "wg_dir"))
-            advanced.addBoolValueInput("browse_wg_dir", "Browse WG folder", False, "", False)
             advanced.addStringValueInput("plot_theme", "Plot theme", _setting_str(settings, "plot_theme"))
-            advanced.addBoolValueInput("open_wg", "Launch WG", True, "", _setting_bool(settings, "open_wg"))
 
             input_changed_handler = CommandInputChangedHandler()
             command.inputChanged.add(input_changed_handler)
@@ -1277,9 +1271,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 _show_message(f"Saved preset:\n{path}")
             elif input_id == "browse_output_root":
                 _choose_folder(inputs, "output_root", "Select WG Metal output root")
-                changed.value = False
-            elif input_id == "browse_wg_dir":
-                _choose_folder(inputs, "wg_dir", "Select Waveguide Generator folder")
                 changed.value = False
             elif input_id == "browse_python_path":
                 _choose_file(inputs, "python_path", "Select Python executable")
@@ -1568,7 +1559,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             mirror_axes = mirror_axes_for_symmetry_planes(symmetry_planes)
             quadrants = quadrants_for_symmetry_planes(symmetry_planes)
             python_path = Path(str(_input_value(inputs, "python_path"))).expanduser()
-            wg_dir = Path(str(_input_value(inputs, "wg_dir"))).expanduser()
             plot_theme = str(_input_value(inputs, "plot_theme") or "hornlab").strip() or "hornlab"
             mesh_only = bool(_input_value(inputs, "mesh_only"))
             clamp_to_mesh_limit = bool(_input_value(inputs, "clamp_to_mesh_limit"))
@@ -1616,7 +1606,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             underresolved_solve_policy = (
                 "clamp-per-source" if clamp_to_mesh_limit else "warn"
             )
-            open_wg = bool(_input_value(inputs, "open_wg"))
             open_output = bool(_input_value(inputs, "open_output"))
             open_report = bool(_input_value(inputs, "open_report"))
 
@@ -1629,8 +1618,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 raise RuntimeError(stale_warning)
             if not python_path.exists():
                 raise RuntimeError(f"Python interpreter does not exist: {python_path}")
-            if open_wg and not wg_dir.exists():
-                raise RuntimeError(f"Waveguide Generator folder does not exist: {wg_dir}")
             if passive_cardioid_enabled:
                 _parse_required_positive_float(
                     passive_cardioid_rear_volume_l,
@@ -1730,10 +1717,8 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "transition_mm": transition_mm,
                 "mirror_plane": mirror_plane,
                 "python_path": str(python_path),
-                "wg_dir": str(wg_dir),
                 "plot_theme": plot_theme,
                 "mesh_only": mesh_only,
-                "open_wg": open_wg,
                 "open_output": open_output,
                 "open_report": open_report,
                 "output_per_driver_plots": output_per_driver_plots,
@@ -1814,9 +1799,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 polar_angle_min_deg=polar_angle_min_deg,
                 polar_angle_max_deg=polar_angle_max_deg,
                 polar_angle_count=polar_angle_count,
-                wg_dir=wg_dir,
                 mesh_only=mesh_only,
-                open_wg=open_wg,
                 open_output=open_output,
                 open_report=open_report,
                 plot_theme=plot_theme,

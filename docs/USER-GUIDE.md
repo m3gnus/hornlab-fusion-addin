@@ -108,8 +108,7 @@ cardioid outputs, Driver LEM sidecars, derived acoustics, VituixCAD export,
 radiation-impedance matrices, pressure bases, and the HTML report. All
 categories default on except VituixCAD, preserving earlier run behavior.
 
-Advanced: choose Python, optional Waveguide Generator folder launch, and mirror
-plane override.
+Advanced: choose Python, plot theme, and mirror plane override.
 
 ## 4. Reading The Outputs
 
@@ -117,8 +116,8 @@ New runs use solver layout version 2. Manifests stay at the run root, while
 exports, mesh-prep files, and solver artifacts are grouped by category:
 
 - `exports/`: Fusion STEP and native `.f3d` archive
-- `mesh/`: prepared tagged mesh, per-source WG meshes, orientation report,
-  expanded full-domain mesh previews, and mesh-prep `manifest.json`
+- `mesh/`: prepared tagged mesh, orientation report, expanded full-domain mesh
+  previews, and mesh-prep `manifest.json`
 - `fem/`: tetrahedral chamber mesh, FEM/BEM matrices, entry flow ratios,
   condensed driver load, synthesized MF basis, and summary
 - `sources/`: per-source result JSON, pressure bases, direct source plots, and

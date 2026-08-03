@@ -56,9 +56,7 @@ def _helper_command(helper, **overrides):
         polar_angle_min_deg="0",
         polar_angle_max_deg="180",
         polar_angle_count="37",
-        wg_dir=Path("/wg"),
         mesh_only=False,
-        open_wg=False,
         open_output=True,
     )
     kwargs.update(overrides)
@@ -351,6 +349,7 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--open-output-folder" in cmd
     assert "--open-report" not in cmd
     assert "--open-wg" not in cmd
+    assert "--wg-dir" not in cmd
     assert "--allow-underresolved-solve" not in cmd
     assert "--skip-per-driver-plots" not in cmd
     assert "--skip-combined-set" not in cmd
@@ -1176,7 +1175,6 @@ def _underresolved_prep_manifest():
         "sources": {"LF": {"tag": 2}, "HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0", "y0"],
         "mesh_frequency_validation": {
@@ -1211,7 +1209,6 @@ def _fem_ready_prep_manifest(
         "skipped_sources": {},
         "unit_scale_to_m": 0.001,
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0", "y0"],
         "mesh_frequency_validation": {
@@ -1520,7 +1517,6 @@ def test_pipeline_orders_direct_solve_sources_hf_mf_lf(tmp_path, monkeypatch):
         },
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0", "y0"],
         "mesh_frequency_validation": {
@@ -1579,7 +1575,6 @@ def test_pipeline_forwards_output_skip_flags_to_direct_solve(tmp_path, monkeypat
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0", "y0"],
         "mesh_frequency_validation": {
@@ -1633,7 +1628,6 @@ def test_pipeline_forwards_plot_theme_to_direct_solve(tmp_path, monkeypatch):
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "mesh_frequency_validation": {
@@ -1683,7 +1677,6 @@ def test_pipeline_writes_solving_manifest_before_direct_solve_returns(
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "mesh_frequency_validation": {
@@ -1761,7 +1754,6 @@ def test_pipeline_opens_output_folder_after_solve_failure(tmp_path, monkeypatch)
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "mesh_frequency_validation": {
@@ -1833,7 +1825,6 @@ def test_pipeline_forwards_passive_cardioid_options_to_direct_solve(tmp_path, mo
         "sources": {"MF": {"tag": 3}, "PORT_EXIT": {"tag": 10}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "mesh_frequency_validation": {
@@ -2312,7 +2303,6 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["x0"],
         "symmetry_planes_mode": "auto",
@@ -2360,8 +2350,9 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
     diagnose_cmd = calls[1][1]
     assert diagnose_cmd[diagnose_cmd.index("--mirror-axes") + 1] == "x"
     assert diagnose_cmd[diagnose_cmd.index("--tol") + 1] == "1e-05"
-    assert diagnose_cmd[diagnose_cmd.index("--unit-scale-to-m") + 1] == "0.001"
+    assert "--unit-scale-to-m" not in diagnose_cmd
     solve_cmd = calls[2][1]
+    assert solve_cmd[solve_cmd.index("--mesh") + 1].endswith("tagged_sources.msh")
     assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] == "yz"
     manifest = json.loads(
         _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
@@ -2373,18 +2364,16 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
     assert manifest["quadrants"] == 14
 
 
-def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypatch):
+def test_pipeline_uses_only_authoritative_mesh_contracts(tmp_path, monkeypatch):
     pipeline = _load_pipeline()
     calls = []
-    expanded_mesh = str(tmp_path / "out" / "expanded_2q_x.msh")
-    expanded_source = str(tmp_path / "out" / "HF_source_tag2_m.msh")
+    expanded_mesh = str(tmp_path / "out" / "expanded_4q_xz.msh")
     prep_manifest = {
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
-        "symmetry_planes": ["x0"],
+        "symmetry_planes": ["x0", "z0"],
         "symmetry_planes_mode": "auto",
         "mesh_frequency_validation": {
             "status": "valid",
@@ -2411,7 +2400,6 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
                 json.dumps(
                     {
                         "expanded_mesh": {"mesh": expanded_mesh},
-                        "wg_source_meshes_m": {"HF": expanded_source},
                         "source_frame_inference": DEFAULT_FRAME_INFERENCE,
                     }
                 )
@@ -2439,24 +2427,37 @@ def test_pipeline_wg_handoff_uses_expanded_full_domain_meshes(tmp_path, monkeypa
             "auto",
             "--freq-max-hz",
             "8000",
+            "--frame-axis",
+            "0,1,0",
+            "--frame-origin",
+            "0,0,0",
+            "--frame-u",
+            "1,0,0",
+            "--frame-v",
+            "0,0,1",
             "--run-solves",
         ]
     )
 
     assert rc == 0
     prep_cmd = calls[0][1]
-    assert "--skip-source-mesh-export" in prep_cmd
+    diagnose_cmd = calls[1][1]
+    solve_cmd = calls[2][1]
+    for cmd in (prep_cmd, diagnose_cmd, solve_cmd):
+        assert "--skip-source-mesh-export" not in cmd
+        assert "--wg-dir" not in cmd
+        assert "--open-wg" not in cmd
+    assert "--unit-scale-to-m" not in diagnose_cmd
+    assert solve_cmd[solve_cmd.index("--mesh") + 1] == expanded_mesh
     manifest = json.loads(
         _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
             encoding="utf-8"
         )
     )
-    assert manifest["solve_mesh"].endswith("tagged_sources.msh")
-    assert manifest["waveguide_generator"]["import_mesh"] == expanded_mesh
-    assert manifest["waveguide_generator"]["per_source_meshes_m"] == {
-        "HF": expanded_source
-    }
-    assert manifest["wg_source_meshes_m"] == {"HF": expanded_source}
+    assert manifest["solve_mesh"] == expanded_mesh
+    assert "wg_source_meshes_m" not in manifest
+    assert "waveguide_generator" not in manifest
+    assert "waveguide_generator_dir" not in manifest
     assert "expanded_4quarter" not in manifest
 
 
@@ -2469,7 +2470,6 @@ def test_pipeline_auto_frame_follows_inferred_horn_axis(tmp_path, monkeypatch):
         "sources": {"LF": {"tag": 2}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": ["z0"],
         "symmetry_planes_mode": "auto",
@@ -2638,7 +2638,6 @@ def test_pipeline_auto_frame_passes_negative_origin_as_option_value(
         "sources": {"LF": {"tag": 2}, "HF": {"tag": 4}},
         "skipped_sources": {},
         "tagged_mesh_step_units": "tagged_sources.msh",
-        "wg_source_meshes_m": {},
         "solver_ready": True,
         "symmetry_planes": [],
         "symmetry_planes_mode": "auto",

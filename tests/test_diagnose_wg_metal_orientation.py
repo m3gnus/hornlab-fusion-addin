@@ -152,39 +152,6 @@ def test_mirror_domain_snaps_near_plane_vertices_before_welding():
     assert np.min(np.abs(expanded_points[:, 0])) == 0.0
 
 
-def test_wg_source_mesh_export_uses_expanded_full_domain(tmp_path):
-    module = _load_script()
-    points, triangles, tags = _open_unit_box_with_top_source()
-    expanded_points, expanded_triangles, expanded_tags = module._mirror_domain(
-        points,
-        triangles,
-        tags,
-        ("x", "y"),
-        tol=module.DEFAULT_TOPOLOGY_TOL,
-    )
-
-    outputs = module._write_wg_source_meshes(
-        tmp_path,
-        expanded_points,
-        expanded_triangles,
-        expanded_tags,
-        [module.Source(name="LF", tag=2)],
-        unit_scale_to_m=0.001,
-    )
-
-    mesh = meshio.read(outputs["LF"])
-    out_tris = mesh.cells_dict["triangle"]
-    out_tags = mesh.cell_data_dict["gmsh:physical"]["triangle"]
-    assert len(module._free_edges(out_tris)) == 0
-    assert set(out_tags.tolist()) == {1, 2}
-    np.testing.assert_array_equal(
-        mesh.cell_data_dict["gmsh:geometrical"]["triangle"],
-        out_tags,
-    )
-    assert set(mesh.field_data) == {"LF", "rigid"}
-    assert float(mesh.points.max()) <= 0.001
-
-
 def test_main_omits_legacy_expanded_4quarter_alias(tmp_path, monkeypatch, capsys):
     module = _load_script()
     points, triangles, tags = _open_unit_box_with_top_source()
@@ -215,6 +182,11 @@ def test_main_omits_legacy_expanded_4quarter_alias(tmp_path, monkeypatch, capsys
     )
     assert report["expanded_mesh"]["mirror_axes"] == ["x", "y"]
     assert "expanded_4quarter" not in report
+    assert "wg_source_meshes_m" not in report
+    assert {path.name for path in out_dir.iterdir()} == {
+        "expanded_4q_xy.msh",
+        "orientation_report.json",
+    }
     capsys.readouterr()
 
 

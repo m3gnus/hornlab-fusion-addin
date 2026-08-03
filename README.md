@@ -56,6 +56,16 @@ Some solve tests exercise a real smoke mesh and skip automatically when
 `runs/scratch/260609-fusion-addin-normalized-sources-smoke/` is absent
 (run artifacts under `runs/` are never tracked).
 
+## Compatibility note
+
+On 2026-08-03 the bianco-era Waveguide Generator bridges were retired. The
+preparation CLI no longer creates per-source metre-unit meshes or accepts
+`--skip-source-mesh-export`, and its manifest no longer contains
+`wg_source_meshes_m`. Orientation diagnosis now emits only its authoritative
+expanded tagged mesh and report. The Fusion dialog's WG-folder and Launch-WG
+controls and the pipeline's `waveguide_generator` handoff were also removed.
+Git history preserves the retired behavior and artifacts.
+
 ## License
 
 AGPL-3.0-or-later

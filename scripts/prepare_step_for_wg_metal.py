@@ -11,8 +11,6 @@ The expected CAD pattern is:
 The script writes:
 
 * ``tagged_sources.msh`` in the STEP units, carrying all named sources,
-* by default, one WG-compatible metre-unit
-  ``<source>_source_tag2_m.msh`` per source,
 * ``manifest.json`` with topology and source mapping diagnostics.
 
 It intentionally refuses to report solver-ready output when the mesh has free
@@ -1537,56 +1535,6 @@ def _topology_stats(
     }
 
 
-def _write_wg_source_meshes(
-    tagged_mesh_path: Path,
-    out_dir: Path,
-    source_specs: list[SourceSpec],
-    *,
-    unit_scale_to_m: float,
-) -> dict[str, str]:
-    mesh = meshio.read(tagged_mesh_path)
-    points, triangles, tags = _mesh_triangle_data(mesh)
-    outputs: dict[str, str] = {}
-    for spec in source_specs:
-        remapped = np.full(tags.shape, RIGID_TAG, dtype=np.int32)
-        remapped[tags == spec.tag] = SOURCE_TAG_BASE
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", spec.name).strip("_") or f"source_{spec.tag}"
-        out_path = out_dir / f"{safe_name}_source_tag2_m.msh"
-        out_mesh = meshio.Mesh(
-            points=points * unit_scale_to_m,
-            cells=[("triangle", triangles)],
-            cell_data={
-                "gmsh:physical": [remapped],
-                "gmsh:geometrical": [remapped],
-            },
-            field_data={
-                "rigid": np.array([RIGID_TAG, 2], dtype=np.int32),
-                safe_name: np.array([SOURCE_TAG_BASE, 2], dtype=np.int32),
-            },
-        )
-        meshio.write(out_path, out_mesh, file_format="gmsh22", binary=False)
-        outputs[spec.name] = str(out_path)
-    return outputs
-
-
-def _maybe_write_wg_source_meshes(
-    tagged_mesh_path: Path,
-    out_dir: Path,
-    source_specs: list[SourceSpec],
-    *,
-    unit_scale_to_m: float,
-    skip_export: bool,
-) -> dict[str, str]:
-    if skip_export:
-        return {}
-    return _write_wg_source_meshes(
-        tagged_mesh_path,
-        out_dir,
-        source_specs,
-        unit_scale_to_m=unit_scale_to_m,
-    )
-
-
 def _surface_diagnostics(surface_tags: list[int]) -> list[dict]:
     rows = []
     for tag in surface_tags:
@@ -1905,15 +1853,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--unit-scale-to-m",
         type=float,
         default=0.001,
-        help="Scale from STEP units to metres for WG output meshes. Fusion STEP is usually mm -> 0.001.",
-    )
-    parser.add_argument(
-        "--skip-source-mesh-export",
-        action="store_true",
         help=(
-            "Skip per-source metre-unit mesh export. The top-level pipeline uses "
-            "this because orientation diagnosis writes full-domain counterparts "
-            "to the same output filenames."
+            "Scale from STEP units to metres for mesh-frequency validation. "
+            "Fusion STEP is usually mm -> 0.001."
         ),
     )
     parser.add_argument("--topology-tol", type=float, default=DEFAULT_TOPOLOGY_TOL)
@@ -2440,14 +2382,6 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
-    wg_meshes = _maybe_write_wg_source_meshes(
-        tagged_mesh_path,
-        out_dir,
-        active_source_specs,
-        unit_scale_to_m=args.unit_scale_to_m,
-        skip_export=args.skip_source_mesh_export,
-    )
-
     solver_ready = (
         topology["nonmanifold_edges"] == 0
         and topology["inconsistent_edges"] == 0
@@ -2458,7 +2392,6 @@ def main(argv: list[str] | None = None) -> int:
         "tagged_mesh_step_units": str(tagged_mesh_path),
         "geometry_healed": bool(geometry_healed),
         "geometry_healing_mode": geometry_healing_mode,
-        "wg_source_meshes_m": wg_meshes,
         "quadrants": args.quadrants,
         "symmetry_planes": list(resolved_symmetry_planes),
         "symmetry_planes_mode": "auto" if symmetry_auto else "explicit",

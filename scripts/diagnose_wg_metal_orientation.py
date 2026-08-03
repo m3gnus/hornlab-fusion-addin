@@ -14,7 +14,6 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 from typing import Iterable
 
 import meshio
@@ -319,41 +318,6 @@ def _write_mesh(
     )
 
 
-def _safe_stem(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "source"
-
-
-def _write_wg_source_meshes(
-    out_dir: Path,
-    points: np.ndarray,
-    triangles: np.ndarray,
-    tags: np.ndarray,
-    sources: list[Source],
-    *,
-    unit_scale_to_m: float,
-) -> dict[str, str]:
-    outputs: dict[str, str] = {}
-    for source in sources:
-        if not np.any(tags == source.tag):
-            continue
-        remapped = np.full(tags.shape, RIGID_TAG, dtype=np.int32)
-        remapped[tags == source.tag] = SOURCE_TAG_BASE
-        safe_name = _safe_stem(source.name)
-        out_path = out_dir / f"{safe_name}_source_tag2_m.msh"
-        _write_mesh(
-            out_path,
-            points=points * unit_scale_to_m,
-            triangles=triangles,
-            tags=remapped,
-            field_data={
-                "rigid": np.array([RIGID_TAG, 2], dtype=np.int32),
-                safe_name: np.array([SOURCE_TAG_BASE, 2], dtype=np.int32),
-            },
-        )
-        outputs[source.name] = str(out_path)
-    return outputs
-
-
 def _write_preview(path: Path, points: np.ndarray, triangles: np.ndarray, tags: np.ndarray) -> None:
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -403,12 +367,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--tol", type=float, default=DEFAULT_TOPOLOGY_TOL)
-    parser.add_argument(
-        "--unit-scale-to-m",
-        type=float,
-        default=0.001,
-        help="Scale from mesh units to metres for WG per-source mesh exports.",
-    )
     parser.add_argument("--no-preview", action="store_true")
     return parser.parse_args()
 
@@ -453,15 +411,6 @@ def main() -> int:
     if not args.no_preview:
         preview_path = out_dir / f"expanded_{expansion_factor}q_{axis_suffix}_preview.png"
         _write_preview(preview_path, expanded_points, expanded_triangles, expanded_tags)
-    wg_source_meshes = _write_wg_source_meshes(
-        out_dir,
-        expanded_points,
-        expanded_triangles,
-        expanded_tags,
-        sources,
-        unit_scale_to_m=args.unit_scale_to_m,
-    )
-
     unique_tags, tag_counts = np.unique(tags, return_counts=True)
     expanded_unique, expanded_counts = np.unique(expanded_tags, return_counts=True)
     report = {
@@ -494,7 +443,6 @@ def main() -> int:
                 for tag, count in zip(expanded_unique, expanded_counts, strict=True)
             },
         },
-        "wg_source_meshes_m": wg_source_meshes,
     }
     report_path = out_dir / "orientation_report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

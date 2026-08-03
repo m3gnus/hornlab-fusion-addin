@@ -836,9 +836,7 @@ def build_pipeline_command(
     polar_angle_min_deg: str,
     polar_angle_max_deg: str,
     polar_angle_count: str,
-    wg_dir: Path,
     mesh_only: bool,
-    open_wg: bool,
     open_output: bool,
     open_report: bool = False,
     plot_theme: str = "hornlab",
@@ -975,8 +973,6 @@ def build_pipeline_command(
         bem_formulation,
         "--complex-k-shift",
         complex_k_shift,
-        "--wg-dir",
-        str(wg_dir),
     ])
     if crossover_lf_mf_hz and str(crossover_lf_mf_hz).strip():
         cmd.extend(["--crossover-lf-mf-hz", str(crossover_lf_mf_hz).strip()])
@@ -990,8 +986,6 @@ def build_pipeline_command(
         cmd.append("--mesh-only")
     else:
         cmd.append("--run-solves")
-    if open_wg:
-        cmd.append("--open-wg")
     if open_output:
         cmd.append("--open-output-folder")
     if open_report:

@@ -7,8 +7,7 @@ active design to STEP, then calls this script to:
 1. prepare source-tagged WG Metal meshes,
 2. run the orientation/4-quarter diagnostic,
 3. optionally run direct hornlab-metal-bem solves,
-4. write one manifest that Waveguide Generator, direct solve tooling, or a
-   human can open.
+4. write one manifest that direct solve tooling or a human can open.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import json
 import math
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import time
@@ -27,7 +25,6 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WG_DIR = REPO_ROOT.parent / "Waveguide Generator"
 DEFAULT_TOPOLOGY_TOL = 1e-5
 ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
 PREP_SCRIPT = REPO_ROOT / "scripts" / "prepare_step_for_wg_metal.py"
@@ -707,21 +704,6 @@ def _finalize_run(args: argparse.Namespace, *, returncode: int, crash_error: str
     _notify(f"WG Metal pipeline {status}", message[:240])
 
 
-def _launch_waveguide_generator(wg_dir: Path, pipeline_manifest: Path) -> None:
-    env_prefix = f"WG_FUSION_PIPELINE_MANIFEST={shlex.quote(str(pipeline_manifest))}"
-    shell_cmd = f"cd {shlex.quote(str(wg_dir))} && {env_prefix} npm start"
-    if sys.platform == "darwin":
-        apple_script = (
-            'tell application "Terminal"\n'
-            "  activate\n"
-            f"  do script {json.dumps(shell_cmd)}\n"
-            "end tell\n"
-        )
-        subprocess.Popen(["osascript", "-e", apple_script])
-    else:
-        subprocess.Popen(["npm", "start"], cwd=str(wg_dir), env={**os.environ, "WG_FUSION_PIPELINE_MANIFEST": str(pipeline_manifest)})
-
-
 def _argv_has_option(argv: list[str], *options: str) -> bool:
     for token in argv:
         for option in options:
@@ -955,7 +937,6 @@ def _apply_preset_defaults(args: argparse.Namespace, argv: list[str]) -> None:
         options=("--mesh-valid-markers", "--no-mesh-valid-markers"),
     )
     for key, dest, options in (
-        ("open_wg", "open_wg", ("--open-wg",)),
         ("open_output", "open_output_folder", ("--open-output-folder",)),
         ("open_report", "open_report", ("--open-report",)),
         ("export_vituixcad", "export_vituixcad", ("--export-vituixcad",)),
@@ -1072,8 +1053,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--unit-scale-to-m", type=float, default=0.001)
     parser.add_argument("--topology-tol", type=float, default=DEFAULT_TOPOLOGY_TOL)
     parser.add_argument("--python", default=sys.executable, help="Python interpreter for child scripts")
-    parser.add_argument("--wg-dir", type=Path, default=DEFAULT_WG_DIR)
-    parser.add_argument("--open-wg", action="store_true", help="Launch Waveguide Generator after pipeline completion")
     parser.add_argument("--open-output-folder", action="store_true")
     parser.add_argument("--open-report", action="store_true", help="Open report.html after pipeline completion")
     parser.add_argument("--allow-leaks", action="store_true")
@@ -1472,7 +1451,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     step_path = args.step.expanduser().resolve()
     out_dir = args.out.expanduser().resolve()
-    wg_dir = args.wg_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     logs_dir = out_dir / "logs"
     mesh_dir = out_dir / "mesh"
@@ -1496,7 +1474,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "auto" if symmetry_auto else (",".join(symmetry_planes) if symmetry_planes else "none"),
         "--unit-scale-to-m",
         str(args.unit_scale_to_m),
-        "--skip-source-mesh-export",
         "--topology-tol",
         str(args.topology_tol),
         "--requested-max-frequency-hz",
@@ -1535,7 +1512,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "output_dir": str(out_dir),
         "mesh_dir": str(mesh_dir),
         "manifests_dir": str(manifests_dir),
-        "waveguide_generator_dir": str(wg_dir),
         "commands": {
             "prepare": prep_cmd,
         },
@@ -1786,8 +1762,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         mirror_axes,
         "--tol",
         str(args.topology_tol),
-        "--unit-scale-to-m",
-        str(args.unit_scale_to_m),
         *diagnose_sources,
     ]
     diagnose_returncode = _run_logged(
@@ -1805,7 +1779,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     )
     pipeline_manifest["prep_manifest"] = str(prep_manifest_path)
     pipeline_manifest["tagged_mesh_step_units"] = prep_manifest.get("tagged_mesh_step_units")
-    pipeline_manifest["wg_source_meshes_m"] = prep_manifest.get("wg_source_meshes_m", {})
     pipeline_manifest["solver_ready"] = bool(prep_manifest.get("solver_ready"))
 
     if diagnose_returncode != 0:
@@ -1835,11 +1808,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     # Readers of the 12 historical pre-expanded_mesh artifacts should use
     # d.get("expanded_mesh") or d.get("expanded_4quarter") or {}.
     pipeline_manifest["expanded_mesh"] = expanded_mesh
-    wg_source_meshes_m = (
-        orientation_report.get("wg_source_meshes_m")
-        or prep_manifest.get("wg_source_meshes_m", {})
-    )
-    pipeline_manifest["wg_source_meshes_m"] = wg_source_meshes_m
     pipeline_manifest["solve_mesh"] = str(solve_mesh_path)
     pipeline_manifest["native_symmetry_plane"] = solve_native_symmetry_plane
 
@@ -1875,14 +1843,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "u": frame_u,
             "v": frame_v,
         }
-    pipeline_manifest["waveguide_generator"] = {
-        "launch_command": (
-            f"cd {shlex.quote(str(wg_dir))} && "
-            f"WG_FUSION_PIPELINE_MANIFEST={shlex.quote(str(pipeline_manifest_path))} npm start"
-        ),
-        "import_mesh": str(expanded_mesh.get("mesh") or solve_mesh_path),
-        "per_source_meshes_m": wg_source_meshes_m,
-    }
     solve_manifest_path = _run_manifest_path(out_dir, "direct_solve_manifest.json")
     solve_returncode = 0
     solve_freq_max_hz = args.freq_max_hz
@@ -2257,8 +2217,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             _write_json(final_summary_manifest_path, pipeline_manifest)
 
     _open_requested_outputs(args, out_dir)
-    if args.open_wg:
-        _launch_waveguide_generator(wg_dir, pipeline_manifest_path)
 
     print(json.dumps(pipeline_manifest, indent=2, sort_keys=True))
     return 0

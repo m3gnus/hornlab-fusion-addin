@@ -192,8 +192,7 @@ artifact names to paths. Root clutter is kept down by grouping preparation
 artifacts and run-level manifests:
 
 - `exports/`: exported `.step` and native `.f3d` Fusion archive
-- `mesh/`: `tagged_sources.msh`, one full-domain metre-unit
-  `<source>_source_tag2_m.msh` per source, `orientation_report.json`,
+- `mesh/`: `tagged_sources.msh`, `orientation_report.json`,
   `expanded_*q_*.msh` plus preview PNG, and mesh-prep `manifest.json`
 - `fem/`: tetrahedral chamber mesh, interior/exterior impedance matrices,
   entry flow ratios, condensed driver load, synthesized MF basis, and summary
@@ -259,8 +258,7 @@ boundary appearance contract, tetrahedron size, and loss factor), **Outputs**
 per-category checkboxes for per-driver plots, combined/crossover,
 passive-cardioid, Driver LEM, derived acoustics, VituixCAD, radiation
 impedance, pressure bases, and HTML report), and **Advanced** (mirror plane
-override, Python interpreter, Waveguide Generator folder, launch WG). Typical
-3-way values:
+override, Python interpreter, and plot theme). Typical 3-way values:
 
 ```text
 LF source mesh mm: 20
@@ -346,6 +344,3 @@ origin=0,0,0.31 m
 u=+X
 v=+Y
 ```
-
-Launching the sibling `Waveguide Generator` checkout remains optional and is
-off by default.

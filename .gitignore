@@ -12,3 +12,6 @@ runs/
 .claude/
 CLAUDE.md
 AGENTS.md
+
+# Local spike scratch; carries CC BY-NC-SA reference geometry that must never be committed.
+spike/

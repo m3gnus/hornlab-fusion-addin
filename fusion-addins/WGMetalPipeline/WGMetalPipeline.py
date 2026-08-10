@@ -1206,9 +1206,11 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 adsk.core.DropDownStyles.TextListDropDownStyle,
             )
             selected_mirror_plane = _setting_str(settings, "mirror_plane")
+            if selected_mirror_plane == "auto-cut":
+                selected_mirror_plane = "Auto detect + cut"
             for name in (
                 "Auto detect",
-                "auto-cut",
+                "Auto detect + cut",
                 "Left/Right + Front/Back",
                 "Left/Right",
                 "Front/Back",

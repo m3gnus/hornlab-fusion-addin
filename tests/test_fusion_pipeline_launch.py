@@ -379,6 +379,21 @@ def test_build_pipeline_command_defers_auto_cut_derivations_to_prepare_manifest(
     assert "--polar-angle-count" not in cmd
 
 
+def test_build_pipeline_command_normalizes_auto_cut_and_ignores_stale_derivations():
+    helper = _load_helper()
+
+    cmd = _helper_command(
+        helper,
+        symmetry_planes="  Auto-Cut  ",
+        quadrants="1234",
+        mirror_axes="none",
+    )
+
+    assert cmd[cmd.index("--symmetry-planes") + 1] == "auto-cut"
+    assert "--quadrants" not in cmd
+    assert "--mirror-axes" not in cmd
+
+
 def test_build_pipeline_command_forwards_fem_chamber_contract():
     helper = _load_helper()
     cmd = _helper_command(
@@ -1048,6 +1063,7 @@ def test_mirror_plane_helpers_map_fusion_names_to_solver_planes():
     helper = _load_helper()
 
     assert helper.symmetry_planes_for_mirror_plane("Auto detect") == "auto"
+    assert helper.symmetry_planes_for_mirror_plane("Auto detect + cut") == "auto-cut"
     assert helper.symmetry_planes_for_mirror_plane("auto-cut") == "auto-cut"
     assert helper.mirror_axes_for_symmetry_planes("auto") == "auto"
     assert helper.quadrants_for_symmetry_planes("auto") == "auto"
@@ -2669,7 +2685,8 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
     assert manifest["quadrants"] == 14
 
 
-def _auto_cut_prep_manifest(planes):
+def _auto_cut_prep_manifest(planes, *, cut_planes=None):
+    actual_cut_planes = list(planes if cut_planes is None else cut_planes)
     return {
         "sources": {"HF": {"tag": 4}},
         "skipped_sources": {},
@@ -2679,7 +2696,9 @@ def _auto_cut_prep_manifest(planes):
         "symmetry_planes_mode": "auto-cut",
         "auto_reduce": {
             "mode": "auto-cut",
-            "cut_planes": list(planes),
+            "cut_planes": actual_cut_planes,
+            "post_cut_detected_planes": list(planes),
+            "post_cut_planes_confirmed": set(actual_cut_planes) <= set(planes),
         },
         "mesh_frequency_validation": {
             "status": "valid",
@@ -2841,6 +2860,44 @@ def test_pipeline_explicit_polar_flags_override_auto_cut_verdict(tmp_path, monke
     derivation = manifest["polar_grid_derivation"]
     assert derivation["explicit_user_flags"] is True
     assert derivation["derivation_applied"] is False
+
+
+def test_pipeline_auto_cut_refuses_unconfirmed_cut_plane(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_auto_cut_prep_manifest([], cut_planes=["x0"]),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--symmetry-planes",
+            "auto-cut",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 2
+    assert [name for name, _cmd in calls] == ["prepare_step_for_wg_metal.py"]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert "x0" in manifest["error"]
+    assert "unconfirmed" in manifest["error"]
 
 
 def test_pipeline_uses_only_authoritative_mesh_contracts(tmp_path, monkeypatch):

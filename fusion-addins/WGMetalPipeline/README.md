@@ -128,7 +128,14 @@ The add-in is designed to not fail on configuration drift:
   and confirms the whole mesh lies on one side of each candidate. The pipeline
   then derives mirror axes, quadrants, and the native Metal symmetry mode from
   the detection. The `Mirror plane` dropdown under Advanced can still force an
-  explicit plane.
+  explicit plane. Choose `Auto detect + cut` for a full model: prepare
+  mirror-tests the OCC geometry, cuts accepted planes to the positive
+  half-space, meshes the reduced body, and independently re-detects its open
+  cut rims. An unconfirmed cut fails instead of solving a reduced body as an
+  open shell. In either automatic mode, the prepare manifest's actual verdict
+  controls quadrants, diagnostic mirror axes, native Metal symmetry, and polar
+  sidedness; manual quadrant, mirror-axis, and native-plane flags do not
+  override it.
 - **Solves run the requested band by default.** The dialog launches with
   `--underresolved-solve-policy warn`: mesh-valid ceilings remain visible in
   the launch dialog and pipeline manifest
@@ -304,6 +311,7 @@ Mirror plane override values map to cut planes as before:
 | Fusion mirror plane | Cut plane | Pipeline behavior |
 |---|---|---|
 | `Auto detect` (default) | from mesh free edges | native solve when supported |
+| `Auto detect + cut` | mirror-tested, then cut before meshing | verdict-driven native solve when supported |
 | `Left/Right + Front/Back` | `x=0` and `y=0` | Native quarter-domain solve (`yz+xz`) |
 | `Left/Right` | `x=0` | Native half-domain solve (`yz`) |
 | `Front/Back` | `y=0` | Native half-domain solve (`xz`) |

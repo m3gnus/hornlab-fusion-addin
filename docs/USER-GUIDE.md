@@ -41,7 +41,13 @@ rear chamber in L, port length in mm, port area in cm2.
 Symmetry is detected from free edges on the `x=0`, `y=0`, and `z=0` planes,
 but a detected cut must also leave the entire mesh on one side of that plane.
 Leave Advanced > Mirror plane on Auto detect unless you need to force a half,
-quarter, or full model.
+quarter, or full model. Choose Auto detect + cut when the Fusion design is a
+full model: prepare mirror-tests the OCC geometry, cuts accepted planes to the
+positive half-space, meshes the reduced body, and independently re-detects the
+open cut rims. If a cut plane is not confirmed in that mesh, the run stops.
+For both automatic modes, the prepare manifest's detected-plane verdict—not
+manual quadrant, mirror-axis, or native-plane flags—determines downstream
+quadrants, diagnostic expansion, native Metal symmetry, and polar sidedness.
 
 ## 3. The Dialog
 

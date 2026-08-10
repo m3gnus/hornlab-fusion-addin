@@ -17,6 +17,8 @@ from typing import Any
 
 MIRROR_PLANE_SYMMETRY_PLANES = {
     "Auto detect": "auto",
+    "Auto detect + cut": "auto-cut",
+    # Preserve settings and direct helper callers from the first auto-cut UI.
     "auto-cut": "auto-cut",
     "Left/Right + Front/Back": "x0,y0",
     "Left/Right": "x0",

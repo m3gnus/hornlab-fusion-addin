@@ -1981,8 +1981,37 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "symmetry_planes_mode",
             requested_symmetry_mode,
         )
-        pipeline_manifest["auto_reduce"] = prep_manifest.get("auto_reduce")
+        auto_reduce = prep_manifest.get("auto_reduce")
+        pipeline_manifest["auto_reduce"] = auto_reduce
         pipeline_manifest["quadrants"] = _quadrants_for_planes(symmetry_planes)
+        if symmetry_auto_cut and isinstance(auto_reduce, dict):
+            raw_cut_planes = auto_reduce.get("cut_planes") or ()
+            try:
+                cut_planes = _parse_symmetry_planes(
+                    ",".join(str(plane) for plane in raw_cut_planes) or "none",
+                    quadrants=args.quadrants,
+                )
+            except (TypeError, ValueError) as exc:
+                pipeline_manifest["status"] = "failed"
+                pipeline_manifest["error"] = (
+                    "prepare manifest has invalid auto_reduce.cut_planes: " f"{exc}"
+                )
+                _write_json(pipeline_manifest_path, pipeline_manifest)
+                _open_requested_outputs(args, out_dir)
+                return 1
+            unconfirmed = [plane for plane in cut_planes if plane not in symmetry_planes]
+            if unconfirmed:
+                pipeline_manifest["status"] = "failed"
+                pipeline_manifest["error"] = (
+                    "auto-cut reduced the model on "
+                    f"{', '.join(cut_planes)} but the prepared mesh reports "
+                    f"{', '.join(symmetry_planes) or 'no'} symmetry planes "
+                    f"({', '.join(unconfirmed)} unconfirmed); refusing to solve "
+                    "the reduced body without its symmetry plane."
+                )
+                _write_json(pipeline_manifest_path, pipeline_manifest)
+                _open_requested_outputs(args, out_dir)
+                return 2
 
     if fem_mesh_path is not None:
         assert fem_manifest_path is not None

@@ -3,6 +3,7 @@ numpy
 scipy
 gmsh
 meshio
+git+https://github.com/m3gnus/hornlab-waveguide-mesher.git@f01598bb158f3649f0eab2573c51a524fcad882d
 
 # Direct BEM solves (Apple Silicon required). This revision includes the
 # corrected acceleration-drive sign used by absolute-phase exports.

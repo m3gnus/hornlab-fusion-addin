@@ -41,6 +41,31 @@ import gmsh
 import meshio
 import numpy as np
 
+try:
+    from hornlab_mesher.step_prepare import (
+        DEFAULT_AUTO_CUT_GRID,
+        DEFAULT_AUTO_CUT_TOLERANCE_REL,
+        DEFAULT_SYMMETRY_SNAP_BAND_MM,
+        OccSurfaceGroup,
+        OccSurfaceRole,
+        OccSurfaceSelector,
+        auto_cut_occ_geometry,
+        evaluate_occ_plane_symmetry,
+        millimetres_to_step_units,
+        remap_surface_tags,
+        sample_occ_surface_points,
+        snap_symmetry_plane_vertices,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "hornlab_mesher" and not (exc.name or "").startswith(
+        "hornlab_mesher."
+    ):
+        raise
+    raise RuntimeError(
+        "hornlab-waveguide-mesher is required to prepare STEP geometry; "
+        "install it with 'python -m pip install hornlab-waveguide-mesher'"
+    ) from exc
+
 # Shared pure-Python sizing/cost predictor, also imported by the Fusion add-in.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wg_mesh_sizing as sizing  # noqa: E402
@@ -51,7 +76,7 @@ RIGID_TAG = 1
 SPEED_OF_SOUND_M_S = 343.0
 FREQUENCY_ELEMENTS_PER_WAVELENGTH = 6.0
 DEFAULT_TOPOLOGY_TOL = 1e-5
-HEALED_SYMMETRY_BAND_MM = 1.0e-4
+HEALED_SYMMETRY_BAND_MM = DEFAULT_SYMMETRY_SNAP_BAND_MM
 GENERIC_PORT_EXIT_SOURCE = "PORT_EXIT"
 LEGACY_PORT_EXIT_SOURCES = frozenset({"PORT_EXIT_L", "PORT_EXIT_R"})
 
@@ -68,12 +93,8 @@ SYMMETRY_AXIS_FOR_PLANE = {"x0": 0, "y0": 1, "z0": 2}
 # which passes both by a wide margin and still stays two orders of magnitude
 # below the finest mesh size any of these models is meshed at (4 mm), so an
 # asymmetry small enough to pass is an asymmetry the BEM cannot resolve.
-AUTO_REDUCE_TOL_REL = 5.0e-4
-AUTO_REDUCE_GRID = 7  # per-face parametric grid; 49 samples/face before trimming
-AUTO_REDUCE_SPAN_REL = 1.0e-3  # a plane the model does not straddle cuts nothing
-AUTO_REDUCE_TRIM_NUDGE_REL = 1.0e-3  # parametric step used for the on-edge grace
-AUTO_REDUCE_BOX_PAD_REL = 0.1  # half-space box overshoot, relative to model size
-AUTO_REDUCE_MAX_SAMPLES = 5  # recorded failure witnesses per plane
+AUTO_REDUCE_TOL_REL = DEFAULT_AUTO_CUT_TOLERANCE_REL
+AUTO_REDUCE_GRID = DEFAULT_AUTO_CUT_GRID
 
 SurfaceGeometry = tuple[tuple[float, float, float], float]
 OCC_HEALING_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -94,7 +115,7 @@ OCC_HEALING_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 def _millimetres_to_step_units(value_mm: float, unit_scale_to_m: float) -> float:
     """Convert a physical millimetre tolerance to the imported STEP units."""
-    return float(value_mm) * 1.0e-3 / float(unit_scale_to_m)
+    return millimetres_to_step_units(value_mm, unit_scale_to_m)
 
 
 @dataclass(frozen=True)
@@ -1001,430 +1022,6 @@ def _repair_triangle_winding(
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class PlaneSymmetryVerdict:
-    """Per-plane result of the geometry mirror test, recorded in the manifest."""
-
-    plane: str
-    accepted: bool
-    reason: str
-    tolerance: float
-    axis_min: float
-    axis_max: float
-    points_tested: int
-    points_off_model: int
-    max_residual: float
-    worst_residual_surface: int | None
-    worst_off_model_distance: float
-    worst_surface: int | None
-    role_mismatches: int
-    failure_samples: tuple[dict[str, object], ...]
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "plane": self.plane,
-            "accepted": bool(self.accepted),
-            "reason": self.reason,
-            "tolerance_step_units": float(self.tolerance),
-            "axis_min_step_units": float(self.axis_min),
-            "axis_max_step_units": float(self.axis_max),
-            "points_tested": int(self.points_tested),
-            "points_off_model": int(self.points_off_model),
-            "max_residual_step_units": (
-                None if self.max_residual < 0.0 else float(self.max_residual)
-            ),
-            "worst_residual_surface": (
-                None
-                if self.worst_residual_surface is None
-                else int(self.worst_residual_surface)
-            ),
-            "worst_off_model_distance_step_units": (
-                None
-                if self.worst_off_model_distance < 0.0
-                else float(self.worst_off_model_distance)
-            ),
-            "worst_surface": (
-                None if self.worst_surface is None else int(self.worst_surface)
-            ),
-            "role_mismatches": int(self.role_mismatches),
-            "failure_samples": list(self.failure_samples),
-        }
-
-
-def _param_inside(surface: int, u: float, v: float) -> bool:
-    """Classify a parametric point against the face's trim loops."""
-    try:
-        return int(gmsh.model.isInside(2, surface, [u, v], parametric=True)) > 0
-    except Exception:
-        # A face gmsh cannot classify is treated as unbounded; the distance
-        # test still has to pass, so this only ever loosens the trim filter.
-        return True
-
-
-def _sample_surface_points(surface: int, *, grid: int) -> np.ndarray:
-    """Sample points that really lie on the *trimmed* OCC face.
-
-    A raw parametric grid is not enough. ``gmsh.model.getValue`` happily
-    returns points on the untrimmed extension of a face -- inside a hole, or on
-    the part of a plane outside its trim loop -- and so does
-    ``getClosestPoint``. Such points are not on the model, and accepting them
-    would let a hole punched into one half only pass as symmetric, because the
-    hole's samples would mirror onto the *unpunched* partner face's underlying
-    surface. ``isInside`` classifies against the trim loops at ~10 us per
-    parametric point, so the filter is affordable per face.
-
-    Sampling is per face, which is what makes the test complete: a feature that
-    exists on one side only is at least one whole face, and that face's own
-    samples mirror into empty space. No grid density can miss it.
-    """
-    try:
-        bounds_min, bounds_max = gmsh.model.getParametrizationBounds(2, surface)
-        umin, vmin = float(bounds_min[0]), float(bounds_min[1])
-        umax, vmax = float(bounds_max[0]), float(bounds_max[1])
-    except Exception:
-        umin = umax = vmin = vmax = 0.0
-    if umax > umin and vmax > vmin:
-        # A thin trimmed sliver can miss every cell centre of the coarse grid;
-        # refine once before falling back to the face's own boundary curves.
-        for factor in (1, 4):
-            n = max(2, grid * factor)
-            kept: list[float] = []
-            for i in range(n):
-                u = umin + (i + 0.5) * (umax - umin) / n
-                for j in range(n):
-                    v = vmin + (j + 0.5) * (vmax - vmin) / n
-                    if _param_inside(surface, u, v):
-                        kept.extend((u, v))
-            if kept:
-                coords = gmsh.model.getValue(2, surface, kept)
-                return np.asarray(coords, dtype=float).reshape(-1, 3)
-    return _sample_surface_boundary_points(surface, grid=grid)
-
-
-def _sample_surface_boundary_points(surface: int, *, grid: int) -> np.ndarray:
-    """Fallback sampling on the face's bounding curves (always on the face)."""
-    points: list[float] = []
-    try:
-        boundary = gmsh.model.getBoundary(
-            [(2, surface)], combined=False, oriented=False, recursive=False
-        )
-    except Exception:
-        boundary = []
-    for dim, curve in boundary:
-        if dim != 1:
-            continue
-        try:
-            bounds_min, bounds_max = gmsh.model.getParametrizationBounds(1, abs(curve))
-            tmin, tmax = float(bounds_min[0]), float(bounds_max[0])
-            if not tmax > tmin:
-                continue
-            params = [tmin + (i + 0.5) * (tmax - tmin) / grid for i in range(grid)]
-            points.extend(gmsh.model.getValue(1, abs(curve), params))
-        except Exception:
-            continue
-    if not points:
-        com = gmsh.model.occ.getCenterOfMass(2, surface)
-        points = [float(v) for v in com]
-    return np.asarray(points, dtype=float).reshape(-1, 3)
-
-
-def _parametric_point_on_face(surface: int, parametric: Iterable[float]) -> bool:
-    """Trim-aware membership, with a grace band for points on a trim edge.
-
-    A rim point of one half mirrors exactly onto the partner's rim, where
-    OCC's face classifier can answer "on boundary" rather than "in". Retrying a
-    hair inside the parametric domain keeps a genuinely shared rim from being
-    read as a hole.
-    """
-    par = [float(value) for value in parametric]
-    if len(par) < 2:
-        return False
-    u, v = par[0], par[1]
-    if _param_inside(surface, u, v):
-        return True
-    try:
-        bounds_min, bounds_max = gmsh.model.getParametrizationBounds(2, surface)
-    except Exception:
-        return False
-    umin, vmin = float(bounds_min[0]), float(bounds_min[1])
-    umax, vmax = float(bounds_max[0]), float(bounds_max[1])
-    du = AUTO_REDUCE_TRIM_NUDGE_REL * (umax - umin)
-    dv = AUTO_REDUCE_TRIM_NUDGE_REL * (vmax - vmin)
-    umid, vmid = 0.5 * (umin + umax), 0.5 * (vmin + vmax)
-    u2 = min(max(u + (du if umid >= u else -du), umin), umax)
-    v2 = min(max(v + (dv if vmid >= v else -dv), vmin), vmax)
-    return _param_inside(surface, u2, v2)
-
-
-def _closest_on_model(
-    point: np.ndarray,
-    *,
-    candidates: list[int],
-    bboxes: dict[int, tuple[float, ...]],
-    tolerance: float,
-) -> tuple[float, float, list[int]]:
-    """Distance from ``point`` to the model, and the faces it lands on.
-
-    Returns ``(matched_distance, nearest_distance, matched_surfaces)``.
-    ``matched_distance`` is negative when nothing was hit, and
-    ``nearest_distance`` is a lower bound for faces cheap enough to reject by
-    bounding box. OCC bounding boxes of trimmed b-splines are inflated (0.32 mm
-    of skew was measured on a model whose faces mirror to 0.0025 mm), which
-    only ever adds candidates, never removes a real one.
-    """
-    matched_distance = -1.0
-    nearest = -1.0
-    matched: list[int] = []
-    px, py, pz = float(point[0]), float(point[1]), float(point[2])
-    for surface in candidates:
-        bbox = bboxes.get(surface)
-        if bbox is None:
-            continue
-        gap = float(
-            np.linalg.norm([
-                max(bbox[0] - px, px - bbox[3], 0.0),
-                max(bbox[1] - py, py - bbox[4], 0.0),
-                max(bbox[2] - pz, pz - bbox[5], 0.0),
-            ])
-        )
-        if gap > tolerance:
-            # Far enough that the exact projection cannot be a hit; the box gap
-            # is a valid lower bound for the reported residual.
-            if nearest < 0.0 or gap < nearest:
-                nearest = gap
-            continue
-        try:
-            closest, parametric = gmsh.model.getClosestPoint(2, surface, [px, py, pz])
-        except Exception:
-            continue
-        distance = float(
-            np.linalg.norm(np.asarray(closest, dtype=float) - np.asarray([px, py, pz]))
-        )
-        if nearest < 0.0 or distance < nearest:
-            nearest = distance
-        if distance > tolerance:
-            continue
-        # getClosestPoint projects onto the untrimmed surface, so a hit still
-        # has to be confirmed against the trim loops before it counts.
-        if not _parametric_point_on_face(surface, parametric):
-            continue
-        matched.append(surface)
-        if matched_distance < 0.0 or distance < matched_distance:
-            matched_distance = distance
-    return matched_distance, nearest, matched
-
-
-def _evaluate_plane_symmetry(
-    plane: str,
-    *,
-    samples: dict[int, np.ndarray],
-    roles: dict[int, str],
-    bboxes: dict[int, tuple[float, ...]],
-    tolerance: float,
-    span_tolerance: float,
-) -> PlaneSymmetryVerdict:
-    """Decide whether the sampled geometry mirrors about ``plane``.
-
-    Two independent conditions have to hold, and both are physical:
-
-    * every sampled point mirrors onto the model within ``tolerance``; and
-    * it mirrors onto a face of the *same acoustic role*. Geometry symmetry is
-      worthless if the tweeter maps onto rigid wall -- the reduced solve would
-      drive the wrong patch. A face that straddles the plane maps onto itself,
-      which satisfies the role test by construction.
-    """
-    axis = SYMMETRY_AXIS_FOR_PLANE[plane]
-    candidates = sorted(samples)
-    all_axis_values = np.concatenate(
-        [samples[surface][:, axis] for surface in candidates]
-    ) if candidates else np.zeros(1)
-    axis_min = float(np.min(all_axis_values))
-    axis_max = float(np.max(all_axis_values))
-    points_tested = int(sum(len(samples[surface]) for surface in candidates))
-
-    if not (axis_min < -span_tolerance and axis_max > span_tolerance):
-        return PlaneSymmetryVerdict(
-            plane=plane,
-            accepted=False,
-            reason=(
-                "model does not straddle the plane; there is no half to remove"
-            ),
-            tolerance=tolerance,
-            axis_min=axis_min,
-            axis_max=axis_max,
-            points_tested=points_tested,
-            points_off_model=0,
-            max_residual=-1.0,
-            worst_residual_surface=None,
-            worst_off_model_distance=-1.0,
-            worst_surface=None,
-            role_mismatches=0,
-            failure_samples=(),
-        )
-
-    max_residual = -1.0
-    max_residual_surface: int | None = None
-    points_off_model = 0
-    role_mismatches = 0
-    worst_off_model = -1.0
-    worst_surface: int | None = None
-    failures: list[dict[str, object]] = []
-    for surface in candidates:
-        role = roles.get(surface, "rigid")
-        for point in samples[surface]:
-            mirrored = point.copy()
-            mirrored[axis] = -mirrored[axis]
-            matched_distance, nearest, hits = _closest_on_model(
-                mirrored,
-                candidates=candidates,
-                bboxes=bboxes,
-                tolerance=tolerance,
-            )
-            if not hits:
-                points_off_model += 1
-                if nearest > worst_off_model:
-                    worst_off_model = nearest
-                    worst_surface = surface
-                if len(failures) < AUTO_REDUCE_MAX_SAMPLES:
-                    failures.append({
-                        "kind": "off_model",
-                        "surface": int(surface),
-                        "role": role,
-                        "point_step_units": [float(v) for v in point],
-                        "mirrored_point_step_units": [float(v) for v in mirrored],
-                        "nearest_distance_step_units": (
-                            None if nearest < 0.0 else float(nearest)
-                        ),
-                    })
-                continue
-            if matched_distance > max_residual:
-                max_residual = matched_distance
-                max_residual_surface = int(surface)
-            if role not in {roles.get(hit, "rigid") for hit in hits}:
-                role_mismatches += 1
-                if len(failures) < AUTO_REDUCE_MAX_SAMPLES:
-                    failures.append({
-                        "kind": "role_mismatch",
-                        "surface": int(surface),
-                        "role": role,
-                        "point_step_units": [float(v) for v in point],
-                        "mirrored_point_step_units": [float(v) for v in mirrored],
-                        "mirrored_surfaces": [int(hit) for hit in hits],
-                        "mirrored_roles": sorted(
-                            {roles.get(hit, "rigid") for hit in hits}
-                        ),
-                    })
-
-    accepted = points_off_model == 0 and role_mismatches == 0
-    if accepted:
-        reason = "geometry and source roles mirror within tolerance"
-    elif points_off_model:
-        reason = (
-            f"{points_off_model} of {points_tested} sampled points do not mirror "
-            "onto the model"
-        )
-    else:
-        reason = (
-            f"{role_mismatches} sampled points mirror onto a face of a different "
-            "acoustic role"
-        )
-    return PlaneSymmetryVerdict(
-        plane=plane,
-        accepted=accepted,
-        reason=reason,
-        tolerance=tolerance,
-        axis_min=axis_min,
-        axis_max=axis_max,
-        points_tested=points_tested,
-        points_off_model=points_off_model,
-        max_residual=max_residual,
-        worst_residual_surface=max_residual_surface,
-        worst_off_model_distance=worst_off_model,
-        worst_surface=worst_surface,
-        role_mismatches=role_mismatches,
-        failure_samples=tuple(failures),
-    )
-
-
-def _cut_geometry_to_positive_side(
-    planes: tuple[str, ...],
-    *,
-    bbox: tuple[float, float, float, float, float, float],
-) -> tuple[dict[int, list[int]], dict[str, object]]:
-    """Trim every face to the positive side of ``planes``; return parentage.
-
-    The cut is a boolean common of the *faces* with one half-space box, not a
-    solid operation, and both properties that follow from that are load-bearing:
-
-    * ``outDimTagsMap`` gives an exact parent -> children map, so the
-      STEP-derived source/refine/shell assignments survive the cut without
-      being re-derived from geometry; and
-    * intersecting faces with a box can only trim faces. Nothing is created on
-      the plane, so the reduced boundary stays *open* at the cut with free
-      edges on it. A planar cap there would mesh as a rigid wall -- a baffle,
-      not a symmetry plane -- and the mirrored solve would be silently wrong.
-      The solver enforces the same contract from its side by rejecting any
-      triangle lying entirely on a requested plane.
-
-    The positive side is kept because the native Metal symmetry solve requires
-    it (``--native-symmetry-plane yz`` refuses a mesh with negative X).
-    """
-    volumes = gmsh.model.getEntities(3)
-    if volumes:
-        # STEP MANIFOLD_SOLID_BREPs import as volumes that own the faces; the
-        # faces cannot be trimmed while a volume still references them. Only
-        # the exterior faces are ever meshed, so the volumes are dead weight.
-        gmsh.model.occ.remove(volumes, recursive=False)
-        gmsh.model.occ.synchronize()
-
-    surfaces = [tag for _dim, tag in sorted(gmsh.model.getEntities(2))]
-    span = max(bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2])
-    pad = AUTO_REDUCE_BOX_PAD_REL * span + 1.0
-    lo = [bbox[0] - pad, bbox[1] - pad, bbox[2] - pad]
-    hi = [bbox[3] + pad, bbox[4] + pad, bbox[5] + pad]
-    for plane in planes:
-        lo[SYMMETRY_AXIS_FOR_PLANE[plane]] = 0.0
-    box = gmsh.model.occ.addBox(
-        lo[0], lo[1], lo[2], hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
-    )
-    gmsh.model.occ.synchronize()
-    _out, out_map = gmsh.model.occ.intersect(
-        [(2, surface) for surface in surfaces],
-        [(3, box)],
-        removeObject=True,
-        removeTool=True,
-    )
-    gmsh.model.occ.synchronize()
-
-    mapping: dict[int, list[int]] = {}
-    for index, surface in enumerate(surfaces):
-        children = out_map[index] if index < len(out_map) else []
-        mapping[surface] = [tag for dim, tag in children if dim == 2]
-    remaining = [tag for _dim, tag in sorted(gmsh.model.getEntities(2))]
-    stats = {
-        "planes": list(planes),
-        "half_space_box_step_units": [float(v) for v in lo + hi],
-        "surfaces_before": len(surfaces),
-        "surfaces_after": len(remaining),
-        "surfaces_dropped": sum(1 for children in mapping.values() if not children),
-        "surfaces_split": sum(1 for children in mapping.values() if len(children) > 1),
-        "residual_volumes": len(gmsh.model.getEntities(3)),
-    }
-    return mapping, stats
-
-
-def _remap_after_cut(surfaces: Iterable[int], mapping: dict[int, list[int]]) -> list[int]:
-    """Follow a surface list through the boolean parent -> children map."""
-    remapped: list[int] = []
-    seen: set[int] = set()
-    for surface in surfaces:
-        for child in mapping.get(int(surface), []):
-            if child not in seen:
-                seen.add(child)
-                remapped.append(child)
-    return remapped
-
-
 def _auto_reduce_geometry(
     *,
     surfaces: list[int],
@@ -1432,72 +1029,27 @@ def _auto_reduce_geometry(
     grid: int,
     tolerance_rel: float,
 ) -> tuple[tuple[str, ...], dict[int, list[int]], dict[str, object]]:
-    """Test the geometry for mirror symmetry and cut the accepted planes.
-
-    Returns the cut planes, the boolean parent -> children map (empty when
-    nothing was cut) and a manifest report. Every plane's residual is reported
-    whether it passed or failed, so a marginal reduction is visible in
-    ``manifest.json`` rather than silent.
-    """
-    samples = {surface: _sample_surface_points(surface, grid=grid) for surface in surfaces}
-    samples = {surface: pts for surface, pts in samples.items() if len(pts)}
-    bboxes = {
-        surface: tuple(float(v) for v in gmsh.model.getBoundingBox(2, surface))
-        for surface in samples
-    }
-    if not samples:
-        return (), {}, {
-            "mode": "auto-cut",
-            "cut_planes": [],
-            "note": "no sampleable acoustic surfaces; auto reduction skipped",
-        }
-
-    stacked = np.concatenate([pts for pts in samples.values()])
-    # The sampled point cloud is the honest extent: OCC bounding boxes of
-    # trimmed b-splines are inflated by tens of millimetres.
-    sample_bbox = (
-        float(np.min(stacked[:, 0])), float(np.min(stacked[:, 1])), float(np.min(stacked[:, 2])),
-        float(np.max(stacked[:, 0])), float(np.max(stacked[:, 1])), float(np.max(stacked[:, 2])),
-    )
-    diagonal = float(
-        np.linalg.norm(np.asarray(sample_bbox[3:]) - np.asarray(sample_bbox[:3]))
-    )
-    tolerance = tolerance_rel * diagonal
-    span_tolerance = AUTO_REDUCE_SPAN_REL * diagonal
-
-    verdicts = [
-        _evaluate_plane_symmetry(
-            plane,
-            samples=samples,
-            roles=roles,
-            bboxes=bboxes,
-            tolerance=tolerance,
-            span_tolerance=span_tolerance,
+    """Adapt add-in surface assignments to the caller-neutral mesher API."""
+    grouped: dict[str, list[int]] = defaultdict(list)
+    for surface in surfaces:
+        grouped[roles[surface]].append(surface)
+    groups = [
+        OccSurfaceGroup(
+            name=f"role-{index}",
+            selector=OccSurfaceSelector(group_surfaces),
+            role=OccSurfaceRole(role),
         )
-        for plane in ("x0", "y0", "z0")
+        for index, (role, group_surfaces) in enumerate(grouped.items())
     ]
-    planes = tuple(verdict.plane for verdict in verdicts if verdict.accepted)
-    report: dict[str, object] = {
-        "mode": "auto-cut",
-        "tolerance_rel": float(tolerance_rel),
-        "tolerance_step_units": float(tolerance),
-        "model_diagonal_step_units": diagonal,
-        "sample_grid": int(grid),
-        "sampled_surfaces": len(samples),
-        "sample_points": int(len(stacked)),
-        "planes": {verdict.plane: verdict.to_dict() for verdict in verdicts},
-        "cut_planes": list(planes),
-    }
-    if not planes:
-        report["cut"] = None
-        return (), {}, report
+    result = auto_cut_occ_geometry(
+        groups, grid=grid, tolerance_rel=tolerance_rel
+    )
+    return result.planes, result.parent_to_children, result.report
 
-    # OCC bounding boxes are inflated, which is exactly what the half-space box
-    # wants: it only has to enclose everything on the kept side.
-    model_bbox = tuple(float(v) for v in gmsh.model.getBoundingBox(-1, -1))
-    mapping, cut_stats = _cut_geometry_to_positive_side(planes, bbox=model_bbox)
-    report["cut"] = cut_stats
-    return planes, mapping, report
+
+_evaluate_plane_symmetry = evaluate_occ_plane_symmetry
+_sample_surface_points = sample_occ_surface_points
+_remap_after_cut = remap_surface_tags
 
 
 def _detect_symmetry_planes(
@@ -1578,17 +1130,7 @@ def _detect_symmetry_planes(
     return detected, detection
 
 
-def _snap_symmetry_plane_vertices(
-    points: np.ndarray,
-    *,
-    symmetry_planes: tuple[str, ...],
-    tolerance: float,
-) -> None:
-    axis_for_plane = {"x0": 0, "y0": 1, "z0": 2}
-    for plane in symmetry_planes:
-        axis = axis_for_plane[plane]
-        mask = np.abs(points[:, axis]) <= tolerance
-        points[mask, axis] = 0.0
+_snap_symmetry_plane_vertices = snap_symmetry_plane_vertices
 
 
 def _normalize_to_positive_side(

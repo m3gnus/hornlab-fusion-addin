@@ -3,11 +3,11 @@ numpy
 scipy
 gmsh
 meshio
-git+https://github.com/m3gnus/hornlab-waveguide-mesher.git@0dfb9c99a769f9084b0fc458ba61c58b7fc32aa5
+git+https://github.com/m3gnus/hornlab-waveguide-mesher.git@48a7df2a53e680830b3e686e6bcfdd093f0af5e1
 
 # Direct BEM solves (Apple Silicon required). This revision includes the
 # corrected acceleration-drive sign used by absolute-phase exports.
-git+https://github.com/m3gnus/hornlab-metal-bem.git@09f3b0b0e99b23936cac31531b1f82c6e369ea44
+git+https://github.com/m3gnus/hornlab-metal-bem.git@469def27469bef411807be95539f8376d13177f6
 
 # Plot rendering dependencies used through hornlab-plots
 matplotlib
@@ -17,8 +17,8 @@ Pillow
 # which the solve step imports at module level). Runtime imports always use
 # these active environment packages rather than undeclared sibling checkouts.
 # Includes hornlab_sim.methods.acoustic_fem for the optional MF chamber path.
-git+https://github.com/m3gnus/hornlab-sim.git@764e94fc49619193c8737da83c35b684a5ccfec6
-git+https://github.com/m3gnus/hornlab-plots.git@916ed784bb026838f47a380c542638da32080fa3
+git+https://github.com/m3gnus/hornlab-sim.git@dbc22732f51925393543c00987f54386fc64aecf
+git+https://github.com/m3gnus/hornlab-plots.git@ea7c94f4d43672745455df97610b65af05c76348
 
 # Tests
 pytest

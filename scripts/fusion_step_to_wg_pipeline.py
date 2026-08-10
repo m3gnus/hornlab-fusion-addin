@@ -396,6 +396,8 @@ def _symmetry_planes_from_quadrants(quadrants: int) -> tuple[str, ...]:
 def _parse_symmetry_planes(raw: str | None, *, quadrants: int) -> tuple[str, ...]:
     if raw is None:
         return _symmetry_planes_from_quadrants(quadrants)
+    if raw.strip().lower() in {"auto", "auto-cut"}:
+        return ()
     planes: list[str] = []
     for part in raw.split(","):
         key = part.strip().lower()
@@ -429,6 +431,106 @@ def _native_symmetry_for_planes(symmetry_planes: tuple[str, ...]) -> str | None:
     if symmetry_planes == ("x0", "y0"):
         return "yz+xz"
     return None
+
+
+def _principal_axis_for_vector(raw: str) -> str | None:
+    """Return the coordinate axis for a signed principal-axis vector."""
+    text = str(raw).strip().lower().replace(" ", "")
+    aliases = {
+        "x": (1.0, 0.0, 0.0),
+        "+x": (1.0, 0.0, 0.0),
+        "-x": (-1.0, 0.0, 0.0),
+        "y": (0.0, 1.0, 0.0),
+        "+y": (0.0, 1.0, 0.0),
+        "-y": (0.0, -1.0, 0.0),
+        "z": (0.0, 0.0, 1.0),
+        "+z": (0.0, 0.0, 1.0),
+        "-z": (0.0, 0.0, -1.0),
+    }
+    values = aliases.get(text)
+    if values is None:
+        try:
+            values = tuple(float(part) for part in text.split(","))
+        except ValueError:
+            return None
+    if len(values) != 3:
+        return None
+    magnitudes = [abs(value) for value in values]
+    dominant = max(range(3), key=magnitudes.__getitem__)
+    if magnitudes[dominant] <= 0.0 or any(
+        value > 1.0e-6 * magnitudes[dominant]
+        for index, value in enumerate(magnitudes)
+        if index != dominant
+    ):
+        return None
+    return "xyz"[dominant]
+
+
+def _derive_auto_cut_polar_grid(
+    *,
+    symmetry_planes: tuple[str, ...],
+    frame_u: str,
+    frame_v: str,
+    requested_min_deg: float,
+    requested_max_deg: float,
+    requested_count: int,
+    explicit_user_flags: bool,
+) -> tuple[float, float, int, dict[str, Any]]:
+    """Conservatively derive the shared solver polar grid from actual cuts."""
+    cut_planes = set(symmetry_planes)
+    plane_vectors = {"horizontal": frame_u, "vertical": frame_v}
+    plane_verdicts: dict[str, dict[str, Any]] = {}
+    for polar_plane, vector in plane_vectors.items():
+        transverse_axis = _principal_axis_for_vector(vector)
+        required_plane = f"{transverse_axis}0" if transverse_axis else None
+        plane_verdicts[polar_plane] = {
+            "transverse_frame_vector": vector,
+            "transverse_axis": transverse_axis,
+            "required_symmetry_plane": required_plane,
+            "symmetry_plane_was_cut": bool(required_plane in cut_planes),
+            "requires_full_circle": bool(required_plane not in cut_planes),
+        }
+
+    effective_min = float(requested_min_deg)
+    effective_max = float(requested_max_deg)
+    effective_count = int(requested_count)
+    derivation_applied = False
+    if not explicit_user_flags and any(
+        verdict["requires_full_circle"] for verdict in plane_verdicts.values()
+    ):
+        if requested_count < 2 or requested_max_deg <= requested_min_deg:
+            raise ValueError("the default polar grid must have a positive angular step")
+        requested_step = (requested_max_deg - requested_min_deg) / (requested_count - 1)
+        intervals = int(round(360.0 / requested_step))
+        if not math.isclose(intervals * requested_step, 360.0, rel_tol=0.0, abs_tol=1.0e-9):
+            raise ValueError(
+                "the default polar angular step must divide a full 360 degree sweep"
+            )
+        effective_min = -180.0
+        effective_max = 180.0
+        effective_count = intervals + 1
+        derivation_applied = True
+
+    report = {
+        "mode": "explicit-user-flags" if explicit_user_flags else "auto-cut-verdict",
+        "explicit_user_flags": bool(explicit_user_flags),
+        "actual_cut_symmetry_planes": list(symmetry_planes),
+        "plane_correspondence": plane_verdicts,
+        "shared_grid": True,
+        "shared_grid_full_circle_if_any_plane_requires_it": True,
+        "derivation_applied": derivation_applied,
+        "requested": {
+            "angle_min_deg": float(requested_min_deg),
+            "angle_max_deg": float(requested_max_deg),
+            "angle_count": int(requested_count),
+        },
+        "effective": {
+            "angle_min_deg": effective_min,
+            "angle_max_deg": effective_max,
+            "angle_count": effective_count,
+        },
+    }
+    return effective_min, effective_max, effective_count, report
 
 
 def _run_logged(cmd: list[str], *, cwd: Path, stdout_path: Path, stderr_path: Path) -> int:
@@ -1198,7 +1300,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Comma-separated symmetry cut planes: x0, y0, z0. Aliases: "
             "left-right, front-back, top-bottom, none. 'auto' detects the cut "
-            "planes from the prepared mesh free edges. Overrides --quadrants."
+            "planes from the prepared mesh free edges; 'auto-cut' mirror-tests "
+            "the full OCC geometry and cuts accepted planes. Overrides --quadrants."
         ),
     )
     parser.add_argument("--mirror-axes", default="auto")
@@ -1437,6 +1540,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--passive-cardioid-drive-voltage", type=float, default=None)
     parser.add_argument("--passive-cardioid-rg-ohm", type=float, default=None)
     args = parser.parse_args(raw_argv)
+    args.polar_flags_explicit = _argv_has_option(
+        raw_argv,
+        "--polar-angle-min-deg",
+        "--polar-angle-max-deg",
+        "--polar-angle-count",
+    )
     _apply_preset_defaults(args, raw_argv)
     return args
 
@@ -1577,16 +1686,19 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         and args.crossover_lf_mf_hz >= args.crossover_mf_hf_hz
     ):
         raise SystemExit("--crossover-lf-mf-hz must be below --crossover-mf-hf-hz")
-    symmetry_auto = (
-        args.symmetry_planes is not None
-        and args.symmetry_planes.strip().lower() == "auto"
+    requested_symmetry_mode = (
+        args.symmetry_planes.strip().lower()
+        if args.symmetry_planes is not None
+        else None
     )
+    symmetry_manifest_driven = requested_symmetry_mode in {"auto", "auto-cut"}
+    symmetry_auto_cut = requested_symmetry_mode == "auto-cut"
     try:
         sources = _normalize_sources(raw_sources)
         requested_sources = list(sources)
         symmetry_planes: tuple[str, ...] = (
             ()
-            if symmetry_auto
+            if symmetry_manifest_driven
             else _parse_symmetry_planes(args.symmetry_planes, quadrants=args.quadrants)
         )
     except ValueError as exc:
@@ -1637,7 +1749,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "--quadrants",
         str(args.quadrants),
         "--symmetry-planes",
-        "auto" if symmetry_auto else (",".join(symmetry_planes) if symmetry_planes else "none"),
+        requested_symmetry_mode
+        if symmetry_manifest_driven
+        else (",".join(symmetry_planes) if symmetry_planes else "none"),
         "--unit-scale-to-m",
         str(args.unit_scale_to_m),
         "--topology-tol",
@@ -1688,8 +1802,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         "requested_sources": requested_sources,
         "sources": sources,
         "quadrants": args.quadrants,
-        "symmetry_planes": "auto" if symmetry_auto else list(symmetry_planes),
-        "symmetry_planes_mode": "auto" if symmetry_auto else "explicit",
+        "symmetry_planes": requested_symmetry_mode if symmetry_manifest_driven else list(symmetry_planes),
+        "symmetry_planes_mode": requested_symmetry_mode if symmetry_manifest_driven else "explicit",
         "rigid_res_mm": args.rigid_res_mm,
     }
 
@@ -1847,9 +1961,27 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         {},
     )
 
-    if symmetry_auto:
-        symmetry_planes = tuple(prep_manifest.get("symmetry_planes") or ())
+    if symmetry_manifest_driven:
+        raw_resolved_planes = prep_manifest.get("symmetry_planes") or ()
+        try:
+            symmetry_planes = _parse_symmetry_planes(
+                ",".join(str(plane) for plane in raw_resolved_planes) or "none",
+                quadrants=args.quadrants,
+            )
+        except (TypeError, ValueError) as exc:
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = (
+                "prepare manifest has invalid resolved symmetry_planes: " f"{exc}"
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 1
         pipeline_manifest["symmetry_planes"] = list(symmetry_planes)
+        pipeline_manifest["symmetry_planes_mode"] = prep_manifest.get(
+            "symmetry_planes_mode",
+            requested_symmetry_mode,
+        )
+        pipeline_manifest["auto_reduce"] = prep_manifest.get("auto_reduce")
         pipeline_manifest["quadrants"] = _quadrants_for_planes(symmetry_planes)
 
     if fem_mesh_path is not None:
@@ -1937,11 +2069,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         return 0
 
     mirror_axes = _mirror_axes_for_symmetry_planes(symmetry_planes)
-    if args.mirror_axes and args.mirror_axes != "auto":
+    if not symmetry_auto_cut and args.mirror_axes and args.mirror_axes != "auto":
         mirror_axes = args.mirror_axes
     native_symmetry_plane = (
         _native_symmetry_for_planes(symmetry_planes)
-        if args.native_symmetry_plane == "auto"
+        if symmetry_auto_cut or args.native_symmetry_plane == "auto"
         else (None if args.native_symmetry_plane == "none" else args.native_symmetry_plane)
     )
 
@@ -2041,6 +2173,32 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "u": frame_u,
             "v": frame_v,
         }
+    polar_angle_min_deg = float(args.polar_angle_min_deg)
+    polar_angle_max_deg = float(args.polar_angle_max_deg)
+    polar_angle_count = int(args.polar_angle_count)
+    if symmetry_auto_cut:
+        try:
+            (
+                polar_angle_min_deg,
+                polar_angle_max_deg,
+                polar_angle_count,
+                polar_grid_derivation,
+            ) = _derive_auto_cut_polar_grid(
+                symmetry_planes=symmetry_planes,
+                frame_u=frame_u,
+                frame_v=frame_v,
+                requested_min_deg=float(args.polar_angle_min_deg),
+                requested_max_deg=float(args.polar_angle_max_deg),
+                requested_count=int(args.polar_angle_count),
+                explicit_user_flags=bool(args.polar_flags_explicit),
+            )
+        except ValueError as exc:
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = f"could not derive auto-cut polar grid: {exc}"
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 2
+        pipeline_manifest["polar_grid_derivation"] = polar_grid_derivation
     solve_manifest_path = _run_manifest_path(out_dir, "direct_solve_manifest.json")
     solve_manifest: dict[str, Any] | None = None
     solve_returncode = 0
@@ -2228,11 +2386,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "--polar-distance-m",
             str(args.polar_distance_m),
             "--polar-angle-min-deg",
-            str(args.polar_angle_min_deg),
+            str(polar_angle_min_deg),
             "--polar-angle-max-deg",
-            str(args.polar_angle_max_deg),
+            str(polar_angle_max_deg),
             "--polar-angle-count",
-            str(args.polar_angle_count),
+            str(polar_angle_count),
             "--bem-formulation",
             str(args.bem_formulation),
             "--complex-k-shift",

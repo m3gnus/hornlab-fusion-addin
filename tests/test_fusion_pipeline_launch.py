@@ -361,6 +361,24 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
     assert "--no-run-report" not in cmd
 
 
+def test_build_pipeline_command_defers_auto_cut_derivations_to_prepare_manifest():
+    helper = _load_helper()
+
+    cmd = _helper_command(
+        helper,
+        symmetry_planes="auto-cut",
+        quadrants="1234",
+        mirror_axes="none",
+    )
+
+    assert cmd[cmd.index("--symmetry-planes") + 1] == "auto-cut"
+    assert "--quadrants" not in cmd
+    assert "--mirror-axes" not in cmd
+    assert "--polar-angle-min-deg" not in cmd
+    assert "--polar-angle-max-deg" not in cmd
+    assert "--polar-angle-count" not in cmd
+
+
 def test_build_pipeline_command_forwards_fem_chamber_contract():
     helper = _load_helper()
     cmd = _helper_command(
@@ -1030,8 +1048,11 @@ def test_mirror_plane_helpers_map_fusion_names_to_solver_planes():
     helper = _load_helper()
 
     assert helper.symmetry_planes_for_mirror_plane("Auto detect") == "auto"
+    assert helper.symmetry_planes_for_mirror_plane("auto-cut") == "auto-cut"
     assert helper.mirror_axes_for_symmetry_planes("auto") == "auto"
     assert helper.quadrants_for_symmetry_planes("auto") == "auto"
+    assert helper.mirror_axes_for_symmetry_planes("auto-cut") == "auto"
+    assert helper.quadrants_for_symmetry_planes("auto-cut") == "auto"
     assert helper.symmetry_planes_for_mirror_plane("Top/Bottom") == "z0"
     assert helper.mirror_axes_for_symmetry_planes("z0") == "z"
     assert helper.quadrants_for_symmetry_planes("z0") == "1234"
@@ -1043,6 +1064,7 @@ def test_mirror_plane_helpers_map_fusion_names_to_solver_planes():
 def test_pipeline_maps_z0_to_native_xy_symmetry():
     pipeline = _load_pipeline()
 
+    assert pipeline._parse_symmetry_planes("auto-cut", quadrants=1) == ()
     assert pipeline._parse_symmetry_planes("top-bottom", quadrants=1) == ("z0",)
     assert pipeline._native_symmetry_for_planes(("z0",)) == "xy"
     args = pipeline.parse_args(
@@ -2645,6 +2667,180 @@ def test_pipeline_auto_symmetry_uses_planes_detected_by_prepare(tmp_path, monkey
     assert manifest["symmetry_planes"] == ["x0"]
     assert manifest["symmetry_planes_mode"] == "auto"
     assert manifest["quadrants"] == 14
+
+
+def _auto_cut_prep_manifest(planes):
+    return {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "solver_ready": True,
+        "symmetry_planes": list(planes),
+        "symmetry_planes_mode": "auto-cut",
+        "auto_reduce": {
+            "mode": "auto-cut",
+            "cut_planes": list(planes),
+        },
+        "mesh_frequency_validation": {
+            "status": "valid",
+            "requested_max_frequency_hz": 8_000.0,
+            "max_valid_frequency_hz": 9_767.0,
+            "per_source": {
+                "HF": {"max_valid_frequency_hz": 9_767.0, "status": "valid"},
+            },
+            "warnings": [],
+        },
+    }
+
+
+def test_pipeline_auto_cut_uses_actual_x0_for_diagnose_and_native_solve(
+    tmp_path, monkeypatch
+):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_auto_cut_prep_manifest(["x0"]),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--symmetry-planes",
+            "auto-cut",
+            "--mirror-axes",
+            "none",
+            "--native-symmetry-plane",
+            "none",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 0
+    prep_cmd = calls[0][1]
+    diagnose_cmd = calls[1][1]
+    solve_cmd = calls[2][1]
+    assert prep_cmd[prep_cmd.index("--symmetry-planes") + 1] == "auto-cut"
+    assert diagnose_cmd[diagnose_cmd.index("--mirror-axes") + 1] == "x"
+    # Exact hazard regression: an actually cut mesh must never be declared full.
+    assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] == "yz"
+    assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] != "none"
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["symmetry_planes"] == ["x0"]
+    assert manifest["symmetry_planes_mode"] == "auto-cut"
+    assert manifest["quadrants"] == 14
+    assert manifest["native_symmetry_plane"] == "yz"
+    mapping = manifest["polar_grid_derivation"]["plane_correspondence"]
+    assert mapping["horizontal"]["required_symmetry_plane"] == "x0"
+    assert mapping["horizontal"]["requires_full_circle"] is False
+    assert mapping["vertical"]["required_symmetry_plane"] == "y0"
+    assert mapping["vertical"]["requires_full_circle"] is True
+
+
+def test_pipeline_auto_cut_without_accepted_planes_uses_full_model_and_full_polars(
+    tmp_path, monkeypatch
+):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_auto_cut_prep_manifest([]),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--symmetry-planes",
+            "auto-cut",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 0
+    diagnose_cmd = calls[1][1]
+    solve_cmd = calls[2][1]
+    assert diagnose_cmd[diagnose_cmd.index("--mirror-axes") + 1] == "none"
+    assert solve_cmd[solve_cmd.index("--native-symmetry-plane") + 1] == "none"
+    assert solve_cmd[solve_cmd.index("--polar-angle-min-deg") + 1] == "-180.0"
+    assert solve_cmd[solve_cmd.index("--polar-angle-max-deg") + 1] == "180.0"
+    assert solve_cmd[solve_cmd.index("--polar-angle-count") + 1] == "73"
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["symmetry_planes"] == []
+    assert manifest["quadrants"] == 1234
+    assert manifest["polar_grid_derivation"]["derivation_applied"] is True
+
+
+def test_pipeline_explicit_polar_flags_override_auto_cut_verdict(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_auto_cut_prep_manifest([]),
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--symmetry-planes",
+            "auto-cut",
+            "--polar-angle-min-deg",
+            "-90",
+            "--polar-angle-max-deg",
+            "90",
+            "--polar-angle-count",
+            "19",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 0
+    solve_cmd = calls[2][1]
+    assert solve_cmd[solve_cmd.index("--polar-angle-min-deg") + 1] == "-90.0"
+    assert solve_cmd[solve_cmd.index("--polar-angle-max-deg") + 1] == "90.0"
+    assert solve_cmd[solve_cmd.index("--polar-angle-count") + 1] == "19"
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    derivation = manifest["polar_grid_derivation"]
+    assert derivation["explicit_user_flags"] is True
+    assert derivation["derivation_applied"] is False
 
 
 def test_pipeline_uses_only_authoritative_mesh_contracts(tmp_path, monkeypatch):

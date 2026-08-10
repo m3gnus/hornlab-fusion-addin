@@ -1208,6 +1208,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             selected_mirror_plane = _setting_str(settings, "mirror_plane")
             for name in (
                 "Auto detect",
+                "auto-cut",
                 "Left/Right + Front/Back",
                 "Left/Right",
                 "Front/Back",

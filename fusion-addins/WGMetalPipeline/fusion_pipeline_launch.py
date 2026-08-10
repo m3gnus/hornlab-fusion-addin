@@ -17,6 +17,7 @@ from typing import Any
 
 MIRROR_PLANE_SYMMETRY_PLANES = {
     "Auto detect": "auto",
+    "auto-cut": "auto-cut",
     "Left/Right + Front/Back": "x0,y0",
     "Left/Right": "x0",
     "Front/Back": "y0",
@@ -944,10 +945,11 @@ def build_pipeline_command(
         entry = str(entry).strip()
         if entry:
             cmd.extend(["--refine", entry])
-    symmetry_auto = symmetry_planes.strip().lower() == "auto"
+    symmetry_mode = symmetry_planes.strip().lower()
+    symmetry_auto = symmetry_mode in {"auto", "auto-cut"}
     if not symmetry_auto and quadrants:
         cmd.extend(["--quadrants", quadrants])
-    cmd.extend(["--symmetry-planes", "auto" if symmetry_auto else symmetry_planes])
+    cmd.extend(["--symmetry-planes", symmetry_mode if symmetry_auto else symmetry_planes])
     if not symmetry_auto and mirror_axes:
         cmd.extend(["--mirror-axes", mirror_axes])
     cmd.extend([
@@ -963,17 +965,30 @@ def build_pipeline_command(
         plot_theme_value,
         "--polar-distance-m",
         polar_distance_m,
-        "--polar-angle-min-deg",
-        polar_angle_min_deg,
-        "--polar-angle-max-deg",
-        polar_angle_max_deg,
-        "--polar-angle-count",
-        polar_angle_count,
         "--bem-formulation",
         bem_formulation,
         "--complex-k-shift",
         complex_k_shift,
     ])
+    try:
+        auto_cut_default_polar = symmetry_mode == "auto-cut" and (
+            float(polar_angle_min_deg) == 0.0
+            and float(polar_angle_max_deg) == 180.0
+            and int(polar_angle_count) == 37
+        )
+    except (TypeError, ValueError):
+        auto_cut_default_polar = False
+    if not auto_cut_default_polar:
+        cmd.extend(
+            [
+                "--polar-angle-min-deg",
+                polar_angle_min_deg,
+                "--polar-angle-max-deg",
+                polar_angle_max_deg,
+                "--polar-angle-count",
+                polar_angle_count,
+            ]
+        )
     if crossover_lf_mf_hz and str(crossover_lf_mf_hz).strip():
         cmd.extend(["--crossover-lf-mf-hz", str(crossover_lf_mf_hz).strip()])
     if crossover_mf_hf_hz and str(crossover_mf_hf_hz).strip():
@@ -1138,7 +1153,7 @@ def symmetry_planes_for_mirror_plane(mirror_plane: str) -> str:
 
 
 def quadrants_for_symmetry_planes(symmetry_planes: str) -> str:
-    if symmetry_planes.strip().lower() == "auto":
+    if symmetry_planes.strip().lower() in {"auto", "auto-cut"}:
         return "auto"
     planes = {
         part.strip().lower()
@@ -1155,7 +1170,7 @@ def quadrants_for_symmetry_planes(symmetry_planes: str) -> str:
 
 
 def mirror_axes_for_symmetry_planes(symmetry_planes: str) -> str:
-    if symmetry_planes.strip().lower() == "auto":
+    if symmetry_planes.strip().lower() in {"auto", "auto-cut"}:
         return "auto"
     axes = []
     for part in symmetry_planes.split(","):

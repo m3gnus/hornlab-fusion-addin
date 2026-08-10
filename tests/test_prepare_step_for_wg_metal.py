@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -24,6 +25,22 @@ def _load_script():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_old_mesher_import_has_actionable_compatibility_error(monkeypatch):
+    original_import = builtins.__import__
+
+    def reject_step_prepare(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hornlab_mesher.step_prepare":
+            raise ImportError(
+                "cannot import name 'auto_cut_occ_geometry'",
+                name="hornlab_mesher.step_prepare",
+            )
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_step_prepare)
+    with pytest.raises(RuntimeError, match=r"compatible.*revision pinned.*requirements"):
+        _load_script()
 
 
 def _quarter_tube(angles_deg, z_values):

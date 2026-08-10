@@ -56,14 +56,14 @@ try:
         sample_occ_surface_points,
         snap_symmetry_plane_vertices,
     )
-except ModuleNotFoundError as exc:
-    if exc.name != "hornlab_mesher" and not (exc.name or "").startswith(
-        "hornlab_mesher."
-    ):
+except (ImportError, ModuleNotFoundError) as exc:
+    missing = exc.name or ""
+    if missing != "hornlab_mesher" and not missing.startswith("hornlab_mesher."):
         raise
     raise RuntimeError(
-        "hornlab-waveguide-mesher is required to prepare STEP geometry; "
-        "install it with 'python -m pip install hornlab-waveguide-mesher'"
+        "a compatible hornlab-waveguide-mesher is required to prepare STEP "
+        "geometry; install or update the exact revision pinned in this add-in's "
+        "requirements.txt"
     ) from exc
 
 # Shared pure-Python sizing/cost predictor, also imported by the Fusion add-in.

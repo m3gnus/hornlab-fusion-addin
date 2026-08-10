@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "fusion-addins" / "WGLink"))
 from wglink_bundle import (  # noqa: E402
     DEFAULT_LIMITS,
+    IDENTITY_MATRIX,
     TAG_AREA_TOLERANCE,
     Limits,
     WgLinkError,
@@ -37,6 +38,7 @@ from wglink_bundle import (  # noqa: E402
     enclosure_plan,
     effective_parameters,
     format_expression,
+    fusion_matrix_to_mm,
     format_measurement_mm,
     health_regressions,
     interface_parameters,
@@ -956,6 +958,7 @@ def test_attribute_payload_stores_document_topology(tmp_path):
     assert topology["section_arc_positions"] == pytest.approx(
         normalized_arc_positions(np.asarray(bundle.grid["inner_points"]))
     )
+    assert topology["sections"] == len(plan.ring_indices)
     assert topology["walls"] == 1
 
 
@@ -1383,3 +1386,46 @@ def test_optional_real_fixtures_share_one_placed_link_local_frame():
             throat_y
         )
         assert throat_y == pytest.approx(80.0)
+
+
+def test_fusion_matrix_translation_is_converted_from_centimetres():
+    """The one place a Fusion matrix crosses into the contract's frame.
+
+    `Matrix3D.asArray()` is row-major with a CENTIMETRE translation column,
+    while D1 says every outbound coordinate is millimetres. Emitting the raw
+    array mixes both in one matrix and is silent while the wrapper sits at the
+    origin.
+    """
+
+    rotation_30_deg = [
+        0.8660254, -0.5, 0.0, 30.0,   # 30 cm  -> 300 mm
+        0.5, 0.8660254, 0.0, -20.0,   # -20 cm -> -200 mm
+        0.0, 0.0, 1.0, 1.0,           # 1 cm   -> 10 mm
+        0.0, 0.0, 0.0, 1.0,
+    ]
+
+    rows = fusion_matrix_to_mm(rotation_30_deg)
+
+    assert [row[3] for row in rows] == pytest.approx([300.0, -200.0, 10.0, 1.0])
+    # The rotation block is dimensionless and must pass through untouched.
+    assert rows[0][:3] == pytest.approx([0.8660254, -0.5, 0.0])
+    assert rows[1][:3] == pytest.approx([0.5, 0.8660254, 0.0])
+    assert rows[3] == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_fusion_matrix_identity_round_trips_unchanged():
+    assert fusion_matrix_to_mm(
+        [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    ) == [list(row) for row in IDENTITY_MATRIX]
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([1.0] * 15, "16 values"),
+        ([1.0] * 16, r"last row"),
+    ],
+)
+def test_fusion_matrix_refuses_malformed_transforms(values, message):
+    with pytest.raises(WgLinkError, match=message):
+        fusion_matrix_to_mm(values)

@@ -121,6 +121,16 @@ def _topology(payload: dict[str, Any]) -> tuple[int, np.ndarray, float, int, boo
         raise ResampleError(
             "topology section_arc_positions must include throat 0.0 and mouth 1.0"
         )
+    section_count = payload.get("sections")
+    if section_count is not None and (
+        isinstance(section_count, bool)
+        or not isinstance(section_count, int)
+        or section_count != len(positions)
+    ):
+        raise ResampleError(
+            "topology sections must equal the number of section_arc_positions, "
+            f"got {section_count!r} and {len(positions)}"
+        )
     overshoot = _finite_number(payload.get("overshoot_mm"), "topology overshoot_mm")
     if overshoot < 0.0:
         raise ResampleError(f"topology overshoot_mm must not be negative, got {overshoot!r}")
@@ -135,14 +145,6 @@ def _topology(payload: dict[str, Any]) -> tuple[int, np.ndarray, float, int, boo
             f"topology walls={walls} conflicts with has_outer={has_outer}"
         )
     return point_count, positions, overshoot, walls, has_outer
-
-
-def _append_overshoot(points: np.ndarray, overshoot_mm: float) -> np.ndarray:
-    if overshoot_mm <= 0.0:
-        return points
-    mouth = np.array(points[:, -1:, :], copy=True)
-    mouth[:, :, 2] += overshoot_mm
-    return np.concatenate([points, mouth], axis=1)
 
 
 def _even_sample(points: np.ndarray, count: int) -> list[list[float]]:
@@ -230,9 +232,6 @@ def build_payload(bundle_path: Path, topology_path: Path) -> dict[str, Any]:
             raise ResampleError(f"could not resample outer_points: {exc}") from exc
 
     checks = _check_points(inner, positions)
-    points = _append_overshoot(points, overshoot)
-    if outer_points is not None:
-        outer_points = _append_overshoot(outer_points, overshoot)
     ring_z = [float(np.mean(points[:, section, 2])) for section in range(points.shape[1])]
     return {
         "check_points": checks,

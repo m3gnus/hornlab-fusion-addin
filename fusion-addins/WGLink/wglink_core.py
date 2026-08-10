@@ -29,6 +29,8 @@ from wglink_bundle import (
     attribute_payload,
     effective_parameters,
     enclosure_plan,
+    format_expression,
+    fusion_matrix_to_mm,
     health_regressions,
     instance_parameter_prefix,
     link_state,
@@ -46,6 +48,7 @@ from wglink_bundle import (
 
 ATTRIBUTE_GROUP = "WGLink"
 ADDIN_DIR = Path(__file__).resolve().parent
+MOUTH_OVERSHOOT_SUFFIX = "mouth_overshoot"
 ROLE_COLOURS = {
     "HF": (255, 0, 0, 255),
     "MF": (255, 187, 0, 255),
@@ -407,13 +410,16 @@ def _component_for_record(design: adsk.fusion.Design, record: dict[str, Any]) ->
 
 
 def _matrix_rows(matrix: object) -> list[list[float]]:
+    """The occurrence placement as the contract's row-major MILLIMETRE matrix."""
+
     try:
         values = [float(value) for value in matrix.asArray()]
     except Exception:  # noqa: BLE001
         return [list(row) for row in IDENTITY_MATRIX]
-    if len(values) != 16:
+    try:
+        return fusion_matrix_to_mm(values)
+    except WgLinkError:
         return [list(row) for row in IDENTITY_MATRIX]
-    return [values[index : index + 4] for index in range(0, 16, 4)]
 
 
 def _assembly_from_link(design: adsk.fusion.Design, record: dict[str, Any]) -> list[list[float]]:
@@ -483,6 +489,50 @@ def _push_parameters(
     return {"created": created, "updated": updated}
 
 
+def _push_mouth_overshoot_parameter(
+    design: adsk.fusion.Design,
+    prefix: str,
+    overshoot_mm: float,
+) -> tuple[str, dict[str, list[str]]]:
+    name = f"{prefix}{MOUTH_OVERSHOOT_SUFFIX}"
+    expression = format_expression(overshoot_mm)
+    existing = design.userParameters.itemByName(name)
+    if existing is None:
+        design.userParameters.add(
+            name,
+            adsk.core.ValueInput.createByString(expression),
+            "mm",
+            "WGLink mouth punch-through depth",
+        )
+        return name, {"created": [name], "updated": []}
+    existing.expression = expression
+    return name, {"created": [], "updated": [name]}
+
+
+def _merge_parameter_reports(
+    target: dict[str, list[str]], source: dict[str, list[str]]
+) -> None:
+    for action in ("created", "updated"):
+        target[action].extend(source[action])
+
+
+def _managed_parameter_expressions(
+    bundle: object,
+    prefix: str,
+    *,
+    mouth_overshoot_mm: float | None = None,
+) -> dict[str, str]:
+    expressions = {
+        parameter.name: parameter.expression
+        for parameter in effective_parameters(bundle, prefix).values()
+    }
+    if mouth_overshoot_mm is not None:
+        expressions[f"{prefix}{MOUTH_OVERSHOOT_SUFFIX}"] = format_expression(
+            mouth_overshoot_mm
+        )
+    return expressions
+
+
 def _point(xyz_mm: list[float] | tuple[float, float, float]) -> object:
     return adsk.core.Point3D.create(*(mm_to_internal(float(value)) for value in xyz_mm))
 
@@ -492,20 +542,13 @@ def _selected_sections(
     plan: object,
     *,
     wall: str = "inner",
-    overshoot_mm: float = 0.0,
 ) -> list[list[list[float]]]:
     source = grid[f"{wall}_points"]
     rays = list(range(0, grid["n_phi"], plan.phi_stride))
-    sections = [
+    return [
         [[float(value) for value in source[ray][station]] for ray in rays]
         for station in plan.ring_indices
     ]
-    if overshoot_mm > 0.0:
-        extra = [list(point) for point in sections[-1]]
-        for point in extra:
-            point[2] += overshoot_mm
-        sections.append(extra)
-    return sections
 
 
 def _add_fit_sketch(
@@ -578,6 +621,74 @@ def _build_loft(
     if not loft.bodies.count:
         raise WgLinkError("The waveguide loft produced no body.")
     return loft.bodies.item(0), loft, sketches
+
+
+def _mouth_cap_face(body: object, mouth_z_mm: float) -> object:
+    target = mm_to_internal(mouth_z_mm)
+    position_tolerance = mm_to_internal(0.0001)
+    direction_tolerance = 1.0e-6
+    candidates: list[object] = []
+    for face in _items(body.faces):
+        try:
+            plane = adsk.core.Plane.cast(face.geometry)
+        except Exception:  # noqa: BLE001 - malformed/non-planar faces are not candidates
+            plane = None
+        if plane is None:
+            continue
+        box = face.boundingBox
+        if (
+            abs(box.minPoint.z - target) > position_tolerance
+            or abs(box.maxPoint.z - target) > position_tolerance
+        ):
+            continue
+        normal = plane.normal
+        sign = -1.0 if bool(face.isParamReversed) else 1.0
+        nx = sign * float(normal.x)
+        ny = sign * float(normal.y)
+        nz = sign * float(normal.z)
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length <= 0.0:
+            continue
+        if (
+            abs(nx / length) <= direction_tolerance
+            and abs(ny / length) <= direction_tolerance
+            and nz / length >= 1.0 - direction_tolerance
+        ):
+            candidates.append(face)
+    if len(candidates) != 1:
+        raise WgLinkError(
+            "Expected exactly one planar loft cap face at the mouth plane "
+            f"z={mouth_z_mm:g} mm with outward normal +z; Fusion found "
+            f"{len(candidates)}. Refusing to extrude an ambiguous face."
+        )
+    return candidates[0]
+
+
+def _extrude_mouth_overshoot(
+    component: object,
+    loft_body: object,
+    *,
+    mouth_z_mm: float,
+    overshoot_parameter: str,
+    instance_id: str,
+) -> tuple[object, object]:
+    face = _mouth_cap_face(loft_body, mouth_z_mm)
+    extrudes = component.features.extrudeFeatures
+    extrude_input = extrudes.createInput(
+        face, adsk.fusion.FeatureOperations.JoinFeatureOperation
+    )
+    extrude_input.setOneSideExtent(
+        adsk.fusion.DistanceExtentDefinition.create(
+            adsk.core.ValueInput.createByString(overshoot_parameter)
+        ),
+        adsk.fusion.ExtentDirections.PositiveExtentDirection,
+    )
+    extrude = extrudes.add(extrude_input)
+    extrude.name = "WGLink mouth overshoot"
+    _stamp_managed(extrude, instance_id, "feature", "mouth_overshoot")
+    if not extrude.bodies.count:
+        raise WgLinkError("The mouth overshoot join extrude produced no body.")
+    return extrude.bodies.item(0), extrude
 
 
 def _throat_edge(body: object, throat_z_mm: float, tolerance_mm: float = 0.5) -> object | None:
@@ -1881,6 +1992,17 @@ def _validate_rebuild_topology(
     walls = int(topology.get("walls", -1))
     expected_rings = sections * walls
     actual_counts = sorted({spline.fitPoints.count for _wall, _section, _sketch, spline in rings})
+    if (
+        float(topology.get("overshoot_mm", 0.0)) > 0.0
+        and len(rings) == expected_rings + walls
+        and actual_counts == [points]
+    ):
+        raise WgLinkError(
+            "This WGLink link predates the mouth face-extrude change and still "
+            f"contains {walls} synthetic overshoot ring sketch(es). The current "
+            f"topology requires {expected_rings} real ring sketches. Recreate the "
+            "link before updating."
+        )
     if len(rings) != expected_rings or actual_counts != [points]:
         count_text = actual_counts if actual_counts else [0]
         raise WgLinkError(
@@ -1940,6 +2062,15 @@ def _move_spline(sketch: object, spline: object, points: list[list[float]]) -> i
         except Exception:  # noqa: BLE001
             pass
     return moved
+
+
+def _rebuild_interface_points(payload: dict[str, Any]) -> dict[str, list[list[float]]]:
+    points = payload["points"]
+    mouth_section = int(payload["sections"]) - 1
+    return {
+        "throat": [points[index][0] for index in range(len(points))],
+        "mouth": [points[index][mouth_section] for index in range(len(points))],
+    }
 
 
 def _fixed_enclosure_sketch(design: object, instance_id: str) -> object | None:
@@ -2180,11 +2311,17 @@ def insert(
         mutated = True
         report["wrapper"] = wrapper_mode
         parameter_report = _push_parameters(design, bundle, parameter_prefix)
+        mouth_overshoot_parameter = None
+        if mode == "enclosure":
+            mouth_overshoot_parameter, overshoot_parameter_report = (
+                _push_mouth_overshoot_parameter(
+                    design, parameter_prefix, overshoot_mm
+                )
+            )
+            _merge_parameter_reports(parameter_report, overshoot_parameter_report)
         interfaces = _build_interface_sketches(component, bundle, plan, instance_id)
         made.extend(interfaces.values())
-        section_points = _selected_sections(
-            bundle.grid, plan, overshoot_mm=overshoot_mm
-        )
+        section_points = _selected_sections(bundle.grid, plan)
         cut_or_surface, loft, ring_sketches = _build_loft(
             component,
             section_points,
@@ -2194,6 +2331,16 @@ def insert(
         )
         made.extend(ring_sketches)
         made.append(loft)
+        if mode == "enclosure":
+            assert mouth_overshoot_parameter is not None
+            cut_or_surface, mouth_extrude = _extrude_mouth_overshoot(
+                component,
+                cut_or_surface,
+                mouth_z_mm=float(bundle.grid["ring_z_mm"][-1]),
+                overshoot_parameter=mouth_overshoot_parameter,
+                instance_id=instance_id,
+            )
+            made.append(mouth_extrude)
         _stamp_managed(cut_or_surface, instance_id, "role", "cut_tool")
         # Keep every managed fit-point sketch before the first non-Sketch /
         # non-Occurrence timeline entry.  The pure rollback rule can then land
@@ -2251,10 +2398,11 @@ def insert(
         )
         payload["bundle_path"] = str(Path(bundle_path).expanduser().resolve())
         payload["parameter_expressions"] = _json(
-            {
-                parameter.name: parameter.expression
-                for parameter in effective_parameters(bundle, parameter_prefix).values()
-            }
+            _managed_parameter_expressions(
+                bundle,
+                parameter_prefix,
+                mouth_overshoot_mm=(overshoot_mm if mode == "enclosure" else None),
+            )
         )
         payload["expected_throat_area_mm2"] = repr(expected_area)
         payload["body_fingerprint"] = _json(_body_fingerprint(final_body))
@@ -2331,12 +2479,14 @@ def insert(
                     "ring_stride": plan.ring_stride,
                     "points_per_ring": plan.points_per_ring,
                     "ring_indices": list(plan.ring_indices),
-                    "sections": len(section_points),
+                    "sections": len(plan.ring_indices),
                     "overshoot_mm": overshoot_mm,
                 },
                 "tag": tag,
             }
         )
+        if mouth_overshoot_parameter is not None:
+            report["mouth_overshoot_parameter"] = mouth_overshoot_parameter
         if mode == "enclosure":
             cabinet = enclosure_plan(bundle, parameter_prefix)
             if cabinet is not None:
@@ -2391,7 +2541,7 @@ def _no_op_update_report(
     throat_z = float(record["payload"].get("throat_z_mm", bundle.grid["ring_z_mm"][0]))
     expected = float(record["payload"].get("expected_throat_area_mm2", throat_area_mm2(bundle)))
     count = design.timeline.count
-    return {
+    report = {
         "wrapper": record["payload"].get("wrapper", "root"),
         "assembly_from_link": _assembly_from_link(design, record),
         "tag": _tag_report(
@@ -2416,6 +2566,15 @@ def _no_op_update_report(
             "restored": design.timeline.markerPosition,
         },
     }
+    if record["payload"].get("build_mode") == "enclosure":
+        prefix = str(
+            record["payload"].get("parameter_prefix")
+            or f"wg_{record['payload'].get('slug', '')}_"
+        )
+        report["mouth_overshoot_parameter"] = (
+            f"{prefix}{MOUTH_OVERSHOOT_SUFFIX}"
+        )
+    return report
 
 
 def update(
@@ -2470,8 +2629,7 @@ def update(
             "only after confirming the replacement."
         )
         raise WgLinkError(f"WGLink refuses {state.verdict}: {remedy}")
-    if state.verdict == "same_export" and not opts.get("force"):
-        return _no_op_update_report(app, design, record, bundle, opts)
+    no_op = state.verdict == "same_export" and not opts.get("force")
     try:
         topology = json.loads(record["payload"]["topology"])
     except (TypeError, ValueError, KeyError) as exc:
@@ -2482,6 +2640,8 @@ def update(
         design, record["instance_id"], record["payload"]
     )
     sections, _points = _validate_rebuild_topology(rings, interfaces, payload, topology)
+    if no_op:
+        return _no_op_update_report(app, design, record, bundle, opts)
 
     _expand_groups(design.timeline)
     entries = _timeline_entries(design.timeline)
@@ -2529,6 +2689,11 @@ def update(
         "progress_path": str(progress_path),
         "progress": [],
     }
+    mouth_overshoot = float(payload.get("overshoot_mm", 0.0))
+    if incoming_mode == "enclosure":
+        report["mouth_overshoot_parameter"] = (
+            f"{parameter_prefix}{MOUTH_OVERSHOOT_SUFFIX}"
+        )
     if before_skipped:
         report["warnings"].append(
             f"Health diagnostics skipped {len(before_skipped)} unreadable timeline entries."
@@ -2540,6 +2705,15 @@ def update(
         design.timeline.markerPosition = target_index
         marker_moved = True
         report["parameters"] = _push_parameters(design, bundle, parameter_prefix)
+        if incoming_mode == "enclosure":
+            _mouth_overshoot_parameter, overshoot_parameter_report = (
+                _push_mouth_overshoot_parameter(
+                    design, parameter_prefix, mouth_overshoot
+                )
+            )
+            _merge_parameter_reports(
+                report["parameters"], overshoot_parameter_report
+            )
         for wall, section, sketch, spline in rings:
             grid = payload["points"] if wall == "inner" else payload["outer_points"]
             points = [grid[index][section] for index in range(len(grid))]
@@ -2558,15 +2732,7 @@ def update(
             _write_progress(progress_path, report)
             adsk.doEvents()
 
-        overshoot = float(payload.get("overshoot_mm", 0.0))
-        mouth_section = sections - 2 if overshoot > 0.0 else sections - 1
-        interface_points = {
-            "throat": [payload["points"][index][0] for index in range(len(payload["points"]))],
-            "mouth": [
-                payload["points"][index][mouth_section]
-                for index in range(len(payload["points"]))
-            ],
-        }
+        interface_points = _rebuild_interface_points(payload)
         for role, (sketch, spline) in interfaces.items():
             report["fit_points_moved"] += _move_spline(
                 sketch, spline, interface_points[role]
@@ -2681,10 +2847,13 @@ def update(
         "local_body_state": evidence_state,
         "parameter_prefix": parameter_prefix,
         "parameter_expressions": _json(
-            {
-                parameter.name: parameter.expression
-                for parameter in effective_parameters(bundle, parameter_prefix).values()
-            }
+            _managed_parameter_expressions(
+                bundle,
+                parameter_prefix,
+                mouth_overshoot_mm=(
+                    mouth_overshoot if incoming_mode == "enclosure" else None
+                ),
+            )
         ),
         "expected_throat_area_mm2": repr(expected),
         "throat_z_mm": repr(throat_z),

@@ -1226,6 +1226,7 @@ def attribute_payload(
         "overshoot_mm": overshoot,
         "point_count": plan.points_per_ring,
         "section_arc_positions": positions,
+        "sections": plan.sections,
         "walls": resolved_walls,
     }
     identity = bundle.identity
@@ -1612,6 +1613,34 @@ def mm_to_internal(value_mm: float) -> float:
     return _finite_number(value_mm, label="millimetre coordinate") / 10.0
 
 
+def fusion_matrix_to_mm(values: Sequence[float]) -> list[list[float]]:
+    """Turn a Fusion 4x4 into the contract's row-major MILLIMETRE matrix.
+
+    `Matrix3D.asArray()` hands back 16 row-major values whose translation
+    column is in Fusion's internal centimetres, while D1 says every outbound
+    coordinate in this contract is millimetres. Emitting the raw array mixes
+    the two in one matrix: the rotation block is dimensionless and correct, and
+    the three translations are 10x too small. It is latent only while the
+    wrapper sits at the origin, which is exactly how a frame bug survives to
+    the first user who moves something.
+    """
+
+    numbers = [
+        _finite_number(value, label=f"transform[{index}]")
+        for index, value in enumerate(values)
+    ]
+    if len(numbers) != 16:
+        raise WgLinkError(f"a Fusion transform must have 16 values, got {len(numbers)}")
+    rows = [numbers[index : index + 4] for index in range(0, 16, 4)]
+    for row in rows[:3]:
+        row[3] *= 10.0
+    if rows[3] != [0.0, 0.0, 0.0, 1.0]:
+        raise WgLinkError(
+            f"a Fusion transform's last row must be [0,0,0,1], got {rows[3]!r}"
+        )
+    return rows
+
+
 __all__ = [
     "Bundle",
     "DEFAULT_LIMITS",
@@ -1628,6 +1657,7 @@ __all__ = [
     "effective_parameters",
     "enclosure_plan",
     "format_expression",
+    "fusion_matrix_to_mm",
     "format_measurement_mm",
     "health_regressions",
     "interface_parameters",

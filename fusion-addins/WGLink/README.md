@@ -25,9 +25,11 @@ a root link cannot be moved or jointed as a unit. Start with an Assembly when
 that behavior matters, or disable `allow_root_fallback` in a head-less call to
 make Insert refuse instead.
 
-WGLink pushes only manifest parameters whose role is `interface`. Existing
-parameters are updated by assigning their expression; they are never deleted
-and recreated. Informational parameters remain JSON metadata, and unrelated
+WGLink pushes manifest parameters whose role is `interface`. Enclosure links
+also own `<parameter_prefix>mouth_overshoot` (5 mm by default), which drives the
+join extrude that carries the cavity through the baffle. Existing parameters
+are updated by assigning their expression; they are never deleted and
+recreated. Informational parameters remain JSON metadata, and unrelated
 `wg_*` parameters are left alone.
 
 The supported reference layer is:
@@ -106,16 +108,16 @@ Tritonia-V enclosure and asro68 freestanding, throwaway documents:
 |---|---|
 | enclosure volume vs the mesher's own solid | **−0.013 %** on insert, **−0.015 %** after an update |
 | enclosure bounding box | exact on all six faces, before and after |
-| cavity surface vs the mesher's grid | mean **0.009 mm**, p95 **0.001 mm**, max 0.23 mm |
+| cavity surface vs the mesher's grid, before the mouth face-extrude change | mean **0.009 mm**, p95 **0.001 mm**, max 0.23 mm |
 | update | 2572 fit points moved, **0 features regressed**, including a user feature built on a managed datum |
 | source tag | one face, 506.70 mm², 0 strays, before and after |
 | freestanding solid vs the mesher's | −0.75 % (the mesher exports an opened throat; the native build has a driver plate) |
 
-The deviation maximum is a handful of points at the mouth lip, where the mesher
-clusters five stations into the last 1.5 mm of z. Curvature-aware sectioning
-took it from 0.865 mm to 0.23 mm; closing the rest costs minutes of rebuild
-time per update for a tenth of a millimetre on one lip. Raise `max_sections`
-(default 40) in a head-less call if a project needs it.
+The pre-change deviation maximum was confined to the last three stations at
+the mouth. It persisted as section density increased because the former axial
+duplicate mouth ring forced the fitted loft's end tangent. The loft now ends at
+the real mouth ring and a separate face extrude provides the punch-through;
+Fusion-side deviation and volume measurements for that change are pending.
 
 **Not verified:** §5.6's moved-wrapper case. Setting `occurrence.transform2`
 from a script reads the new matrix straight back, but after

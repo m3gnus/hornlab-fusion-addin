@@ -137,6 +137,7 @@ def _write_topology(
                 "overshoot_mm": overshoot,
                 "point_count": point_count,
                 "section_arc_positions": positions or [0.0, 0.35, 1.0],
+                "sections": len(positions or [0.0, 0.35, 1.0]),
                 "walls": walls,
             },
             sort_keys=True,
@@ -169,20 +170,35 @@ def test_payload_shape_counts_and_stored_arc_positions_are_honoured(tmp_path):
     assert payload["outer_points"] is None
 
 
-def test_positive_overshoot_appends_exact_translated_mouth_section(tmp_path):
+def test_topology_section_count_must_match_stored_arc_positions(tmp_path):
     module = _load_script()
     bundle, _grid = _write_bundle(tmp_path / "new.wglink")
+    topology = _write_topology(tmp_path / "topology.json")
+    stored = json.loads(topology.read_text(encoding="utf-8"))
+    stored["sections"] = 4
+    topology.write_text(json.dumps(stored), encoding="utf-8")
+
+    with pytest.raises(module.ResampleError, match="sections must equal"):
+        module.build_payload(bundle, topology)
+
+
+def test_positive_overshoot_travels_without_adding_a_section(tmp_path):
+    module = _load_script()
+    bundle, grid = _write_bundle(tmp_path / "new.wglink")
     topology = _write_topology(tmp_path / "topology.json", overshoot=5.0)
 
     payload = module.build_payload(bundle, topology)
     points = np.asarray(payload["points"])
-
-    assert payload["sections"] == 4
-    assert points[:, -1, :2] == pytest.approx(points[:, -2, :2])
-    assert points[:, -1, 2] == pytest.approx(points[:, -2, 2] + 5.0)
-    assert payload["ring_z_mm"][-1] == pytest.approx(
-        payload["ring_z_mm"][-2] + 5.0
+    expected = resample_point_grid(
+        np.asarray(grid["inner_points"]),
+        point_count=5,
+        section_arc_positions=np.asarray([0.0, 0.35, 1.0]),
     )
+
+    assert payload["overshoot_mm"] == 5.0
+    assert payload["sections"] == 3
+    assert points.shape == (5, 3, 3)
+    assert points == pytest.approx(expected)
 
 
 def test_zero_overshoot_does_not_append_section(tmp_path):
@@ -196,7 +212,7 @@ def test_zero_overshoot_does_not_append_section(tmp_path):
     assert np.asarray(payload["points"]).shape == (5, 3, 3)
 
 
-def test_two_wall_payload_resamples_outer_and_appends_overshoot(tmp_path):
+def test_two_wall_payload_resamples_outer_without_adding_overshoot_section(tmp_path):
     module = _load_script()
     bundle, _grid = _write_bundle(tmp_path / "new.wglink", outer=True)
     topology = _write_topology(
@@ -209,9 +225,9 @@ def test_two_wall_payload_resamples_outer_and_appends_overshoot(tmp_path):
     payload = module.build_payload(bundle, topology)
     outer = np.asarray(payload["outer_points"])
 
-    assert outer.shape == (5, 4, 3)
-    assert outer[:, -1, :2] == pytest.approx(outer[:, -2, :2])
-    assert outer[:, -1, 2] == pytest.approx(outer[:, -2, 2] + 2.5)
+    assert payload["overshoot_mm"] == 2.5
+    assert payload["sections"] == 3
+    assert outer.shape == (5, 3, 3)
 
 
 def test_check_points_are_raw_new_grid_points_strictly_between_sections(tmp_path):

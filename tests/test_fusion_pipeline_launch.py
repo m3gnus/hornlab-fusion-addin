@@ -1100,6 +1100,289 @@ def test_pipeline_filters_sources_to_prepare_manifest():
     ]
 
 
+def test_pipeline_warns_prominently_when_requested_source_is_skipped(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {
+            "LF": {"tag": 2, "reason": "no STEP shell or style named LF"},
+        },
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {"status": "valid"},
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(calls, prep_manifest_payload=prep_manifest),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--sources",
+            "LF:20,HF:5",
+            "--skip-missing-sources",
+            "--mesh-only",
+            "--symmetry-planes",
+            "x0",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 0
+    assert (
+        "WARNING: DEGRADED RUN - requested source(s) were skipped: "
+        "LF: no STEP shell or style named LF"
+    ) in capsys.readouterr().err
+
+
+def test_pipeline_require_sources_fails_with_recorded_prepare_reason(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {
+            "LF": {"tag": 2, "reason": "no STEP shell or style named LF"},
+        },
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {"status": "valid"},
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=prep_manifest,
+            solve_manifest_payload={
+                "status": "complete",
+                "sources": [{"name": "HF", "tag": 4, "status": "complete"}],
+            },
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--sources",
+            "LF:20,HF:5",
+            "--skip-missing-sources",
+            "--require-sources",
+            "--run-solves",
+            "--symmetry-planes",
+            "x0",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "ERROR: required source LF was not prepared" in captured.err
+    assert "no STEP shell or style named LF" in captured.err
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert manifest["required_source_validation"]["failures"] == [
+        {
+            "name": "LF",
+            "stage": "prepare",
+            "reason": "no STEP shell or style named LF",
+        }
+    ]
+
+
+def test_pipeline_require_sources_fails_for_source_skipped_by_solve_policy(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    pipeline = _load_pipeline()
+    calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=_underresolved_prep_manifest(),
+            solve_manifest_payload={
+                "status": "complete",
+                "sources": [{"name": "HF", "tag": 4, "status": "complete"}],
+            },
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--sources",
+            "LF:30,HF:5",
+            "--require-sources",
+            "--run-solves",
+            "--freq-min-hz",
+            "2000",
+            "--underresolved-solve-policy",
+            "clamp-per-source",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 2
+    assert "ERROR: required source LF was not solved" in capsys.readouterr().err
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    failure = manifest["required_source_validation"]["failures"][0]
+    assert failure["name"] == "LF"
+    assert failure["stage"] == "solve"
+    assert "below --freq-min-hz" in failure["reason"]
+
+
+def test_pipeline_require_sources_passes_when_solve_records_have_no_status(
+    tmp_path,
+    monkeypatch,
+):
+    """A healthy direct solve writes per-source records WITHOUT a status field.
+
+    Measured on a real run (m8_FRESH, 2026-08-09): direct_solve_manifest.json
+    sources are [{"name": "HF", ...}] with no "status" key at all. Requiring
+    status == "complete" would fail every successful run.
+    """
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}, "LF": {"tag": 2}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {"status": "valid"},
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(
+            calls,
+            prep_manifest_payload=prep_manifest,
+            solve_manifest_payload={
+                "status": "complete",
+                "sources": [{"name": "HF", "tag": 4}, {"name": "LF", "tag": 2}],
+            },
+        ),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--sources",
+            "LF:20,HF:5",
+            "--require-sources",
+            "--run-solves",
+            "--symmetry-planes",
+            "x0",
+            "--no-run-report",
+        ]
+    )
+
+    assert rc == 0
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["required_source_validation"] == {
+        "status": "passed",
+        "failures": [],
+    }
+
+
+def test_pipeline_preflight_only_uses_manifest_sizing_and_does_not_solve(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = {
+        "sources": {"HF": {"tag": 4}},
+        "skipped_sources": {},
+        "tagged_mesh_step_units": "tagged_sources.msh",
+        "solver_ready": True,
+        "symmetry_planes": ["x0"],
+        "mesh_frequency_validation": {"status": "valid"},
+        "mesh_size_prediction": {
+            "n_triangles": 9_000,
+            "actual_n_triangles": 10_000,
+            "matrix_ram_gb": 1.296,
+            "solve_seconds_per_freq": 1.4,
+        },
+    }
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(calls, prep_manifest_payload=prep_manifest),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--preflight-only",
+            "--freq-count",
+            "40",
+        ]
+    )
+
+    assert rc == 0
+    assert [name for name, _cmd in calls] == ["prepare_step_for_wg_metal.py"]
+    output = capsys.readouterr().out
+    assert "SOLVE COST PREFLIGHT: triangles predicted=9000, actual=10000" in output
+    assert "dense matrix RAM=1.600 GB" in output
+    assert "frequency count=40" in output
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    preflight = manifest["solve_cost_preflight"]
+    assert manifest["mode"] == "preflight_only"
+    assert preflight["cost_basis"] == "actual"
+    assert preflight["dense_matrix_ram_bytes"] == 10_000**2 * 16
+    assert preflight["frequency_count"] == 40
+
+
 DEFAULT_FRAME_INFERENCE = [
     {
         "name": "HF",

@@ -25,6 +25,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPO_ROOT / "scripts"
 DEFAULT_TOPOLOGY_TOL = 1e-5
 ADDIN_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
 PREP_SCRIPT = REPO_ROOT / "scripts" / "prepare_step_for_wg_metal.py"
@@ -34,6 +35,9 @@ SOLVE_SCRIPT = REPO_ROOT / "scripts" / "solve_fusion_wg_metal.py"
 REPORT_SCRIPT = REPO_ROOT / "scripts" / "render_run_report.py"
 if ADDIN_DIR.is_dir() and str(ADDIN_DIR) not in sys.path:
     sys.path.insert(0, str(ADDIN_DIR))
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+import wg_mesh_sizing as sizing  # noqa: E402
 from fusion_pipeline_launch import (  # noqa: E402
     RUN_MANIFESTS_DIR_NAME,
     build_source_specs,
@@ -227,6 +231,154 @@ def _sources_present_in_manifest(sources: list[str], prep_manifest: dict[str, An
     if not present:
         raise ValueError("prepare manifest did not contain any requested sources")
     return present
+
+
+def _skipped_requested_sources(
+    requested_sources: list[str],
+    prep_manifest: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Return requested sources absent from the prepare manifest, with reasons."""
+    prepared = prep_manifest.get("sources", {})
+    skipped = prep_manifest.get("skipped_sources", {})
+    prepared = prepared if isinstance(prepared, dict) else {}
+    skipped = skipped if isinstance(skipped, dict) else {}
+    missing: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source in requested_sources:
+        name, _ = _source_name_tag(source)
+        if name in seen:
+            continue
+        seen.add(name)
+        record = skipped.get(name)
+        if name in prepared and record is None:
+            continue
+        reason = record.get("reason") if isinstance(record, dict) else None
+        missing.append(
+            {
+                "name": name,
+                "reason": str(reason or "not present in prepare manifest"),
+            }
+        )
+    return missing
+
+
+def _required_source_failures(
+    requested_sources: list[str],
+    prep_manifest: dict[str, Any],
+    solve_manifest: dict[str, Any] | None,
+    pipeline_manifest: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Verify requested sources against the prepare and direct-solve manifests."""
+    failures = [
+        {**entry, "stage": "prepare"}
+        for entry in _skipped_requested_sources(requested_sources, prep_manifest)
+    ]
+    failed_names = {entry["name"] for entry in failures}
+
+    solved_records: dict[str, dict[str, Any]] = {}
+    if isinstance(solve_manifest, dict):
+        raw_sources = solve_manifest.get("sources", [])
+        if isinstance(raw_sources, list):
+            solved_records = {
+                str(record.get("name")): record
+                for record in raw_sources
+                if isinstance(record, dict) and record.get("name")
+            }
+
+    adjustment = pipeline_manifest.get("solve_frequency_adjustment", {})
+    adjustment = adjustment if isinstance(adjustment, dict) else {}
+    skipped_solves = adjustment.get("skipped_sources", [])
+    skipped_solve_reasons = {
+        str(record.get("name")): str(record.get("reason") or "skipped by solve policy")
+        for record in skipped_solves
+        if isinstance(record, dict) and record.get("name")
+    } if isinstance(skipped_solves, list) else {}
+
+    checked_names: set[str] = set()
+    for source in requested_sources:
+        name, _ = _source_name_tag(source)
+        if name in checked_names:
+            continue
+        checked_names.add(name)
+        if name in failed_names:
+            continue
+        record = solved_records.get(name)
+        # A healthy direct solve writes per-source records with no status field
+        # (status None); only an explicit non-complete status is a failure.
+        status = record.get("status") if record is not None else None
+        if (
+            record is not None
+            and name not in skipped_solve_reasons
+            and (status is None or str(status) == "complete")
+        ):
+            continue
+        if name in skipped_solve_reasons:
+            reason = skipped_solve_reasons[name]
+        elif solve_manifest is None:
+            reason = "direct solve was not run"
+        elif record is None:
+            reason = "not present in direct solve manifest"
+        else:
+            reason = str(
+                record.get("reason")
+                or record.get("error")
+                or f"direct solve status is {record.get('status')!r}"
+            )
+        failures.append({"name": name, "stage": "solve", "reason": reason})
+    return failures
+
+
+def _solve_preflight(
+    prep_manifest: dict[str, Any],
+    *,
+    freq_count: int,
+) -> dict[str, Any]:
+    """Build solve-cost output from the prepare script's sizing report."""
+    prediction = prep_manifest.get("mesh_size_prediction", {})
+    if not isinstance(prediction, dict):
+        prediction = {}
+    try:
+        predicted = int(prediction.get("n_triangles", 0))
+    except (TypeError, ValueError):
+        predicted = 0
+    try:
+        actual = int(prediction.get("actual_n_triangles", 0))
+    except (TypeError, ValueError):
+        actual = 0
+    cost_triangles = actual if actual > 0 else predicted
+    ram_bytes = sizing.matrix_ram_bytes(cost_triangles)
+    seconds_per_frequency = sizing.solve_seconds_per_freq(cost_triangles)
+    frequency_count = max(int(freq_count), 1)
+    return {
+        "predicted_n_triangles": predicted,
+        "actual_n_triangles": actual or None,
+        "cost_basis_n_triangles": cost_triangles,
+        "cost_basis": "actual" if actual > 0 else "predicted",
+        "dense_matrix_ram_bytes": ram_bytes,
+        "dense_matrix_ram_gb": ram_bytes / 1.0e9,
+        "estimated_wall_seconds_per_frequency": seconds_per_frequency,
+        "estimated_wall_seconds_total": seconds_per_frequency * frequency_count,
+        "frequency_count": frequency_count,
+        "formula": "dense matrix RAM = N^2 * 16 bytes (complex128)",
+        "estimator": "wg_mesh_sizing.solve_seconds_per_freq",
+    }
+
+
+def _print_solve_preflight(preflight: dict[str, Any]) -> None:
+    predicted = int(preflight["predicted_n_triangles"])
+    actual = preflight.get("actual_n_triangles")
+    actual_text = str(int(actual)) if actual is not None else "unavailable"
+    print(
+        "SOLVE COST PREFLIGHT: "
+        f"triangles predicted={predicted}, actual={actual_text}; "
+        f"dense matrix RAM={float(preflight['dense_matrix_ram_gb']):.3f} GB "
+        "(N^2 * 16 bytes, complex128); "
+        f"estimated wall clock={float(preflight['estimated_wall_seconds_per_frequency']):.1f} s "
+        "per frequency solve, "
+        f"{float(preflight['estimated_wall_seconds_total']):.1f} s for the whole run; "
+        f"frequency count={int(preflight['frequency_count'])}",
+        flush=True,
+    )
 
 
 def _symmetry_planes_from_quadrants(quadrants: int) -> tuple[str, ...]:
@@ -1064,6 +1216,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "At least one requested source must still be present."
         ),
     )
+    parser.add_argument(
+        "--require-sources",
+        action="store_true",
+        help=(
+            "After the run, fail unless every requested source appears in both "
+            "the prepare and completed direct-solve manifests."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Prepare the mesh, print solve cost, and exit successfully without solving.",
+    )
     parser.add_argument("--mesh-only", action="store_true", help="Stop after mesh preparation and orientation diagnostic")
     parser.add_argument("--run-solves", action="store_true", help="Run direct hornlab-metal-bem solves after diagnostics")
     parser.add_argument(
@@ -1418,6 +1583,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     )
     try:
         sources = _normalize_sources(raw_sources)
+        requested_sources = list(sources)
         symmetry_planes: tuple[str, ...] = (
             ()
             if symmetry_auto
@@ -1519,7 +1685,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "prepare_stdout": str(logs_dir / "prepare_step_for_wg_metal.stdout.log"),
             "prepare_stderr": str(logs_dir / "prepare_step_for_wg_metal.stderr.log"),
         },
-        "requested_sources": sources,
+        "requested_sources": requested_sources,
         "sources": sources,
         "quadrants": args.quadrants,
         "symmetry_planes": "auto" if symmetry_auto else list(symmetry_planes),
@@ -1615,6 +1781,20 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         return 1
     skipped_sources = prep_manifest.get("skipped_sources", {})
     pipeline_manifest["skipped_sources"] = skipped_sources
+    skipped_requested_sources = _skipped_requested_sources(
+        requested_sources,
+        prep_manifest,
+    )
+    if skipped_requested_sources:
+        details = "; ".join(
+            f"{entry['name']}: {entry['reason']}"
+            for entry in skipped_requested_sources
+        )
+        print(
+            "WARNING: DEGRADED RUN - requested source(s) were skipped: " + details,
+            file=sys.stderr,
+            flush=True,
+        )
     if fem_mesh_path is not None:
         missing_fem_entries = [name for name in fem_entries if name not in manifest_sources]
         if missing_fem_entries:
@@ -1734,6 +1914,28 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             _open_requested_outputs(args, out_dir)
             return 2
 
+    pipeline_manifest["prep_manifest"] = str(prep_manifest_path)
+    pipeline_manifest["tagged_mesh_step_units"] = prep_manifest.get(
+        "tagged_mesh_step_units"
+    )
+    pipeline_manifest["solver_ready"] = bool(prep_manifest.get("solver_ready"))
+    if (args.run_solves and not args.mesh_only) or args.preflight_only:
+        solve_preflight = _solve_preflight(
+            prep_manifest,
+            freq_count=args.freq_count,
+        )
+        pipeline_manifest["solve_cost_preflight"] = solve_preflight
+        _print_solve_preflight(solve_preflight)
+    if args.preflight_only:
+        pipeline_manifest["status"] = "complete"
+        pipeline_manifest["mode"] = "preflight_only"
+        pipeline_manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _write_json(pipeline_manifest_path, pipeline_manifest)
+        _write_json(final_summary_manifest_path, pipeline_manifest)
+        _open_requested_outputs(args, out_dir)
+        print(json.dumps(pipeline_manifest, indent=2, sort_keys=True))
+        return 0
+
     mirror_axes = _mirror_axes_for_symmetry_planes(symmetry_planes)
     if args.mirror_axes and args.mirror_axes != "auto":
         mirror_axes = args.mirror_axes
@@ -1777,10 +1979,6 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "diagnose_stderr": str(logs_dir / "diagnose_wg_metal_orientation.stderr.log"),
         }
     )
-    pipeline_manifest["prep_manifest"] = str(prep_manifest_path)
-    pipeline_manifest["tagged_mesh_step_units"] = prep_manifest.get("tagged_mesh_step_units")
-    pipeline_manifest["solver_ready"] = bool(prep_manifest.get("solver_ready"))
-
     if diagnose_returncode != 0:
         pipeline_manifest["status"] = "failed"
         pipeline_manifest["error"] = "diagnose_wg_metal_orientation.py failed"
@@ -1844,6 +2042,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             "v": frame_v,
         }
     solve_manifest_path = _run_manifest_path(out_dir, "direct_solve_manifest.json")
+    solve_manifest: dict[str, Any] | None = None
     solve_returncode = 0
     solve_freq_max_hz = args.freq_max_hz
     solve_sources = _order_sources_for_direct_solve(sources)
@@ -2195,6 +2394,41 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
         solve_manifest = _read_json(solve_manifest_path)
         pipeline_manifest["direct_solve"] = solve_manifest
+
+    if args.require_sources:
+        source_failures = _required_source_failures(
+            requested_sources,
+            prep_manifest,
+            solve_manifest,
+            pipeline_manifest,
+        )
+        pipeline_manifest["required_source_validation"] = {
+            "status": "failed" if source_failures else "passed",
+            "failures": source_failures,
+        }
+        if source_failures:
+            error = "required source validation failed: " + "; ".join(
+                f"{entry['name']} ({entry['stage']}): {entry['reason']}"
+                for entry in source_failures
+            )
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = error
+            pipeline_manifest["returncode"] = 2
+            pipeline_manifest["finished_at"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _write_json(final_summary_manifest_path, pipeline_manifest)
+            for entry in source_failures:
+                print(
+                    f"ERROR: required source {entry['name']} was not "
+                    f"{('prepared' if entry['stage'] == 'prepare' else 'solved')}: "
+                    f"{entry['reason']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            _open_requested_outputs(args, out_dir)
+            return 2
 
     pipeline_manifest["status"] = "complete"
     pipeline_manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")

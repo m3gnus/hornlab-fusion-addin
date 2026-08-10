@@ -332,6 +332,7 @@ def _solve_preflight(
     prep_manifest: dict[str, Any],
     *,
     freq_count: int,
+    mesh_expansion_factor: int = 1,
 ) -> dict[str, Any]:
     """Build solve-cost output from the prepare script's sizing report."""
     prediction = prep_manifest.get("mesh_size_prediction", {})
@@ -345,7 +346,9 @@ def _solve_preflight(
         actual = int(prediction.get("actual_n_triangles", 0))
     except (TypeError, ValueError):
         actual = 0
-    cost_triangles = actual if actual > 0 else predicted
+    expansion_factor = max(int(mesh_expansion_factor), 1)
+    prepared_triangles = actual if actual > 0 else predicted
+    cost_triangles = prepared_triangles * expansion_factor
     ram_bytes = sizing.matrix_ram_bytes(cost_triangles)
     seconds_per_frequency = sizing.solve_seconds_per_freq(cost_triangles)
     frequency_count = max(int(freq_count), 1)
@@ -354,6 +357,7 @@ def _solve_preflight(
         "actual_n_triangles": actual or None,
         "cost_basis_n_triangles": cost_triangles,
         "cost_basis": "actual" if actual > 0 else "predicted",
+        "mesh_expansion_factor": expansion_factor,
         "dense_matrix_ram_bytes": ram_bytes,
         "dense_matrix_ram_gb": ram_bytes / 1.0e9,
         "estimated_wall_seconds_per_frequency": seconds_per_frequency,
@@ -368,9 +372,16 @@ def _print_solve_preflight(preflight: dict[str, Any]) -> None:
     predicted = int(preflight["predicted_n_triangles"])
     actual = preflight.get("actual_n_triangles")
     actual_text = str(int(actual)) if actual is not None else "unavailable"
+    expansion_factor = int(preflight.get("mesh_expansion_factor", 1))
+    expansion_text = (
+        f"; solve mesh={int(preflight['cost_basis_n_triangles'])} "
+        f"triangles after {expansion_factor}x symmetry expansion"
+        if expansion_factor > 1
+        else ""
+    )
     print(
         "SOLVE COST PREFLIGHT: "
-        f"triangles predicted={predicted}, actual={actual_text}; "
+        f"triangles predicted={predicted}, actual={actual_text}{expansion_text}; "
         f"dense matrix RAM={float(preflight['dense_matrix_ram_gb']):.3f} GB "
         "(N^2 * 16 bytes, complex128); "
         f"estimated wall clock={float(preflight['estimated_wall_seconds_per_frequency']):.1f} s "
@@ -1989,20 +2000,22 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         auto_reduce = prep_manifest.get("auto_reduce")
         pipeline_manifest["auto_reduce"] = auto_reduce
         pipeline_manifest["quadrants"] = _quadrants_for_planes(symmetry_planes)
+        if symmetry_auto_cut and not (
+            isinstance(auto_reduce, dict)
+            and auto_reduce.get("mode") == "auto-cut"
+            and isinstance(auto_reduce.get("cut_planes"), (list, tuple))
+        ):
+            pipeline_manifest["status"] = "failed"
+            pipeline_manifest["error"] = (
+                "auto-cut prepare manifest has no valid auto_reduce verdict; "
+                "refusing to solve without an authoritative reduction record."
+            )
+            _write_json(pipeline_manifest_path, pipeline_manifest)
+            _open_requested_outputs(args, out_dir)
+            return 2
         if symmetry_auto_cut:
-            if not isinstance(auto_reduce, dict) or not isinstance(
-                auto_reduce.get("cut_planes"), list
-            ):
-                pipeline_manifest["status"] = "failed"
-                pipeline_manifest["error"] = (
-                    "auto-cut prepare manifest is missing the required "
-                    "auto_reduce.cut_planes contract; refusing to solve because "
-                    "the mesh reduction state cannot be confirmed"
-                )
-                _write_json(pipeline_manifest_path, pipeline_manifest)
-                _open_requested_outputs(args, out_dir)
-                return 2
-            raw_cut_planes = auto_reduce["cut_planes"]
+            assert isinstance(auto_reduce, dict)
+            raw_cut_planes = auto_reduce.get("cut_planes") or ()
             try:
                 cut_planes = _parse_symmetry_planes(
                     ",".join(str(plane) for plane in raw_cut_planes) or "none",
@@ -2108,13 +2121,65 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     )
     pipeline_manifest["solver_ready"] = bool(prep_manifest.get("solver_ready"))
     if (args.run_solves and not args.mesh_only) or args.preflight_only:
+        preflight_native_symmetry_plane = (
+            _native_symmetry_for_planes(symmetry_planes)
+            if symmetry_auto_cut or args.native_symmetry_plane == "auto"
+            else (
+                None
+                if args.native_symmetry_plane == "none"
+                else args.native_symmetry_plane
+            )
+        )
+        mesh_expansion_factor = (
+            2 ** len(symmetry_planes)
+            if symmetry_planes and preflight_native_symmetry_plane is None
+            else 1
+        )
         solve_preflight = _solve_preflight(
             prep_manifest,
             freq_count=args.freq_count,
+            mesh_expansion_factor=mesh_expansion_factor,
         )
         pipeline_manifest["solve_cost_preflight"] = solve_preflight
         _print_solve_preflight(solve_preflight)
     if args.preflight_only:
+        if args.require_sources:
+            source_failures = [
+                {**entry, "stage": "prepare"}
+                for entry in _skipped_requested_sources(
+                    requested_sources,
+                    prep_manifest,
+                )
+            ]
+            pipeline_manifest["required_source_validation"] = {
+                "status": "failed" if source_failures else "passed",
+                "failures": source_failures,
+                "scope": "prepare-only",
+            }
+            if source_failures:
+                pipeline_manifest["status"] = "failed"
+                pipeline_manifest["error"] = (
+                    "required source validation failed: "
+                    + "; ".join(
+                        f"{entry['name']} (prepare): {entry['reason']}"
+                        for entry in source_failures
+                    )
+                )
+                pipeline_manifest["returncode"] = 2
+                pipeline_manifest["finished_at"] = datetime.now().isoformat(
+                    timespec="seconds"
+                )
+                _write_json(pipeline_manifest_path, pipeline_manifest)
+                _write_json(final_summary_manifest_path, pipeline_manifest)
+                for entry in source_failures:
+                    print(
+                        f"ERROR: required source {entry['name']} was not prepared: "
+                        f"{entry['reason']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                _open_requested_outputs(args, out_dir)
+                return 2
         pipeline_manifest["status"] = "complete"
         pipeline_manifest["mode"] = "preflight_only"
         pipeline_manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")

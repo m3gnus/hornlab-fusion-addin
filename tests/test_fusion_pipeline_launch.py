@@ -2921,7 +2921,7 @@ def test_pipeline_auto_cut_refuses_unconfirmed_cut_plane(tmp_path, monkeypatch):
     assert "unconfirmed" in manifest["error"]
 
 
-def test_pipeline_auto_cut_refuses_a_missing_reduction_contract(tmp_path, monkeypatch):
+def test_pipeline_auto_cut_refuses_missing_reduction_verdict(tmp_path, monkeypatch):
     pipeline = _load_pipeline()
     calls = []
     prep_manifest = _auto_cut_prep_manifest([])
@@ -2955,6 +2955,7 @@ def test_pipeline_auto_cut_refuses_a_missing_reduction_contract(tmp_path, monkey
     )
     assert manifest["status"] == "failed"
     assert "auto_reduce" in manifest["error"]
+    assert "valid auto_reduce verdict" in manifest["error"]
 
 
 def test_pipeline_uses_only_authoritative_mesh_contracts(tmp_path, monkeypatch):

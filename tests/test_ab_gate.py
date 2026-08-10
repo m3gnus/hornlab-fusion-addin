@@ -97,20 +97,33 @@ def test_metrics_apply_band_polar_and_beamwidth_gates(tmp_path):
     assert metrics["beamwidth_vertical_deg"] is None
 
 
-def test_metrics_refuse_to_silently_drop_a_missing_beamwidth_plane(tmp_path):
+def test_metrics_refuse_mismatched_beamwidth_planes(tmp_path):
     ab_gate = _load_ab_gate()
     _write_run(tmp_path, "arm_a", 0.0)
     _write_run(tmp_path, "arm_b", 1.0)
-    beamwidth_path = tmp_path / "arm_b" / "derived" / "HF_beamwidth.json"
-    beamwidth = json.loads(beamwidth_path.read_text(encoding="utf-8"))
-    del beamwidth["beamwidth_deg"]["vertical"]
-    del beamwidth["limited_by_grid"]["vertical"]
-    beamwidth_path.write_text(json.dumps(beamwidth), encoding="utf-8")
-
     a = ab_gate._load_source(tmp_path / "arm_a", "HF")
     b = ab_gate._load_source(tmp_path / "arm_b", "HF")
-    with pytest.raises(ValueError, match="beamwidth planes differ"):
+    del b["beamwidth"]["vertical"]
+
+    with np.testing.assert_raises_regex(ValueError, "beamwidth planes differ"):
         ab_gate.compute_metrics(a, b, (500.0, 2000.0))
+
+
+def test_load_refuses_beamwidth_plane_omitted_from_both_arms(tmp_path):
+    ab_gate = _load_ab_gate()
+    for name in ("arm_a", "arm_b"):
+        _write_run(tmp_path, name, 0.0)
+        beamwidth_path = tmp_path / name / "derived" / "HF_beamwidth.json"
+        beamwidth = json.loads(beamwidth_path.read_text(encoding="utf-8"))
+        del beamwidth["beamwidth_deg"]["vertical"]
+        del beamwidth["limited_by_grid"]["vertical"]
+        beamwidth_path.write_text(json.dumps(beamwidth), encoding="utf-8")
+
+    with np.testing.assert_raises_regex(
+        ValueError,
+        "beamwidth planes do not match polar planes",
+    ):
+        ab_gate._load_source(tmp_path / "arm_a", "HF")
 
 
 def test_floor_uses_largest_perturbation_and_ratios_band_maxima(tmp_path):

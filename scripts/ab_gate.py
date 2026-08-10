@@ -215,16 +215,22 @@ def _load_source(run: Path, source: str) -> dict[str, Any]:
     on_axis = np.asarray(result["on_axis_spl_db"], dtype=float)
     if on_axis.shape != frequencies.shape:
         raise ValueError(f"on-axis grid shape mismatch in {result_path}")
+    beamwidth_values = {
+        str(plane): np.asarray(values, dtype=float)
+        for plane, values in beamwidth["beamwidth_deg"].items()
+    }
+    if set(beamwidth_values) != set(planes):
+        raise ValueError(
+            f"beamwidth planes do not match polar planes in {beamwidth_path}: "
+            f"{sorted(beamwidth_values)} != {sorted(planes)}"
+        )
     return {
         "frequencies": frequencies,
         "on_axis": on_axis,
         "polar": polar,
         "angles": angles,
         "planes": planes,
-        "beamwidth": {
-            str(plane): np.asarray(values, dtype=float)
-            for plane, values in beamwidth["beamwidth_deg"].items()
-        },
+        "beamwidth": beamwidth_values,
         "limited": {
             str(plane): np.asarray(values, dtype=bool)
             for plane, values in beamwidth.get("limited_by_grid", {}).items()
@@ -272,7 +278,14 @@ def compute_metrics(
             float(np.nanmax(delta)) if np.any(np.isfinite(delta)) else None
         )
 
-    for plane in sorted(a["beamwidth"]):
+    beamwidth_planes_a = set(a["beamwidth"])
+    beamwidth_planes_b = set(b["beamwidth"])
+    if beamwidth_planes_a != beamwidth_planes_b:
+        raise ValueError(
+            "beamwidth planes differ for comparison: "
+            f"{sorted(beamwidth_planes_a)} != {sorted(beamwidth_planes_b)}"
+        )
+    for plane in sorted(beamwidth_planes_a):
         values_a = a["beamwidth"][plane]
         values_b = b["beamwidth"][plane]
         if values_a.shape != frequencies.shape or values_b.shape != frequencies.shape:

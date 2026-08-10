@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the HornLab WG Metal Fusion add-in into Fusion's AddIns folder."""
+"""Install HornLab Fusion add-ins into Fusion's AddIns folder."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import shutil
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_DIR = REPO_ROOT / "fusion-addins" / "WGMetalPipeline"
+ADDIN_NAMES = ("WGMetalPipeline", "WGLink")
 DEFAULT_LEGACY_ADDINS_DIR = (
     Path.home()
     / "Library"
@@ -42,8 +42,22 @@ def parse_args() -> argparse.Namespace:
             "By default, uses the legacy macOS path and falls back to the current path."
         ),
     )
+    parser.add_argument(
+        "--addin",
+        action="append",
+        choices=(*ADDIN_NAMES, "all"),
+        default=[],
+        help=(
+            "Add-in to install; may be repeated. Defaults to WGMetalPipeline for "
+            "backwards compatibility. Use '--addin all' for both add-ins."
+        ),
+    )
     parser.add_argument("--symlink", action="store_true", help="Symlink instead of copying")
-    parser.add_argument("--replace", action="store_true", help="Replace an existing WGMetalPipeline install")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace an existing selected add-in install",
+    )
     return parser.parse_args()
 
 
@@ -55,9 +69,15 @@ def _default_addins_dirs() -> list[Path]:
     return [DEFAULT_ADDINS_DIR]
 
 
-def _install_one(addins_dir: Path, *, replace: bool, symlink: bool) -> tuple[str, Path]:
+def _install_one(
+    source_dir: Path,
+    addins_dir: Path,
+    *,
+    replace: bool,
+    symlink: bool,
+) -> tuple[str, Path]:
     addins_dir = addins_dir.expanduser().resolve()
-    target = addins_dir / "WGMetalPipeline"
+    target = addins_dir / source_dir.name
     addins_dir.mkdir(parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         if not replace:
@@ -68,19 +88,29 @@ def _install_one(addins_dir: Path, *, replace: bool, symlink: bool) -> tuple[str
             shutil.rmtree(target)
 
     if symlink:
-        target.symlink_to(SOURCE_DIR, target_is_directory=True)
+        target.symlink_to(source_dir, target_is_directory=True)
         return "symlinked", target
-    shutil.copytree(SOURCE_DIR, target, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(source_dir, target, ignore=shutil.ignore_patterns("__pycache__"))
     return "copied", target
 
 
 def main() -> int:
     args = parse_args()
     addins_dirs = args.addins_dir or _default_addins_dirs()
+    requested = args.addin or ["WGMetalPipeline"]
+    addin_names = ADDIN_NAMES if "all" in requested else tuple(dict.fromkeys(requested))
     for addins_dir in addins_dirs:
-        mode, target = _install_one(addins_dir, replace=args.replace, symlink=args.symlink)
-        print(f"{mode} {SOURCE_DIR} -> {target}")
-    print("Restart Fusion, then open Utilities > Add-Ins > Add-Ins > WGMetalPipeline.")
+        for addin_name in addin_names:
+            source_dir = REPO_ROOT / "fusion-addins" / addin_name
+            mode, target = _install_one(
+                source_dir,
+                addins_dir,
+                replace=args.replace,
+                symlink=args.symlink,
+            )
+            print(f"{mode} {source_dir} -> {target}")
+    joined = ", ".join(addin_names)
+    print(f"Restart Fusion, then open Utilities > Add-Ins > Add-Ins > {joined}.")
     return 0
 
 

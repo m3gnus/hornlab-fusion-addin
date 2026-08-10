@@ -3483,16 +3483,17 @@ def test_harmonize_bases_zeroes_clamped_source_above_its_band():
     clamped = np.geomspace(100.0, 800.0, 25)
     angles = np.array([0.0, 90.0])
     planes = np.array(["horizontal"], dtype=str)
-    make = lambda freqs: module.PressureBasis(
-        source_name="X",
-        source_tag=1,
-        frequencies_hz=freqs,
-        observation_angles_deg=angles,
-        observation_planes=planes,
-        pressure_complex=np.full(
-            (freqs.size, 1, angles.size), 0.02 + 0.0j, dtype=np.complex128
-        ),
-    )
+    def make(freqs):
+        return module.PressureBasis(
+            source_name="X",
+            source_tag=1,
+            frequencies_hz=freqs,
+            observation_angles_deg=angles,
+            observation_planes=planes,
+            pressure_complex=np.full(
+                (freqs.size, 1, angles.size), 0.02 + 0.0j, dtype=np.complex128
+            ),
+        )
     freqs, grids, solved_top = module._harmonize_bases(
         {"LF": make(clamped), "HF": make(full)}
     )

@@ -13,6 +13,12 @@ The script writes:
 * ``tagged_sources.msh`` in the STEP units, carrying all named sources,
 * ``manifest.json`` with topology and source mapping diagnostics.
 
+A full (uncut) model can be reduced automatically with ``--symmetry-planes
+auto-cut``: the OCC geometry is tested for mirror symmetry face by face, and
+each plane that passes -- geometry *and* source roles -- is cut away, keeping
+the positive side and leaving the boundary open on the plane. The mirror test
+runs before meshing on purpose; see the block above ``_detect_symmetry_planes``.
+
 It intentionally refuses to report solver-ready output when the mesh has free
 edges away from the declared symmetry planes. Use ``--allow-leaks`` only for
 debugging bad exports.
@@ -53,6 +59,21 @@ WELD_TOLERANCE_MM = 5.0e-3  # 5 micrometres; closes near-duplicate OCC patch nod
 DEGENERATE_MIN_QUALITY = 1.0e-4  # drops needle slivers that make dense solves singular
 ANCHOR_MAX_AREA_REL_DIFF = 0.02
 ANCHOR_MAX_CENTROID_DISTANCE_MM = 5.0
+
+SYMMETRY_AXIS_FOR_PLANE = {"x0": 0, "y0": 1, "z0": 2}
+# Mirror-test tolerance as a fraction of the sampled model diagonal. An
+# absolute micron threshold is wrong at both ends: a circular horn was once
+# rejected over 0.08 mm of CAD discretisation noise, while the asro68 test
+# model mirrors to 0.0025 mm. At 5e-4 of a ~720 mm diagonal this is 0.36 mm,
+# which passes both by a wide margin and still stays two orders of magnitude
+# below the finest mesh size any of these models is meshed at (4 mm), so an
+# asymmetry small enough to pass is an asymmetry the BEM cannot resolve.
+AUTO_REDUCE_TOL_REL = 5.0e-4
+AUTO_REDUCE_GRID = 7  # per-face parametric grid; 49 samples/face before trimming
+AUTO_REDUCE_SPAN_REL = 1.0e-3  # a plane the model does not straddle cuts nothing
+AUTO_REDUCE_TRIM_NUDGE_REL = 1.0e-3  # parametric step used for the on-edge grace
+AUTO_REDUCE_BOX_PAD_REL = 0.1  # half-space box overshoot, relative to model size
+AUTO_REDUCE_MAX_SAMPLES = 5  # recorded failure witnesses per plane
 
 SurfaceGeometry = tuple[tuple[float, float, float], float]
 OCC_HEALING_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -962,6 +983,518 @@ def _repair_triangle_winding(
     return repaired, stats
 
 
+# ---------------------------------------------------------------------------
+# Stage 1 of symmetry handling: does the OCC *geometry* mirror, and cut it.
+#
+# Stage 2 is ``_detect_symmetry_planes`` below, which re-reads the cut from the
+# meshed result. The two are not interchangeable and the order matters. gmsh
+# triangulates a mirror-symmetric solid asymmetrically (the two halves get
+# different node counts), so a mesh-based mirror test false-negatives on valid
+# geometry, and a mesh test that passes says nothing about the CAD it came
+# from. Everything below therefore runs against the OCC B-rep, before
+# ``gmsh.model.mesh.generate``.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlaneSymmetryVerdict:
+    """Per-plane result of the geometry mirror test, recorded in the manifest."""
+
+    plane: str
+    accepted: bool
+    reason: str
+    tolerance: float
+    axis_min: float
+    axis_max: float
+    points_tested: int
+    points_off_model: int
+    max_residual: float
+    worst_residual_surface: int | None
+    worst_off_model_distance: float
+    worst_surface: int | None
+    role_mismatches: int
+    failure_samples: tuple[dict[str, object], ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "plane": self.plane,
+            "accepted": bool(self.accepted),
+            "reason": self.reason,
+            "tolerance_step_units": float(self.tolerance),
+            "axis_min_step_units": float(self.axis_min),
+            "axis_max_step_units": float(self.axis_max),
+            "points_tested": int(self.points_tested),
+            "points_off_model": int(self.points_off_model),
+            "max_residual_step_units": (
+                None if self.max_residual < 0.0 else float(self.max_residual)
+            ),
+            "worst_residual_surface": (
+                None
+                if self.worst_residual_surface is None
+                else int(self.worst_residual_surface)
+            ),
+            "worst_off_model_distance_step_units": (
+                None
+                if self.worst_off_model_distance < 0.0
+                else float(self.worst_off_model_distance)
+            ),
+            "worst_surface": (
+                None if self.worst_surface is None else int(self.worst_surface)
+            ),
+            "role_mismatches": int(self.role_mismatches),
+            "failure_samples": list(self.failure_samples),
+        }
+
+
+def _param_inside(surface: int, u: float, v: float) -> bool:
+    """Classify a parametric point against the face's trim loops."""
+    try:
+        return int(gmsh.model.isInside(2, surface, [u, v], parametric=True)) > 0
+    except Exception:
+        # A face gmsh cannot classify is treated as unbounded; the distance
+        # test still has to pass, so this only ever loosens the trim filter.
+        return True
+
+
+def _sample_surface_points(surface: int, *, grid: int) -> np.ndarray:
+    """Sample points that really lie on the *trimmed* OCC face.
+
+    A raw parametric grid is not enough. ``gmsh.model.getValue`` happily
+    returns points on the untrimmed extension of a face -- inside a hole, or on
+    the part of a plane outside its trim loop -- and so does
+    ``getClosestPoint``. Such points are not on the model, and accepting them
+    would let a hole punched into one half only pass as symmetric, because the
+    hole's samples would mirror onto the *unpunched* partner face's underlying
+    surface. ``isInside`` classifies against the trim loops at ~10 us per
+    parametric point, so the filter is affordable per face.
+
+    Sampling is per face, which is what makes the test complete: a feature that
+    exists on one side only is at least one whole face, and that face's own
+    samples mirror into empty space. No grid density can miss it.
+    """
+    try:
+        bounds_min, bounds_max = gmsh.model.getParametrizationBounds(2, surface)
+        umin, vmin = float(bounds_min[0]), float(bounds_min[1])
+        umax, vmax = float(bounds_max[0]), float(bounds_max[1])
+    except Exception:
+        umin = umax = vmin = vmax = 0.0
+    if umax > umin and vmax > vmin:
+        # A thin trimmed sliver can miss every cell centre of the coarse grid;
+        # refine once before falling back to the face's own boundary curves.
+        for factor in (1, 4):
+            n = max(2, grid * factor)
+            kept: list[float] = []
+            for i in range(n):
+                u = umin + (i + 0.5) * (umax - umin) / n
+                for j in range(n):
+                    v = vmin + (j + 0.5) * (vmax - vmin) / n
+                    if _param_inside(surface, u, v):
+                        kept.extend((u, v))
+            if kept:
+                coords = gmsh.model.getValue(2, surface, kept)
+                return np.asarray(coords, dtype=float).reshape(-1, 3)
+    return _sample_surface_boundary_points(surface, grid=grid)
+
+
+def _sample_surface_boundary_points(surface: int, *, grid: int) -> np.ndarray:
+    """Fallback sampling on the face's bounding curves (always on the face)."""
+    points: list[float] = []
+    try:
+        boundary = gmsh.model.getBoundary(
+            [(2, surface)], combined=False, oriented=False, recursive=False
+        )
+    except Exception:
+        boundary = []
+    for dim, curve in boundary:
+        if dim != 1:
+            continue
+        try:
+            bounds_min, bounds_max = gmsh.model.getParametrizationBounds(1, abs(curve))
+            tmin, tmax = float(bounds_min[0]), float(bounds_max[0])
+            if not tmax > tmin:
+                continue
+            params = [tmin + (i + 0.5) * (tmax - tmin) / grid for i in range(grid)]
+            points.extend(gmsh.model.getValue(1, abs(curve), params))
+        except Exception:
+            continue
+    if not points:
+        com = gmsh.model.occ.getCenterOfMass(2, surface)
+        points = [float(v) for v in com]
+    return np.asarray(points, dtype=float).reshape(-1, 3)
+
+
+def _parametric_point_on_face(surface: int, parametric: Iterable[float]) -> bool:
+    """Trim-aware membership, with a grace band for points on a trim edge.
+
+    A rim point of one half mirrors exactly onto the partner's rim, where
+    OCC's face classifier can answer "on boundary" rather than "in". Retrying a
+    hair inside the parametric domain keeps a genuinely shared rim from being
+    read as a hole.
+    """
+    par = [float(value) for value in parametric]
+    if len(par) < 2:
+        return False
+    u, v = par[0], par[1]
+    if _param_inside(surface, u, v):
+        return True
+    try:
+        bounds_min, bounds_max = gmsh.model.getParametrizationBounds(2, surface)
+    except Exception:
+        return False
+    umin, vmin = float(bounds_min[0]), float(bounds_min[1])
+    umax, vmax = float(bounds_max[0]), float(bounds_max[1])
+    du = AUTO_REDUCE_TRIM_NUDGE_REL * (umax - umin)
+    dv = AUTO_REDUCE_TRIM_NUDGE_REL * (vmax - vmin)
+    umid, vmid = 0.5 * (umin + umax), 0.5 * (vmin + vmax)
+    u2 = min(max(u + (du if umid >= u else -du), umin), umax)
+    v2 = min(max(v + (dv if vmid >= v else -dv), vmin), vmax)
+    return _param_inside(surface, u2, v2)
+
+
+def _closest_on_model(
+    point: np.ndarray,
+    *,
+    candidates: list[int],
+    bboxes: dict[int, tuple[float, ...]],
+    tolerance: float,
+) -> tuple[float, float, list[int]]:
+    """Distance from ``point`` to the model, and the faces it lands on.
+
+    Returns ``(matched_distance, nearest_distance, matched_surfaces)``.
+    ``matched_distance`` is negative when nothing was hit, and
+    ``nearest_distance`` is a lower bound for faces cheap enough to reject by
+    bounding box. OCC bounding boxes of trimmed b-splines are inflated (0.32 mm
+    of skew was measured on a model whose faces mirror to 0.0025 mm), which
+    only ever adds candidates, never removes a real one.
+    """
+    matched_distance = -1.0
+    nearest = -1.0
+    matched: list[int] = []
+    px, py, pz = float(point[0]), float(point[1]), float(point[2])
+    for surface in candidates:
+        bbox = bboxes.get(surface)
+        if bbox is None:
+            continue
+        gap = float(
+            np.linalg.norm([
+                max(bbox[0] - px, px - bbox[3], 0.0),
+                max(bbox[1] - py, py - bbox[4], 0.0),
+                max(bbox[2] - pz, pz - bbox[5], 0.0),
+            ])
+        )
+        if gap > tolerance:
+            # Far enough that the exact projection cannot be a hit; the box gap
+            # is a valid lower bound for the reported residual.
+            if nearest < 0.0 or gap < nearest:
+                nearest = gap
+            continue
+        try:
+            closest, parametric = gmsh.model.getClosestPoint(2, surface, [px, py, pz])
+        except Exception:
+            continue
+        distance = float(
+            np.linalg.norm(np.asarray(closest, dtype=float) - np.asarray([px, py, pz]))
+        )
+        if nearest < 0.0 or distance < nearest:
+            nearest = distance
+        if distance > tolerance:
+            continue
+        # getClosestPoint projects onto the untrimmed surface, so a hit still
+        # has to be confirmed against the trim loops before it counts.
+        if not _parametric_point_on_face(surface, parametric):
+            continue
+        matched.append(surface)
+        if matched_distance < 0.0 or distance < matched_distance:
+            matched_distance = distance
+    return matched_distance, nearest, matched
+
+
+def _evaluate_plane_symmetry(
+    plane: str,
+    *,
+    samples: dict[int, np.ndarray],
+    roles: dict[int, str],
+    bboxes: dict[int, tuple[float, ...]],
+    tolerance: float,
+    span_tolerance: float,
+) -> PlaneSymmetryVerdict:
+    """Decide whether the sampled geometry mirrors about ``plane``.
+
+    Two independent conditions have to hold, and both are physical:
+
+    * every sampled point mirrors onto the model within ``tolerance``; and
+    * it mirrors onto a face of the *same acoustic role*. Geometry symmetry is
+      worthless if the tweeter maps onto rigid wall -- the reduced solve would
+      drive the wrong patch. A face that straddles the plane maps onto itself,
+      which satisfies the role test by construction.
+    """
+    axis = SYMMETRY_AXIS_FOR_PLANE[plane]
+    candidates = sorted(samples)
+    all_axis_values = np.concatenate(
+        [samples[surface][:, axis] for surface in candidates]
+    ) if candidates else np.zeros(1)
+    axis_min = float(np.min(all_axis_values))
+    axis_max = float(np.max(all_axis_values))
+    points_tested = int(sum(len(samples[surface]) for surface in candidates))
+
+    if not (axis_min < -span_tolerance and axis_max > span_tolerance):
+        return PlaneSymmetryVerdict(
+            plane=plane,
+            accepted=False,
+            reason=(
+                "model does not straddle the plane; there is no half to remove"
+            ),
+            tolerance=tolerance,
+            axis_min=axis_min,
+            axis_max=axis_max,
+            points_tested=points_tested,
+            points_off_model=0,
+            max_residual=-1.0,
+            worst_residual_surface=None,
+            worst_off_model_distance=-1.0,
+            worst_surface=None,
+            role_mismatches=0,
+            failure_samples=(),
+        )
+
+    max_residual = -1.0
+    max_residual_surface: int | None = None
+    points_off_model = 0
+    role_mismatches = 0
+    worst_off_model = -1.0
+    worst_surface: int | None = None
+    failures: list[dict[str, object]] = []
+    for surface in candidates:
+        role = roles.get(surface, "rigid")
+        for point in samples[surface]:
+            mirrored = point.copy()
+            mirrored[axis] = -mirrored[axis]
+            matched_distance, nearest, hits = _closest_on_model(
+                mirrored,
+                candidates=candidates,
+                bboxes=bboxes,
+                tolerance=tolerance,
+            )
+            if not hits:
+                points_off_model += 1
+                if nearest > worst_off_model:
+                    worst_off_model = nearest
+                    worst_surface = surface
+                if len(failures) < AUTO_REDUCE_MAX_SAMPLES:
+                    failures.append({
+                        "kind": "off_model",
+                        "surface": int(surface),
+                        "role": role,
+                        "point_step_units": [float(v) for v in point],
+                        "mirrored_point_step_units": [float(v) for v in mirrored],
+                        "nearest_distance_step_units": (
+                            None if nearest < 0.0 else float(nearest)
+                        ),
+                    })
+                continue
+            if matched_distance > max_residual:
+                max_residual = matched_distance
+                max_residual_surface = int(surface)
+            if role not in {roles.get(hit, "rigid") for hit in hits}:
+                role_mismatches += 1
+                if len(failures) < AUTO_REDUCE_MAX_SAMPLES:
+                    failures.append({
+                        "kind": "role_mismatch",
+                        "surface": int(surface),
+                        "role": role,
+                        "point_step_units": [float(v) for v in point],
+                        "mirrored_point_step_units": [float(v) for v in mirrored],
+                        "mirrored_surfaces": [int(hit) for hit in hits],
+                        "mirrored_roles": sorted(
+                            {roles.get(hit, "rigid") for hit in hits}
+                        ),
+                    })
+
+    accepted = points_off_model == 0 and role_mismatches == 0
+    if accepted:
+        reason = "geometry and source roles mirror within tolerance"
+    elif points_off_model:
+        reason = (
+            f"{points_off_model} of {points_tested} sampled points do not mirror "
+            "onto the model"
+        )
+    else:
+        reason = (
+            f"{role_mismatches} sampled points mirror onto a face of a different "
+            "acoustic role"
+        )
+    return PlaneSymmetryVerdict(
+        plane=plane,
+        accepted=accepted,
+        reason=reason,
+        tolerance=tolerance,
+        axis_min=axis_min,
+        axis_max=axis_max,
+        points_tested=points_tested,
+        points_off_model=points_off_model,
+        max_residual=max_residual,
+        worst_residual_surface=max_residual_surface,
+        worst_off_model_distance=worst_off_model,
+        worst_surface=worst_surface,
+        role_mismatches=role_mismatches,
+        failure_samples=tuple(failures),
+    )
+
+
+def _cut_geometry_to_positive_side(
+    planes: tuple[str, ...],
+    *,
+    bbox: tuple[float, float, float, float, float, float],
+) -> tuple[dict[int, list[int]], dict[str, object]]:
+    """Trim every face to the positive side of ``planes``; return parentage.
+
+    The cut is a boolean common of the *faces* with one half-space box, not a
+    solid operation, and both properties that follow from that are load-bearing:
+
+    * ``outDimTagsMap`` gives an exact parent -> children map, so the
+      STEP-derived source/refine/shell assignments survive the cut without
+      being re-derived from geometry; and
+    * intersecting faces with a box can only trim faces. Nothing is created on
+      the plane, so the reduced boundary stays *open* at the cut with free
+      edges on it. A planar cap there would mesh as a rigid wall -- a baffle,
+      not a symmetry plane -- and the mirrored solve would be silently wrong.
+      The solver enforces the same contract from its side by rejecting any
+      triangle lying entirely on a requested plane.
+
+    The positive side is kept because the native Metal symmetry solve requires
+    it (``--native-symmetry-plane yz`` refuses a mesh with negative X).
+    """
+    volumes = gmsh.model.getEntities(3)
+    if volumes:
+        # STEP MANIFOLD_SOLID_BREPs import as volumes that own the faces; the
+        # faces cannot be trimmed while a volume still references them. Only
+        # the exterior faces are ever meshed, so the volumes are dead weight.
+        gmsh.model.occ.remove(volumes, recursive=False)
+        gmsh.model.occ.synchronize()
+
+    surfaces = [tag for _dim, tag in sorted(gmsh.model.getEntities(2))]
+    span = max(bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2])
+    pad = AUTO_REDUCE_BOX_PAD_REL * span + 1.0
+    lo = [bbox[0] - pad, bbox[1] - pad, bbox[2] - pad]
+    hi = [bbox[3] + pad, bbox[4] + pad, bbox[5] + pad]
+    for plane in planes:
+        lo[SYMMETRY_AXIS_FOR_PLANE[plane]] = 0.0
+    box = gmsh.model.occ.addBox(
+        lo[0], lo[1], lo[2], hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+    )
+    gmsh.model.occ.synchronize()
+    _out, out_map = gmsh.model.occ.intersect(
+        [(2, surface) for surface in surfaces],
+        [(3, box)],
+        removeObject=True,
+        removeTool=True,
+    )
+    gmsh.model.occ.synchronize()
+
+    mapping: dict[int, list[int]] = {}
+    for index, surface in enumerate(surfaces):
+        children = out_map[index] if index < len(out_map) else []
+        mapping[surface] = [tag for dim, tag in children if dim == 2]
+    remaining = [tag for _dim, tag in sorted(gmsh.model.getEntities(2))]
+    stats = {
+        "planes": list(planes),
+        "half_space_box_step_units": [float(v) for v in lo + hi],
+        "surfaces_before": len(surfaces),
+        "surfaces_after": len(remaining),
+        "surfaces_dropped": sum(1 for children in mapping.values() if not children),
+        "surfaces_split": sum(1 for children in mapping.values() if len(children) > 1),
+        "residual_volumes": len(gmsh.model.getEntities(3)),
+    }
+    return mapping, stats
+
+
+def _remap_after_cut(surfaces: Iterable[int], mapping: dict[int, list[int]]) -> list[int]:
+    """Follow a surface list through the boolean parent -> children map."""
+    remapped: list[int] = []
+    seen: set[int] = set()
+    for surface in surfaces:
+        for child in mapping.get(int(surface), []):
+            if child not in seen:
+                seen.add(child)
+                remapped.append(child)
+    return remapped
+
+
+def _auto_reduce_geometry(
+    *,
+    surfaces: list[int],
+    roles: dict[int, str],
+    grid: int,
+    tolerance_rel: float,
+) -> tuple[tuple[str, ...], dict[int, list[int]], dict[str, object]]:
+    """Test the geometry for mirror symmetry and cut the accepted planes.
+
+    Returns the cut planes, the boolean parent -> children map (empty when
+    nothing was cut) and a manifest report. Every plane's residual is reported
+    whether it passed or failed, so a marginal reduction is visible in
+    ``manifest.json`` rather than silent.
+    """
+    samples = {surface: _sample_surface_points(surface, grid=grid) for surface in surfaces}
+    samples = {surface: pts for surface, pts in samples.items() if len(pts)}
+    bboxes = {
+        surface: tuple(float(v) for v in gmsh.model.getBoundingBox(2, surface))
+        for surface in samples
+    }
+    if not samples:
+        return (), {}, {
+            "mode": "auto-cut",
+            "cut_planes": [],
+            "note": "no sampleable acoustic surfaces; auto reduction skipped",
+        }
+
+    stacked = np.concatenate([pts for pts in samples.values()])
+    # The sampled point cloud is the honest extent: OCC bounding boxes of
+    # trimmed b-splines are inflated by tens of millimetres.
+    sample_bbox = (
+        float(np.min(stacked[:, 0])), float(np.min(stacked[:, 1])), float(np.min(stacked[:, 2])),
+        float(np.max(stacked[:, 0])), float(np.max(stacked[:, 1])), float(np.max(stacked[:, 2])),
+    )
+    diagonal = float(
+        np.linalg.norm(np.asarray(sample_bbox[3:]) - np.asarray(sample_bbox[:3]))
+    )
+    tolerance = tolerance_rel * diagonal
+    span_tolerance = AUTO_REDUCE_SPAN_REL * diagonal
+
+    verdicts = [
+        _evaluate_plane_symmetry(
+            plane,
+            samples=samples,
+            roles=roles,
+            bboxes=bboxes,
+            tolerance=tolerance,
+            span_tolerance=span_tolerance,
+        )
+        for plane in ("x0", "y0", "z0")
+    ]
+    planes = tuple(verdict.plane for verdict in verdicts if verdict.accepted)
+    report: dict[str, object] = {
+        "mode": "auto-cut",
+        "tolerance_rel": float(tolerance_rel),
+        "tolerance_step_units": float(tolerance),
+        "model_diagonal_step_units": diagonal,
+        "sample_grid": int(grid),
+        "sampled_surfaces": len(samples),
+        "sample_points": int(len(stacked)),
+        "planes": {verdict.plane: verdict.to_dict() for verdict in verdicts},
+        "cut_planes": list(planes),
+    }
+    if not planes:
+        report["cut"] = None
+        return (), {}, report
+
+    # OCC bounding boxes are inflated, which is exactly what the half-space box
+    # wants: it only has to enclose everything on the kept side.
+    model_bbox = tuple(float(v) for v in gmsh.model.getBoundingBox(-1, -1))
+    mapping, cut_stats = _cut_geometry_to_positive_side(planes, bbox=model_bbox)
+    report["cut"] = cut_stats
+    return planes, mapping, report
+
+
 def _detect_symmetry_planes(
     points: np.ndarray,
     triangles: np.ndarray,
@@ -1845,8 +2378,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Comma-separated symmetry cut planes: x0, y0, z0. Aliases: "
             "left-right, front-back, top-bottom, none. 'auto' detects the cut "
-            "planes from free edges on the coordinate planes. Overrides "
-            "--quadrants."
+            "planes from free edges on the coordinate planes of an "
+            "already-cut model. 'auto-cut' additionally tests a full model's "
+            "geometry for mirror symmetry and cuts it to the positive side "
+            "before meshing. Overrides --quadrants."
+        ),
+    )
+    parser.add_argument(
+        "--auto-reduce-tol-rel",
+        type=float,
+        default=AUTO_REDUCE_TOL_REL,
+        help=(
+            "Mirror-test tolerance for --symmetry-planes auto-cut, as a "
+            "fraction of the sampled model diagonal."
+        ),
+    )
+    parser.add_argument(
+        "--auto-reduce-grid",
+        type=int,
+        default=AUTO_REDUCE_GRID,
+        help=(
+            "Per-face parametric sampling grid used by the auto-cut mirror "
+            "test (N x N samples per face before trim filtering)."
         ),
     )
     parser.add_argument(
@@ -1998,11 +2551,26 @@ def main(argv: list[str] | None = None) -> int:
         refine_specs = [_parse_refine_spec(raw) for raw in args.refine]
     except argparse.ArgumentTypeError as exc:
         raise SystemExit(str(exc)) from exc
-    symmetry_auto = (
-        args.symmetry_planes is not None
-        and args.symmetry_planes.strip().lower() == "auto"
+    if args.auto_reduce_tol_rel <= 0.0:
+        raise SystemExit("--auto-reduce-tol-rel must be positive")
+    if args.auto_reduce_grid < 2:
+        raise SystemExit("--auto-reduce-grid must be >= 2")
+    symmetry_mode = (
+        args.symmetry_planes.strip().lower()
+        if args.symmetry_planes is not None
+        else ""
     )
+    # 'auto-cut' is a third mode of the same knob rather than an independent
+    # --auto-reduce flag on purpose: symmetry already has exactly one source of
+    # truth here, and a separate boolean would make '--auto-reduce
+    # --symmetry-planes x0' a state with two contradictory answers.
+    auto_reduce = symmetry_mode == "auto-cut"
+    symmetry_auto = symmetry_mode == "auto" or auto_reduce
     if symmetry_auto:
+        # After an auto-cut the reduced mesh is re-read by the free-edge
+        # detector, exactly as an already-cut CAD model would be. That makes
+        # the cut self-checking: the planes it reports back must match the
+        # planes that were cut.
         symmetry_planes: tuple[str, ...] | str = "auto"
     else:
         try:
@@ -2085,21 +2653,10 @@ def main(argv: list[str] | None = None) -> int:
             source_surface_set = {
                 tag for tags_for_source in source_surfaces.values() for tag in tags_for_source
             }
-            rigid_surfaces = [tag for tag in all_surfaces if tag not in source_surface_set]
-            if not rigid_surfaces:
-                raise RuntimeError("no rigid surfaces remain after source classification")
 
-            gmsh.model.addPhysicalGroup(2, rigid_surfaces, tag=RIGID_TAG, name="rigid")
-            for spec in active_source_specs:
-                gmsh.model.addPhysicalGroup(
-                    2,
-                    source_surfaces[spec.name],
-                    tag=spec.tag,
-                    name=spec.name,
-                )
-
-            # Resolve painted refine groups and auto-classify radiating (flare)
-            # surfaces from the STEP body/shell structure.
+            # Resolve painted refine groups and the STEP body/shell structure
+            # before any geometry cut: every one of these lookups is keyed on
+            # the STEP face order, which a boolean invalidates.
             refine_surfaces, refine_origins = _map_refine_groups_to_gmsh_surfaces(
                 step_path, refine_specs, ordered_surfaces
             )
@@ -2115,6 +2672,73 @@ def main(argv: list[str] | None = None) -> int:
                 name: [surface for surface in surfaces if surface not in excluded_surfaces]
                 for name, surfaces in shell_surfaces.items()
             }
+
+            auto_reduce_report: dict[str, object] = {"mode": "off"}
+            auto_reduce_planes: tuple[str, ...] = ()
+            if auto_reduce:
+                # Roles are the source name or 'rigid'. Refine groups are mesh
+                # paint, not physics, so they do not get a vote; a painted
+                # group that only existed on the discarded half simply shows up
+                # emptied in the manifest's refine_groups block.
+                roles = {surface: "rigid" for surface in all_surfaces}
+                for name, surfaces in source_surfaces.items():
+                    for surface in surfaces:
+                        roles[surface] = name
+                auto_reduce_planes, cut_map, auto_reduce_report = _auto_reduce_geometry(
+                    surfaces=all_surfaces,
+                    roles=roles,
+                    grid=args.auto_reduce_grid,
+                    tolerance_rel=args.auto_reduce_tol_rel,
+                )
+                if auto_reduce_planes:
+                    source_surfaces = {
+                        name: _remap_after_cut(surfaces, cut_map)
+                        for name, surfaces in source_surfaces.items()
+                    }
+                    emptied_sources = [
+                        name for name, surfaces in source_surfaces.items() if not surfaces
+                    ]
+                    if emptied_sources:
+                        raise RuntimeError(
+                            "auto-cut removed every face of sources: "
+                            + ", ".join(emptied_sources)
+                        )
+                    refine_surfaces = {
+                        name: _remap_after_cut(surfaces, cut_map)
+                        for name, surfaces in refine_surfaces.items()
+                    }
+                    refine_surfaces = {
+                        name: surfaces for name, surfaces in refine_surfaces.items() if surfaces
+                    }
+                    shell_surfaces = {
+                        name: _remap_after_cut(surfaces, cut_map)
+                        for name, surfaces in shell_surfaces.items()
+                    }
+                    excluded_surfaces = set(_remap_after_cut(excluded_surfaces, cut_map))
+                    all_surfaces = _remap_after_cut(all_surfaces, cut_map)
+                    active_source_specs = [
+                        spec for spec in active_source_specs
+                        if source_surfaces.get(spec.name)
+                    ]
+                    source_surface_set = {
+                        tag
+                        for tags_for_source in source_surfaces.values()
+                        for tag in tags_for_source
+                    }
+
+            rigid_surfaces = [tag for tag in all_surfaces if tag not in source_surface_set]
+            if not rigid_surfaces:
+                raise RuntimeError("no rigid surfaces remain after source classification")
+
+            gmsh.model.addPhysicalGroup(2, rigid_surfaces, tag=RIGID_TAG, name="rigid")
+            for spec in active_source_specs:
+                gmsh.model.addPhysicalGroup(
+                    2,
+                    source_surfaces[spec.name],
+                    tag=spec.tag,
+                    name=spec.name,
+                )
+
             auto_radiating = _auto_radiating_surfaces(shell_surfaces, source_surface_set)
             refined_surface_set = {
                 tag for tags_for_group in refine_surfaces.values() for tag in tags_for_group
@@ -2217,7 +2841,9 @@ def main(argv: list[str] | None = None) -> int:
                 density=density,
                 transition_mm=args.transition_mm,
                 shadow_res=shadow_res,
-                symmetry_planes=symmetry_planes,
+                symmetry_planes=(
+                    auto_reduce_planes if auto_reduce_planes else symmetry_planes
+                ),
             )
 
             try:
@@ -2266,6 +2892,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             return {
                 "surface_geoms": surface_geoms,
+                "auto_reduce": auto_reduce_report,
+                "auto_reduce_planes": auto_reduce_planes,
                 "source_surfaces": source_surfaces,
                 "active_source_specs": active_source_specs,
                 "rigid_surfaces": rigid_surfaces,
@@ -2310,15 +2938,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         geometry_healed = True
 
-    source_surfaces = gmsh_state["source_surfaces"]
+    auto_reduce_report = gmsh_state["auto_reduce"]
+    auto_reduce_planes = tuple(gmsh_state["auto_reduce_planes"])
     active_source_specs = gmsh_state["active_source_specs"]
-    rigid_surfaces = gmsh_state["rigid_surfaces"]
     density = gmsh_state["density"]
     mesh_size_prediction = gmsh_state["mesh_size_prediction"]
-    refine_surfaces = gmsh_state["refine_surfaces"]
-    refine_origins = gmsh_state["refine_origins"]
-    auto_radiating = gmsh_state["auto_radiating"]
-    shell_surfaces = gmsh_state["shell_surfaces"]
     duplicate_node_stats = gmsh_state["duplicate_node_stats"]
     source_diag = gmsh_state["source_diag"]
     skipped_sources = gmsh_state["skipped_sources"]
@@ -2332,10 +2956,29 @@ def main(argv: list[str] | None = None) -> int:
         symmetry_planes=symmetry_planes,
         tolerance=args.topology_tol,
         symmetry_snap_tolerance=(
-            HEALED_SYMMETRY_BAND_MM if geometry_healed else None
+            # The native Metal solve rejects a reduced mesh whose minimum
+            # coordinate is below -1e-7 m. An OCC trim lands on the plane to
+            # roughly 1e-9 mm, but snapping the cut band to exactly zero
+            # removes the question entirely.
+            HEALED_SYMMETRY_BAND_MM
+            if (geometry_healed or auto_reduce_planes)
+            else None
         ),
     )
     resolved_symmetry_planes = tuple(topology["expected_symmetry_planes"])
+    # Self-check: the free-edge detector re-reads the cut from the mesh with no
+    # knowledge of what was cut. Every plane that was cut must come back as an
+    # open rim; if one does not, the reduced boundary was capped there, and a
+    # capped plane meshes as a rigid baffle rather than a symmetry plane. The
+    # test is containment, not equality: a model supplied already cut on one
+    # plane and auto-cut on another legitimately reports both.
+    auto_reduce_planes_confirmed = set(auto_reduce_planes) <= set(
+        resolved_symmetry_planes
+    )
+    if auto_reduce_planes:
+        auto_reduce_report = dict(auto_reduce_report)
+        auto_reduce_report["post_cut_detected_planes"] = list(resolved_symmetry_planes)
+        auto_reduce_report["post_cut_planes_confirmed"] = bool(auto_reduce_planes_confirmed)
     meshio.write(tagged_mesh_path, repaired_mesh, file_format="gmsh22", binary=False)
     points, triangles, tags = _mesh_triangle_data(repaired_mesh)
     frequency_validation = _mesh_frequency_validation(
@@ -2386,6 +3029,7 @@ def main(argv: list[str] | None = None) -> int:
         topology["nonmanifold_edges"] == 0
         and topology["inconsistent_edges"] == 0
         and topology["unexpected_free_edges"] == 0
+        and auto_reduce_planes_confirmed
     )
     manifest = {
         "step": str(step_path),
@@ -2393,8 +3037,11 @@ def main(argv: list[str] | None = None) -> int:
         "geometry_healed": bool(geometry_healed),
         "geometry_healing_mode": geometry_healing_mode,
         "quadrants": args.quadrants,
+        "auto_reduce": auto_reduce_report,
         "symmetry_planes": list(resolved_symmetry_planes),
-        "symmetry_planes_mode": "auto" if symmetry_auto else "explicit",
+        "symmetry_planes_mode": (
+            "auto-cut" if auto_reduce else ("auto" if symmetry_auto else "explicit")
+        ),
         "unit_scale_to_m": args.unit_scale_to_m,
         "global_res_mm": rigid_res,
         "rigid_res_mm": rigid_res,
@@ -2426,6 +3073,14 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print(json.dumps(manifest, indent=2, sort_keys=True))
+    if not auto_reduce_planes_confirmed:
+        print(
+            "ERROR: auto-cut reduced the model on "
+            f"{','.join(auto_reduce_planes)} but the meshed boundary reports "
+            f"{','.join(resolved_symmetry_planes) or 'no'} symmetry planes. "
+            "The cut plane is not open in the mesh; refusing the reduction.",
+            file=sys.stderr,
+        )
     if not solver_ready and not args.allow_leaks:
         print(
             "ERROR: mesh is not solver-ready; unexpected free/non-manifold edges "

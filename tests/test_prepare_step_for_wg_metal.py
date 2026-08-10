@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 
@@ -1133,3 +1136,290 @@ def test_dual_legacy_port_exit_sources_do_not_alias_same_generic_style(monkeypat
         "PORT_EXIT_L",
         "PORT_EXIT_R",
     }
+
+
+# ---------------------------------------------------------------------------
+# Geometry-level auto reduction (--symmetry-planes auto-cut)
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _gmsh_session(module):
+    """Own a gmsh session for a geometry test, whatever the body does."""
+    module.gmsh.initialize()
+    try:
+        module.gmsh.option.setNumber("General.Terminal", 0)
+        module.gmsh.model.add("auto_reduce_fixture")
+        yield module.gmsh
+    finally:
+        module.gmsh.finalize()
+
+
+def _box_surfaces(gmsh_module, x0, y0, z0, dx, dy, dz):
+    """Add an OCC box and return its face tags."""
+    volume = gmsh_module.model.occ.addBox(x0, y0, z0, dx, dy, dz)
+    gmsh_module.model.occ.synchronize()
+    return [
+        tag
+        for dim, tag in gmsh_module.model.getBoundary(
+            [(3, volume)], combined=False, oriented=False
+        )
+        if dim == 2
+    ]
+
+
+def _face_with_center(gmsh_module, surfaces, axis, value, tolerance=1e-9):
+    """The face whose centre of mass sits at ``value`` along ``axis``."""
+    for surface in surfaces:
+        com = gmsh_module.model.occ.getCenterOfMass(2, surface)
+        if abs(float(com[axis]) - value) <= tolerance:
+            return surface
+    raise AssertionError(f"no face centred at axis {axis} = {value}")
+
+
+def test_auto_reduce_cuts_only_the_plane_the_full_model_mirrors_about():
+    module = _load_script()
+    with _gmsh_session(module) as gmsh_module:
+        # Symmetric about x=0; deliberately offset in y (it straddles y=0 but
+        # does not mirror about it) and entirely above z=0.
+        surfaces = _box_surfaces(gmsh_module, -1.0, -0.5, 0.0, 2.0, 2.0, 2.0)
+        roles = {surface: "rigid" for surface in surfaces}
+        # A source face that straddles the plane maps onto itself, which is a
+        # valid mirror pair and has to pass the role test.
+        straddling = _face_with_center(gmsh_module, surfaces, 1, -0.5)
+        roles[straddling] = "HF"
+
+        planes, mapping, report = module._auto_reduce_geometry(
+            surfaces=surfaces,
+            roles=roles,
+            grid=5,
+            tolerance_rel=module.AUTO_REDUCE_TOL_REL,
+        )
+
+        assert planes == ("x0",)
+        assert report["cut_planes"] == ["x0"]
+        assert report["planes"]["x0"]["accepted"] is True
+        assert report["planes"]["x0"]["points_off_model"] == 0
+        assert report["planes"]["x0"]["role_mismatches"] == 0
+        assert report["planes"]["x0"]["max_residual_step_units"] < (
+            report["planes"]["x0"]["tolerance_step_units"]
+        )
+        # y=0 is straddled but not mirrored; z=0 is not straddled at all.
+        assert report["planes"]["y0"]["accepted"] is False
+        assert report["planes"]["y0"]["points_off_model"] > 0
+        assert report["planes"]["z0"]["accepted"] is False
+        assert "straddle" in report["planes"]["z0"]["reason"]
+
+        # The source face survives the cut and is still one face.
+        assert mapping[straddling]
+        remaining = [tag for dim, tag in gmsh_module.model.getEntities(2) if dim == 2]
+        # The x=-1 face is gone, no face was created on the cut plane.
+        assert len(remaining) == 5
+        assert gmsh_module.model.getEntities(3) == []
+        for surface in remaining:
+            bbox = gmsh_module.model.getBoundingBox(2, surface)
+            assert bbox[0] > -1.0e-6
+            assert bbox[3] > 1.0e-6, "a face left lying on x=0 would mesh as a baffle"
+
+
+def test_auto_reduce_cut_leaves_the_meshed_boundary_open_on_the_plane():
+    module = _load_script()
+    with _gmsh_session(module) as gmsh_module:
+        surfaces = _box_surfaces(gmsh_module, -1.0, -0.5, 0.0, 2.0, 2.0, 2.0)
+        planes, _mapping, _report = module._auto_reduce_geometry(
+            surfaces=surfaces,
+            roles={surface: "rigid" for surface in surfaces},
+            grid=5,
+            tolerance_rel=module.AUTO_REDUCE_TOL_REL,
+        )
+        assert planes == ("x0",)
+
+        gmsh_module.option.setNumber("Mesh.MeshSizeMin", 0.25)
+        gmsh_module.option.setNumber("Mesh.MeshSizeMax", 0.5)
+        gmsh_module.model.mesh.generate(2)
+        node_tags, coords, _ = gmsh_module.model.mesh.getNodes()
+        index = {int(tag): i for i, tag in enumerate(node_tags)}
+        points = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
+        triangles = []
+        for dim, surface in gmsh_module.model.getEntities(2):
+            if dim != 2:
+                continue
+            _types, _tags, node_lists = gmsh_module.model.mesh.getElements(2, surface)
+            for nodes in node_lists:
+                flat = [index[int(node)] for node in nodes]
+                triangles.extend(
+                    flat[i : i + 3] for i in range(0, len(flat), 3)
+                )
+        triangles = np.asarray(triangles, dtype=np.int64)
+
+    assert len(triangles) > 0
+    # Nothing may lie flat on the cut plane: the solver rejects such a triangle
+    # because a symmetry plane is an image plane, not a physical boundary.
+    on_plane = np.all(np.abs(points[triangles][:, :, 0]) <= 1e-9, axis=1)
+    assert not np.any(on_plane)
+    # And the free-edge detector must recover exactly the plane that was cut,
+    # with no knowledge that a cut happened.
+    detected, detection = module._detect_symmetry_planes(
+        points, triangles, tolerance=1e-6
+    )
+    assert detected == ("x0",)
+    assert detection["plane_free_edge_counts"]["x0"] > 0
+
+
+def test_auto_reduce_refuses_a_full_model_that_does_not_mirror():
+    module = _load_script()
+    with _gmsh_session(module) as gmsh_module:
+        # Straddles x=0 but is one unit longer on the positive side.
+        surfaces = _box_surfaces(gmsh_module, -1.0, -0.5, 0.0, 3.0, 2.0, 2.0)
+        planes, mapping, report = module._auto_reduce_geometry(
+            surfaces=surfaces,
+            roles={surface: "rigid" for surface in surfaces},
+            grid=5,
+            tolerance_rel=module.AUTO_REDUCE_TOL_REL,
+        )
+
+        assert planes == ()
+        assert mapping == {}
+        assert report["cut"] is None
+        verdict = report["planes"]["x0"]
+        assert verdict["accepted"] is False
+        assert verdict["points_off_model"] > 0
+        assert verdict["worst_off_model_distance_step_units"] > (
+            verdict["tolerance_step_units"]
+        )
+        assert verdict["failure_samples"]
+        # Nothing was touched: the geometry is still the full model.
+        assert len(gmsh_module.model.getEntities(2)) == len(surfaces)
+
+
+def test_auto_reduce_refuses_sources_that_mirror_geometrically_but_not_by_role():
+    module = _load_script()
+    with _gmsh_session(module) as gmsh_module:
+        # Two boxes that are each other's mirror image about x=0, so the
+        # geometry test alone passes. Only their source painting differs.
+        right = _box_surfaces(gmsh_module, 0.2, -0.5, 0.0, 0.8, 1.0, 1.0)
+        left = _box_surfaces(gmsh_module, -1.0, -0.5, 0.0, 0.8, 1.0, 1.0)
+        surfaces = right + left
+        right_front = _face_with_center(gmsh_module, right, 1, -0.5)
+        left_front = _face_with_center(gmsh_module, left, 1, -0.5)
+
+        roles = {surface: "rigid" for surface in surfaces}
+        roles[right_front] = "HF"
+        mismatched = module._evaluate_plane_symmetry(
+            "x0",
+            samples={
+                surface: module._sample_surface_points(surface, grid=5)
+                for surface in surfaces
+            },
+            roles=roles,
+            bboxes={
+                surface: tuple(
+                    float(v) for v in gmsh_module.model.getBoundingBox(2, surface)
+                )
+                for surface in surfaces
+            },
+            tolerance=0.01,
+            span_tolerance=1e-3,
+        )
+
+        assert mismatched.accepted is False
+        assert mismatched.points_off_model == 0, "the geometry itself does mirror"
+        assert mismatched.role_mismatches > 0
+        assert any(
+            sample["kind"] == "role_mismatch" for sample in mismatched.failure_samples
+        )
+
+        # Painting the mirror partner with the same role is the only difference,
+        # and it flips the verdict.
+        roles[left_front] = "HF"
+        matched = module._evaluate_plane_symmetry(
+            "x0",
+            samples={
+                surface: module._sample_surface_points(surface, grid=5)
+                for surface in surfaces
+            },
+            roles=roles,
+            bboxes={
+                surface: tuple(
+                    float(v) for v in gmsh_module.model.getBoundingBox(2, surface)
+                )
+                for surface in surfaces
+            },
+            tolerance=0.01,
+            span_tolerance=1e-3,
+        )
+        assert matched.accepted is True
+        assert matched.role_mismatches == 0
+
+
+def test_auto_reduce_ignores_untrimmed_surface_extensions():
+    module = _load_script()
+    with _gmsh_session(module) as gmsh_module:
+        # A bore punched through the +x half only. Both halves of the top face
+        # lie on the same underlying plane, so a closest-point test that
+        # ignored trimming would happily mirror the bore onto solid material
+        # and call x=0 symmetric. y=0 stays a genuine mirror plane, which keeps
+        # the test honest: the trim filter has to reject one and keep the other.
+        box = gmsh_module.model.occ.addBox(-1.0, -0.5, 0.0, 2.0, 1.0, 1.0)
+        bore = gmsh_module.model.occ.addCylinder(0.5, 0.0, -0.1, 0.0, 0.0, 1.2, 0.2)
+        gmsh_module.model.occ.cut([(3, box)], [(3, bore)])
+        gmsh_module.model.occ.synchronize()
+        surfaces = [tag for dim, tag in gmsh_module.model.getEntities(2) if dim == 2]
+
+        planes, _mapping, report = module._auto_reduce_geometry(
+            surfaces=surfaces,
+            roles={surface: "rigid" for surface in surfaces},
+            grid=9,
+            tolerance_rel=module.AUTO_REDUCE_TOL_REL,
+        )
+
+        assert planes == ("y0",)
+        assert report["planes"]["x0"]["accepted"] is False
+        assert report["planes"]["x0"]["points_off_model"] > 0
+
+
+def test_symmetry_planes_auto_cut_is_opt_in_and_off_by_default(tmp_path):
+    module = _load_script()
+    base = [
+        "--step", str(tmp_path / "model.step"),
+        "--out", str(tmp_path / "out"),
+        "--source", "HF:5",
+    ]
+
+    default_args = module.parse_args(base)
+    assert default_args.symmetry_planes is None
+    assert default_args.auto_reduce_tol_rel == module.AUTO_REDUCE_TOL_REL
+    assert default_args.auto_reduce_grid == module.AUTO_REDUCE_GRID
+
+    auto_cut_args = module.parse_args(base + ["--symmetry-planes", "auto-cut"])
+    assert auto_cut_args.symmetry_planes == "auto-cut"
+    # 'auto-cut' is handled in main() before the plane parser, which still only
+    # understands the explicit plane vocabulary.
+    with pytest.raises(ValueError):
+        module._parse_symmetry_planes("auto-cut", quadrants=1234)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HORNLAB_AUTO_REDUCE_STEP"),
+    reason="set HORNLAB_AUTO_REDUCE_STEP to a full mirror-symmetric STEP to run",
+)
+def test_auto_reduce_matches_expected_planes_for_a_real_step(tmp_path):
+    """End-to-end auto-cut against a real CAD export, when one is provided.
+
+    ``HORNLAB_AUTO_REDUCE_STEP`` points at the STEP; ``HORNLAB_AUTO_REDUCE_ARGS``
+    carries the whitespace-separated ``--source`` flags it needs. The reference
+    models are licensed CC BY-NC-SA and are never vendored into this repo.
+    """
+    module = _load_script()
+    step = Path(os.environ["HORNLAB_AUTO_REDUCE_STEP"]).expanduser()
+    extra = os.environ.get("HORNLAB_AUTO_REDUCE_ARGS", "--source HF:4 --source LF:20").split()
+    expected = os.environ.get("HORNLAB_AUTO_REDUCE_EXPECT_PLANES", "x0").split(",")
+    out = tmp_path / "out"
+    assert module.main(
+        ["--step", str(step), "--out", str(out), *extra, "--symmetry-planes", "auto-cut"]
+    ) == 0
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["auto_reduce"]["cut_planes"] == expected
+    assert manifest["symmetry_planes"] == expected
+    assert manifest["auto_reduce"]["post_cut_planes_confirmed"] is True
+    assert manifest["solver_ready"] is True

@@ -1671,6 +1671,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     raw_sources = _split_sources([*args.source, *args.sources])
     if not raw_sources:
         raise SystemExit("at least one --source or --sources entry is required")
+    if args.require_sources and args.preflight_only:
+        raise SystemExit(
+            "--require-sources cannot be used with --preflight-only because "
+            "preflight does not produce a completed direct-solve manifest"
+        )
     if args.complex_k_shift < 0.0:
         raise SystemExit("--complex-k-shift must be non-negative")
     for flag, value in (
@@ -1984,8 +1989,20 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         auto_reduce = prep_manifest.get("auto_reduce")
         pipeline_manifest["auto_reduce"] = auto_reduce
         pipeline_manifest["quadrants"] = _quadrants_for_planes(symmetry_planes)
-        if symmetry_auto_cut and isinstance(auto_reduce, dict):
-            raw_cut_planes = auto_reduce.get("cut_planes") or ()
+        if symmetry_auto_cut:
+            if not isinstance(auto_reduce, dict) or not isinstance(
+                auto_reduce.get("cut_planes"), list
+            ):
+                pipeline_manifest["status"] = "failed"
+                pipeline_manifest["error"] = (
+                    "auto-cut prepare manifest is missing the required "
+                    "auto_reduce.cut_planes contract; refusing to solve because "
+                    "the mesh reduction state cannot be confirmed"
+                )
+                _write_json(pipeline_manifest_path, pipeline_manifest)
+                _open_requested_outputs(args, out_dir)
+                return 2
+            raw_cut_planes = auto_reduce["cut_planes"]
             try:
                 cut_planes = _parse_symmetry_planes(
                     ",".join(str(plane) for plane in raw_cut_planes) or "none",
@@ -2008,6 +2025,16 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     f"{', '.join(symmetry_planes) or 'no'} symmetry planes "
                     f"({', '.join(unconfirmed)} unconfirmed); refusing to solve "
                     "the reduced body without its symmetry plane."
+                )
+                _write_json(pipeline_manifest_path, pipeline_manifest)
+                _open_requested_outputs(args, out_dir)
+                return 2
+            if cut_planes and auto_reduce.get("post_cut_planes_confirmed") is not True:
+                pipeline_manifest["status"] = "failed"
+                pipeline_manifest["error"] = (
+                    "auto-cut prepare manifest does not confirm that every cut "
+                    "plane remained open in the mesh; refusing to solve the "
+                    "reduced body"
                 )
                 _write_json(pipeline_manifest_path, pipeline_manifest)
                 _open_requested_outputs(args, out_dir)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,6 +97,22 @@ def test_metrics_apply_band_polar_and_beamwidth_gates(tmp_path):
     assert metrics["beamwidth_vertical_deg"] is None
 
 
+def test_metrics_refuse_to_silently_drop_a_missing_beamwidth_plane(tmp_path):
+    ab_gate = _load_ab_gate()
+    _write_run(tmp_path, "arm_a", 0.0)
+    _write_run(tmp_path, "arm_b", 1.0)
+    beamwidth_path = tmp_path / "arm_b" / "derived" / "HF_beamwidth.json"
+    beamwidth = json.loads(beamwidth_path.read_text(encoding="utf-8"))
+    del beamwidth["beamwidth_deg"]["vertical"]
+    del beamwidth["limited_by_grid"]["vertical"]
+    beamwidth_path.write_text(json.dumps(beamwidth), encoding="utf-8")
+
+    a = ab_gate._load_source(tmp_path / "arm_a", "HF")
+    b = ab_gate._load_source(tmp_path / "arm_b", "HF")
+    with pytest.raises(ValueError, match="beamwidth planes differ"):
+        ab_gate.compute_metrics(a, b, (500.0, 2000.0))
+
+
 def test_floor_uses_largest_perturbation_and_ratios_band_maxima(tmp_path):
     ab_gate = _load_ab_gate()
     for name, scale in (
@@ -117,6 +135,39 @@ def test_floor_uses_largest_perturbation_and_ratios_band_maxima(tmp_path):
     assert hf["ratio"]["on_axis_db"] == 2.0
     assert hf["ratio"]["polar_horizontal_db"] == 2.0
     assert failed is False
+
+
+def test_ratio_gate_fails_closed_when_a_signal_metric_has_no_floor(tmp_path):
+    ab_gate = _load_ab_gate()
+    for name, scale in (
+        ("arm_a", 0.0),
+        ("arm_b", 1.0),
+        ("floor_minus", 0.25),
+        ("floor_plus", 0.5),
+    ):
+        _write_run(tmp_path, name, scale)
+    for name in ("floor_minus", "floor_plus"):
+        path = tmp_path / name / "derived" / "HF_beamwidth.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["limited_by_grid"]["horizontal"][1] = True
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    verdict, failed = ab_gate.analyse_runs(
+        {
+            name: tmp_path / name
+            for name in ("arm_a", "arm_b", "floor_minus", "floor_plus")
+        },
+        (500.0, 2000.0),
+        max_ratio=1.0e9,
+    )
+
+    assert failed is True
+    assert {
+        "source": "HF",
+        "metric": "beamwidth_horizontal_deg",
+        "ratio": None,
+        "reason": "floor metric is unavailable",
+    } in verdict["exceeded"]
 
 
 def test_max_ratio_controls_exit_and_skip_solves_uses_existing_runs(tmp_path, monkeypatch):
@@ -147,6 +198,35 @@ def test_max_ratio_controls_exit_and_skip_solves_uses_existing_runs(tmp_path, mo
     assert calls == []
     verdict = json.loads((tmp_path / "verdict.json").read_text(encoding="utf-8"))
     assert verdict["passed"] is False
+
+
+def test_max_ratio_requires_a_floor_perturbation(tmp_path):
+    ab_gate = _load_ab_gate()
+
+    with pytest.raises(SystemExit, match="--max-ratio requires --floor-refine"):
+        ab_gate.main(
+            [
+                "a.step",
+                "b.step",
+                "--out",
+                str(tmp_path),
+                "--band-hz",
+                "500:2000",
+                "--max-ratio",
+                "2",
+                "--skip-solves",
+            ]
+        )
+
+
+def test_floor_refine_rejects_a_non_positive_minus_perturbation():
+    ab_gate = _load_ab_gate()
+
+    with pytest.raises(
+        argparse.ArgumentTypeError,
+        match="below 100",
+    ):
+        ab_gate.RefinePerturbation.parse("WGWALL:8mm:100")
 
 
 def test_command_builder_gives_a_and_b_identical_pipeline_flags(tmp_path, monkeypatch):

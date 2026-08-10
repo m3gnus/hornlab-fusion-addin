@@ -1421,6 +1421,27 @@ def test_pipeline_preflight_only_uses_manifest_sizing_and_does_not_solve(
     assert preflight["frequency_count"] == 40
 
 
+def test_pipeline_rejects_require_sources_with_preflight_only(tmp_path):
+    pipeline = _load_pipeline()
+
+    with pytest.raises(
+        SystemExit,
+        match="--require-sources cannot be used with --preflight-only",
+    ):
+        pipeline.main(
+            [
+                "--step",
+                str(tmp_path / "design.step"),
+                "--out",
+                str(tmp_path / "out"),
+                "--source",
+                "HF:5",
+                "--require-sources",
+                "--preflight-only",
+            ]
+        )
+
+
 DEFAULT_FRAME_INFERENCE = [
     {
         "name": "HF",
@@ -2898,6 +2919,42 @@ def test_pipeline_auto_cut_refuses_unconfirmed_cut_plane(tmp_path, monkeypatch):
     assert manifest["status"] == "failed"
     assert "x0" in manifest["error"]
     assert "unconfirmed" in manifest["error"]
+
+
+def test_pipeline_auto_cut_refuses_a_missing_reduction_contract(tmp_path, monkeypatch):
+    pipeline = _load_pipeline()
+    calls = []
+    prep_manifest = _auto_cut_prep_manifest([])
+    del prep_manifest["auto_reduce"]
+    monkeypatch.setattr(
+        pipeline,
+        "_run_logged",
+        _fake_run_logged(calls, prep_manifest_payload=prep_manifest),
+    )
+
+    rc = pipeline.main(
+        [
+            "--step",
+            str(tmp_path / "design.step"),
+            "--out",
+            str(tmp_path / "out"),
+            "--source",
+            "HF:5",
+            "--symmetry-planes",
+            "auto-cut",
+            "--run-solves",
+        ]
+    )
+
+    assert rc == 2
+    assert [name for name, _cmd in calls] == ["prepare_step_for_wg_metal.py"]
+    manifest = json.loads(
+        _run_manifest_path(tmp_path / "out", "fusion_wg_pipeline_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert "auto_reduce" in manifest["error"]
 
 
 def test_pipeline_uses_only_authoritative_mesh_contracts(tmp_path, monkeypatch):

@@ -1399,6 +1399,16 @@ def test_symmetry_planes_auto_cut_is_opt_in_and_off_by_default(tmp_path):
         module._parse_symmetry_planes("auto-cut", quadrants=1234)
 
 
+def test_auto_cut_snap_band_is_converted_from_mm_to_step_units():
+    module = _load_script()
+
+    assert module._millimetres_to_step_units(1.0e-4, 1.0e-3) == pytest.approx(1.0e-4)
+    assert module._millimetres_to_step_units(1.0e-4, 1.0) == pytest.approx(1.0e-7)
+    assert module._millimetres_to_step_units(1.0e-4, 0.0254) == pytest.approx(
+        1.0e-4 / 25.4
+    )
+
+
 @pytest.mark.skipif(
     not os.environ.get("HORNLAB_AUTO_REDUCE_STEP"),
     reason="set HORNLAB_AUTO_REDUCE_STEP to a full mirror-symmetric STEP to run",

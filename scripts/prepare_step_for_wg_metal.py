@@ -92,6 +92,11 @@ OCC_HEALING_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+def _millimetres_to_step_units(value_mm: float, unit_scale_to_m: float) -> float:
+    """Convert a physical millimetre tolerance to the imported STEP units."""
+    return float(value_mm) * 1.0e-3 / float(unit_scale_to_m)
+
+
 @dataclass(frozen=True)
 class SourceSpec:
     name: str
@@ -2959,10 +2964,15 @@ def main(argv: list[str] | None = None) -> int:
             # The native Metal solve rejects a reduced mesh whose minimum
             # coordinate is below -1e-7 m. An OCC trim lands on the plane to
             # roughly 1e-9 mm, but snapping the cut band to exactly zero
-            # removes the question entirely.
-            HEALED_SYMMETRY_BAND_MM
-            if (geometry_healed or auto_reduce_planes)
-            else None
+            # removes the question entirely. Auto-cut accepts non-mm STEP
+            # units, so its physical-mm band must be converted before it is
+            # compared with mesh coordinates.
+            _millimetres_to_step_units(
+                HEALED_SYMMETRY_BAND_MM,
+                args.unit_scale_to_m,
+            )
+            if auto_reduce_planes
+            else (HEALED_SYMMETRY_BAND_MM if geometry_healed else None)
         ),
     )
     resolved_symmetry_planes = tuple(topology["expected_symmetry_planes"])

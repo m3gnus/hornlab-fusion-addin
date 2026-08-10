@@ -51,6 +51,11 @@ class RefinePerturbation:
             raise argparse.ArgumentTypeError(
                 "refine group, size, and percentage must all be positive"
             )
+        if delta_pct >= 100.0:
+            raise argparse.ArgumentTypeError(
+                "refine perturbation percentage must be below 100 so the "
+                "minus-floor mesh size stays positive"
+            )
         return cls(group=group, size_mm=size_mm, delta_pct=delta_pct)
 
 
@@ -235,6 +240,12 @@ def _same_grid(a: dict[str, Any], b: dict[str, Any], label: str) -> None:
     )
     if not all(checks):
         raise ValueError(f"result grid mismatch for {label}")
+    beamwidth_a = set(a["beamwidth"])
+    beamwidth_b = set(b["beamwidth"])
+    if beamwidth_a != beamwidth_b:
+        raise ValueError(f"beamwidth planes differ for {label}")
+    if set(a["limited"]) != beamwidth_a or set(b["limited"]) != beamwidth_b:
+        raise ValueError(f"beamwidth limited-by-grid planes differ for {label}")
 
 
 def compute_metrics(
@@ -261,14 +272,15 @@ def compute_metrics(
             float(np.nanmax(delta)) if np.any(np.isfinite(delta)) else None
         )
 
-    common_beamwidth = a["beamwidth"].keys() & b["beamwidth"].keys()
-    for plane in sorted(common_beamwidth):
+    for plane in sorted(a["beamwidth"]):
         values_a = a["beamwidth"][plane]
         values_b = b["beamwidth"][plane]
         if values_a.shape != frequencies.shape or values_b.shape != frequencies.shape:
             raise ValueError(f"beamwidth grid shape mismatch for {plane}")
-        limited_a = a["limited"].get(plane, np.zeros(frequencies.shape, dtype=bool))
-        limited_b = b["limited"].get(plane, np.zeros(frequencies.shape, dtype=bool))
+        limited_a = a["limited"][plane]
+        limited_b = b["limited"][plane]
+        if limited_a.shape != frequencies.shape or limited_b.shape != frequencies.shape:
+            raise ValueError(f"beamwidth limited-by-grid shape mismatch for {plane}")
         usable = band & ~limited_a & ~limited_b & np.isfinite(values_a) & np.isfinite(values_b)
         delta = np.abs(values_a[usable] - values_b[usable])
         metrics[f"beamwidth_{plane}_deg"] = float(np.max(delta)) if delta.size else None
@@ -352,7 +364,18 @@ def analyse_runs(
         if max_ratio is not None and floor is not None:
             for metric, signal_value in signal.items():
                 floor_value = floor.get(metric)
-                if signal_value is None or floor_value is None:
+                if signal_value is None:
+                    continue
+                if floor_value is None:
+                    failed = True
+                    verdict["exceeded"].append(
+                        {
+                            "source": source,
+                            "metric": metric,
+                            "ratio": None,
+                            "reason": "floor metric is unavailable",
+                        }
+                    )
                     continue
                 if signal_value > max_ratio * floor_value:
                     failed = True
@@ -412,6 +435,8 @@ def main(argv: list[str] | None = None) -> int:
         args, pipeline_flags = _parser().parse_known_args(raw_argv)
     if args.max_ratio is not None and args.max_ratio < 0.0:
         raise SystemExit("--max-ratio must be non-negative")
+    if args.max_ratio is not None and args.floor_refine is None:
+        raise SystemExit("--max-ratio requires --floor-refine")
     try:
         specs = build_commands(
             args.step_a,

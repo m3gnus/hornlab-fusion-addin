@@ -225,7 +225,7 @@ def plan_export_scope(
     Body descriptors use ``body_kind`` (``solid``, ``surface``, or ``mesh``),
     ``visible``, and optional occurrence evidence such as ``suppressed`` and
     ``external_reference``.  Declarations use ``declaration`` with
-    ``exterior-shell`` or ``fem-air-volume``.  The four dependency booleans
+    ``exterior-shell``, ``exclude``, or ``fem-air-volume``.  The four dependency booleans
     have the names used by :func:`_dependency_reason`.
     """
 
@@ -376,6 +376,18 @@ def plan_export_scope(
                 }
             )
             fem_air_volumes.append(record)
+            continue
+
+        if candidate.get("declaration") == "exclude":
+            record = _skipped_record(
+                candidate,
+                index,
+                kind="excluded_body",
+                reason="body is explicitly excluded from the acoustic exterior",
+                severity="degraded",
+            )
+            skipped.append((record, candidate))
+            degraded = True
             continue
 
         managed = candidate.get("wglink_managed") is True
@@ -604,7 +616,10 @@ def _validate_fingerprint(value: object, *, label: str) -> None:
     _required(record, ("is_solid", "volume_mm3", "bbox_mm"), label=label)
     if not isinstance(record["is_solid"], bool):
         raise WgReturnError(f"{label}.is_solid must be boolean")
-    _number(record["volume_mm3"], label=f"{label}.volume_mm3", minimum=0.0)
+    if record["is_solid"]:
+        _number(record["volume_mm3"], label=f"{label}.volume_mm3", minimum=0.0)
+    elif record["volume_mm3"] is not None:
+        raise WgReturnError(f"{label}.volume_mm3 must be null for a surface body")
     bbox = _list(record["bbox_mm"], label=f"{label}.bbox_mm")
     if len(bbox) != 6:
         raise WgReturnError(f"{label}.bbox_mm must contain six values")

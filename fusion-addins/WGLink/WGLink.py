@@ -15,6 +15,7 @@ if str(ADDIN_DIR) not in sys.path:
     sys.path.insert(0, str(ADDIN_DIR))
 
 import wglink_core  # noqa: E402
+import wglink_send  # noqa: E402
 from wglink_bundle import format_measurement_mm  # noqa: E402
 
 
@@ -36,6 +37,11 @@ COMMANDS = {
         "hornlab_wglink_audit",
         "Audit",
         "Inspect link identity, parameter drift, tag state, and feature health.",
+    ),
+    "send": (
+        "hornlab_wglink_send",
+        "Send to WG",
+        "Export the displayed acoustic assembly as a validated .wgreturn bundle.",
     ),
     "relink": (
         "hornlab_wglink_relink",
@@ -119,6 +125,23 @@ def _choose_bundle(title: str, source_kind: str) -> str | None:
     return str(selected)
 
 
+def _choose_return_folder(command_inputs: object) -> None:
+    ui = _ui()
+    if ui is None:
+        return
+    current = Path(str(_input_value(command_inputs, "output_folder") or Path.home())).expanduser()
+    dialog = ui.createFolderDialog()
+    dialog.title = "Select the WG return output folder"
+    initial = current if current.is_dir() else current.parent
+    if initial.exists():
+        dialog.initialDirectory = str(initial)
+    if dialog.showDialog() != adsk.core.DialogResults.DialogOK:
+        return
+    target = _input(command_inputs, "output_folder")
+    if target is not None:
+        target.value = str(dialog.folder)
+
+
 def _input(command_inputs: object, name: str) -> object | None:
     try:
         return command_inputs.itemById(name)
@@ -151,6 +174,57 @@ def _command_options(command_inputs: object) -> dict[str, object]:
     if fallback is not None:
         result["allow_root_fallback"] = bool(fallback)
     return result
+
+
+def _send_selection(command_inputs: object) -> object:
+    item = _input(command_inputs, "send_selection")
+    try:
+        if item.selectionCount:
+            return item.selection(0).entity
+    except Exception:  # noqa: BLE001
+        pass
+    return "root"
+
+
+def _send_options(command_inputs: object) -> dict[str, object]:
+    options: dict[str, object] = {
+        "selection": _send_selection(command_inputs),
+        "output_folder": str(_input_value(command_inputs, "output_folder") or "").strip(),
+        "overwrite": bool(_input_value(command_inputs, "overwrite")),
+    }
+    anchor_input = _input(command_inputs, "anchor_instance_id")
+    try:
+        if anchor_input.isVisible:
+            anchor = str(anchor_input.selectedItem.name).strip()
+            if anchor:
+                options["anchor_instance_id"] = anchor
+    except Exception:  # noqa: BLE001
+        pass
+    return options
+
+
+def _sync_anchor_choices(command_inputs: object) -> None:
+    anchor = _input(command_inputs, "anchor_instance_id")
+    if anchor is None:
+        return
+    try:
+        report = wglink_send.inspect_scope(
+            _app(), {"selection": _send_selection(command_inputs)}
+        )
+        instance_ids = list(report.get("instance_ids", []))
+    except Exception:  # noqa: BLE001 - execute will present the actionable refusal
+        instance_ids = []
+    anchor.isVisible = len(instance_ids) > 1
+    try:
+        previous = str(anchor.selectedItem.name) if anchor.selectedItem else None
+    except Exception:  # noqa: BLE001
+        previous = None
+    try:
+        anchor.listItems.clear()
+        for index, instance_id in enumerate(instance_ids):
+            anchor.listItems.add(str(instance_id), str(instance_id) == previous or (previous is None and index == 0))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _tag_summary(tag: object) -> str:
@@ -202,6 +276,27 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             f"{report.get('direct_reference_limit', '')}"
             f"{_warnings(report)}"
         )
+    if operation == "send":
+        scope = report.get("scope", {})
+        status = scope.get("status", "?") if isinstance(scope, dict) else "?"
+        message = (
+            f"Return bundle written: {report.get('bundle_path', '?')}\n"
+            f"Return ID: {report.get('return_id', '?')}\n"
+            f"Scope: {status}\n"
+            f"Sources: {len(report.get('sources', []))}"
+        )
+        if status == "degraded" and isinstance(scope, dict):
+            skipped = scope.get("skipped", [])
+            names = []
+            if isinstance(skipped, list):
+                for record in skipped:
+                    if not isinstance(record, dict) or record.get("kind") == "construction":
+                        continue
+                    names.append(
+                        str(record.get("path") or record.get("name") or record.get("object_id") or "unnamed body")
+                    )
+            message += "\n\nDEGRADED EXPORT — skipped bodies:\n- " + "\n- ".join(names or ["none reported"])
+        return message
     if operation == "relink":
         return (
             f"Relinked WGLink instance {report.get('instance_id', '?')}.\n"
@@ -236,6 +331,14 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 report = wglink_core.update(_app(), None, options)
             elif self.operation == "audit":
                 report = wglink_core.audit(_app(), options)
+            elif self.operation == "send":
+                send_options = _send_options(inputs)
+                output_folder = str(send_options.get("output_folder", ""))
+                if output_folder:
+                    settings = _load_settings()
+                    settings["last_return_folder"] = output_folder
+                    _save_settings(settings)
+                report = wglink_send.send(_app(), send_options)
             elif self.operation == "relink":
                 source_kind = _selected_name(inputs, "bundle_source", "Bundle folder")
                 path = _choose_bundle("Select the relocated .wglink bundle", source_kind)
@@ -251,6 +354,21 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             _message(traceback.format_exc(), "WGLink error")
 
 
+class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
+    def notify(self, args: object) -> None:
+        try:
+            changed = getattr(args, "input", None)
+            input_id = str(getattr(changed, "id", ""))
+            inputs = args.inputs
+            if input_id == "browse_output_folder":
+                _choose_return_folder(inputs)
+                changed.value = False
+            elif input_id == "send_selection":
+                _sync_anchor_choices(inputs)
+        except Exception:  # noqa: BLE001 - execute remains the validation boundary
+            pass
+
+
 class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def __init__(self, operation: str):
         super().__init__()
@@ -259,6 +377,35 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args: object) -> None:
         try:
             inputs = args.command.commandInputs
+            if self.operation == "send":
+                selection = inputs.addSelectionInput(
+                    "send_selection",
+                    "Assembly scope",
+                    "Leave empty for the root, or select one occurrence subtree.",
+                )
+                selection.addSelectionFilter("Occurrences")
+                selection.setSelectionLimits(0, 1)
+                settings = _load_settings()
+                default_folder = str(settings.get("last_return_folder", Path.home()))
+                inputs.addStringValueInput(
+                    "output_folder", "Output folder", default_folder
+                )
+                inputs.addBoolValueInput(
+                    "browse_output_folder", "Browse output folder", False, "", False
+                )
+                anchor = inputs.addDropDownCommandInput(
+                    "anchor_instance_id",
+                    "Solver anchor instance",
+                    adsk.core.DropDownStyles.TextListDropDownStyle,
+                )
+                anchor.isVisible = False
+                inputs.addBoolValueInput(
+                    "overwrite", "Replace an existing return bundle", True, "", False
+                )
+                _sync_anchor_choices(inputs)
+                changed = CommandInputChangedHandler()
+                args.command.inputChanged.add(changed)
+                _handlers.append(changed)
             if self.operation in {"insert", "relink"}:
                 source = inputs.addDropDownCommandInput(
                     "bundle_source",
@@ -267,7 +414,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 source.listItems.add("Bundle folder", True)
                 source.listItems.add("Zipped .wglink file", False)
-            if self.operation != "insert":
+            if self.operation not in {"insert", "send"}:
                 inputs.addStringValueInput(
                     "instance_id",
                     "Instance ID (optional)",

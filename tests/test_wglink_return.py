@@ -219,6 +219,40 @@ def test_return_module_imports_only_the_standard_library():
     assert imported <= sys.stdlib_module_names | {"__future__"}
 
 
+def test_surface_fingerprint_accepts_the_observer_null_volume():
+    manifest = _worked_example()
+    evidence = manifest["instances"][0]["body_evidence"]
+    surface = {
+        "is_solid": False,
+        "volume_mm3": None,
+        "bbox_mm": [-1.0, -2.0, 0.0, 1.0, 2.0, 0.0],
+    }
+    evidence["baseline_fingerprint"] = surface
+    evidence["observed_fingerprint"] = surface
+
+    validate_return_manifest(manifest)
+
+
+def test_explicit_body_exclusion_is_a_recorded_degradation():
+    plan = plan_export_scope(
+        "root",
+        [
+            {
+                "kind": "body",
+                "body_kind": "solid",
+                "object_id": "body-jig",
+                "name": "measurement jig",
+                "component": "Speaker",
+                "visible": True,
+                "declaration": "exclude",
+            }
+        ],
+    )
+
+    assert plan.status == "degraded"
+    assert plan.skipped[0]["kind"] == "excluded_body"
+
+
 def test_section_2_6_worked_example_round_trips_exactly():
     manifest = _worked_example()
 

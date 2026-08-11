@@ -66,14 +66,20 @@ The supported reference layer is:
 - **Audit** reports bundle/link state, pushed-parameter drift, source tag state,
   feature health, the measured link-frame offset, and evidence that the managed
   body is unmodified, modified, missing, or unknown.
+- **Send to WG** observes the root or one occurrence subtree without changing
+  the document, applies the explicit return-scope policy, and writes an atomic,
+  checksummed `.wgreturn` bundle. A body can carry the `WGLink` attribute
+  `return_declaration=exterior-shell` or `return_declaration=exclude` when its
+  surface/exclusion intent cannot be inferred safely.
 - **Relink** records a moved or renamed bundle path. The design id must match
   unless the caller explicitly forces the operation.
 - **Detach** removes `WGLink` attributes only. Bodies, sketches, features, and
   appearances remain in the document.
 
-Insert and Relink remember the last bundle folder. When a document has multiple
-links, enter the instance id in the command dialog so the command does not have
-to guess.
+Insert and Relink remember the last bundle folder; Send remembers its last
+output folder. When a document has multiple links, enter the instance id in the
+command dialog so the command does not have to guess. Send instead exposes an
+anchor choice only when its selected scope contains several linked instances.
 
 ## Update atomicity and recovery
 

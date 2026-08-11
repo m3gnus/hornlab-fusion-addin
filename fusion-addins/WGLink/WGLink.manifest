@@ -4,7 +4,7 @@
   "id": "0cdbb593-fc6c-4615-96b5-1f05a5e18d3a",
   "author": "m3gnus <megamaggi@gmail.com>",
   "description": {
-    "": "Insert, update, audit, relink, and detach native Waveguide Generator links."
+    "": "Insert, update, audit, send, relink, and detach native Waveguide Generator links."
   },
   "version": "0.1.1",
   "runOnStartup": false,

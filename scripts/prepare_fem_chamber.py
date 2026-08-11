@@ -19,17 +19,17 @@ import gmsh
 import meshio
 import numpy as np
 
-from prepare_step_for_wg_metal import (
+from hornlab_mesher.step_import import (
+    RIGID_TAG,
     SurfaceGeometry,
-    _advanced_face_order,
-    _anchor_surface_order,
-    _gmsh_surface_geometries,
-    _parse_named_shell_faces,
-    _parse_styled_face_groups,
+    advanced_face_order as _advanced_face_order,
+    anchor_surface_order as _anchor_surface_order,
+    gmsh_surface_geometries as _gmsh_surface_geometries,
+    parse_named_shell_faces as _parse_named_shell_faces,
+    parse_styled_face_groups as _parse_styled_face_groups,
 )
 
 
-RIGID_TAG = 1
 AIR_VOLUME_TAG = 1000
 FIRST_INTERFACE_TAG = 100
 SPEED_OF_SOUND_M_S = 343.0

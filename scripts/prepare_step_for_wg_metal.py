@@ -103,8 +103,6 @@ from hornlab_mesher import mesh_sizing as sizing
 SOURCE_TAG_BASE = 2
 DEFAULT_TOPOLOGY_TOL = 1e-5
 HEALED_SYMMETRY_BAND_MM = DEFAULT_SYMMETRY_SNAP_BAND_MM
-GENERIC_PORT_EXIT_SOURCE = "PORT_EXIT"
-LEGACY_PORT_EXIT_SOURCES = frozenset({"PORT_EXIT_L", "PORT_EXIT_R"})
 
 SYMMETRY_AXIS_FOR_PLANE = {"x0": 0, "y0": 1, "z0": 2}
 # Mirror-test tolerance as a fraction of the sampled model diagonal. An
@@ -204,31 +202,19 @@ def _auto_radiating_surfaces(
 
 
 def _step_face_groups(source_specs: list[SourceSpec]) -> list[StepFaceGroup]:
-    """Apply add-in label-alias and tag policy to caller-neutral selectors."""
-    requested_source_names = {spec.name.strip().upper() for spec in source_specs}
-    requested_legacy_port_exits = [
-        spec
-        for spec in source_specs
-        if spec.name.strip().upper() in LEGACY_PORT_EXIT_SOURCES
-    ]
-    allow_generic_port_exit_alias = (
-        GENERIC_PORT_EXIT_SOURCE not in requested_source_names
-        and len(requested_legacy_port_exits) == 1
-    )
+    """Apply the add-in's source tag policy to caller-neutral selectors.
+
+    A source is matched by its own painted label and nothing else. There used
+    to be a fallback here -- a requested PORT_EXIT_L/_R resolving to the generic
+    PORT_EXIT when the generic name was not itself requested -- removed
+    2026-08-11 after it was measured never to fire: across 471 recorded prepare
+    runs, the only two that asked for PORT_EXIT_L resolved it directly from an
+    appearance/style of that exact name.
+    """
     return [
         StepFaceGroup(
             name=spec.name,
-            selector=StepLabelSelector(
-                spec.name,
-                (
-                    (GENERIC_PORT_EXIT_SOURCE,)
-                    if (
-                        allow_generic_port_exit_alias
-                        and spec.name.strip().upper() in LEGACY_PORT_EXIT_SOURCES
-                    )
-                    else ()
-                ),
-            ),
+            selector=StepLabelSelector(spec.name),
             role=OccSurfaceRole("source"),
             tag=spec.tag,
             resolution_mm=spec.resolution_mm,

@@ -1093,7 +1093,17 @@ def test_skip_missing_sources_is_explicit_escape_hatch(monkeypatch, tmp_path):
     assert module._map_step_faces_to_gmsh_surfaces.last_missing["HF"]["tag"] == 4
 
 
-def test_single_legacy_port_exit_source_aliases_generic_port_exit_style(monkeypatch, tmp_path):
+def test_a_source_is_matched_only_by_its_own_painted_label(monkeypatch, tmp_path):
+    """No label ever stands in for another, in either direction.
+
+    Replaces two tests for a PORT_EXIT_L/_R -> PORT_EXIT fallback, deleted
+    2026-08-11: across 471 recorded prepare runs it never fired once, and the
+    only two runs requesting PORT_EXIT_L resolved it directly from an
+    appearance/style of that exact name. The second of those tests had also
+    become a false pass -- it asserted the fallback was correctly SUPPRESSED
+    when both legacy names were requested, which now holds trivially because
+    there is no fallback at all.
+    """
     module = _load_script()
     step_path = tmp_path / "model.step"
     step_path.write_text("", encoding="ascii")
@@ -1108,39 +1118,9 @@ def test_single_legacy_port_exit_source_aliases_generic_port_exit_style(monkeypa
         lambda _path: {"LF": [10], "PORT_EXIT": [11, 12]},
     )
     monkeypatch.setattr(module, "_advanced_face_order", lambda _path: [10, 11, 12])
-    monkeypatch.setattr(module.gmsh.model, "getEntities", lambda dim: [(2, 101), (2, 102), (2, 103)])
-
-    mapping = module._map_step_faces_to_gmsh_surfaces(
-        step_path,
-        specs,
-        skip_missing_sources=True,
-    )
-
-    assert mapping == {"LF": [101], "PORT_EXIT_L": [102, 103]}
-    assert (
-        module._map_step_faces_to_gmsh_surfaces.last_origins["PORT_EXIT_L"]
-        == "appearance/style (PORT_EXIT alias for PORT_EXIT_L)"
-    )
-    assert module._map_step_faces_to_gmsh_surfaces.last_missing == {}
-
-
-def test_dual_legacy_port_exit_sources_do_not_alias_same_generic_style(monkeypatch, tmp_path):
-    module = _load_script()
-    step_path = tmp_path / "model.step"
-    step_path.write_text("", encoding="ascii")
-    specs = [
-        module.SourceSpec("LF", 20.0, 2),
-        module.SourceSpec("PORT_EXIT_L", 25.0, 10),
-        module.SourceSpec("PORT_EXIT_R", 25.0, 11),
-    ]
-    monkeypatch.setattr(module, "_parse_named_shell_faces", lambda _path: {})
     monkeypatch.setattr(
-        module,
-        "_parse_styled_face_groups",
-        lambda _path: {"LF": [10], "PORT_EXIT": [11, 12]},
+        module.gmsh.model, "getEntities", lambda dim: [(2, 101), (2, 102), (2, 103)]
     )
-    monkeypatch.setattr(module, "_advanced_face_order", lambda _path: [10, 11, 12])
-    monkeypatch.setattr(module.gmsh.model, "getEntities", lambda dim: [(2, 101), (2, 102), (2, 103)])
 
     mapping = module._map_step_faces_to_gmsh_surfaces(
         step_path,
@@ -1148,11 +1128,14 @@ def test_dual_legacy_port_exit_sources_do_not_alias_same_generic_style(monkeypat
         skip_missing_sources=True,
     )
 
+    # PORT_EXIT is painted, PORT_EXIT_L is not: the request is MISSING, not
+    # quietly satisfied by the neighbouring label.
     assert mapping == {"LF": [101]}
-    assert set(module._map_step_faces_to_gmsh_surfaces.last_missing) == {
-        "PORT_EXIT_L",
-        "PORT_EXIT_R",
-    }
+    assert set(module._map_step_faces_to_gmsh_surfaces.last_missing) == {"PORT_EXIT_L"}
+    assert (
+        module._map_step_faces_to_gmsh_surfaces.last_origins["LF"]
+        == "appearance/style"
+    )
 
 
 # ---------------------------------------------------------------------------

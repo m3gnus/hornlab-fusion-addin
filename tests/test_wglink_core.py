@@ -97,6 +97,115 @@ def test_body_naming_table_covers_every_insert_body_role(core):
     }
 
 
+def test_create_wrapper_clears_ground_to_parent(core):
+    occurrence = types.SimpleNamespace(
+        component=types.SimpleNamespace(name=""),
+        isGroundToParent=True,
+    )
+    occurrences = types.SimpleNamespace(
+        count=0,
+        item=lambda _index: None,
+        addNewComponent=lambda _transform: occurrence,
+    )
+    design = types.SimpleNamespace(
+        rootComponent=types.SimpleNamespace(occurrences=occurrences)
+    )
+    core.adsk.core.Matrix3D = types.SimpleNamespace(create=lambda: object())
+    warnings = []
+
+    component, created, mode = core._create_wrapper(design, "tiny", {}, warnings)
+
+    assert created is occurrence
+    assert component is occurrence.component
+    assert component.name == "WGLink_tiny_1"
+    assert occurrence.isGroundToParent is False
+    assert mode == "occurrence"
+    assert warnings == []
+
+
+def test_create_wrapper_ground_to_parent_refusal_is_a_loud_warning(core):
+    class Occurrence:
+        component = types.SimpleNamespace(name="")
+
+        @property
+        def isGroundToParent(self):
+            return True
+
+        @isGroundToParent.setter
+        def isGroundToParent(self, _value):
+            raise RuntimeError("read only")
+
+    occurrence = Occurrence()
+    occurrences = types.SimpleNamespace(
+        count=0,
+        item=lambda _index: None,
+        addNewComponent=lambda _transform: occurrence,
+    )
+    design = types.SimpleNamespace(
+        rootComponent=types.SimpleNamespace(occurrences=occurrences)
+    )
+    core.adsk.core.Matrix3D = types.SimpleNamespace(create=lambda: object())
+    warnings = []
+
+    component, created, mode = core._create_wrapper(design, "tiny", {}, warnings)
+
+    assert (component, created, mode) == (occurrence.component, occurrence, "occurrence")
+    assert occurrence.isGroundToParent is True
+    assert len(warnings) == 1
+    assert warnings[0].startswith("LOUD:")
+    assert "Unground From Parent" in warnings[0]
+
+
+@pytest.mark.parametrize("grounded", [False, True])
+def test_audit_reports_ground_to_parent_without_mutating_it(core, monkeypatch, grounded):
+    class Occurrence:
+        objectType = "adsk::fusion::Occurrence"
+
+        def __init__(self, value):
+            self._value = value
+            self.writes = 0
+
+        @property
+        def isGroundToParent(self):
+            return self._value
+
+        @isGroundToParent.setter
+        def isGroundToParent(self, value):
+            self.writes += 1
+            self._value = value
+
+    occurrence = Occurrence(grounded)
+    design = types.SimpleNamespace(findEntityByToken=lambda _token: [occurrence])
+    record = {
+        "instance_id": "instance-1",
+        "payload": {
+            "bundle_path": "",
+            "occurrence_token": "occurrence-1",
+            "wrapper": "occurrence",
+        },
+        "body": None,
+    }
+    monkeypatch.setattr(core, "_design", lambda _app: design)
+    monkeypatch.setattr(core, "_resolve_link", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(core, "_feature_health", lambda _design: ([], []))
+    monkeypatch.setattr(
+        core, "_link_frame_report", lambda *_args: {"verdict": "in_frame"}
+    )
+    monkeypatch.setattr(core, "_local_body_state", lambda _record: "unchanged")
+    monkeypatch.setattr(core, "_parameter_drift", lambda *_args: [])
+
+    report = core.audit(object())
+
+    assert report["ground_to_parent"] is grounded
+    assert occurrence.writes == 0
+    remedy = [
+        warning
+        for warning in report["warnings"]
+        if "Unground From Parent" in warning
+    ]
+    assert bool(remedy) is grounded
+
+
 def test_link_frame_verdict_accepts_component_local_throat_within_tolerance(core):
     verdict = core.link_frame_verdict(
         [0.004, 79.994],

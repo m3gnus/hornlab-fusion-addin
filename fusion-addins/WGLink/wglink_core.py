@@ -2320,6 +2320,16 @@ def _create_wrapper(
             "a unit; use an Assembly document for a movable wrapper."
         )
         return root, None, "root"
+    try:
+        # MEASURED Fusion 2704.1.53: the first component is grounded to its
+        # parent at creation, and that separate flag silently discards moves.
+        occurrence.isGroundToParent = False
+    except Exception as exc:  # noqa: BLE001 - a grounded link remains usable
+        warnings.append(
+            "LOUD: Fusion refused to clear Ground to Parent on the WGLink wrapper: "
+            f"{exc}. It cannot be moved or jointed as a unit until you right-click "
+            "the component in the browser and choose Unground From Parent."
+        )
     component = occurrence.component
     component.name = name
     return component, occurrence, "occurrence"
@@ -3050,6 +3060,31 @@ def _parameter_drift(design: object, record: dict[str, Any]) -> list[dict[str, o
     return drift
 
 
+def _ground_to_parent(design: object, record: dict[str, Any]) -> bool:
+    if record.get("payload", {}).get("wrapper") == "root":
+        return False
+    token = record.get("payload", {}).get("occurrence_token", "")
+    occurrences = [
+        entity
+        for entity in _find_by_token(design, token)
+        if _kind(entity) == "Occurrence"
+    ]
+    if not occurrences:
+        component = _component_for_record(design, record)
+        for occurrence in _items(getattr(design.rootComponent, "allOccurrences", None)):
+            try:
+                if occurrence.component == component:
+                    occurrences.append(occurrence)
+            except Exception:  # noqa: BLE001
+                continue
+    if len(occurrences) == 1:
+        try:
+            return bool(occurrences[0].isGroundToParent)
+        except Exception:  # noqa: BLE001 - Audit evidence must remain best-effort
+            return False
+    return False
+
+
 def audit(
     app: adsk.core.Application,
     options: dict[str, Any] | None = None,
@@ -3090,6 +3125,13 @@ def audit(
     if skipped:
         warnings.append(f"Health diagnostics skipped {len(skipped)} unreadable timeline entries.")
     link_frame = _link_frame_report(design, record)
+    ground_to_parent = _ground_to_parent(design, record)
+    if ground_to_parent:
+        warnings.append(
+            "The WGLink wrapper is grounded to its parent and cannot be moved or "
+            "jointed as a unit. Right-click the component in the browser and choose "
+            "Unground From Parent, or re-run Insert."
+        )
     local_state = _local_body_state(record)
     if link_frame.get("verdict") == "moved":
         local_state = "modified"
@@ -3138,6 +3180,7 @@ def audit(
         "unsupported_references": unsupported,
         "local_body_state": local_state,
         "link_frame": link_frame,
+        "ground_to_parent": ground_to_parent,
         "direct_reference_limit": (
             "Fusion exposes no face-to-feature reverse index. Audit can name unhealthy "
             "features, but cannot detect a reference that silently rebound to the wrong face."

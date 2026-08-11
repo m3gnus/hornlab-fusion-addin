@@ -128,6 +128,11 @@ host = plane.createForAssemblyContext(occurrence)   # now usable from the root
 The same applies to faces of the managed body. In the UI this is automatic —
 clicking the datum inside the occurrence picks the proxy for you.
 
+Fusion grounds the first component created in a design to its parent. On Insert,
+WGLink clears that flag from its wrapper so the component can be placed and
+jointed. For a document built before this change, right-click the wrapper in the
+browser and choose **Unground From Parent**, or re-run Insert.
+
 ## Measured behaviour, Fusion 2704.1.53
 
 Tritonia-V enclosure and asro68 freestanding, throwaway documents:

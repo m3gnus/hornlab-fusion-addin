@@ -6,7 +6,7 @@
   "description": {
     "": "Export the active Fusion design to STEP, prepare tagged WG Metal BEM meshes, run orientation diagnostics, and open Waveguide Generator."
   },
-  "version": "0.1.0",
+  "version": "0.1.1",
   "runOnStartup": true,
   "supportedOS": "windows|mac",
   "editEnabled": true

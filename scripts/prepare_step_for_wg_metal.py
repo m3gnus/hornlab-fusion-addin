@@ -1217,11 +1217,13 @@ def main(argv: list[str] | None = None) -> int:
         # spherical caps that make gmsh's periodic-surface 1D mesh
         # self-intersect; OCC small-edge/degenerate healing removes them, but
         # it is fallback-only because it regresses some otherwise-clean exports.
-        gmsh_state, geometry_healing_mode = _run_occ_healing_fallbacks(
-            _run_gmsh_attempt,
-            original_mesh_error=original_mesh_error,
-            original_traceback=original_traceback,
-            surface_order_reference=surface_order_reference,
+        gmsh_state, geometry_healing_mode, _rejected_healing_attempts = (
+            _run_occ_healing_fallbacks(
+                _run_gmsh_attempt,
+                original_mesh_error=original_mesh_error,
+                original_traceback=original_traceback,
+                surface_order_reference=surface_order_reference,
+            )
         )
         geometry_healed = True
 

@@ -175,7 +175,7 @@ def test_occ_healing_fallback_retries_after_anchor_rejection(capsys):
             )
         return expected_state
 
-    state, mode = module._run_occ_healing_fallbacks(
+    state, mode, rejected = module._run_occ_healing_fallbacks(
         run_attempt,
         original_mesh_error=RuntimeError("unhealed gmsh meshing failed"),
         original_traceback=None,
@@ -184,6 +184,7 @@ def test_occ_healing_fallback_retries_after_anchor_rejection(capsys):
 
     assert state is expected_state
     assert mode == "full"
+    assert [attempt["mode"] for attempt in rejected] == ["sew"]
     assert [attempt[0] for attempt in attempts] == [
         mode_options for _mode, mode_options in module.OCC_HEALING_FALLBACKS
     ]

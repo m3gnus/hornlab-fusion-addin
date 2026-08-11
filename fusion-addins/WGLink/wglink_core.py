@@ -49,6 +49,15 @@ from wglink_bundle import (
 ATTRIBUTE_GROUP = "WGLink"
 ADDIN_DIR = Path(__file__).resolve().parent
 MOUTH_OVERSHOOT_SUFFIX = "mouth_overshoot"
+LINK_FRAME_TOLERANCE_MM = 0.01
+BODY_NAMES = {
+    "cut_tool": "WGLink waveguide cut tool",
+    "enclosure": "WGLink enclosure",
+    "throat_patch": "WGLink throat patch body",
+    "stitched_waveguide": "WGLink stitched waveguide body",
+    "waveguide": "WGLink freestanding waveguide",
+    "waveguide_surface": "WGLink waveguide surface",
+}
 ROLE_COLOURS = {
     "HF": (255, 0, 0, 255),
     "MF": (255, 187, 0, 255),
@@ -202,6 +211,13 @@ def _stamp_managed(entity: object, instance_id: str, name: str, value: object) -
     token = _entity_token(entity)
     if token:
         _set_attribute(entity, "entity_token", token)
+
+
+def _name_body(body: object, role: str) -> object:
+    """Apply a browser name without making that presentation name identity."""
+
+    body.name = BODY_NAMES[role]
+    return body
 
 
 def _stamp_payload(entity: object, payload: dict[str, str]) -> None:
@@ -620,7 +636,9 @@ def _build_loft(
     _stamp_managed(loft, instance_id, "feature", "loft")
     if not loft.bodies.count:
         raise WgLinkError("The waveguide loft produced no body.")
-    return loft.bodies.item(0), loft, sketches
+    body = loft.bodies.item(0)
+    _name_body(body, "cut_tool" if solid else "waveguide_surface")
+    return body, loft, sketches
 
 
 def _mouth_cap_face(body: object, mouth_z_mm: float) -> object:
@@ -688,7 +706,7 @@ def _extrude_mouth_overshoot(
     _stamp_managed(extrude, instance_id, "feature", "mouth_overshoot")
     if not extrude.bodies.count:
         raise WgLinkError("The mouth overshoot join extrude produced no body.")
-    return extrude.bodies.item(0), extrude
+    return _name_body(extrude.bodies.item(0), "cut_tool"), extrude
 
 
 def _throat_edge(body: object, throat_z_mm: float, tolerance_mm: float = 0.5) -> object | None:
@@ -784,12 +802,13 @@ def _close_and_thicken(
     patch = features.patchFeatures.add(patch_input)
     patch.name = "WGLink throat patch"
     _stamp_managed(patch, instance_id, "feature", "patch")
-    _stamp_managed(patch.bodies.item(0), instance_id, "role", "cut_tool")
+    patch_body = _name_body(patch.bodies.item(0), "throat_patch")
+    _stamp_managed(patch_body, instance_id, "role", "cut_tool")
     made.append(patch)
 
     surfaces = adsk.core.ObjectCollection.create()
     surfaces.add(surface_body)
-    surfaces.add(patch.bodies.item(0))
+    surfaces.add(patch_body)
     stitch_input = features.stitchFeatures.createInput(
         surfaces,
         adsk.core.ValueInput.createByReal(mm_to_internal(0.01)),
@@ -799,7 +818,7 @@ def _close_and_thicken(
     stitch.name = "WGLink stitched waveguide"
     _stamp_managed(stitch, instance_id, "feature", "stitch")
     made.append(stitch)
-    stitched = stitch.bodies.item(0)
+    stitched = _name_body(stitch.bodies.item(0), "stitched_waveguide")
     _stamp_managed(stitched, instance_id, "role", "cut_tool")
 
     for sign in (1, -1):
@@ -814,7 +833,7 @@ def _close_and_thicken(
             True,
         )
         thicken = features.thickenFeatures.add(thicken_input)
-        solid = thicken.bodies.item(0)
+        solid = _name_body(thicken.bodies.item(0), "waveguide")
         cavity_ok, backing_ok, exact_opposite, cavity_state, backing_state = _wall_side_probe(
             solid, throat_axis_mm, wall_t_mm
         )
@@ -1204,42 +1223,35 @@ def _build_enclosure(
     extrude.name = "WGLink enclosure block"
     _stamp_managed(extrude, instance_id, "feature", "extrude")
     made.append(extrude)
-    box = extrude.bodies.item(0)
+    box = _name_body(extrude.bodies.item(0), "enclosure")
     _stamp_managed(box, instance_id, "role", "enclosure")
 
     vertical_edges = _edges_spanning_z(box)
     if len(vertical_edges) != 4:
         raise WgLinkError(
-            f"Expected 4 vertical enclosure edges before plan chamfer; Fusion found {len(vertical_edges)}."
+            f"Expected 4 vertical enclosure edges before edge treatment; Fusion found {len(vertical_edges)}."
         )
-    plan_treatment = _add_edge_treatment(
+    front = _face_at_z(box, plan.front_extent_mm)
+    back = _face_at_z(box, -plan.back_extent_mm)
+    if front is None or back is None:
+        raise WgLinkError("Could not identify both enclosure perimeter faces before edge treatment.")
+    perimeter_edges = _items(front.edges) + _items(back.edges)
+    if len(perimeter_edges) != 8:
+        raise WgLinkError(
+            f"Expected 8 front/back perimeter edges before edge treatment; Fusion found {len(perimeter_edges)}."
+        )
+    edges = vertical_edges + perimeter_edges
+    if len({id(edge) for edge in edges}) != 12:
+        raise WgLinkError("The enclosure edge set did not contain 12 distinct prism edges.")
+    edge_treatment = _add_edge_treatment(
         component,
-        vertical_edges,
+        edges,
         plan.edge_expression,
         plan.edge_type,
         instance_id,
         "plan-corner",
     )
-    made.append(plan_treatment)
-
-    front = _face_at_z(box, plan.front_extent_mm)
-    back = _face_at_z(box, -plan.back_extent_mm)
-    if front is None or back is None:
-        raise WgLinkError("Could not identify both enclosure perimeter faces after plan chamfer.")
-    perimeter_edges = _items(front.edges) + _items(back.edges)
-    if len(perimeter_edges) != 16:
-        raise WgLinkError(
-            f"Expected 16 front/back perimeter edges after plan chamfer; Fusion found {len(perimeter_edges)}."
-        )
-    perimeter_treatment = _add_edge_treatment(
-        component,
-        perimeter_edges,
-        plan.edge_expression,
-        plan.edge_type,
-        instance_id,
-        "front-and-back-perimeter",
-    )
-    made.append(perimeter_treatment)
+    made.append(edge_treatment)
 
     tools = adsk.core.ObjectCollection.create()
     tools.add(cut_tool)
@@ -1257,8 +1269,7 @@ def _build_enclosure(
         "parametric": parametric,
         "edge_type": plan.edge_type,
         "sketch_fully_constrained": fully_constrained,
-        "vertical_edges": len(vertical_edges),
-        "perimeter_edges": len(perimeter_edges),
+        "edges": len(edges),
     }, made
 
 
@@ -1695,6 +1706,136 @@ def _local_body_state(record: dict[str, Any]) -> str:
     if matches is None:
         return "unknown"
     return "unmodified" if matches else "modified"
+
+
+def link_frame_verdict(
+    throat_center_mm: tuple[float, float] | list[float],
+    throat_plane_z_mm: float,
+    expected_vertical_offset_mm: float,
+    expected_throat_z_mm: float,
+    tolerance_mm: float = LINK_FRAME_TOLERANCE_MM,
+) -> dict[str, object]:
+    """Compare native body geometry with the component-local link frame."""
+
+    center_x = float(throat_center_mm[0])
+    center_y = float(throat_center_mm[1])
+    plane_z = float(throat_plane_z_mm)
+    expected_y = float(expected_vertical_offset_mm)
+    expected_z = float(expected_throat_z_mm)
+    tolerance = float(tolerance_mm)
+    offset = [center_x, center_y - expected_y, plane_z - expected_z]
+    in_frame = all(abs(value) <= tolerance for value in offset)
+    return {
+        "verdict": "in_frame" if in_frame else "moved",
+        "center_mm": [center_x, center_y],
+        "expected_center_mm": [0.0, expected_y],
+        "plane_z_mm": plane_z,
+        "expected_plane_z_mm": expected_z,
+        "offset_mm": offset,
+        "distance_mm": math.sqrt(sum(value * value for value in offset)),
+        "tolerance_mm": tolerance,
+    }
+
+
+def _frame_face(design: object, record: dict[str, Any]) -> object:
+    """Resolve the tagged throat face by attributes/token, never by its name."""
+
+    payload = record.get("payload", {})
+    role = str(payload.get("source_role", "HF"))
+    instance_id = str(record.get("instance_id", ""))
+
+    body = record.get("body")
+    faces = _items(getattr(body, "faces", None)) if body is not None else []
+    attributed = [
+        face
+        for face in faces
+        if _attribute_value(face, "face_role") == role
+        and _attribute_value(face, "instance_id") == instance_id
+    ]
+    if len(attributed) == 1:
+        return attributed[0]
+
+    painted = [face for face in faces if _appearance_name(face) == role]
+    if len(painted) == 1:
+        return painted[0]
+
+    token = _token_table(payload).get(f"face:{role}", "")
+    token_faces = [
+        entity
+        for entity in _find_by_token(design, token)
+        if _kind(entity) == "BRepFace"
+    ]
+    if len(token_faces) == 1:
+        return token_faces[0]
+    raise WgLinkError(
+        "could not resolve exactly one tagged throat face "
+        f"(token={len(token_faces)}, attributed={len(attributed)}, painted={len(painted)})"
+    )
+
+
+def _link_frame_report(design: object, record: dict[str, Any]) -> dict[str, object]:
+    """Measure in native component coordinates, intentionally ignoring occurrence moves.
+
+    This catches a body moved relative to its own managed datums. A whole
+    component moved together with those datums is a legitimate placement and
+    therefore remains in frame here.
+    """
+
+    payload = record.get("payload", {})
+    prefix = str(
+        payload.get("parameter_prefix") or f"wg_{payload.get('slug', '')}_"
+    )
+    parameter_name = f"{prefix}vertical_offset"
+    expected_z = float(payload.get("throat_z_mm", 0.0) or 0.0)
+    try:
+        parameter = design.userParameters.itemByName(parameter_name)
+        if parameter is None:
+            raise WgLinkError(f"managed parameter {parameter_name!r} is missing")
+        expected_y = float(parameter.value) * 10.0
+        face = _frame_face(design, record)
+        center = face.centroid
+        plane = adsk.core.Plane.cast(face.geometry)
+        if plane is None:
+            raise WgLinkError("the tagged throat face is not planar")
+        report = link_frame_verdict(
+            [float(center.x) * 10.0, float(center.y) * 10.0],
+            float(plane.origin.z) * 10.0,
+            expected_y,
+            expected_z,
+        )
+        report["vertical_offset_parameter"] = parameter_name
+        return report
+    except Exception as exc:  # noqa: BLE001 - Audit must report, never refuse
+        return {
+            "verdict": "unknown",
+            "expected_center_mm": [0.0, None],
+            "expected_plane_z_mm": expected_z,
+            "vertical_offset_parameter": parameter_name,
+            "error": str(exc),
+        }
+
+
+def _refuse_bad_link_frame(frame: dict[str, object], *, force: bool) -> None:
+    if frame.get("verdict") == "in_frame" or force:
+        return
+    if frame.get("verdict") == "moved":
+        center = frame["center_mm"]
+        expected = frame["expected_center_mm"]
+        offset = frame["offset_mm"]
+        raise WgLinkError(
+            "WGLink refuses Update because the managed body has left the link frame: "
+            f"tagged throat centre is ({center[0]:.3f}, {center[1]:.3f}) mm, "
+            f"expected ({expected[0]:.3f}, {expected[1]:.3f}) mm; measured "
+            f"offset is ({offset[0]:+.3f}, {offset[1]:+.3f}, {offset[2]:+.3f}) mm "
+            "in x/y/plane-z. Undo the body Move, or Detach if the body is now "
+            "genuinely yours. A caller that intentionally accepts this can pass force=True."
+        )
+    raise WgLinkError(
+        "WGLink refuses Update because it could not verify the managed body's link "
+        f"frame ({frame.get('error', 'unknown reason')}). Restore/recreate the managed "
+        "link, or Detach if the body is now yours. A caller may pass force=True only "
+        "if proceeding intentionally."
+    )
 
 
 def _repo_root(options: dict[str, Any]) -> Path:
@@ -2342,6 +2483,10 @@ def insert(
             )
             made.append(mouth_extrude)
         _stamp_managed(cut_or_surface, instance_id, "role", "cut_tool")
+        _name_body(
+            cut_or_surface,
+            "cut_tool" if mode == "enclosure" else "waveguide_surface",
+        )
         # Keep every managed fit-point sketch before the first non-Sketch /
         # non-Occurrence timeline entry.  The pure rollback rule can then land
         # on the loft without suppressing captured sketch references.  Datum
@@ -2363,6 +2508,7 @@ def insert(
             )
             made.extend(close_features)
             _stamp_managed(final_body, instance_id, "role", "waveguide")
+            _name_body(final_body, "waveguide")
         else:
             final_body, enclosure_report, enclosure_features = _build_enclosure(
                 component,
@@ -2374,6 +2520,7 @@ def insert(
             )
             made.extend(enclosure_features)
             _stamp_managed(final_body, instance_id, "role", "enclosure")
+            _name_body(final_body, "enclosure")
 
         tag = _tag_report(
             app,
@@ -2535,6 +2682,7 @@ def _no_op_update_report(
     record: dict[str, Any],
     bundle: object,
     options: dict[str, Any],
+    link_frame: dict[str, object],
 ) -> dict[str, Any]:
     body = record["body"]
     role = record["payload"].get("source_role", "HF")
@@ -2544,6 +2692,7 @@ def _no_op_update_report(
     report = {
         "wrapper": record["payload"].get("wrapper", "root"),
         "assembly_from_link": _assembly_from_link(design, record),
+        "link_frame": link_frame,
         "tag": _tag_report(
             app,
             design,
@@ -2587,6 +2736,8 @@ def update(
     opts = _options(options)
     design = _design(app)
     record = _resolve_link(design, opts)
+    link_frame = _link_frame_report(design, record)
+    _refuse_bad_link_frame(link_frame, force=bool(opts.get("force")))
     source_path = _bundle_path_for_update(record, bundle_path)
     bundle = _read_owned_bundle(source_path)
     state = link_state(record["payload"], bundle)
@@ -2641,7 +2792,9 @@ def update(
     )
     sections, _points = _validate_rebuild_topology(rings, interfaces, payload, topology)
     if no_op:
-        return _no_op_update_report(app, design, record, bundle, opts)
+        return _no_op_update_report(
+            app, design, record, bundle, opts, link_frame
+        )
 
     _expand_groups(design.timeline)
     entries = _timeline_entries(design.timeline)
@@ -2681,6 +2834,7 @@ def update(
     report: dict[str, Any] = {
         "wrapper": record["payload"].get("wrapper", "root"),
         "assembly_from_link": _assembly_from_link(design, record),
+        "link_frame": link_frame,
         "warnings": [],
         "fit_points_moved": 0,
         "sections_done": 0,
@@ -2935,7 +3089,21 @@ def audit(
     ]
     if skipped:
         warnings.append(f"Health diagnostics skipped {len(skipped)} unreadable timeline entries.")
+    link_frame = _link_frame_report(design, record)
     local_state = _local_body_state(record)
+    if link_frame.get("verdict") == "moved":
+        local_state = "modified"
+        offset = link_frame.get("offset_mm", [])
+        warnings.append(
+            "The managed body has left its link frame; tagged throat offset "
+            f"is {offset} mm in x/y/plane-z. Undo the body Move, or Detach if "
+            "the body is now yours."
+        )
+    elif link_frame.get("verdict") == "unknown":
+        warnings.append(
+            "The managed body link frame could not be checked: "
+            f"{link_frame.get('error', 'unknown reason')}."
+        )
     if local_state == "missing":
         warnings.append("The managed body is missing. Recreate the link; Audit cannot restore it.")
     role = payload.get("source_role", "HF")
@@ -2969,6 +3137,7 @@ def audit(
         "regressed": unhealthy,
         "unsupported_references": unsupported,
         "local_body_state": local_state,
+        "link_frame": link_frame,
         "direct_reference_limit": (
             "Fusion exposes no face-to-feature reverse index. Audit can name unhealthy "
             "features, but cannot detect a reference that silently rebound to the wrong face."

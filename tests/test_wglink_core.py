@@ -86,6 +86,63 @@ def test_mouth_overshoot_parameter_is_created_then_updated_in_place(core):
     assert len(parameters.added) == 1
 
 
+def test_body_naming_table_covers_every_insert_body_role(core):
+    assert core.BODY_NAMES == {
+        "cut_tool": "WGLink waveguide cut tool",
+        "enclosure": "WGLink enclosure",
+        "throat_patch": "WGLink throat patch body",
+        "stitched_waveguide": "WGLink stitched waveguide body",
+        "waveguide": "WGLink freestanding waveguide",
+        "waveguide_surface": "WGLink waveguide surface",
+    }
+
+
+def test_link_frame_verdict_accepts_component_local_throat_within_tolerance(core):
+    verdict = core.link_frame_verdict(
+        [0.004, 79.994],
+        0.003,
+        80.0,
+        0.0,
+    )
+
+    assert verdict["verdict"] == "in_frame"
+    assert verdict["offset_mm"] == pytest.approx([0.004, -0.006, 0.003])
+
+
+def test_link_frame_verdict_reports_measured_body_move(core):
+    verdict = core.link_frame_verdict(
+        [23.26, 258.79],
+        0.0,
+        80.0,
+        0.0,
+    )
+
+    assert verdict["verdict"] == "moved"
+    assert verdict["expected_center_mm"] == [0.0, 80.0]
+    assert verdict["offset_mm"] == pytest.approx([23.26, 178.79, 0.0])
+    assert verdict["distance_mm"] == pytest.approx(180.2966, rel=1.0e-5)
+
+
+def test_link_frame_verdict_checks_stored_throat_plane_independently(core):
+    verdict = core.link_frame_verdict([0.0, 80.0], 2.5, 80.0, 0.0)
+
+    assert verdict["verdict"] == "moved"
+    assert verdict["offset_mm"] == [0.0, 0.0, 2.5]
+
+
+def test_link_frame_refusal_names_offset_and_both_remedies_but_force_allows(core):
+    frame = core.link_frame_verdict([23.26, 258.79], 0.0, 80.0, 0.0)
+
+    with pytest.raises(core.WgLinkError) as caught:
+        core._refuse_bad_link_frame(frame, force=False)
+
+    message = str(caught.value)
+    assert "+23.260, +178.790, +0.000" in message
+    assert "Undo the body Move" in message
+    assert "Detach" in message
+    core._refuse_bad_link_frame(frame, force=True)
+
+
 def _spline(point_count: int):
     return types.SimpleNamespace(fitPoints=types.SimpleNamespace(count=point_count))
 
@@ -174,7 +231,7 @@ def test_mouth_cap_face_requires_unique_planar_face_at_mouth_with_plus_z_normal(
 def test_mouth_overshoot_extrude_joins_face_using_parameter_expression(core, monkeypatch):
     face = object()
     body = object()
-    result_body = object()
+    result_body = types.SimpleNamespace(name="")
     captured = {}
 
     class ExtrudeInput:
@@ -221,6 +278,7 @@ def test_mouth_overshoot_extrude_joins_face_using_parameter_expression(core, mon
     )
 
     assert extended is result_body
+    assert result_body.name == core.BODY_NAMES["cut_tool"]
     assert captured == {
         "profile": face,
         "operation": "join",

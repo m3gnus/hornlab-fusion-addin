@@ -3,7 +3,7 @@
 WGLink inserts a Waveguide Generator `.wglink` bundle as native, managed
 Fusion history. It supports the two solid WG export modes:
 
-- `enclosure`: the realized enclosure block with both edge treatments, minus
+- `enclosure`: the realized enclosure block with one all-edge treatment, minus
   the waveguide cavity;
 - `freestanding`: the fitted-spline surface, throat patch, stitch, and outward
   parameter-driven wall thickness that form the freestanding waveguide solid.
@@ -18,6 +18,21 @@ the WG parameters, datum planes and axis, stable throat and mouth interface
 sketches, ring sketches, native features, final body, source-role face, and the
 attributes/entity tokens that identify them. Move and joint the wrapper, not an
 individual managed body.
+
+The enclosure starts as a rectangular prism. Its four longitudinal edges and
+both four-edge end perimeters are passed together to one parametric treatment:
+`edge_type=1` makes one fillet and `edge_type=2` makes one chamfer, with the
+distance/radius still driven by the link's `enc_edge` expression. Giving Fusion
+all twelve original edges at once lets it construct the three-way corner
+mitres; no feature runs over faces made by an earlier chamfer.
+
+Every browser object created by Insert has a deliberate user-facing name.
+Bodies use `WGLink enclosure`, `WGLink freestanding waveguide`, and `WGLink
+waveguide cut tool`; the freestanding construction bodies are named `WGLink
+waveguide surface`, `WGLink throat patch body`, and `WGLink stitched waveguide
+body` while they exist. These names are presentation only. WGLink continues to
+resolve ownership and topology exclusively through attributes and entity
+tokens, never names.
 
 Fusion Part Design documents reject a second component. Insert therefore has
 an explicit root-component fallback, enabled by default. Its report warns that
@@ -45,10 +60,12 @@ The supported reference layer is:
   builds the full WG viewport model.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
-  moves fit points in place. It creates and deletes no document features.
+  moves fit points in place. Before its first mutation it also verifies that
+  the tagged throat face remains in the component-local link frame. It creates
+  and deletes no document features.
 - **Audit** reports bundle/link state, pushed-parameter drift, source tag state,
-  feature health, and evidence that the managed body is unmodified, modified,
-  missing, or unknown.
+  feature health, the measured link-frame offset, and evidence that the managed
+  body is unmodified, modified, missing, or unknown.
 - **Relink** records a moved or renamed bundle path. The design id must match
   unless the caller explicitly forces the operation.
 - **Detach** removes `WGLink` attributes only. Bodies, sketches, features, and
@@ -63,9 +80,20 @@ to guess.
 Fusion offers no transaction covering parameter edits and sketch fit-point
 moves. WGLink validates identity, build mode, bundle content, resampler output,
 ring counts, points per ring, interface sketches, and rollback availability
-before the first mutation. It then performs one rolled-back pass and restores
-the timeline marker for a single recompute. A progress JSON file is written
-after every ring.
+before the first mutation. It also compares the tagged throat face centre with
+`(0, vertical_offset)` and its plane with the stored throat z. If a body Move
+has carried the body away from its own datums, Update reports the measured
+x/y/plane-z offset and refuses. Undo the body Move, or use **Detach** if the
+geometry is now genuinely user-owned. Head-less callers can pass `force=True`
+when proceeding is intentional. It then performs one rolled-back pass and
+restores the timeline marker for a single recompute. A progress JSON file is
+written after every ring.
+
+The frame guard is deliberately component-local. Moving the whole wrapper
+component moves its body and managed datums together, is a legitimate assembly
+placement, and still passes. The guard only detects a body moved relative to
+those datums. Audit never refuses: it reports the offset and marks the local
+body state `modified` when the invariant fails.
 
 That is the strongest honest boundary Fusion exposes; it is not a database
 transaction. If a rebuild fails after mutation begins, use **Undo** to recover
@@ -106,9 +134,10 @@ Tritonia-V enclosure and asro68 freestanding, throwaway documents:
 
 | | measured |
 |---|---|
-| enclosure volume vs the mesher's own solid | **−0.013 %** on insert, **−0.015 %** after an update |
+| enclosure volume vs the mesher's own solid | **−0.0047 %** (53,558,269 mm³), one all-edge treatment |
+| enclosure face inventory | 3 planar-z, 8 at 45°, **8 at 54.7°** (three-way mitres), 8 vertical, 1 cavity |
 | enclosure bounding box | exact on all six faces, before and after |
-| cavity surface vs the mesher's grid, before the mouth face-extrude change | mean **0.009 mm**, p95 **0.001 mm**, max 0.23 mm |
+| cavity surface vs the mesher's grid | mean **0.00016 mm**, max **0.0012 mm** |
 | update | 2572 fit points moved, **0 features regressed**, including a user feature built on a managed datum |
 | source tag | one face, 506.70 mm², 0 strays, before and after |
 | freestanding solid vs the mesher's | −0.75 % (the mesher exports an opened throat; the native build has a driver plate) |
@@ -118,6 +147,11 @@ the mouth. It persisted as section density increased because the former axial
 duplicate mouth ring forced the fitted loft's end tangent. The loft now ends at
 the real mouth ring and a separate face extrude provides the punch-through;
 Fusion-side deviation and volume measurements for that change are pending.
+
+The one-feature enclosure measurement above is from the owner's hand-corrected
+document. The implementation enforces a twelve-edge input before creating the
+single treatment, but the add-in-built corner face inventory and resulting
+volume still require the Fusion verification fixture.
 
 **Not verified:** §5.6's moved-wrapper case. Setting `occurrence.transform2`
 from a script reads the new matrix straight back, but after

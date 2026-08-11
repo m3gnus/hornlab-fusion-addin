@@ -753,6 +753,28 @@ def test_manual_mm_clamp_estimate_uses_explicit_mm_caps():
     assert clamped["HF"] == pytest.approx(343000.0 / (6.0 * 30.0), rel=1e-3)
 
 
+def test_load_sizing_names_every_location_when_mesher_is_unavailable(
+    tmp_path, monkeypatch
+):
+    helper = _load_helper()
+    override_dir = tmp_path / "missing-override"
+    addin_repo = tmp_path / "hornlab-fusion-addin"
+    sibling_dir = tmp_path / "hornlab-waveguide-mesher" / "hornlab_mesher"
+    monkeypatch.setenv("HORNLAB_MESHER_DIR", str(override_dir))
+    monkeypatch.setattr(helper.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(helper, "FUSION_ADDIN_REPO_ROOT", addin_repo)
+    monkeypatch.delitem(sys.modules, "mesh_sizing", raising=False)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        helper._load_sizing()
+
+    message = str(exc_info.value)
+    assert "mesh_sizing.py was not found" in message
+    assert f"HORNLAB_MESHER_DIR={override_dir}" in message
+    assert "installed hornlab_mesher package (not found)" in message
+    assert f"sibling checkout at {sibling_dir}" in message
+
+
 def test_estimate_design_mesh_cost_sizes_by_role():
     helper = _load_helper()
 

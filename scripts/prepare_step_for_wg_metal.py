@@ -66,9 +66,7 @@ except (ImportError, ModuleNotFoundError) as exc:
         "requirements.txt"
     ) from exc
 
-# Shared pure-Python sizing/cost predictor, also imported by the Fusion add-in.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import wg_mesh_sizing as sizing  # noqa: E402
+from hornlab_mesher import mesh_sizing as sizing
 
 
 SOURCE_TAG_BASE = 2

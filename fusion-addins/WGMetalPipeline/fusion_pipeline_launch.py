@@ -7,6 +7,7 @@ launch metadata can be checked outside Fusion.
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import math
 import os
@@ -674,13 +675,55 @@ def estimate_clamped_solve_band(
 
 
 def _load_sizing():
-    """Import the shared pure-Python sizing helper from the repo's scripts/."""
-    scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-    import wg_mesh_sizing  # noqa: E402
+    """Import the shared stdlib-only sizing module without package imports."""
+    tried = []
+    candidates = []
 
-    return wg_mesh_sizing
+    override = os.environ.get("HORNLAB_MESHER_DIR")
+    if override:
+        override_dir = Path(override).expanduser()
+        candidates.append(override_dir)
+        tried.append(f"HORNLAB_MESHER_DIR={override_dir}")
+    else:
+        tried.append("HORNLAB_MESHER_DIR (not set)")
+
+    try:
+        package_spec = importlib.util.find_spec("hornlab_mesher")
+    except (ImportError, AttributeError, ValueError):
+        package_spec = None
+    if package_spec is not None and package_spec.submodule_search_locations:
+        installed_dir = Path(next(iter(package_spec.submodule_search_locations)))
+        candidates.append(installed_dir)
+        tried.append(f"installed hornlab_mesher package at {installed_dir}")
+    else:
+        tried.append("installed hornlab_mesher package (not found)")
+
+    sibling_dir = (
+        FUSION_ADDIN_REPO_ROOT.parent
+        / "hornlab-waveguide-mesher"
+        / "hornlab_mesher"
+    )
+    candidates.append(sibling_dir)
+    tried.append(f"sibling checkout at {sibling_dir}")
+
+    sizing_dir = next(
+        (candidate for candidate in candidates if (candidate / "mesh_sizing.py").is_file()),
+        None,
+    )
+    if sizing_dir is None:
+        raise RuntimeError(
+            "HornLab mesh sizing is unavailable: mesh_sizing.py was not found. "
+            f"Tried: {'; '.join(tried)}. Set HORNLAB_MESHER_DIR to the "
+            "hornlab_mesher package directory."
+        )
+
+    if str(sizing_dir) not in sys.path:
+        sys.path.insert(0, str(sizing_dir))
+    # This must remain a plain import: dataclasses in Fusion's Python 3.14
+    # resolves the class module through sys.modules while applying @dataclass.
+    import mesh_sizing  # noqa: E402
+
+    return mesh_sizing
 
 
 def estimate_design_mesh_cost(

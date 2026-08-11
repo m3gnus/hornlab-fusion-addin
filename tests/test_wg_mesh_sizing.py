@@ -8,11 +8,11 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "wg_mesh_sizing.py"
+SCRIPT = ROOT.parent / "hornlab-waveguide-mesher" / "hornlab_mesher" / "mesh_sizing.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("wg_mesh_sizing", SCRIPT)
+    spec = importlib.util.spec_from_file_location("mesh_sizing", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

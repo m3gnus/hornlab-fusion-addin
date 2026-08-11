@@ -37,7 +37,7 @@ if ADDIN_DIR.is_dir() and str(ADDIN_DIR) not in sys.path:
     sys.path.insert(0, str(ADDIN_DIR))
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-import wg_mesh_sizing as sizing  # noqa: E402
+from hornlab_mesher import mesh_sizing as sizing  # noqa: E402
 from fusion_pipeline_launch import (  # noqa: E402
     RUN_MANIFESTS_DIR_NAME,
     build_source_specs,
@@ -364,7 +364,7 @@ def _solve_preflight(
         "estimated_wall_seconds_total": seconds_per_frequency * frequency_count,
         "frequency_count": frequency_count,
         "formula": "dense matrix RAM = N^2 * 16 bytes (complex128)",
-        "estimator": "wg_mesh_sizing.solve_seconds_per_freq",
+        "estimator": "hornlab_mesher.mesh_sizing.solve_seconds_per_freq",
     }
 
 

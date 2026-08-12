@@ -59,6 +59,11 @@ _handlers: list[object] = []
 _definitions: list[object] = []
 _controls: list[object] = []
 _panel = None
+# False while another registration of this add-in owns the panel. Fusion loads
+# each registered path as its own module with its own globals, so two
+# registrations of one add-in are two instances that cannot see each other's
+# state -- only the panel they share.
+_owned = False
 
 
 def _app() -> object:
@@ -458,14 +463,38 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
+def _installed_control_count(panel: object) -> int:
+    try:
+        controls = panel.controls
+    except Exception:  # noqa: BLE001 - an unreadable panel counts as not installed
+        return 0
+    # Fusion exposes count as an int property; a list-like collection exposes it
+    # as a method, so only trust the attribute when it is already a number.
+    count = getattr(controls, "count", None)
+    if isinstance(count, int):
+        return count
+    try:
+        return len(controls)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def run(_context: object) -> None:
-    global _panel
+    global _panel, _owned
     try:
         ui = _ui()
         if ui is None:
             return
         workspace = _workspace(ui)
         stale_panel = workspace.toolbarPanels.itemById(PANEL_ID)
+        if stale_panel and _installed_control_count(stale_panel):
+            # Another registration of this same add-in already built the panel.
+            # Rebuilding it here would delete definitions that instance owns and
+            # leave the toolbar holding dead buttons, so adopt it and stay out of
+            # the way. Nothing is torn down on stop either -- see _owned.
+            _panel = stale_panel
+            _owned = False
+            return
         if stale_panel:
             _delete_quietly(stale_panel)
         _panel = workspace.toolbarPanels.add(
@@ -474,6 +503,9 @@ def run(_context: object) -> None:
             "SolidScriptsAddinsPanel",
             False,
         )
+        # Claimed before the buttons go on, so a start that fails partway still
+        # tears its own half-built panel down on stop.
+        _owned = True
         for operation, (command_id, name, description) in COMMANDS.items():
             stale = ui.commandDefinitions.itemById(command_id)
             if stale:
@@ -494,8 +526,15 @@ def run(_context: object) -> None:
 
 
 def stop(_context: object) -> None:
-    global _panel
+    global _panel, _owned
     try:
+        if not _owned:
+            # A panel this instance adopted belongs to another registration.
+            # Deleting the command definitions by id would strip that instance's
+            # live buttons, which is how a duplicate registration used to leave
+            # WGLink showing a panel whose commands did nothing.
+            _panel = None
+            return
         for control in reversed(_controls):
             _delete_quietly(control)
         _controls.clear()
@@ -508,6 +547,7 @@ def stop(_context: object) -> None:
                 _delete_quietly(ui.commandDefinitions.itemById(command_id))
         _delete_quietly(_panel)
         _panel = None
+        _owned = False
         _handlers.clear()
     except Exception:  # noqa: BLE001
         _message(traceback.format_exc(), "WGLink stop error")

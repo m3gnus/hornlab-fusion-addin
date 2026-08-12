@@ -18,11 +18,14 @@ if str(ADDIN_DIR) not in sys.path:
 import wglink_core  # noqa: E402
 import wglink_send  # noqa: E402
 import wglink_watch  # noqa: E402
+import wglink_workspace  # noqa: E402
 from wglink_bundle import format_measurement_mm  # noqa: E402
 
 
 PANEL_ID = "hornlab_wglink_panel"
 PANEL_NAME = "WGLink"
+BROWSE_FOLDER = "Browse for a bundle folder…"
+BROWSE_ZIP = "Browse for a zipped .wglink file…"
 SETTINGS_PATH = Path.home() / ".hornlab" / "WGLink" / "settings.json"
 COMMANDS = {
     "insert": (
@@ -113,14 +116,42 @@ def _save_settings(settings: dict[str, object]) -> None:
         pass
 
 
+def _discovered_bundles() -> list:
+    try:
+        return wglink_workspace.discover_bundles()
+    except Exception:  # noqa: BLE001 - discovery is a convenience, never a gate
+        return []
+
+
+def _resolve_source(source_kind: str) -> tuple[str, str | None]:
+    """Turn a dropdown choice into either a chosen bundle or a dialog to open.
+
+    Returns ``(kind, path)``: a path means the workspace already answered the
+    question, and ``None`` means fall through to the picker.
+    """
+
+    if source_kind in {BROWSE_FOLDER, BROWSE_ZIP}:
+        return source_kind, None
+    for bundle in _discovered_bundles():
+        if bundle.label() == source_kind:
+            return BROWSE_FOLDER, str(bundle.path)
+    # A workspace that changed under an open dialog: ask rather than guess.
+    return BROWSE_FOLDER, None
+
+
 def _choose_bundle(title: str, source_kind: str) -> str | None:
     ui = _ui()
     if ui is None:
         return None
     settings = _load_settings()
-    previous = Path(str(settings.get("last_bundle_folder", Path.home()))).expanduser()
+    default_folder = wglink_workspace.bundle_folder()
+    previous = Path(
+        str(settings.get("last_bundle_folder", default_folder or Path.home()))
+    ).expanduser()
+    if not previous.is_dir() and default_folder is not None:
+        previous = default_folder
     initial = previous if previous.is_dir() else previous.parent
-    if source_kind == "Zipped .wglink file":
+    if source_kind == BROWSE_ZIP:
         dialog = ui.createFileDialog()
         dialog.title = title
         dialog.isMultiSelectEnabled = False
@@ -345,8 +376,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             inputs = args.command.commandInputs
             options = _command_options(inputs)
             if self.operation == "insert":
-                source_kind = _selected_name(inputs, "bundle_source", "Bundle folder")
-                path = _choose_bundle("Select a .wglink bundle to insert", source_kind)
+                kind, chosen = _resolve_source(
+                    _selected_name(inputs, "bundle_source", BROWSE_FOLDER)
+                )
+                path = chosen or _choose_bundle(
+                    "Select a .wglink bundle to insert", kind
+                )
                 if path is None:
                     return
                 report = wglink_core.insert(_app(), path, options)
@@ -363,8 +398,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     _save_settings(settings)
                 report = wglink_send.send(_app(), send_options)
             elif self.operation == "relink":
-                source_kind = _selected_name(inputs, "bundle_source", "Bundle folder")
-                path = _choose_bundle("Select the relocated .wglink bundle", source_kind)
+                kind, chosen = _resolve_source(
+                    _selected_name(inputs, "bundle_source", BROWSE_FOLDER)
+                )
+                path = chosen or _choose_bundle(
+                    "Select the relocated .wglink bundle", kind
+                )
                 if path is None:
                     return
                 report = wglink_core.relink(_app(), path, options)
@@ -440,8 +479,14 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     "Bundle source",
                     adsk.core.DropDownStyles.TextListDropDownStyle,
                 )
-                source.listItems.add("Bundle folder", True)
-                source.listItems.add("Zipped .wglink file", False)
+                # Bundles already sitting in WG's workspace come first, so the
+                # ordinary case needs no file dialog and no second copy of a
+                # folder the user set once in WG.
+                discovered = _discovered_bundles()
+                for index, bundle in enumerate(discovered):
+                    source.listItems.add(bundle.label(), index == 0)
+                source.listItems.add(BROWSE_FOLDER, not discovered)
+                source.listItems.add(BROWSE_ZIP, False)
             if self.operation not in {"insert", "send"}:
                 inputs.addStringValueInput(
                     "instance_id",

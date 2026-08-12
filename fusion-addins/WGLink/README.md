@@ -56,8 +56,9 @@ The supported reference layer is:
 
 ## Commands
 
-- **Insert** selects a bundle folder, validates it before Fusion mutation, and
-  builds the full WG viewport model.
+- **Insert** offers the bundles already sitting in Waveguide Generator's
+  workspace, validates the chosen one before Fusion mutation, and builds the
+  full WG viewport model.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
   moves fit points in place. Before its first mutation it also verifies that
@@ -75,6 +76,21 @@ The supported reference layer is:
   unless the caller explicitly forces the operation.
 - **Detach** removes `WGLink` attributes only. Bodies, sketches, features, and
   appearances remain in the document.
+
+## The workspace is WG's setting
+
+The workspace folder is chosen once, in Waveguide Generator. WGLink reads it
+from WG's own `workspace_settings.json` — resolved the way WG resolves it,
+`WG2_DATA_DIR` included — and lists the bundles in `<workspace>/wglink` in the
+Insert and Relink dropdowns, newest first, labelled by design name and export
+sequence. Nothing is ever written back to that file.
+
+There is deliberately no second copy of the folder here. Storing one made the
+first insert a two-place setup and let the two settings disagree, which inserts
+a bundle WG is no longer writing to. When the workspace cannot be read — WG
+never ran, the folder is on a disconnected drive, the bundle came from another
+machine — the dropdown falls back to the browse entries and the manual picker
+behaves as it always did.
 
 Insert and Relink remember the last bundle folder; Send remembers its last
 output folder. When a document has multiple links, enter the instance id in the

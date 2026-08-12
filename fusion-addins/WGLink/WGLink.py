@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -86,6 +87,11 @@ _command_busy = False
 # later Send carries a new export id and is attempted normally.
 _handoff_attempted_id: str | None = None
 _watch_session_id = str(uuid.uuid4())
+
+
+def _fingerprint_hash(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _app() -> object:
@@ -566,6 +572,22 @@ def _document_links() -> list[dict[str, str]]:
     except Exception:  # noqa: BLE001 - a document we cannot read has no links
         return []
     links: list[dict[str, str]] = []
+    first_instance = next(iter(sorted(records)), None)
+    try:
+        return_state = wglink_send.return_state(
+            app,
+            {
+                "selection": "root",
+                **({"anchor_instance_id": first_instance} if first_instance else {}),
+            },
+        )
+        document_signature_hash = str(return_state.get("hash") or "")
+        document_body_count = str(return_state.get("body_count") or "")
+        source_state_hash = str(return_state.get("source_hash") or "")
+    except Exception:  # noqa: BLE001 - advisory heartbeat may omit the token
+        document_signature_hash = ""
+        document_body_count = ""
+        source_state_hash = ""
     for instance_id, record in records.items():
         payload = record.get("payload") or {}
         try:
@@ -587,9 +609,14 @@ def _document_links() -> list[dict[str, str]]:
         try:
             parameter_drift_count = len(wglink_core._parameter_drift(design, record))
             local_body_state = wglink_core._local_body_state(record)
+            body = record.get("body")
+            body_fingerprint = (
+                wglink_core._body_fingerprint(body) if body is not None else None
+            )
         except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
             parameter_drift_count = 0
             local_body_state = "unknown"
+            body_fingerprint = None
         links.append({
             "instance_id": str(instance_id),
             "bundle_path": str(payload.get("bundle_path") or ""),
@@ -603,10 +630,30 @@ def _document_links() -> list[dict[str, str]]:
             "parameter_count": str(parameter_count),
             "parameter_drift_count": str(parameter_drift_count),
             "local_body_state": str(local_body_state),
+            "body_fingerprint_hash": (
+                _fingerprint_hash(body_fingerprint) if body_fingerprint else ""
+            ),
+            "document_signature_hash": document_signature_hash,
+            "document_body_count": document_body_count,
+            "source_state_hash": source_state_hash,
             "export_id": str(payload.get("export_id") or ""),
             "export_sequence": str(payload.get("export_sequence") or ""),
         })
     return links
+
+
+def _active_document_id() -> str | None:
+    app = _app()
+    document = getattr(app, "activeDocument", None) if app else None
+    if document is None:
+        return None
+    try:
+        native_id = str(document.dataFile.id or "").strip()
+        if native_id:
+            return f"fusion:{native_id}"
+    except Exception:  # noqa: BLE001 - unsaved local document
+        pass
+    return f"local:{_watch_session_id}:{id(document)}"
 
 
 def _publish_fusion_status() -> None:
@@ -629,6 +676,7 @@ def _publish_fusion_status() -> None:
             folder,
             session_id=_watch_session_id,
             document_name=document_name,
+            document_id=_active_document_id(),
             links=links,
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
@@ -666,6 +714,73 @@ def _pending_handoff() -> wglink_watch.PendingHandoff | None:
         ipc / wglink_watch.HANDOFF_FILENAME,
         bundle_root=bundles,
     )
+
+
+def _pending_return_request() -> wglink_watch.PendingReturnRequest | None:
+    ipc = wglink_workspace.ipc_folder(create=True)
+    if ipc is None:
+        return None
+    return wglink_watch.read_return_request(
+        ipc / wglink_watch.RETURN_REQUEST_FILENAME,
+        session_id=_watch_session_id,
+    )
+
+
+def _apply_pending_return_request() -> bool:
+    """Export the current Fusion body/tags after an explicit WG request."""
+
+    global _command_busy
+    request = _pending_return_request()
+    if request is None:
+        return False
+    _command_busy = True
+    try:
+        if not request.design_id or not request.document_id or not request.instance_id:
+            raise wglink_core.WgLinkError(
+                "WG return request is missing an exact document and link target. Refresh CAD Link and try again."
+            )
+        if request.document_id != _active_document_id():
+            raise wglink_core.WgLinkError(
+                "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again."
+            )
+        matching = [
+            link for link in _document_links()
+            if link.get("design_id") == request.design_id
+            and link.get("instance_id") == request.instance_id
+        ]
+        if len(matching) != 1:
+            raise wglink_core.WgLinkError(
+                "The active Fusion document no longer contains the exact WG link requested by WG."
+            )
+        current_state_hash = str(matching[0].get("document_signature_hash") or "")
+        if (
+            request.expected_return_state_hash
+            and current_state_hash != request.expected_return_state_hash
+        ):
+            raise wglink_core.WgLinkError(
+                "The Fusion model changed after WG displayed its status. Refresh CAD Link and try again."
+            )
+        output = wglink_workspace.return_folder()
+        if output is None:
+            raise wglink_core.WgLinkError(
+                "Waveguide Generator has no selected return workspace."
+            )
+        options: dict[str, object] = {
+            "selection": "root",
+            "output_folder": str(output),
+            "overwrite": True,
+            "request_id": request.request_id,
+            "anchor_instance_id": request.instance_id,
+        }
+        wglink_send.send(_app(), options)
+        wglink_watch.acknowledge_return_request(request)
+    except wglink_core.WgLinkError as exc:
+        _message(str(exc), "WGLink return to WG refused")
+    except Exception:  # noqa: BLE001 - main-thread add-in boundary
+        _message(traceback.format_exc(), "WGLink return to WG error")
+    finally:
+        _command_busy = False
+    return True
 
 
 def _design_ready() -> bool:
@@ -732,11 +847,28 @@ def _apply_pending_handoff() -> bool:
     _handoff_attempted_id = handoff.export_id
     _command_busy = True
     try:
+        if handoff.expected_document_id:
+            if handoff.expected_document_id != _active_document_id():
+                raise wglink_core.WgLinkError(
+                    "The active Fusion document changed after WG prepared this update. Refresh CAD Link and try again."
+                )
+            if len(linked) != 1:
+                raise wglink_core.WgLinkError(
+                    "The active Fusion document no longer contains exactly one matching WG link. Refresh CAD Link and try again."
+                )
         if linked:
             # One design identity can appear more than once in an assembly.
             # An explicit WG update targets the first active-document instance;
             # never silently rewrite every copy.
             link = linked[0]
+            current_state_hash = str(link.get("document_signature_hash") or "")
+            if (
+                handoff.expected_return_state_hash
+                and current_state_hash != handoff.expected_return_state_hash
+            ):
+                raise wglink_core.WgLinkError(
+                    "The Fusion model changed after WG prepared this update. Refresh CAD Link and choose a sync direction again."
+                )
             if link.get("export_id") != handoff.export_id:
                 wglink_core.update(
                     _app(),
@@ -778,6 +910,8 @@ def _on_watch_tick() -> None:
     _publish_fusion_status()
     try:
         if _apply_pending_handoff():
+            return
+        if _apply_pending_return_request():
             return
         announcements = _watcher.survey(_document_links())
         if not announcements:

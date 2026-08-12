@@ -49,6 +49,8 @@ def _handoff(root: Path, bundle: Path, export_id: str = "wge_2") -> Path:
             "exportId": export_id,
             "sequence": 2,
             "designId": "wgd_a",
+            "expectedDocumentId": "fusion:doc-a",
+            "expectedReturnStateHash": "sha256:return-state",
         }),
         encoding="utf-8",
     )
@@ -66,6 +68,8 @@ def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> No
     assert handoff.export_id == "wge_2"
     assert handoff.sequence == "2"
     assert handoff.design_id == "wgd_a"
+    assert handoff.expected_document_id == "fusion:doc-a"
+    assert handoff.expected_return_state_hash == "sha256:return-state"
     assert wglink_watch.acknowledge_handoff(handoff) is True
     assert not marker.exists()
 
@@ -98,6 +102,10 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
             "parameter_count": "14",
             "parameter_drift_count": "2",
             "local_body_state": "modified",
+            "body_fingerprint_hash": "sha256:body",
+            "document_signature_hash": "sha256:return-state",
+            "document_body_count": "3",
+            "source_state_hash": "sha256:sources",
             "export_id": "wge_a",
         }],
         updated_at=datetime(2026, 8, 12, 15, 30, tzinfo=timezone.utc),
@@ -120,10 +128,38 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         "parameterCount": 14,
         "parameterDriftCount": 2,
         "localBodyState": "modified",
+        "bodyFingerprintHash": "sha256:body",
+        "documentSignatureHash": "sha256:return-state",
+        "documentBodyCount": 3,
+        "sourceStateHash": "sha256:sources",
     }
     assert list(tmp_path.glob(f"{wglink_watch.FUSION_STATUS_FILENAME}.*")) == []
     assert wglink_watch.remove_fusion_status(tmp_path, session_id="other") is False
     assert wglink_watch.remove_fusion_status(tmp_path, session_id="session-a") is True
+    assert not marker.exists()
+
+
+def test_return_request_is_targeted_to_one_addin_session_and_acknowledged(tmp_path: Path) -> None:
+    marker = tmp_path / wglink_watch.RETURN_REQUEST_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "requestId": "request-a",
+        "sessionId": "session-a",
+        "designId": "wgd_a",
+        "documentId": "fusion:doc-a",
+        "instanceId": "instance-a",
+        "expectedReturnStateHash": "sha256:return-state",
+    }))
+
+    assert wglink_watch.read_return_request(marker, session_id="other") is None
+    request = wglink_watch.read_return_request(marker, session_id="session-a")
+    assert request is not None
+    assert request.design_id == "wgd_a"
+    assert request.document_id == "fusion:doc-a"
+    assert request.instance_id == "instance-a"
+    assert request.expected_return_state_hash == "sha256:return-state"
+    assert wglink_watch.acknowledge_return_request(request) is True
     assert not marker.exists()
 
 

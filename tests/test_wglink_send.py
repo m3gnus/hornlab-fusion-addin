@@ -203,6 +203,16 @@ def test_user_source_inventory_converts_area_and_excludes_claimed_throat(send_mo
     assert all("advanced_face_indices" not in source["selectors"] for source in sources)
 
 
+def test_shape_fingerprint_includes_source_roles_and_face_geometry(send_module):
+    candidate = body("speaker", faces=[face("MF", area=2.5)])
+
+    fingerprint = send_module._shape_fingerprint(candidate)
+
+    assert fingerprint["face_count"] == 1
+    assert fingerprint["faces"][0]["source_role"] == "MF"
+    assert fingerprint["faces"][0]["area_mm2"] == pytest.approx(250.0)
+
+
 def test_full_unlinked_send_writes_valid_atomic_bundle(send_module, tmp_path, monkeypatch):
     painted = face("LF", area=2.5)
     exterior = body("cabinet", faces=[painted])

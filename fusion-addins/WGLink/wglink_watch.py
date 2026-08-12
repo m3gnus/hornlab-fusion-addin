@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping
 
 HANDOFF_FILENAME = ".fusion-handoff.json"
 FUSION_STATUS_FILENAME = ".fusion-status.json"
+RETURN_REQUEST_FILENAME = ".fusion-return-request.json"
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,62 @@ class PendingHandoff:
     export_id: str
     sequence: str
     design_id: str
+    expected_document_id: str
+    expected_return_state_hash: str
+
+
+@dataclass(frozen=True)
+class PendingReturnRequest:
+    """A request from WG to export the active Fusion document back to WG."""
+
+    marker_path: Path
+    request_id: str
+    session_id: str
+    design_id: str
+    document_id: str
+    instance_id: str
+    expected_return_state_hash: str
+
+
+def read_return_request(
+    marker_path: Path, *, session_id: str
+) -> PendingReturnRequest | None:
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    request_id = payload.get("requestId")
+    target_session = payload.get("sessionId")
+    if (
+        payload.get("schemaVersion") != 1
+        or payload.get("target") != "fusion360"
+        or not isinstance(request_id, str)
+        or not request_id
+        or target_session != session_id
+    ):
+        return None
+    return PendingReturnRequest(
+        marker_path=marker_path,
+        request_id=request_id,
+        session_id=session_id,
+        design_id=str(payload.get("designId") or ""),
+        document_id=str(payload.get("documentId") or ""),
+        instance_id=str(payload.get("instanceId") or ""),
+        expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
+    )
+
+
+def acknowledge_return_request(request: PendingReturnRequest) -> bool:
+    current = read_return_request(request.marker_path, session_id=request.session_id)
+    if current is None or current.request_id != request.request_id:
+        return False
+    try:
+        request.marker_path.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def read_pending_handoff(
@@ -91,6 +148,8 @@ def read_pending_handoff(
         export_id=str(export_id),
         sequence="" if sequence is None else str(sequence),
         design_id=str(payload.get("designId") or ""),
+        expected_document_id=str(payload.get("expectedDocumentId") or ""),
+        expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
     )
 
 
@@ -116,6 +175,7 @@ def write_fusion_status(
     *,
     session_id: str,
     document_name: str | None,
+    document_id: str | None = None,
     links: Iterable[Mapping[str, Any]],
     updated_at: datetime | None = None,
 ) -> Path:
@@ -137,6 +197,10 @@ def write_fusion_status(
         "parameter_count": "parameterCount",
         "parameter_drift_count": "parameterDriftCount",
         "local_body_state": "localBodyState",
+        "body_fingerprint_hash": "bodyFingerprintHash",
+        "document_signature_hash": "documentSignatureHash",
+        "document_body_count": "documentBodyCount",
+        "source_state_hash": "sourceStateHash",
         "export_id": "exportId",
         "export_sequence": "exportSequence",
     }
@@ -158,6 +222,10 @@ def write_fusion_status(
             record["parameterDriftCount"] = int(record["parameterDriftCount"] or 0)
         except (TypeError, ValueError):
             record["parameterDriftCount"] = 0
+        try:
+            record["documentBodyCount"] = int(record["documentBodyCount"] or 0)
+        except (TypeError, ValueError):
+            record["documentBodyCount"] = 0
         copied.append(record)
     timestamp = (updated_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     payload = {
@@ -166,7 +234,7 @@ def write_fusion_status(
         "sessionId": str(session_id),
         "updatedAt": timestamp.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "document": (
-            {"name": document_name, "links": copied}
+            {"name": document_name, "id": document_id, "links": copied}
             if document_name is not None
             else None
         ),

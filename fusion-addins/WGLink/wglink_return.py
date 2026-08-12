@@ -924,6 +924,8 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
     _string(document["name"], label="document.name")
     if "native_id" in document:
         _string(document["native_id"], label="document.native_id", nullable=True)
+    if "request_id" in document:
+        _string(document["request_id"], label="document.request_id", nullable=True)
 
     coordinate = _mapping(root["coordinate_system"], label="coordinate_system")
     _required(

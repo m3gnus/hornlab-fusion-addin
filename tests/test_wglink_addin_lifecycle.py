@@ -487,6 +487,79 @@ def test_a_pending_update_targets_design_identity_after_bundle_move(
     assert not marker.exists()
 
 
+def test_a_targeted_return_refuses_if_the_active_document_changed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Other document")
+    module = _load_instance(monkeypatch, "WGLink_return_wrong_document", ui, app)
+    request = types.SimpleNamespace(
+        design_id="wgd-a",
+        document_id="fusion:expected",
+        instance_id="instance-a",
+        expected_return_state_hash="sha256:state-a",
+        request_id="request-a",
+    )
+    monkeypatch.setattr(module, "_pending_return_request", lambda: request)
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:other")
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+
+    assert module._apply_pending_return_request() is True
+
+    assert sent == []
+    assert ui.messages == [(
+        "WGLink return to WG refused",
+        "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again.",
+    )]
+
+
+def test_a_targeted_return_exports_only_the_exact_live_link(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_return_exact_document", ui, app)
+    request = types.SimpleNamespace(
+        design_id="wgd-a",
+        document_id="fusion:doc-a",
+        instance_id="instance-a",
+        expected_return_state_hash="sha256:state-a",
+        request_id="request-a",
+    )
+    monkeypatch.setattr(module, "_pending_return_request", lambda: request)
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda: [{
+        "design_id": "wgd-a", "instance_id": "instance-a",
+        "document_signature_hash": "sha256:state-a",
+    }])
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+    acknowledged: list[object] = []
+    monkeypatch.setattr(module.wglink_watch, "acknowledge_return_request", acknowledged.append)
+
+    assert module._apply_pending_return_request() is True
+
+    assert sent == [{
+        "selection": "root",
+        "output_folder": str(tmp_path),
+        "overwrite": True,
+        "request_id": "request-a",
+        "anchor_instance_id": "instance-a",
+    }]
+    assert acknowledged == [request]
+    assert ui.messages == []
+
+
 def test_a_refused_automatic_insert_is_not_retried_every_tick(
     monkeypatch, tmp_path: Path
 ) -> None:

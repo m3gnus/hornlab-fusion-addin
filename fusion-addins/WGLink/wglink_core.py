@@ -3066,6 +3066,48 @@ def _parameter_drift(design: object, record: dict[str, Any]) -> list[dict[str, o
     return drift
 
 
+def _observed_parameters(design: object, record: dict[str, Any]) -> list[dict[str, object]]:
+    """Read the live values for every WG-managed Fusion parameter."""
+
+    expected = _stored_json(record["payload"], "parameter_expressions", {})
+    if not isinstance(expected, dict):
+        return []
+    observed = []
+    for name, expected_expression in sorted(expected.items()):
+        parameter = design.userParameters.itemByName(str(name))
+        if parameter is None:
+            observed.append({
+                "name": str(name),
+                "expected_expression": str(expected_expression),
+                "expression": None,
+                "value": None,
+                "unit": None,
+            })
+            continue
+        try:
+            expression = str(parameter.expression)
+        except Exception:  # noqa: BLE001
+            expression = None
+        try:
+            value = float(parameter.value)
+            if not math.isfinite(value):
+                value = None
+        except Exception:  # noqa: BLE001
+            value = None
+        try:
+            unit = str(parameter.unit or "") or None
+        except Exception:  # noqa: BLE001
+            unit = None
+        observed.append({
+            "name": str(name),
+            "expected_expression": str(expected_expression),
+            "expression": expression,
+            "value": value,
+            "unit": unit,
+        })
+    return observed
+
+
 def _ground_to_parent(design: object, record: dict[str, Any]) -> bool:
     if record.get("payload", {}).get("wrapper") == "root":
         return False

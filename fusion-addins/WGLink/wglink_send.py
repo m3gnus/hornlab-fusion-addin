@@ -56,6 +56,45 @@ def _adapter_version() -> str:
 ADAPTER_VERSION = _adapter_version()
 
 
+def _canonical_hash(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _shape_fingerprint(body: object) -> dict[str, Any]:
+    """A deterministic, transform-aware shape summary for live change detection."""
+
+    faces = []
+    for face in wglink_core._items(getattr(body, "faces", None)):
+        try:
+            box = face.boundingBox
+            face_box = [
+                float(box.minPoint.x) * 10.0,
+                float(box.minPoint.y) * 10.0,
+                float(box.minPoint.z) * 10.0,
+                float(box.maxPoint.x) * 10.0,
+                float(box.maxPoint.y) * 10.0,
+                float(box.maxPoint.z) * 10.0,
+            ]
+            faces.append({
+                "area_mm2": float(face.area) * 100.0,
+                "bbox_mm": face_box,
+                "source_role": _face_role(face),
+            })
+        except Exception:  # noqa: BLE001 - one unreadable face degrades the token
+            faces.append({"unreadable": True})
+    faces.sort(key=lambda value: json.dumps(value, sort_keys=True))
+    return {
+        **wglink_core._body_fingerprint(body),
+        "revision_id": str(getattr(body, "revisionId", "") or "") or None,
+        "face_count": len(faces),
+        "edge_count": len(wglink_core._items(getattr(body, "edges", None))),
+        "faces": faces,
+    }
+
+
 def declare_body(body: object, declaration: str) -> None:
     """Set or replace the explicit return classification on one body."""
 
@@ -495,6 +534,98 @@ def inspect_scope(app: object, options: dict[str, Any] | None = None) -> dict[st
     }
 
 
+def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Fingerprint the same root assembly, sources, and parameters a return exports.
+
+    This deliberately does not write STEP. It runs on Fusion's main thread and
+    gives WG a cheap optimistic-concurrency token for the live CAD document.
+    """
+
+    opts = dict(options or {})
+    design = wglink_core._design(app)
+    walk = _scope_walk(design, opts.get("selection"))
+    records = _records_in_scope(design, walk)
+    instance_ids = [str(record["instance_id"]) for record in records]
+    requested_anchor = _nullable(opts.get("anchor_instance_id"))
+    if len(instance_ids) == 1:
+        anchor = instance_ids[0]
+    elif len(instance_ids) > 1:
+        if requested_anchor is None or str(requested_anchor) not in instance_ids:
+            return {"hash": None, "reason": "ambiguous-link-anchor"}
+        anchor = str(requested_anchor)
+    else:
+        anchor = None
+    for candidate in walk["candidates"]:
+        candidate["contains_solver_anchor"] = bool(
+            anchor and candidate.get("wglink_instance_id") == anchor
+        )
+    try:
+        scope = plan_export_scope(
+            walk["selection"], walk["candidates"]
+        ).manifest_scope()
+    except WgReturnError as exc:
+        return {"hash": None, "reason": str(exc)}
+    included_pairs = [
+        (item, walk["bodies"][item["object_id"]])
+        for item in scope["included"]
+        if item["object_id"] in walk["bodies"]
+    ]
+    if len(included_pairs) != len(scope["included"]):
+        return {"hash": None, "reason": "unresolved-included-body"}
+    for record in records:
+        source_body = next(
+            (
+                body
+                for included, body in included_pairs
+                if included.get("wglink_instance_id") == record["instance_id"]
+            ),
+            None,
+        )
+        if source_body is not None:
+            record["source_body"] = source_body
+    try:
+        sources = _sources(records, [body for _item, body in included_pairs])
+    except wglink_core.WgLinkError as exc:
+        return {"hash": None, "reason": str(exc)}
+    bodies = []
+    for item, body in included_pairs:
+        bodies.append({
+            "object_id": item["object_id"],
+            "path": item.get("path"),
+            "body_kind": item.get("body_kind"),
+            "wglink_instance_id": item.get("wglink_instance_id"),
+            "fingerprint": _shape_fingerprint(body),
+        })
+    instances = []
+    for record in records:
+        instances.append({
+            "instance_id": str(record["instance_id"]),
+            "design_id": str(record.get("payload", {}).get("design_id") or ""),
+            "assembly_from_link": _strict_assembly_from_link(design, record)[0],
+            "observed_parameters": wglink_core._observed_parameters(design, record),
+        })
+    source_state = [{
+        "id": source["id"],
+        "role": source["role"],
+        "instance_id": source.get("instance_id"),
+        "expected_connected_components": source["expected_connected_components"],
+        "observed": source["observed"],
+    } for source in sources]
+    state = {
+        "selection": scope["selection"],
+        "bodies": bodies,
+        "fem_air_volumes": scope["fem_air_volumes"],
+        "instances": instances,
+        "sources": source_state,
+    }
+    return {
+        "hash": _canonical_hash(state),
+        "body_count": len(bodies),
+        "source_hash": _canonical_hash(source_state),
+        "state": state,
+    }
+
+
 def _strict_matrix_rows(matrix: object, instance_id: str) -> list[list[float]]:
     if matrix is None:
         raise wglink_core.WgLinkError(
@@ -725,6 +856,7 @@ def _instance_record(design: object, record: dict[str, Any], observed_at: str) -
             "observed_at": observed_at,
         },
         "source_contract": _source_contract(design, record),
+        "observed_parameters": wglink_core._observed_parameters(design, record),
     }
     for key in ("design_id", "export_id", "build_mode", "parameter_prefix"):
         if result[key] is None:
@@ -1067,6 +1199,12 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     observed_at = _utc_timestamp()
     instance_records = [_instance_record(design, record, observed_at) for record in records]
     sources = _sources(records, included_bodies)
+    return_state_snapshot = return_state(app, options)
+    return_state_hash = return_state_snapshot.get("hash")
+    if not return_state_hash:
+        raise wglink_core.WgLinkError(
+            f"Could not fingerprint the Fusion return state: {return_state_snapshot.get('reason', 'unknown error')}."
+        )
     document_name, native_id = _document(app, design)
     output = Path(output_value).expanduser()
     try:
@@ -1075,7 +1213,9 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         raise wglink_core.WgLinkError(
             f"Could not create return output folder {output}: {exc}."
         ) from exc
-    target = output / f"{_safe_document_name(document_name)}.wgreturn"
+    request_id = _nullable(options.get("request_id"))
+    suffix = f"-{_safe_document_name(str(request_id))[:12]}" if request_id else ""
+    target = output / f"{_safe_document_name(document_name)}{suffix}.wgreturn"
     overwrite = bool(options.get("overwrite", False))
     if target.exists() and not target.is_dir():
         raise wglink_core.WgLinkError(
@@ -1133,12 +1273,17 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
                 "cad_app": "fusion360",
                 "cad_version": str(getattr(app, "version", "unknown") or "unknown"),
             },
-            document={"name": document_name, "native_id": native_id},
+            document={
+                "name": document_name,
+                "native_id": native_id,
+                **({"request_id": request_id} if request_id else {}),
+            },
             coordinate_system=coordinate,
             assembly={
                 "file": "assembly.step",
                 "n_bodies_expected": expected_count,
                 "bbox_mm": _bbox(included_bodies),
+                "signature_hash": return_state_hash,
             },
             files=files,
             scope=scope,

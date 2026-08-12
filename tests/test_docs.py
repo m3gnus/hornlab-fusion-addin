@@ -19,14 +19,14 @@ def test_dependency_pins_cover_required_solver_contracts():
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 
     assert (
-        "hornlab-metal-bem.git@469def27469bef411807be95539f8376d13177f6"
+        "hornlab-metal-bem.git@328f981d2ad37642a68be97a7ea2e46cb7b14683"
         in requirements
     )
     assert (
-        "hornlab-sim.git@dbc22732f51925393543c00987f54386fc64aecf"
+        "hornlab-sim.git@d6a0c36da229eb7d5a71823052b60f0a82847646"
         in requirements
     )
     assert (
-        "hornlab-plots.git@ea7c94f4d43672745455df97610b65af05c76348"
+        "hornlab-plots.git@a15bcf5b7498dd60437ef5f567e852af6f270c0b"
         in requirements
     )

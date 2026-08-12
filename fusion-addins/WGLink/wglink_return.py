@@ -600,6 +600,12 @@ def _member_name(value: object, *, label: str) -> str:
 def _check_forbidden_fields(value: object, *, path: str = "wgreturn") -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
+            # instances[].config is WG-authored provenance echoed byte-for-byte
+            # by CAD, not a CAD verdict. Its schema legitimately contains
+            # names such as "symmetry" and "tags" that are forbidden only in
+            # the CAD-evidence namespace surrounding it.
+            if key == "config" and path.startswith("wgreturn.instances["):
+                continue
             if isinstance(key, str) and key.lower() in _FORBIDDEN_EVIDENCE_KEYS:
                 raise WgReturnError(
                     f"{path}.{key} is WG-authored verdict data and must not appear "
@@ -671,6 +677,10 @@ def _validate_instance(value: object, *, index: int) -> str:
     for key in optional_strings:
         if key in record:
             _string(record[key], label=f"{label}.{key}", nullable=True)
+    if "formula" in record:
+        _string(record["formula"], label=f"{label}.formula", nullable=True)
+    if "config" in record and record["config"] is not None:
+        _mapping(record["config"], label=f"{label}.config")
     if "edit_version" in record and record["edit_version"] is not None:
         _integer(record["edit_version"], label=f"{label}.edit_version", minimum=1)
 

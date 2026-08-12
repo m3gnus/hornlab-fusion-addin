@@ -72,6 +72,8 @@ def test_the_selected_workspace_is_read_from_wg(tmp_path: Path) -> None:
     workspace.mkdir(parents=True)
     data = _wg_data_dir(tmp_path, workspace)
     assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) == workspace.resolve()
+    assert ws.return_folder(environ={ws.DATA_DIR_ENV: str(data)}) == workspace.resolve() / "wgreturn"
+    assert ws.ipc_folder(create=True, environ={ws.DATA_DIR_ENV: str(data)}) == data / "ipc" / "wglink"
 
 
 def test_wg_default_workspace_is_used_when_none_was_selected(tmp_path: Path) -> None:

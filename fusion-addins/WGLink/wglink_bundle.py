@@ -1250,6 +1250,10 @@ def attribute_payload(
         "design_hash": str(design.get("design_hash", "")),
         "design_id": identity.design_id,
         "design_name": str(design.get("name", "")),
+        "config_json": json.dumps(
+            design.get("config", {}), sort_keys=True, separators=(",", ":")
+        ),
+        "formula": str(design.get("formula", "")),
         "edit_version": str(design.get("edit_version", "")),
         "export_id": identity.export_id,
         "export_sequence": str(identity.export_sequence),

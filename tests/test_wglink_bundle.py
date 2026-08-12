@@ -152,6 +152,8 @@ def _manifest(*, include_placement: bool = True) -> dict:
         "enclosure": {"edge_type": 2, "plan_type": 1},
         "design": {
             "build_mode": "enclosure",
+            "config": {"formula": "R-OSSE", "R": {"value": 360, "raw": "180*2"}},
+            "formula": "r-osse",
             "id": "wgd_test",
             "lineage_id": "wgl_test",
         },
@@ -951,6 +953,11 @@ def test_attribute_payload_stores_document_topology(tmp_path):
     assert attributes["design_hash"] == ""
     assert attributes["edit_version"] == ""
     assert attributes["design_name"] == ""
+    assert attributes["formula"] == "r-osse"
+    assert json.loads(attributes["config_json"]) == {
+        "R": {"raw": "180*2", "value": 360},
+        "formula": "R-OSSE",
+    }
     assert "thicken_sign" not in attributes
     assert topology["has_outer"] is False
     assert topology["overshoot_mm"] == 0.0

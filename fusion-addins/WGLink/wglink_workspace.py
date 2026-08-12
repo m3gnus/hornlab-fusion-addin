@@ -29,6 +29,8 @@ APP_DIRECTORY = "WaveguideGenerator"
 SETTINGS_NAME = "workspace_settings.json"
 BUNDLE_SUBDIRECTORY = "wglink"
 BUNDLE_SUFFIX = ".wglink"
+RETURN_SUBDIRECTORY = "wgreturn"
+IPC_SUBDIRECTORY = Path("ipc") / "wglink"
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,34 @@ def bundle_folder(**kwargs: Any) -> Path | None:
     if root is None:
         return None
     folder = root / BUNDLE_SUBDIRECTORY
+    return folder if folder.is_dir() else None
+
+
+def return_folder(**kwargs: Any) -> Path | None:
+    """The folder WG reads CAD-authored returns from.
+
+    Unlike ``bundle_folder``, the folder does not have to exist yet: the Send
+    command creates it atomically with the first return.  Resolving this from
+    WG's selected workspace keeps the two applications on the same transport
+    path even when an old Fusion preference points somewhere else.
+    """
+
+    root = workspace_root(**kwargs)
+    return root / RETURN_SUBDIRECTORY if root is not None else None
+
+
+def ipc_folder(*, create: bool = False, **kwargs: Any) -> Path | None:
+    """Machine-local command/status transport; never place it in Dropbox."""
+
+    root = data_dir(**kwargs)
+    if root is None:
+        return None
+    folder = root / IPC_SUBDIRECTORY
+    if create:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
     return folder if folder.is_dir() else None
 
 

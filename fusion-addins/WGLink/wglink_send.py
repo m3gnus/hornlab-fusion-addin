@@ -617,6 +617,18 @@ def _stored_fingerprint(value: object) -> dict[str, Any] | None:
     return dict(parsed) if isinstance(parsed, dict) else None
 
 
+def _stored_config(value: object) -> dict[str, Any] | None:
+    """Decode the exact WG config snapshot stored on a managed instance."""
+
+    if value is None or value == "":
+        return None
+    try:
+        parsed = json.loads(str(value)) if not isinstance(value, dict) else value
+    except (TypeError, ValueError):
+        return None
+    return dict(parsed) if isinstance(parsed, dict) and parsed else None
+
+
 def _named(collection: object, name: str) -> object | None:
     try:
         found = collection.itemByName(name)
@@ -695,6 +707,8 @@ def _instance_record(design: object, record: dict[str, Any], observed_at: str) -
         "lineage_id": _nullable(payload.get("lineage_id")),
         "edit_version": _integer_echo(payload, "edit_version", required=False),
         "design_hash": _nullable(payload.get("design_hash")),
+        "formula": _nullable(payload.get("formula")),
+        "config": _stored_config(payload.get("config_json")),
         "export_id": _nullable(payload.get("export_id")),
         "export_sequence": _integer_echo(payload, "export_sequence", required=True),
         "geometry_hash": _nullable(payload.get("geometry_hash")),

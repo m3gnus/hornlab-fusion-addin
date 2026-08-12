@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import threading
 import traceback
+import uuid
 
 import adsk.core
 
@@ -84,6 +85,7 @@ _command_busy = False
 # this Fusion session instead of showing the same error every four seconds. A
 # later Send carries a new export id and is attempted normally.
 _handoff_attempted_id: str | None = None
+_watch_session_id = str(uuid.uuid4())
 
 
 def _app() -> object:
@@ -193,6 +195,15 @@ def _choose_return_folder(command_inputs: object) -> None:
     target = _input(command_inputs, "output_folder")
     if target is not None:
         target.value = str(dialog.folder)
+
+
+def _default_return_folder(settings: dict[str, object]) -> str:
+    """Prefer WG's live workspace over Fusion's historical picker value."""
+
+    workspace_return = wglink_workspace.return_folder()
+    if workspace_return is not None:
+        return str(workspace_return)
+    return str(settings.get("last_return_folder", Path.home()))
 
 
 def _input(command_inputs: object, name: str) -> object | None:
@@ -336,7 +347,8 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             f"Return bundle written: {report.get('bundle_path', '?')}\n"
             f"Return ID: {report.get('return_id', '?')}\n"
             f"Scope: {status}\n"
-            f"Sources: {len(report.get('sources', []))}"
+            f"Sources: {len(report.get('sources', []))}\n\n"
+            "Waveguide Generator will detect and open this return automatically."
         )
         if status == "degraded" and isinstance(scope, dict):
             skipped = scope.get("skipped", [])
@@ -457,9 +469,9 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 selection.addSelectionFilter("Occurrences")
                 selection.setSelectionLimits(0, 1)
                 settings = _load_settings()
-                default_folder = str(settings.get("last_return_folder", Path.home()))
+                default_folder = _default_return_folder(settings)
                 inputs.addStringValueInput(
-                    "output_folder", "Output folder", default_folder
+                    "output_folder", "WG return folder", default_folder
                 )
                 inputs.addBoolValueInput(
                     "browse_output_folder", "Browse output folder", False, "", False
@@ -471,7 +483,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 anchor.isVisible = False
                 inputs.addBoolValueInput(
-                    "overwrite", "Replace an existing return bundle", True, "", False
+                    "overwrite", "Replace an existing return bundle", True, "", True
                 )
                 _sync_anchor_choices(inputs)
                 changed = CommandInputChangedHandler()
@@ -556,12 +568,71 @@ def _document_links() -> list[dict[str, str]]:
     links: list[dict[str, str]] = []
     for instance_id, record in records.items():
         payload = record.get("payload") or {}
+        try:
+            stored_config = json.loads(str(payload.get("config_json") or ""))
+            config_present = isinstance(stored_config, dict) and bool(stored_config)
+        except (TypeError, ValueError):
+            config_present = False
+        try:
+            parameter_expressions = json.loads(
+                str(payload.get("parameter_expressions") or "{}")
+            )
+            parameter_count = (
+                len(parameter_expressions)
+                if isinstance(parameter_expressions, dict)
+                else 0
+            )
+        except (TypeError, ValueError):
+            parameter_count = 0
+        try:
+            parameter_drift_count = len(wglink_core._parameter_drift(design, record))
+            local_body_state = wglink_core._local_body_state(record)
+        except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
+            parameter_drift_count = 0
+            local_body_state = "unknown"
         links.append({
             "instance_id": str(instance_id),
             "bundle_path": str(payload.get("bundle_path") or ""),
+            "design_id": str(payload.get("design_id") or ""),
+            "lineage_id": str(payload.get("lineage_id") or ""),
+            "edit_version": str(payload.get("edit_version") or ""),
+            "design_hash": str(payload.get("design_hash") or ""),
+            "design_name": str(payload.get("design_name") or ""),
+            "formula": str(payload.get("formula") or ""),
+            "config_present": "true" if config_present else "false",
+            "parameter_count": str(parameter_count),
+            "parameter_drift_count": str(parameter_drift_count),
+            "local_body_state": str(local_body_state),
             "export_id": str(payload.get("export_id") or ""),
+            "export_sequence": str(payload.get("export_sequence") or ""),
         })
     return links
+
+
+def _publish_fusion_status() -> None:
+    """Best-effort presence for WG; every Fusion read stays on this thread."""
+
+    folder = wglink_workspace.ipc_folder(create=True)
+    if folder is None:
+        return
+    app = _app()
+    product = app.activeProduct if app else None
+    active_document = getattr(app, "activeDocument", None) if app else None
+    if active_document is None and product is None:
+        document_name = None
+        links: list[dict[str, str]] = []
+    else:
+        document_name = str(getattr(active_document, "name", "") or "Untitled")
+        links = _document_links()
+    try:
+        wglink_watch.write_fusion_status(
+            folder,
+            session_id=_watch_session_id,
+            document_name=document_name,
+            links=links,
+        )
+    except Exception:  # noqa: BLE001 - presence must never block CAD commands
+        pass
 
 
 def _apply_announced_updates(announcements: list) -> None:
@@ -587,11 +658,13 @@ def _apply_announced_updates(announcements: list) -> None:
 
 
 def _pending_handoff() -> wglink_watch.PendingHandoff | None:
-    folder = wglink_workspace.bundle_folder()
-    if folder is None:
+    ipc = wglink_workspace.ipc_folder(create=True)
+    bundles = wglink_workspace.bundle_folder()
+    if ipc is None or bundles is None:
         return None
     return wglink_watch.read_pending_handoff(
-        folder / wglink_watch.HANDOFF_FILENAME
+        ipc / wglink_watch.HANDOFF_FILENAME,
+        bundle_root=bundles,
     )
 
 
@@ -601,43 +674,83 @@ def _design_ready() -> bool:
     return bool(design and "Design" in str(getattr(design, "objectType", "")))
 
 
-def _apply_pending_handoff() -> bool:
-    """Insert a new send, or route an existing link to the update watcher.
+def _ensure_design_ready() -> bool:
+    """Create a Fusion Design document for an explicit WG handoff if needed."""
 
-    Returns true when this tick is fully handled.  A pending export for a bundle
-    already linked in the active document is merely acknowledged here; the
-    ordinary watcher below then offers the in-place Update path.
-    """
+    if _design_ready():
+        return True
+    app = _app()
+    if app is None:
+        return False
+    try:
+        app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    except Exception as exc:  # noqa: BLE001 - surfaced as an actionable refusal
+        raise wglink_core.WgLinkError(
+            f"Could not create a Fusion Design document for this waveguide: {exc}"
+        ) from exc
+    return _design_ready()
+
+
+def _apply_pending_handoff() -> bool:
+    """Insert or update the bundle named by WG's explicit CAD action."""
 
     global _command_busy, _handoff_attempted_id
     handoff = _pending_handoff()
-    if handoff is None or not _design_ready():
+    if handoff is None:
+        return False
+
+    if _handoff_attempted_id == handoff.export_id:
+        return True
+    try:
+        ready = _ensure_design_ready()
+    except wglink_core.WgLinkError as exc:
+        _handoff_attempted_id = handoff.export_id
+        _message(str(exc), "WGLink automatic open refused")
+        return True
+    if not ready:
         return False
 
     links = _document_links()
     try:
         pending_path = Path(handoff.bundle_path).resolve()
-        already_linked = any(
-            Path(link.get("bundle_path") or "").expanduser().resolve()
-            == pending_path
+        linked = [
+            link
             for link in links
-            if link.get("bundle_path")
-        )
+            if (
+                handoff.design_id
+                and link.get("design_id") == handoff.design_id
+            ) or (
+                not handoff.design_id
+                and link.get("bundle_path")
+                and Path(link.get("bundle_path") or "").expanduser().resolve()
+                == pending_path
+            )
+        ]
     except OSError:
-        already_linked = False
-    if already_linked:
-        wglink_watch.acknowledge_handoff(handoff)
-        return False
-    if _handoff_attempted_id == handoff.export_id:
-        return True
+        linked = []
 
     _handoff_attempted_id = handoff.export_id
     _command_busy = True
     try:
-        wglink_core.insert(
-            _app(), handoff.bundle_path, {"allow_root_fallback": True}
+        if linked:
+            # One design identity can appear more than once in an assembly.
+            # An explicit WG update targets the first active-document instance;
+            # never silently rewrite every copy.
+            link = linked[0]
+            if link.get("export_id") != handoff.export_id:
+                wglink_core.update(
+                    _app(),
+                    handoff.bundle_path,
+                    {"instance_id": link["instance_id"]},
+                )
+        else:
+            wglink_core.insert(
+                _app(), handoff.bundle_path, {"allow_root_fallback": True}
+            )
+        wglink_watch.acknowledge_handoff(
+            handoff,
+            bundle_root=wglink_workspace.bundle_folder(),
         )
-        wglink_watch.acknowledge_handoff(handoff)
         _watcher.reset()
         # An automatic send already has two visible success signals: the model
         # appears and the browser reports the completed bundle. A modal report
@@ -646,9 +759,11 @@ def _apply_pending_handoff() -> bool:
         # the manual Insert command; automatic success stays silent. Genuine
         # refusals and unexpected failures below still demand attention.
     except wglink_core.WgLinkError as exc:
-        _message(str(exc), "WGLink automatic insert refused")
+        operation = "update" if linked else "insert"
+        _message(str(exc), f"WGLink automatic {operation} refused")
     except Exception:  # noqa: BLE001 - main-thread add-in boundary
-        _message(traceback.format_exc(), "WGLink automatic insert error")
+        operation = "update" if linked else "insert"
+        _message(traceback.format_exc(), f"WGLink automatic {operation} error")
     finally:
         _command_busy = False
     return True
@@ -660,28 +775,32 @@ def _on_watch_tick() -> None:
     global _command_busy
     if _command_busy:
         return
-    if _apply_pending_handoff():
-        return
-    announcements = _watcher.survey(_document_links())
-    if not announcements:
-        return
-    ui = _ui()
-    if ui is None:
-        return
-    _command_busy = True
+    _publish_fusion_status()
     try:
-        answer = ui.messageBox(
-            wglink_watch.prompt_text(announcements),
-            f"{PANEL_NAME} — newer export available",
-            adsk.core.MessageBoxButtonTypes.YesNoButtonType,
-            adsk.core.MessageBoxIconTypes.QuestionIconType,
-        )
-        if answer == adsk.core.DialogResults.DialogYes:
-            _apply_announced_updates(announcements)
-    except Exception:  # noqa: BLE001
-        _message(traceback.format_exc(), "WGLink watch error")
+        if _apply_pending_handoff():
+            return
+        announcements = _watcher.survey(_document_links())
+        if not announcements:
+            return
+        ui = _ui()
+        if ui is None:
+            return
+        _command_busy = True
+        try:
+            answer = ui.messageBox(
+                wglink_watch.prompt_text(announcements),
+                f"{PANEL_NAME} — newer export available",
+                adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+                adsk.core.MessageBoxIconTypes.QuestionIconType,
+            )
+            if answer == adsk.core.DialogResults.DialogYes:
+                _apply_announced_updates(announcements)
+        except Exception:  # noqa: BLE001
+            _message(traceback.format_exc(), "WGLink watch error")
+        finally:
+            _command_busy = False
     finally:
-        _command_busy = False
+        _publish_fusion_status()
 
 
 class WatchEventHandler(adsk.core.CustomEventHandler):
@@ -722,6 +841,7 @@ def _start_watch(app: object) -> None:
         target=_watch_loop, args=(_watch_stop,), name="WGLinkExportWatch", daemon=True
     )
     _watch_thread.start()
+    _publish_fusion_status()
 
 
 def _stop_watch(app: object) -> None:
@@ -741,6 +861,14 @@ def _stop_watch(app: object) -> None:
             app.unregisterCustomEvent(WATCH_EVENT_ID)
     except Exception:  # noqa: BLE001
         pass
+    folder = wglink_workspace.ipc_folder()
+    if folder is not None:
+        try:
+            wglink_watch.remove_fusion_status(
+                folder, session_id=_watch_session_id
+            )
+        except Exception:  # noqa: BLE001 - shutdown cleanup is best effort
+            pass
     _watch_event = _watch_handler = _watch_stop = _watch_thread = None
     _handoff_attempted_id = None
     _watcher.reset()

@@ -168,6 +168,17 @@ def test_ulid_shape_uniqueness_and_time_prefix(send_module):
     assert first[4:14] < second[4:14]
 
 
+def test_stored_wg_config_is_echoed_as_structured_data(send_module):
+    config = {
+        "root": {"formula": "OSSE"},
+        "dimensions": {"coverage": {"raw": "45 - 5*cos(p)^5", "value": 45}},
+    }
+
+    assert send_module._stored_config(__import__("json").dumps(config)) == config
+    assert send_module._stored_config("") is None
+    assert send_module._stored_config("not json") is None
+
+
 def test_user_source_inventory_converts_area_and_excludes_claimed_throat(send_module):
     shared = object()
     throat = face("HF", area=5.06707)

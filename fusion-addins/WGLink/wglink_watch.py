@@ -14,12 +14,16 @@ before mutating a document and the wrong thing to do every few seconds.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Iterable, Mapping
 
 
 HANDOFF_FILENAME = ".fusion-handoff.json"
+FUSION_STATUS_FILENAME = ".fusion-status.json"
 
 
 @dataclass(frozen=True)
@@ -47,9 +51,14 @@ class PendingHandoff:
     bundle_id: str
     export_id: str
     sequence: str
+    design_id: str
 
 
-def read_pending_handoff(marker_path: Path) -> PendingHandoff | None:
+def read_pending_handoff(
+    marker_path: Path,
+    *,
+    bundle_root: Path | None = None,
+) -> PendingHandoff | None:
     """Read a scoped one-shot handoff without trusting an arbitrary path."""
 
     try:
@@ -66,11 +75,11 @@ def read_pending_handoff(marker_path: Path) -> PendingHandoff | None:
     if not all(isinstance(value, str) and value for value in (bundle_id, export_id, bundle_value)):
         return None
     try:
-        bundle_root = marker_path.parent.resolve()
+        allowed_bundle_root = (bundle_root or marker_path.parent).resolve()
         bundle_path = Path(str(bundle_value)).expanduser().resolve()
     except OSError:
         return None
-    if bundle_path.parent != bundle_root:
+    if bundle_path.parent != allowed_bundle_root:
         return None
     if bundle_path.is_symlink() or not bundle_path.is_dir():
         return None
@@ -81,18 +90,114 @@ def read_pending_handoff(marker_path: Path) -> PendingHandoff | None:
         bundle_id=str(bundle_id),
         export_id=str(export_id),
         sequence="" if sequence is None else str(sequence),
+        design_id=str(payload.get("designId") or ""),
     )
 
 
-def acknowledge_handoff(handoff: PendingHandoff) -> bool:
+def acknowledge_handoff(
+    handoff: PendingHandoff,
+    *,
+    bundle_root: Path | None = None,
+) -> bool:
     """Remove only the marker this insert consumed, never a newer send."""
 
-    current = read_pending_handoff(handoff.marker_path)
+    current = read_pending_handoff(handoff.marker_path, bundle_root=bundle_root)
     if current is None or current.export_id != handoff.export_id:
         return False
     try:
         handoff.marker_path.unlink()
     except OSError:
+        return False
+    return True
+
+
+def write_fusion_status(
+    bundle_root: Path,
+    *,
+    session_id: str,
+    document_name: str | None,
+    links: Iterable[Mapping[str, Any]],
+    updated_at: datetime | None = None,
+) -> Path:
+    """Atomically publish the active Fusion document as inert JSON."""
+
+    root = bundle_root.expanduser().resolve()
+    if not root.is_dir():
+        raise OSError(f"WGLink bundle folder is unavailable: {root}")
+    allowed = {
+        "instance_id": "instanceId",
+        "bundle_path": "bundlePath",
+        "design_id": "designId",
+        "lineage_id": "lineageId",
+        "edit_version": "editVersion",
+        "design_hash": "designHash",
+        "design_name": "designName",
+        "formula": "formula",
+        "config_present": "configPresent",
+        "parameter_count": "parameterCount",
+        "parameter_drift_count": "parameterDriftCount",
+        "local_body_state": "localBodyState",
+        "export_id": "exportId",
+        "export_sequence": "exportSequence",
+    }
+    copied = []
+    for link in links:
+        instance_id = str(link.get("instance_id") or "")
+        if not instance_id:
+            continue
+        record = {
+            wire_name: str(link.get(source_name) or "") or None
+            for source_name, wire_name in allowed.items()
+        }
+        record["configPresent"] = record["configPresent"] == "true"
+        try:
+            record["parameterCount"] = int(record["parameterCount"] or 0)
+        except (TypeError, ValueError):
+            record["parameterCount"] = 0
+        try:
+            record["parameterDriftCount"] = int(record["parameterDriftCount"] or 0)
+        except (TypeError, ValueError):
+            record["parameterDriftCount"] = 0
+        copied.append(record)
+    timestamp = (updated_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    payload = {
+        "schemaVersion": 1,
+        "cadApplication": "fusion360",
+        "sessionId": str(session_id),
+        "updatedAt": timestamp.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "document": (
+            {"name": document_name, "links": copied}
+            if document_name is not None
+            else None
+        ),
+    }
+    marker = root / FUSION_STATUS_FILENAME
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{FUSION_STATUS_FILENAME}.", dir=root
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return marker
+
+
+def remove_fusion_status(bundle_root: Path, *, session_id: str) -> bool:
+    """Remove only this add-in session's heartbeat, never a replacement's."""
+
+    marker = bundle_root.expanduser().resolve() / FUSION_STATUS_FILENAME
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping) or payload.get("sessionId") != session_id:
+            return False
+        marker.unlink()
+    except (OSError, ValueError, TypeError):
         return False
     return True
 

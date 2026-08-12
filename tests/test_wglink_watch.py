@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -47,6 +48,7 @@ def _handoff(root: Path, bundle: Path, export_id: str = "wge_2") -> Path:
             "bundleId": "wgb_2",
             "exportId": export_id,
             "sequence": 2,
+            "designId": "wgd_a",
         }),
         encoding="utf-8",
     )
@@ -63,6 +65,7 @@ def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> No
     assert handoff.bundle_path == str(bundle)
     assert handoff.export_id == "wge_2"
     assert handoff.sequence == "2"
+    assert handoff.design_id == "wgd_a"
     assert wglink_watch.acknowledge_handoff(handoff) is True
     assert not marker.exists()
 
@@ -79,6 +82,51 @@ def test_acknowledging_an_insert_never_deletes_a_newer_send(tmp_path: Path) -> N
     assert json.loads(marker.read_text())["exportId"] == "wge_3"
 
 
+def test_fusion_status_publishes_document_config_and_parameters_atomically(
+    tmp_path: Path,
+) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="Tritonia V",
+        links=[{
+            "instance_id": "instance-a",
+            "design_id": "wgd_a",
+            "design_hash": "sha256:config",
+            "formula": "r-osse",
+            "config_present": "true",
+            "parameter_count": "14",
+            "parameter_drift_count": "2",
+            "local_body_state": "modified",
+            "export_id": "wge_a",
+        }],
+        updated_at=datetime(2026, 8, 12, 15, 30, tzinfo=timezone.utc),
+    )
+
+    payload = json.loads(marker.read_text())
+    assert payload["document"]["name"] == "Tritonia V"
+    assert payload["document"]["links"][0] == {
+        "bundlePath": None,
+        "configPresent": True,
+        "designHash": "sha256:config",
+        "designId": "wgd_a",
+        "designName": None,
+        "editVersion": None,
+        "exportId": "wge_a",
+        "exportSequence": None,
+        "formula": "r-osse",
+        "instanceId": "instance-a",
+        "lineageId": None,
+        "parameterCount": 14,
+        "parameterDriftCount": 2,
+        "localBodyState": "modified",
+    }
+    assert list(tmp_path.glob(f"{wglink_watch.FUSION_STATUS_FILENAME}.*")) == []
+    assert wglink_watch.remove_fusion_status(tmp_path, session_id="other") is False
+    assert wglink_watch.remove_fusion_status(tmp_path, session_id="session-a") is True
+    assert not marker.exists()
+
+
 def test_handoff_refuses_an_out_of_workspace_bundle(tmp_path: Path) -> None:
     root = tmp_path / "workspace" / "wglink"
     root.mkdir(parents=True)
@@ -86,6 +134,22 @@ def test_handoff_refuses_an_out_of_workspace_bundle(tmp_path: Path) -> None:
     marker = _handoff(root, outside)
 
     assert wglink_watch.read_pending_handoff(marker) is None
+
+
+def test_machine_local_handoff_accepts_only_the_selected_workspace_bundle_root(
+    tmp_path: Path,
+) -> None:
+    bundles = tmp_path / "workspace" / "wglink"
+    bundles.mkdir(parents=True)
+    bundle = _bundle(bundles, "horn", "wge_2")
+    ipc = tmp_path / "data" / "ipc" / "wglink"
+    ipc.mkdir(parents=True)
+    marker = _handoff(ipc, bundle)
+
+    handoff = wglink_watch.read_pending_handoff(marker, bundle_root=bundles)
+
+    assert handoff is not None
+    assert wglink_watch.acknowledge_handoff(handoff, bundle_root=bundles) is True
 
 
 @pytest.mark.parametrize(

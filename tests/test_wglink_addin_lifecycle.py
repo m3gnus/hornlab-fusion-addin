@@ -52,6 +52,13 @@ class _Application:
         self.events: dict[str, _CustomEvent] = {}
         self.fired: list[str] = []
         self.activeProduct = None
+        self.activeDocument = None
+        self.documents = types.SimpleNamespace(add=self._add_document)
+
+    def _add_document(self, _document_type: object) -> object:
+        self.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+        self.activeDocument = types.SimpleNamespace(name="Untitled")
+        return self.activeDocument
 
     def registerCustomEvent(self, event_id: str) -> _CustomEvent:
         event = _CustomEvent()
@@ -170,6 +177,7 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
         setattr(core, handler, type(handler, (object,), {}))
     resolved = app if app is not None else _Application(ui)
     core.Application = types.SimpleNamespace(get=lambda: resolved)
+    core.DocumentTypes = types.SimpleNamespace(FusionDesignDocumentType="fusion-design")
     adsk.core, adsk.fusion = core, fusion  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "adsk", adsk)
     monkeypatch.setitem(sys.modules, "adsk.core", core)
@@ -181,7 +189,25 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
+    # Lifecycle tests should never publish presence into the user's real WG
+    # workspace. Individual handoff tests replace this with their temp folder.
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: None)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: None)
     return module
+
+
+def test_send_defaults_to_wgs_live_return_folder_over_stale_fusion_history(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_return_default",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    expected = tmp_path / "selected-workspace" / "wgreturn"
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: expected)
+
+    assert module._default_return_folder({"last_return_folder": "/Users/old"}) == str(expected)
 
 
 @pytest.mark.parametrize("reserve_ids", [True, False], ids=["id-reserved", "id-freed"])
@@ -304,6 +330,7 @@ def test_a_pending_new_bundle_is_inserted_once_and_acknowledged(
         "sequence": 2,
     }))
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
     monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
     inserted: list[tuple[object, str, dict[str, object]]] = []
     monkeypatch.setattr(
@@ -329,6 +356,137 @@ def test_a_pending_new_bundle_is_inserted_once_and_acknowledged(
     assert ui.messages == []
 
 
+def test_a_pending_bundle_creates_a_design_document_when_none_is_open(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_pending_new_document", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    _marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    _marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_2",
+        "exportId": "wge_2",
+        "sequence": 2,
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
+    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
+    inserted: list[str] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "insert",
+        lambda _app, path, _options: inserted.append(path),
+    )
+
+    module._on_watch_tick()
+
+    assert app.activeDocument.name == "Untitled"
+    assert inserted == [str(bundle)]
+    assert not _marker.exists()
+
+
+def test_a_pending_new_export_updates_the_existing_link_without_a_prompt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_pending_update", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_3",
+        "exportId": "wge_3",
+        "sequence": 3,
+        "designId": "wgd-a",
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
+    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {
+        "instance-a": {"payload": {
+            "bundle_path": str(bundle),
+            "design_id": "wgd-a",
+            "export_id": "wge_2",
+        }},
+    })
+    updated: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "update",
+        lambda _app, path, options: updated.append((path, options)),
+    )
+
+    module._on_watch_tick()
+
+    assert updated == [(str(bundle), {"instance_id": "instance-a"})]
+    assert not marker.exists()
+    assert ui.messages == []
+
+
+def test_a_pending_update_targets_design_identity_after_bundle_move(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_pending_moved_bundle", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "renamed.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_4",
+        "exportId": "wge_4",
+        "sequence": 4,
+        "designId": "wgd-a",
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
+    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {
+        "instance-a": {"payload": {
+            "bundle_path": str(tmp_path / "old" / "horn.wglink"),
+            "design_id": "wgd-a",
+            "export_id": "wge_3",
+        }},
+    })
+    updated: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "update",
+        lambda _app, path, options: updated.append((path, options)),
+    )
+
+    module._on_watch_tick()
+
+    assert updated == [(str(bundle), {"instance_id": "instance-a"})]
+    assert not marker.exists()
+
+
 def test_a_refused_automatic_insert_is_not_retried_every_tick(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -352,6 +510,7 @@ def test_a_refused_automatic_insert_is_not_retried_every_tick(
         "sequence": 2,
     }))
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
     monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
     attempts: list[str] = []
 

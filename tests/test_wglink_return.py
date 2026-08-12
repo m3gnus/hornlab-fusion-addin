@@ -55,6 +55,12 @@ def _instance(
         "lineage_id": "wgl_01J4Y2WZQK8Z3TFD3E7V9XKQ4M",
         "edit_version": 19,
         "design_hash": "sha256:" + "6b" * 32,
+        "formula": "osse",
+        "config": {
+            "root": {"formula": "OSSE"},
+            "dimensions": {"length": {"raw": "130", "value": 130.0}},
+            "extra_keys": {"Symmetry": "1234", "Tag": "preserved WG input"},
+        },
         "export_id": "wge_01J4Y2ZDK8Z3TFD3E7V9XKQ4M",
         "export_sequence": 7,
         "geometry_hash": "sha256:" + "96" * 32,
@@ -759,3 +765,13 @@ def test_launch_feature_vocabulary_is_the_ratified_three_features():
         "assembly-frame-v1",
         "instance-records-v1",
     )
+
+
+def test_instance_round_trip_preserves_the_wg_formula_and_exact_config() -> None:
+    manifest = loads_return_manifest(dumps_return_manifest(_worked_example()))
+
+    assert manifest["instances"][0]["formula"] == "osse"
+    assert manifest["instances"][0]["config"]["dimensions"]["length"] == {
+        "raw": "130",
+        "value": 130.0,
+    }

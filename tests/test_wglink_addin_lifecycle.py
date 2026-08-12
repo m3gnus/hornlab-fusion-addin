@@ -10,6 +10,7 @@ definitions were dead.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import types
@@ -276,6 +277,96 @@ def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> Non
     module._command_busy = False
     module._on_watch_tick()
     assert len(surveyed) == 1
+
+
+def test_a_pending_new_bundle_is_inserted_once_and_acknowledged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_pending_insert", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text(
+        json.dumps({"export": {"id": "wge_2", "sequence": 2}})
+    )
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_2",
+        "exportId": "wge_2",
+        "sequence": 2,
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
+    inserted: list[tuple[object, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "insert",
+        lambda active_app, path, options: (
+            inserted.append((active_app, path, options))
+            or {
+                "instance_id": "horn-1",
+                "wrapper": "WGLink horn",
+                "tag": {},
+                "deviation": {},
+                "warnings": [],
+            }
+        ),
+    )
+
+    module._on_watch_tick()
+    module._on_watch_tick()
+
+    assert inserted == [(app, str(bundle), {"allow_root_fallback": True})]
+    assert not marker.exists()
+    assert ui.messages == []
+
+
+def test_a_refused_automatic_insert_is_not_retried_every_tick(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_pending_refusal", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_2",
+        "exportId": "wge_2",
+        "sequence": 2,
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
+    attempts: list[str] = []
+
+    def refuse(_app: object, path: str, _options: object) -> None:
+        attempts.append(path)
+        raise module.wglink_core.WgLinkError("bad bundle")
+
+    monkeypatch.setattr(module.wglink_core, "insert", refuse)
+
+    module._on_watch_tick()
+    module._on_watch_tick()
+
+    assert attempts == [str(bundle)]
+    assert marker.exists()
+    assert ui.messages == [("WGLink automatic insert refused", "bad bundle")]
 
 
 def test_a_start_that_fails_partway_still_owns_its_half_built_panel(

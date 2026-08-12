@@ -37,6 +37,74 @@ def _link(bundle: Path, export_id: str, instance_id: str = "instance-a") -> dict
     }
 
 
+def _handoff(root: Path, bundle: Path, export_id: str = "wge_2") -> Path:
+    marker = root / wglink_watch.HANDOFF_FILENAME
+    marker.write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "target": "fusion360",
+            "bundlePath": str(bundle),
+            "bundleId": "wgb_2",
+            "exportId": export_id,
+            "sequence": 2,
+        }),
+        encoding="utf-8",
+    )
+    return marker
+
+
+def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "horn", "wge_2", sequence=2)
+    marker = _handoff(tmp_path, bundle)
+
+    handoff = wglink_watch.read_pending_handoff(marker)
+
+    assert handoff is not None
+    assert handoff.bundle_path == str(bundle)
+    assert handoff.export_id == "wge_2"
+    assert handoff.sequence == "2"
+    assert wglink_watch.acknowledge_handoff(handoff) is True
+    assert not marker.exists()
+
+
+def test_acknowledging_an_insert_never_deletes_a_newer_send(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "horn", "wge_2")
+    marker = _handoff(tmp_path, bundle)
+    handoff = wglink_watch.read_pending_handoff(marker)
+    assert handoff is not None
+
+    _handoff(tmp_path, bundle, export_id="wge_3")
+
+    assert wglink_watch.acknowledge_handoff(handoff) is False
+    assert json.loads(marker.read_text())["exportId"] == "wge_3"
+
+
+def test_handoff_refuses_an_out_of_workspace_bundle(tmp_path: Path) -> None:
+    root = tmp_path / "workspace" / "wglink"
+    root.mkdir(parents=True)
+    outside = _bundle(tmp_path, "outside", "wge_2")
+    marker = _handoff(root, outside)
+
+    assert wglink_watch.read_pending_handoff(marker) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"schemaVersion": 2, "target": "fusion360"},
+        {"schemaVersion": 1, "target": "other"},
+        {"schemaVersion": 1, "target": "fusion360", "bundlePath": ""},
+    ],
+)
+def test_an_invalid_pending_handoff_is_silent(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    marker = tmp_path / wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps(payload))
+    assert wglink_watch.read_pending_handoff(marker) is None
+
+
 def test_a_newer_export_is_announced_once(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path, "horn", "wge_2", sequence=2)
     watcher = wglink_watch.ExportWatcher()

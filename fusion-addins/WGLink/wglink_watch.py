@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
+HANDOFF_FILENAME = ".fusion-handoff.json"
+
+
 @dataclass(frozen=True)
 class Announcement:
     """A link whose bundle on disk has moved past what the document holds."""
@@ -33,6 +36,65 @@ class Announcement:
         return (
             f"{self.instance_id} — export sequence {self.available_sequence or '?'}"
         )
+
+
+@dataclass(frozen=True)
+class PendingHandoff:
+    """A completed WG export that the user explicitly sent to Fusion."""
+
+    marker_path: Path
+    bundle_path: str
+    bundle_id: str
+    export_id: str
+    sequence: str
+
+
+def read_pending_handoff(marker_path: Path) -> PendingHandoff | None:
+    """Read a scoped one-shot handoff without trusting an arbitrary path."""
+
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schemaVersion") != 1 or payload.get("target") != "fusion360":
+        return None
+    bundle_id = payload.get("bundleId")
+    export_id = payload.get("exportId")
+    bundle_value = payload.get("bundlePath")
+    if not all(isinstance(value, str) and value for value in (bundle_id, export_id, bundle_value)):
+        return None
+    try:
+        bundle_root = marker_path.parent.resolve()
+        bundle_path = Path(str(bundle_value)).expanduser().resolve()
+    except OSError:
+        return None
+    if bundle_path.parent != bundle_root:
+        return None
+    if bundle_path.is_symlink() or not bundle_path.is_dir():
+        return None
+    sequence = payload.get("sequence")
+    return PendingHandoff(
+        marker_path=marker_path,
+        bundle_path=str(bundle_path),
+        bundle_id=str(bundle_id),
+        export_id=str(export_id),
+        sequence="" if sequence is None else str(sequence),
+    )
+
+
+def acknowledge_handoff(handoff: PendingHandoff) -> bool:
+    """Remove only the marker this insert consumed, never a newer send."""
+
+    current = read_pending_handoff(handoff.marker_path)
+    if current is None or current.export_id != handoff.export_id:
+        return False
+    try:
+        handoff.marker_path.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def _manifest_path(bundle_path: str) -> Path:

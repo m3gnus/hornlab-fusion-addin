@@ -80,6 +80,10 @@ _watch_thread: threading.Thread | None = None
 # Set while a WGLink command runs. The heartbeat keeps ticking, but the handler
 # refuses to raise a prompt over a command that is mid-execution.
 _command_busy = False
+# The marker remains on disk when Insert refuses, so remember that refusal for
+# this Fusion session instead of showing the same error every four seconds. A
+# later Send carries a new export id and is attempted normally.
+_handoff_attempted_id: str | None = None
 
 
 def _app() -> object:
@@ -582,11 +586,81 @@ def _apply_announced_updates(announcements: list) -> None:
         _message("\n\n".join(lines), f"{PANEL_NAME} update")
 
 
+def _pending_handoff() -> wglink_watch.PendingHandoff | None:
+    folder = wglink_workspace.bundle_folder()
+    if folder is None:
+        return None
+    return wglink_watch.read_pending_handoff(
+        folder / wglink_watch.HANDOFF_FILENAME
+    )
+
+
+def _design_ready() -> bool:
+    app = _app()
+    design = app.activeProduct if app else None
+    return bool(design and "Design" in str(getattr(design, "objectType", "")))
+
+
+def _apply_pending_handoff() -> bool:
+    """Insert a new send, or route an existing link to the update watcher.
+
+    Returns true when this tick is fully handled.  A pending export for a bundle
+    already linked in the active document is merely acknowledged here; the
+    ordinary watcher below then offers the in-place Update path.
+    """
+
+    global _command_busy, _handoff_attempted_id
+    handoff = _pending_handoff()
+    if handoff is None or not _design_ready():
+        return False
+
+    links = _document_links()
+    try:
+        pending_path = Path(handoff.bundle_path).resolve()
+        already_linked = any(
+            Path(link.get("bundle_path") or "").expanduser().resolve()
+            == pending_path
+            for link in links
+            if link.get("bundle_path")
+        )
+    except OSError:
+        already_linked = False
+    if already_linked:
+        wglink_watch.acknowledge_handoff(handoff)
+        return False
+    if _handoff_attempted_id == handoff.export_id:
+        return True
+
+    _handoff_attempted_id = handoff.export_id
+    _command_busy = True
+    try:
+        wglink_core.insert(
+            _app(), handoff.bundle_path, {"allow_root_fallback": True}
+        )
+        wglink_watch.acknowledge_handoff(handoff)
+        _watcher.reset()
+        # An automatic send already has two visible success signals: the model
+        # appears and the browser reports the completed bundle. A modal report
+        # here blocked Fusion on every send and made the ordinary Part Design
+        # root-fallback warning look like an error. Keep detailed reports for
+        # the manual Insert command; automatic success stays silent. Genuine
+        # refusals and unexpected failures below still demand attention.
+    except wglink_core.WgLinkError as exc:
+        _message(str(exc), "WGLink automatic insert refused")
+    except Exception:  # noqa: BLE001 - main-thread add-in boundary
+        _message(traceback.format_exc(), "WGLink automatic insert error")
+    finally:
+        _command_busy = False
+    return True
+
+
 def _on_watch_tick() -> None:
     """Main-thread half of the watcher: survey, ask, and apply if asked."""
 
     global _command_busy
     if _command_busy:
+        return
+    if _apply_pending_handoff():
         return
     announcements = _watcher.survey(_document_links())
     if not announcements:
@@ -631,7 +705,9 @@ def _watch_loop(stop: threading.Event) -> None:
 
 def _start_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
+    global _handoff_attempted_id
     _watcher.reset()
+    _handoff_attempted_id = None
     try:
         app.unregisterCustomEvent(WATCH_EVENT_ID)
     except Exception:  # noqa: BLE001 - no stale registration to clear
@@ -650,6 +726,7 @@ def _start_watch(app: object) -> None:
 
 def _stop_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
+    global _handoff_attempted_id
     if _watch_stop is not None:
         _watch_stop.set()
     if _watch_thread is not None and _watch_thread.is_alive():
@@ -665,6 +742,7 @@ def _stop_watch(app: object) -> None:
     except Exception:  # noqa: BLE001
         pass
     _watch_event = _watch_handler = _watch_stop = _watch_thread = None
+    _handoff_attempted_id = None
     _watcher.reset()
 
 

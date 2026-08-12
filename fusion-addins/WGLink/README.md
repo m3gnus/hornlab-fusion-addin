@@ -58,7 +58,11 @@ The supported reference layer is:
 
 - **Insert** offers the bundles already sitting in Waveguide Generator's
   workspace, validates the chosen one before Fusion mutation, and builds the
-  full WG viewport model.
+  full WG viewport model. **Send to CAD** in Waveguide Generator also publishes
+  a one-shot handoff beside the completed bundle: WGLink inserts a new link into
+  the active Fusion design automatically, including after a cold start. If that
+  bundle is already linked in the active document, the existing watcher offers
+  the normal in-place Update instead of inserting a duplicate.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
   moves fit points in place. Before its first mutation it also verifies that

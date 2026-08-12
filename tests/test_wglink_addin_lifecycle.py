@@ -22,12 +22,47 @@ ADDIN = Path(__file__).resolve().parents[1] / "fusion-addins" / "WGLink" / "WGLi
 _HANDLER_TYPES = (
     "CommandCreatedEventHandler",
     "CommandEventHandler",
+    "CustomEventHandler",
     "InputChangedEventHandler",
     "ValidateInputsEventHandler",
     "SelectionEventHandler",
     "CommandEventArgs",
     "InputChangedEventArgs",
 )
+
+
+class _CustomEvent:
+    def __init__(self) -> None:
+        self.handlers: list[object] = []
+
+    def add(self, handler: object) -> None:
+        self.handlers.append(handler)
+
+    def remove(self, handler: object) -> None:
+        if handler in self.handlers:
+            self.handlers.remove(handler)
+
+
+class _Application:
+    """Enough Application surface for the watcher's registration dance."""
+
+    def __init__(self, ui: "_UI") -> None:
+        self.userInterface = ui
+        self.events: dict[str, _CustomEvent] = {}
+        self.fired: list[str] = []
+        self.activeProduct = None
+
+    def registerCustomEvent(self, event_id: str) -> _CustomEvent:
+        event = _CustomEvent()
+        self.events[event_id] = event
+        return event
+
+    def unregisterCustomEvent(self, event_id: str) -> bool:
+        return self.events.pop(event_id, None) is not None
+
+    def fireCustomEvent(self, event_id: str, _payload: str = "") -> bool:
+        self.fired.append(event_id)
+        return True
 
 
 class _Control:
@@ -125,16 +160,15 @@ class _UI:
         self.messages.append((title, text))
 
 
-def _load_instance(monkeypatch, name: str, ui: _UI):
+def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = None):
     adsk = types.ModuleType("adsk")
     adsk.__path__ = []  # type: ignore[attr-defined]
     core = types.ModuleType("adsk.core")
     fusion = types.ModuleType("adsk.fusion")
     for handler in _HANDLER_TYPES:
         setattr(core, handler, type(handler, (object,), {}))
-    core.Application = types.SimpleNamespace(
-        get=lambda: types.SimpleNamespace(userInterface=ui)
-    )
+    resolved = app if app is not None else _Application(ui)
+    core.Application = types.SimpleNamespace(get=lambda: resolved)
     adsk.core, adsk.fusion = core, fusion  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "adsk", adsk)
     monkeypatch.setitem(sys.modules, "adsk.core", core)
@@ -194,6 +228,54 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     first.stop(None)
     assert panels.itemById(first.PANEL_ID) is None
     assert [d for d in definitions.items.values() if d.isValid] == []
+
+
+def test_only_the_owning_instance_runs_an_export_watcher(monkeypatch) -> None:
+    """Two watchers would prompt twice for one export."""
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+
+    first = _load_instance(monkeypatch, "WGLink_watch_first", ui, app)
+    first.run(None)
+    assert first.WATCH_EVENT_ID in app.events
+    assert first._watch_thread is not None and first._watch_thread.is_alive()
+
+    second = _load_instance(monkeypatch, "WGLink_watch_second", ui, app)
+    second.run(None)
+    assert second._watch_thread is None
+    assert list(app.events) == [first.WATCH_EVENT_ID]
+
+    # The adopted instance stopping must leave the owner's watcher registered.
+    second.stop(None)
+    assert first.WATCH_EVENT_ID in app.events
+    assert first._watch_thread.is_alive()
+
+    first.stop(None)
+    assert first.WATCH_EVENT_ID not in app.events
+    assert first._watch_thread is None
+
+
+def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_busy", ui, app)
+
+    surveyed: list[object] = []
+    monkeypatch.setattr(
+        module._watcher, "survey", lambda links: surveyed.append(links) or []
+    )
+    module._command_busy = True
+    module._on_watch_tick()
+    assert surveyed == []
+
+    module._command_busy = False
+    module._on_watch_tick()
+    assert len(surveyed) == 1
 
 
 def test_a_start_that_fails_partway_still_owns_its_half_built_panel(

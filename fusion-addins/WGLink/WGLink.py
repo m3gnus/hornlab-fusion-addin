@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import threading
 import traceback
 
 import adsk.core
@@ -16,6 +17,7 @@ if str(ADDIN_DIR) not in sys.path:
 
 import wglink_core  # noqa: E402
 import wglink_send  # noqa: E402
+import wglink_watch  # noqa: E402
 from wglink_bundle import format_measurement_mm  # noqa: E402
 
 
@@ -64,6 +66,17 @@ _panel = None
 # registrations of one add-in are two instances that cannot see each other's
 # state -- only the panel they share.
 _owned = False
+
+WATCH_EVENT_ID = "hornlab_wglink_export_available"
+WATCH_INTERVAL_SECONDS = 4.0
+_watcher = wglink_watch.ExportWatcher()
+_watch_event = None
+_watch_handler = None
+_watch_stop: threading.Event | None = None
+_watch_thread: threading.Thread | None = None
+# Set while a WGLink command runs. The heartbeat keeps ticking, but the handler
+# refuses to raise a prompt over a command that is mid-execution.
+_command_busy = False
 
 
 def _app() -> object:
@@ -322,6 +335,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         self.operation = operation
 
     def notify(self, args: object) -> None:
+        global _command_busy
+        # Hold the watcher off: it must not open a prompt over a running
+        # command, and an operation that rewrites a link's stored export id
+        # would otherwise be surveyed halfway through.
+        _command_busy = True
         try:
             adsk.doEvents()
             inputs = args.command.commandInputs
@@ -357,6 +375,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             _message(str(exc), "WGLink refused")
         except Exception:  # noqa: BLE001 - UI boundary; core remains head-less
             _message(traceback.format_exc(), "WGLink error")
+        finally:
+            _command_busy = False
+            # This command may have moved the link on; re-survey from scratch so
+            # a stale announcement cannot re-offer what was just applied.
+            _watcher.reset()
 
 
 class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
@@ -463,6 +486,143 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
+def _document_links() -> list[dict[str, str]]:
+    """Copy each managed link's identity out of the document as plain strings.
+
+    Called on Fusion's main thread only. What it returns is deliberately inert
+    data: the watcher runs on another thread and must never hold a live Fusion
+    object.
+    """
+
+    app = _app()
+    design = app.activeProduct if app else None
+    if design is None or not isinstance(getattr(design, "objectType", ""), str):
+        return []
+    if "Design" not in str(design.objectType):
+        return []
+    try:
+        records = wglink_core._link_records(design)
+    except Exception:  # noqa: BLE001 - a document we cannot read has no links
+        return []
+    links: list[dict[str, str]] = []
+    for instance_id, record in records.items():
+        payload = record.get("payload") or {}
+        links.append({
+            "instance_id": str(instance_id),
+            "bundle_path": str(payload.get("bundle_path") or ""),
+            "export_id": str(payload.get("export_id") or ""),
+        })
+    return links
+
+
+def _apply_announced_updates(announcements: list) -> None:
+    applied, failed = [], []
+    for announcement in announcements:
+        try:
+            wglink_core.update(_app(), announcement.bundle_path, {
+                "instance_id": announcement.instance_id,
+            })
+        except Exception as exc:  # noqa: BLE001 - one bad link must not stop the rest
+            failed.append(f"{announcement.instance_id}: {exc}")
+            # Let the next tick offer it again rather than swallowing it.
+            _watcher.forget(announcement.instance_id)
+        else:
+            applied.append(announcement.describe())
+    lines = []
+    if applied:
+        lines.append("Updated:\n" + "\n".join(f"  • {item}" for item in applied))
+    if failed:
+        lines.append("Not updated:\n" + "\n".join(f"  • {item}" for item in failed))
+    if lines:
+        _message("\n\n".join(lines), f"{PANEL_NAME} update")
+
+
+def _on_watch_tick() -> None:
+    """Main-thread half of the watcher: survey, ask, and apply if asked."""
+
+    global _command_busy
+    if _command_busy:
+        return
+    announcements = _watcher.survey(_document_links())
+    if not announcements:
+        return
+    ui = _ui()
+    if ui is None:
+        return
+    _command_busy = True
+    try:
+        answer = ui.messageBox(
+            wglink_watch.prompt_text(announcements),
+            f"{PANEL_NAME} — newer export available",
+            adsk.core.MessageBoxButtonTypes.YesNoButtonType,
+            adsk.core.MessageBoxIconTypes.QuestionIconType,
+        )
+        if answer == adsk.core.DialogResults.DialogYes:
+            _apply_announced_updates(announcements)
+    except Exception:  # noqa: BLE001
+        _message(traceback.format_exc(), "WGLink watch error")
+    finally:
+        _command_busy = False
+
+
+class WatchEventHandler(adsk.core.CustomEventHandler):
+    def notify(self, _args: object) -> None:
+        try:
+            _on_watch_tick()
+        except Exception:  # noqa: BLE001
+            _message(traceback.format_exc(), "WGLink watch error")
+
+
+def _watch_loop(stop: threading.Event) -> None:
+    """Heartbeat only. Every Fusion call belongs to the event handler."""
+
+    app = _app()
+    while not stop.wait(WATCH_INTERVAL_SECONDS):
+        try:
+            app.fireCustomEvent(WATCH_EVENT_ID)
+        except Exception:  # noqa: BLE001 - a torn-down event ends the thread
+            return
+
+
+def _start_watch(app: object) -> None:
+    global _watch_event, _watch_handler, _watch_stop, _watch_thread
+    _watcher.reset()
+    try:
+        app.unregisterCustomEvent(WATCH_EVENT_ID)
+    except Exception:  # noqa: BLE001 - no stale registration to clear
+        pass
+    _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
+    if _watch_event is None:
+        return
+    _watch_handler = WatchEventHandler()
+    _watch_event.add(_watch_handler)
+    _watch_stop = threading.Event()
+    _watch_thread = threading.Thread(
+        target=_watch_loop, args=(_watch_stop,), name="WGLinkExportWatch", daemon=True
+    )
+    _watch_thread.start()
+
+
+def _stop_watch(app: object) -> None:
+    global _watch_event, _watch_handler, _watch_stop, _watch_thread
+    if _watch_stop is not None:
+        _watch_stop.set()
+    if _watch_thread is not None and _watch_thread.is_alive():
+        _watch_thread.join(timeout=WATCH_INTERVAL_SECONDS + 1)
+    if _watch_event is not None and _watch_handler is not None:
+        try:
+            _watch_event.remove(_watch_handler)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if app:
+            app.unregisterCustomEvent(WATCH_EVENT_ID)
+    except Exception:  # noqa: BLE001
+        pass
+    _watch_event = _watch_handler = _watch_stop = _watch_thread = None
+    _watcher.reset()
+
+
 def _icon_folder(operation: str) -> str:
     """Fusion's per-command resource folder, or '' to fall back to no icon.
 
@@ -533,6 +693,7 @@ def run(_context: object) -> None:
             _definitions.append(definition)
             control = _panel.controls.addCommand(definition)
             _controls.append(control)
+        _start_watch(_app())
     except Exception:  # noqa: BLE001
         _message(traceback.format_exc(), "WGLink start error")
 
@@ -547,6 +708,7 @@ def stop(_context: object) -> None:
             # WGLink showing a panel whose commands did nothing.
             _panel = None
             return
+        _stop_watch(_app())
         for control in reversed(_controls):
             _delete_quietly(control)
         _controls.clear()

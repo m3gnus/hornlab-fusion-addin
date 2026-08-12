@@ -463,6 +463,17 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
+def _icon_folder(operation: str) -> str:
+    """Fusion's per-command resource folder, or '' to fall back to no icon.
+
+    Passing a path that holds no PNGs makes Fusion draw an empty button, so an
+    incomplete checkout degrades to the unadorned text button it had before.
+    """
+
+    folder = ADDIN_DIR / "resources" / operation
+    return str(folder) if (folder / "16x16.png").is_file() else ""
+
+
 def _installed_control_count(panel: object) -> int:
     try:
         controls = panel.controls
@@ -514,6 +525,7 @@ def run(_context: object) -> None:
                 command_id,
                 name,
                 description,
+                _icon_folder(operation),
             )
             created = CommandCreatedHandler(operation)
             definition.commandCreated.add(created)

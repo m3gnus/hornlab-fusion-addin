@@ -186,6 +186,13 @@ the scientific interpolation stack. A copied install can still work when
 `HORNLAB_FUSION_ADDIN_REPO` points to the checkout, or when a head-less caller
 passes `repo_root` and `python_path` options.
 
-Restart Fusion, open **Utilities > Add-Ins**, start WGLink, and use the WGLink
-toolbar panel. The manifest deliberately sets `runOnStartup` to `false`, so no
-heavy geometry work runs while Fusion is starting.
+Restart Fusion and use the WGLink toolbar panel under **Utilities**. The
+manifest sets `runOnStartup` to `true`: start-up only registers a panel and six
+command definitions, and every piece of geometry work happens when a command is
+executed, so there is nothing heavy to defer. Leaving it `false` meant the panel
+was gone after each Fusion restart until it was started by hand, which also kept
+the export watcher from ever running.
+
+Icons live in `resources/<operation>/{16x16,32x32,64x64}.png` and are generated
+by `scripts/make_wglink_icons.py`. A checkout without them still works; Fusion
+falls back to unadorned buttons.

@@ -94,6 +94,7 @@ class _Definition:
 class _Definitions:
     def __init__(self, *, reserve_ids: bool) -> None:
         self.items: dict[str, _Definition] = {}
+        self.resource_folders: list[str] = []
         self._reserve_ids = reserve_ids
 
     def itemById(self, definition_id: str) -> _Definition | None:
@@ -101,8 +102,9 @@ class _Definitions:
         return definition if definition is not None and definition.isValid else None
 
     def addButtonDefinition(
-        self, definition_id: str, _name: str, _description: str
+        self, definition_id: str, _name: str, _description: str, resource_folder: str = ""
     ) -> _Definition | None:
+        self.resource_folders.append(resource_folder)
         stale = self.items.get(definition_id)
         if self._reserve_ids and stale is not None and not stale.isValid:
             return None
@@ -161,6 +163,11 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     assert panel is not None
     assert panel.controls.count == len(first.COMMANDS)
     assert first._owned is True
+    # Every command ships an icon folder holding the 16 px art Fusion draws in
+    # the panel dropdown; a missing folder would silently give a blank button.
+    assert len(definitions.resource_folders) == len(first.COMMANDS)
+    for folder in definitions.resource_folders:
+        assert folder and (Path(folder) / "16x16.png").is_file()
 
     second = _load_instance(monkeypatch, "WGLink_second", ui)
     second.run(None)

@@ -86,29 +86,67 @@ def test_mouth_overshoot_parameter_is_created_then_updated_in_place(core):
     assert len(parameters.added) == 1
 
 
-def test_observed_parameters_convert_fusion_internal_cm_to_mm(core):
-    parameter = types.SimpleNamespace(
-        expression="25 mm",
-        value=2.5,
-        unit="mm",
-    )
+def test_observed_parameters_normalize_lengths_to_mm_and_reject_other_units(core):
+    parameter_by_name = {
+        "wg_angle": types.SimpleNamespace(expression="30 deg", value=0.5, unit="deg"),
+        "wg_horn_length": types.SimpleNamespace(expression="25 mm", value=2.5, unit="mm"),
+        "wg_horn_length_cm": types.SimpleNamespace(expression="2.5 cm", value=2.5, unit="cm"),
+        "wg_horn_length_in": types.SimpleNamespace(expression="0.984 in", value=2.5, unit="in"),
+    }
     parameters = types.SimpleNamespace(
-        itemByName=lambda name: parameter if name == "wg_horn_length" else None
+        itemByName=parameter_by_name.get,
     )
-    design = types.SimpleNamespace(userParameters=parameters)
+    length_scales = {"mm": 1.0, "cm": 10.0, "in": 25.4}
+
+    def convert(value, source_unit, target_unit):
+        assert target_unit == "mm"
+        if source_unit == "internalUnits":
+            return value * 10.0
+        return value * length_scales.get(source_unit, -1.0)
+
+    design = types.SimpleNamespace(
+        userParameters=parameters,
+        unitsManager=types.SimpleNamespace(convert=convert),
+    )
     record = {
         "payload": {
-            "parameter_expressions": '{"wg_horn_length": "25 mm"}',
+            "parameter_expressions": (
+                '{"wg_angle": "30 deg", "wg_horn_length": "25 mm", '
+                '"wg_horn_length_cm": "2.5 cm", "wg_horn_length_in": "0.984 in"}'
+            ),
         },
     }
 
-    assert core._observed_parameters(design, record) == [{
-        "name": "wg_horn_length",
-        "expected_expression": "25 mm",
-        "expression": "25 mm",
-        "value": 25.0,
-        "unit": "mm",
-    }]
+    assert core._observed_parameters(design, record) == [
+        {
+            "name": "wg_angle",
+            "expected_expression": "30 deg",
+            "expression": "30 deg",
+            "value": None,
+            "unit": None,
+        },
+        {
+            "name": "wg_horn_length",
+            "expected_expression": "25 mm",
+            "expression": "25 mm",
+            "value": 25.0,
+            "unit": "mm",
+        },
+        {
+            "name": "wg_horn_length_cm",
+            "expected_expression": "2.5 cm",
+            "expression": "2.5 cm",
+            "value": 25.0,
+            "unit": "mm",
+        },
+        {
+            "name": "wg_horn_length_in",
+            "expected_expression": "0.984 in",
+            "expression": "0.984 in",
+            "value": 25.0,
+            "unit": "mm",
+        },
+    ]
 
 
 def test_body_naming_table_covers_every_insert_body_role(core):

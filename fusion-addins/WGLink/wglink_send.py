@@ -1228,7 +1228,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             f"Could not create return output folder {output}: {exc}."
         ) from exc
     request_id = _nullable(options.get("request_id"))
-    suffix = f"-{_safe_document_name(str(request_id))[:12]}" if request_id else ""
+    suffix = f"-{_safe_document_name(str(request_id))}" if request_id else ""
     target = output / f"{_safe_document_name(document_name)}{suffix}.wgreturn"
     overwrite = bool(options.get("overwrite", False))
     if not overwrite:

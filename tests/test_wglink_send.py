@@ -213,7 +213,7 @@ def test_shape_fingerprint_includes_source_roles_and_face_geometry(send_module):
     assert fingerprint["faces"][0]["area_mm2"] == pytest.approx(250.0)
 
 
-def test_full_unlinked_send_avoids_collisions_unless_overwrite_is_explicit(
+def test_full_unlinked_send_avoids_collisions_and_uses_full_request_ids(
     send_module, tmp_path, monkeypatch
 ):
     painted = face("LF", area=2.5)
@@ -269,6 +269,24 @@ def test_full_unlinked_send_avoids_collisions_unless_overwrite_is_explicit(
     assert Path(replacement_report["bundle_path"]) == target
     assert replacement_report["return_id"] != report["return_id"]
     assert not marker.exists()
+
+    request_a = "request-collision-prefix-alpha"
+    request_b = "request-collision-prefix-beta"
+    assert request_a[:12] == request_b[:12]
+    request_a_report = send_module.send(
+        app,
+        {"output_folder": str(tmp_path), "overwrite": True, "request_id": request_a},
+    )
+    request_b_report = send_module.send(
+        app,
+        {"output_folder": str(tmp_path), "overwrite": True, "request_id": request_b},
+    )
+    assert Path(request_a_report["bundle_path"]) == (
+        tmp_path / f"My Speaker-{request_a}.wgreturn"
+    )
+    assert Path(request_b_report["bundle_path"]) == (
+        tmp_path / f"My Speaker-{request_b}.wgreturn"
+    )
 
 
 def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch):

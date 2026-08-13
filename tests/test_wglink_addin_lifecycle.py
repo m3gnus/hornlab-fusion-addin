@@ -352,6 +352,33 @@ def test_adopted_instance_runs_presence_without_a_second_export_watcher(
     assert first._watch_thread is None
 
 
+def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_captured_app", ui, app)
+
+    class OneTick:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, _interval: float) -> bool:
+            self.calls += 1
+            return self.calls > 1
+
+    monkeypatch.setattr(
+        module,
+        "_app",
+        lambda: (_ for _ in ()).throw(AssertionError("worker called Application.get()")),
+    )
+
+    module._watch_loop(app, OneTick())
+    module._presence_loop(app, OneTick())
+
+    assert app.fired == [module.WATCH_EVENT_ID, module._presence_event_id]
+
+
 def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> None:
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)
@@ -583,6 +610,48 @@ def test_a_targeted_return_refuses_if_the_active_document_changed(
         "WGLink return to WG refused",
         "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again.",
     )]
+
+
+def test_a_refused_return_request_is_attempted_once_until_its_id_changes(
+    monkeypatch,
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_return_refusal_suppression", ui, app)
+    request_a = types.SimpleNamespace(
+        design_id="wgd-a",
+        document_id="fusion:expected",
+        instance_id="instance-a",
+        expected_return_state_hash="sha256:state-a",
+        request_id="request-a",
+    )
+    request_b = types.SimpleNamespace(**{
+        **vars(request_a),
+        "request_id": "request-b",
+    })
+    pending = {"request": request_a}
+    attempts: list[str] = []
+    monkeypatch.setattr(module, "_pending_return_request", lambda: pending["request"])
+
+    def wrong_document() -> str:
+        attempts.append(pending["request"].request_id)
+        return "fusion:other"
+
+    monkeypatch.setattr(module, "_active_document_id", wrong_document)
+
+    assert module._apply_pending_return_request() is True
+    assert module._apply_pending_return_request() is True
+    pending["request"] = request_b
+    assert module._apply_pending_return_request() is True
+
+    assert attempts == ["request-a", "request-b"]
+    assert [title for title, _text in ui.messages] == [
+        "WGLink return to WG refused",
+        "WGLink return to WG refused",
+    ]
 
 
 def test_a_targeted_return_exports_only_the_exact_live_link(

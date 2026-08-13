@@ -3088,16 +3088,23 @@ def _observed_parameters(design: object, record: dict[str, Any]) -> list[dict[st
             expression = str(parameter.expression)
         except Exception:  # noqa: BLE001
             expression = None
+        unit = None
         try:
-            value = float(parameter.value) * 10.0
+            live_unit = str(parameter.unit or "")
+            # Fusion stores numeric values in dimension-specific internal units.
+            # Prove this parameter is a length before asking for millimetres;
+            # incompatible conversions return -1 (or can raise).
+            length_scale = float(design.unitsManager.convert(1.0, live_unit, "mm"))
+            if not live_unit or not math.isfinite(length_scale) or length_scale <= 0:
+                raise ValueError("parameter is not a length")
+            value = float(
+                design.unitsManager.convert(float(parameter.value), "internalUnits", "mm")
+            )
             if not math.isfinite(value):
                 value = None
+            unit = "mm"
         except Exception:  # noqa: BLE001
             value = None
-        try:
-            unit = str(parameter.unit or "") or None
-        except Exception:  # noqa: BLE001
-            unit = None
         observed.append({
             "name": str(name),
             "expected_expression": str(expected_expression),

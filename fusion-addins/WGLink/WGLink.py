@@ -131,6 +131,9 @@ _command_busy = False
 # this Fusion session instead of showing the same error every four seconds. A
 # later Send carries a new export id and is attempted normally.
 _handoff_attempted_id: str | None = None
+# A refused return request also remains on disk. Suppress repeated attempts for
+# that exact request while allowing a later request id through normally.
+_return_request_attempted_id: str | None = None
 
 
 def _fingerprint_hash(value: object) -> str:
@@ -773,10 +776,13 @@ def _pending_return_request() -> wglink_watch.PendingReturnRequest | None:
 def _apply_pending_return_request() -> bool:
     """Export the current Fusion body/tags after an explicit WG request."""
 
-    global _command_busy
+    global _command_busy, _return_request_attempted_id
     request = _pending_return_request()
     if request is None:
         return False
+    if _return_request_attempted_id == request.request_id:
+        return True
+    _return_request_attempted_id = request.request_id
     _command_busy = True
     try:
         if not request.design_id or not request.document_id or not request.instance_id:
@@ -999,10 +1005,9 @@ class PresenceEventHandler(adsk.core.CustomEventHandler):
             pass
 
 
-def _watch_loop(stop: threading.Event) -> None:
+def _watch_loop(app: object, stop: threading.Event) -> None:
     """Heartbeat only. Every Fusion call belongs to the event handler."""
 
-    app = _app()
     while not stop.wait(WATCH_INTERVAL_SECONDS):
         try:
             app.fireCustomEvent(WATCH_EVENT_ID)
@@ -1010,10 +1015,9 @@ def _watch_loop(stop: threading.Event) -> None:
             return
 
 
-def _presence_loop(stop: threading.Event) -> None:
+def _presence_loop(app: object, stop: threading.Event) -> None:
     """Raise only this registration's private presence event."""
 
-    app = _app()
     while not stop.wait(WATCH_INTERVAL_SECONDS):
         try:
             app.fireCustomEvent(_presence_event_id)
@@ -1033,7 +1037,7 @@ def _start_presence(app: object) -> None:
     _presence_stop = threading.Event()
     _presence_thread = threading.Thread(
         target=_presence_loop,
-        args=(_presence_stop,),
+        args=(app, _presence_stop),
         name="WGLinkPresence",
         daemon=True,
     )
@@ -1068,9 +1072,10 @@ def _stop_presence(app: object) -> None:
 
 def _start_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
-    global _handoff_attempted_id
+    global _handoff_attempted_id, _return_request_attempted_id
     _watcher.reset()
     _handoff_attempted_id = None
+    _return_request_attempted_id = None
     try:
         app.unregisterCustomEvent(WATCH_EVENT_ID)
     except Exception:  # noqa: BLE001 - no stale registration to clear
@@ -1082,7 +1087,10 @@ def _start_watch(app: object) -> None:
     _watch_event.add(_watch_handler)
     _watch_stop = threading.Event()
     _watch_thread = threading.Thread(
-        target=_watch_loop, args=(_watch_stop,), name="WGLinkExportWatch", daemon=True
+        target=_watch_loop,
+        args=(app, _watch_stop),
+        name="WGLinkExportWatch",
+        daemon=True,
     )
     _watch_thread.start()
     _publish_fusion_status()
@@ -1090,7 +1098,7 @@ def _start_watch(app: object) -> None:
 
 def _stop_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
-    global _handoff_attempted_id
+    global _handoff_attempted_id, _return_request_attempted_id
     if _watch_stop is not None:
         _watch_stop.set()
     if _watch_thread is not None and _watch_thread.is_alive():
@@ -1115,6 +1123,7 @@ def _stop_watch(app: object) -> None:
             pass
     _watch_event = _watch_handler = _watch_stop = _watch_thread = None
     _handoff_attempted_id = None
+    _return_request_attempted_id = None
     _watcher.reset()
 
 
@@ -1148,7 +1157,8 @@ def _installed_control_count(panel: object) -> int:
 def run(_context: object) -> None:
     global _panel, _owned
     try:
-        ui = _ui()
+        app = _app()
+        ui = app.userInterface if app else None
         if ui is None:
             return
         workspace = _workspace(ui)
@@ -1160,7 +1170,7 @@ def run(_context: object) -> None:
             # the way. Nothing is torn down on stop either -- see _owned.
             _panel = stale_panel
             _owned = False
-            _start_presence(_app())
+            _start_presence(app)
             return
         if stale_panel:
             _delete_quietly(stale_panel)
@@ -1189,7 +1199,7 @@ def run(_context: object) -> None:
             _definitions.append(definition)
             control = _panel.controls.addCommand(definition)
             _controls.append(control)
-        _start_watch(_app())
+        _start_watch(app)
     except Exception:  # noqa: BLE001
         _message(traceback.format_exc(), "WGLink start error")
 

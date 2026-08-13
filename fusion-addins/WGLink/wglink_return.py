@@ -1114,7 +1114,7 @@ def build_return_manifest(
     instances: Sequence[Mapping[str, Any]],
     sources: Sequence[Mapping[str, Any]],
     acoustics: None = None,
-    wgreturn_version: str = "1.0",
+    wgreturn_version: str = "1.1",
     required_features: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build a detached manifest and validate it before returning it."""

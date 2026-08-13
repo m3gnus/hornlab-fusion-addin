@@ -213,6 +213,58 @@ def test_shape_fingerprint_includes_source_roles_and_face_geometry(send_module):
     assert fingerprint["faces"][0]["area_mm2"] == pytest.approx(250.0)
 
 
+def test_schema_1_1_stamp_stays_paired_with_fail_closed_fingerprint_guard(
+    send_module, tmp_path, monkeypatch
+):
+    exterior = body("cabinet", faces=[face("LF")])
+    root = component("Pairing", [exterior])
+
+    class ExportManager:
+        def createSTEPExportOptions(self, path, geometry=None):
+            return path, geometry
+
+        def execute(self, options):
+            Path(options[0]).write_text(
+                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
+                encoding="utf-8",
+            )
+            return True
+
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=ExportManager(),
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="Pairing"),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(app, {"output_folder": str(tmp_path)})
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["wgreturn_version"] == "1.1"
+
+    # These are one change: an old WG silently accepts a hash-less 1.1 bundle
+    # while a new WG refuses it, so this guard must never relax while stamped 1.1.
+    monkeypatch.setattr(
+        send_module,
+        "return_state",
+        lambda _app, _options: {"hash": None, "reason": "simulated failure"},
+    )
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match="Could not fingerprint.*simulated failure",
+    ):
+        send_module.send(
+            app,
+            {"output_folder": str(tmp_path), "request_id": "fingerprint-failure"},
+        )
+    assert not (tmp_path / "Pairing-fingerprint-failure.wgreturn").exists()
+
+
 def test_full_unlinked_send_avoids_collisions_and_uses_full_request_ids(
     send_module, tmp_path, monkeypatch
 ):

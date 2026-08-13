@@ -210,6 +210,25 @@ def test_send_defaults_to_wgs_live_return_folder_over_stale_fusion_history(
     assert module._default_return_folder({"last_return_folder": "/Users/old"}) == str(expected)
 
 
+def test_load_ignores_an_incompatible_workspace_module_cached_by_fusion(
+    monkeypatch,
+) -> None:
+    stale = types.ModuleType("wglink_workspace")
+    stale.__file__ = "/old/WGLink/wglink_workspace.py"
+    monkeypatch.setitem(sys.modules, "wglink_workspace", stale)
+
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_with_stale_workspace",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+
+    assert module.wglink_workspace is not stale
+    assert Path(module.wglink_workspace.__file__).resolve() == (
+        ADDIN.parent / "wglink_workspace.py"
+    ).resolve()
+
+
 @pytest.mark.parametrize("reserve_ids", [True, False], ids=["id-reserved", "id-freed"])
 def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     monkeypatch, reserve_ids: bool,
@@ -257,8 +276,10 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     assert [d for d in definitions.items.values() if d.isValid] == []
 
 
-def test_only_the_owning_instance_runs_an_export_watcher(monkeypatch) -> None:
-    """Two watchers would prompt twice for one export."""
+def test_adopted_instance_runs_presence_without_a_second_export_watcher(
+    monkeypatch,
+) -> None:
+    """A stale owner cannot suppress presence, but prompts remain single-owner."""
 
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)
@@ -271,13 +292,22 @@ def test_only_the_owning_instance_runs_an_export_watcher(monkeypatch) -> None:
     assert first._watch_thread is not None and first._watch_thread.is_alive()
 
     second = _load_instance(monkeypatch, "WGLink_watch_second", ui, app)
+    published: list[bool] = []
+    monkeypatch.setattr(second, "_publish_fusion_status", lambda: published.append(True))
     second.run(None)
     assert second._watch_thread is None
-    assert list(app.events) == [first.WATCH_EVENT_ID]
+    assert second._presence_thread is not None and second._presence_thread.is_alive()
+    assert published == [True]
+    assert set(app.events) == {first.WATCH_EVENT_ID, second._presence_event_id}
 
-    # The adopted instance stopping must leave the owner's watcher registered.
+    second._presence_handler.notify(None)
+    assert published == [True, True]
+
+    # The adopted instance stops only its private heartbeat and leaves the
+    # owner's export watcher registered.
     second.stop(None)
     assert first.WATCH_EVENT_ID in app.events
+    assert second._presence_event_id not in app.events
     assert first._watch_thread.is_alive()
 
     first.stop(None)

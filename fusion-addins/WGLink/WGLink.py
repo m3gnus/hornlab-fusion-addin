@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -14,13 +15,51 @@ import adsk.core
 
 
 ADDIN_DIR = Path(__file__).resolve().parent
-if str(ADDIN_DIR) not in sys.path:
-    sys.path.insert(0, str(ADDIN_DIR))
+try:
+    sys.path.remove(str(ADDIN_DIR))
+except ValueError:
+    pass
+sys.path.insert(0, str(ADDIN_DIR))
+
+
+def _load_local_workspace_module():
+    """Load this registration's workspace helper, not Fusion's cached copy.
+
+    Fusion can load two WGLink registrations in one Python process.  Bare
+    imports are cached by module name, so a newer registration could otherwise
+    inherit an older ``wglink_workspace`` that does not implement its API.
+    """
+
+    name = "wglink_workspace"
+    path = ADDIN_DIR / f"{name}.py"
+    cached = sys.modules.get(name)
+    try:
+        cached_path = Path(str(getattr(cached, "__file__", ""))).resolve()
+    except (OSError, RuntimeError, ValueError):
+        cached_path = None
+    if cached_path == path.resolve() and hasattr(cached, "ipc_folder"):
+        return cached
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
+    return module
 
 import wglink_core  # noqa: E402
 import wglink_send  # noqa: E402
 import wglink_watch  # noqa: E402
-import wglink_workspace  # noqa: E402
+wglink_workspace = _load_local_workspace_module()
 from wglink_bundle import format_measurement_mm  # noqa: E402
 
 
@@ -79,6 +118,12 @@ _watch_event = None
 _watch_handler = None
 _watch_stop: threading.Event | None = None
 _watch_thread: threading.Thread | None = None
+_watch_session_id = str(uuid.uuid4())
+_presence_event_id = f"hornlab_wglink_presence_{_watch_session_id}"
+_presence_event = None
+_presence_handler = None
+_presence_stop: threading.Event | None = None
+_presence_thread: threading.Thread | None = None
 # Set while a WGLink command runs. The heartbeat keeps ticking, but the handler
 # refuses to raise a prompt over a command that is mid-execution.
 _command_busy = False
@@ -86,7 +131,6 @@ _command_busy = False
 # this Fusion session instead of showing the same error every four seconds. A
 # later Send carries a new export id and is attempted normally.
 _handoff_attempted_id: str | None = None
-_watch_session_id = str(uuid.uuid4())
 
 
 def _fingerprint_hash(value: object) -> str:
@@ -945,6 +989,16 @@ class WatchEventHandler(adsk.core.CustomEventHandler):
             _message(traceback.format_exc(), "WGLink watch error")
 
 
+class PresenceEventHandler(adsk.core.CustomEventHandler):
+    """Publish status for a registration that adopted another one's panel."""
+
+    def notify(self, _args: object) -> None:
+        try:
+            _publish_fusion_status()
+        except Exception:  # noqa: BLE001 - presence is advisory
+            pass
+
+
 def _watch_loop(stop: threading.Event) -> None:
     """Heartbeat only. Every Fusion call belongs to the event handler."""
 
@@ -954,6 +1008,62 @@ def _watch_loop(stop: threading.Event) -> None:
             app.fireCustomEvent(WATCH_EVENT_ID)
         except Exception:  # noqa: BLE001 - a torn-down event ends the thread
             return
+
+
+def _presence_loop(stop: threading.Event) -> None:
+    """Raise only this registration's private presence event."""
+
+    app = _app()
+    while not stop.wait(WATCH_INTERVAL_SECONDS):
+        try:
+            app.fireCustomEvent(_presence_event_id)
+        except Exception:  # noqa: BLE001 - a torn-down event ends the thread
+            return
+
+
+def _start_presence(app: object) -> None:
+    """Keep WG online when an older duplicate owns the command panel."""
+
+    global _presence_event, _presence_handler, _presence_stop, _presence_thread
+    _presence_event = app.registerCustomEvent(_presence_event_id)
+    if _presence_event is None:
+        return
+    _presence_handler = PresenceEventHandler()
+    _presence_event.add(_presence_handler)
+    _presence_stop = threading.Event()
+    _presence_thread = threading.Thread(
+        target=_presence_loop,
+        args=(_presence_stop,),
+        name="WGLinkPresence",
+        daemon=True,
+    )
+    _presence_thread.start()
+    _publish_fusion_status()
+
+
+def _stop_presence(app: object) -> None:
+    global _presence_event, _presence_handler, _presence_stop, _presence_thread
+    if _presence_stop is not None:
+        _presence_stop.set()
+    if _presence_thread is not None and _presence_thread.is_alive():
+        _presence_thread.join(timeout=WATCH_INTERVAL_SECONDS + 1)
+    if _presence_event is not None and _presence_handler is not None:
+        try:
+            _presence_event.remove(_presence_handler)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if app:
+            app.unregisterCustomEvent(_presence_event_id)
+    except Exception:  # noqa: BLE001
+        pass
+    folder = wglink_workspace.ipc_folder()
+    if folder is not None:
+        try:
+            wglink_watch.remove_fusion_status(folder, session_id=_watch_session_id)
+        except Exception:  # noqa: BLE001 - shutdown cleanup is best effort
+            pass
+    _presence_event = _presence_handler = _presence_stop = _presence_thread = None
 
 
 def _start_watch(app: object) -> None:
@@ -1050,6 +1160,7 @@ def run(_context: object) -> None:
             # the way. Nothing is torn down on stop either -- see _owned.
             _panel = stale_panel
             _owned = False
+            _start_presence(_app())
             return
         if stale_panel:
             _delete_quietly(stale_panel)
@@ -1091,6 +1202,7 @@ def stop(_context: object) -> None:
             # Deleting the command definitions by id would strip that instance's
             # live buttons, which is how a duplicate registration used to leave
             # WGLink showing a panel whose commands did nothing.
+            _stop_presence(_app())
             _panel = None
             return
         _stop_watch(_app())

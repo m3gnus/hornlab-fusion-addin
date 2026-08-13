@@ -1119,6 +1119,20 @@ def _safe_document_name(name: str) -> str:
     return value or "Untitled"
 
 
+def _available_target(target: Path) -> Path:
+    """Return the first unused numbered variant of a return bundle path."""
+
+    if not target.exists():
+        return target
+    stem = target.name.removesuffix(".wgreturn")
+    index = 2
+    while True:
+        candidate = target.with_name(f"{stem}-{index}.wgreturn")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def _publish(temp: Path, target: Path, overwrite: bool) -> None:
     if target.exists() and not overwrite:
         raise wglink_core.WgLinkError(
@@ -1217,13 +1231,11 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     suffix = f"-{_safe_document_name(str(request_id))[:12]}" if request_id else ""
     target = output / f"{_safe_document_name(document_name)}{suffix}.wgreturn"
     overwrite = bool(options.get("overwrite", False))
+    if not overwrite:
+        target = _available_target(target)
     if target.exists() and not target.is_dir():
         raise wglink_core.WgLinkError(
             f"Return target exists but is not a bundle folder: {target}."
-        )
-    if target.exists() and not overwrite:
-        raise wglink_core.WgLinkError(
-            f"Return bundle already exists: {target}. Pass options['overwrite']=true to replace it."
         )
 
     try:

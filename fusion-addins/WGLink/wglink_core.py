@@ -3089,7 +3089,7 @@ def _observed_parameters(design: object, record: dict[str, Any]) -> list[dict[st
         except Exception:  # noqa: BLE001
             expression = None
         try:
-            value = float(parameter.value)
+            value = float(parameter.value) * 10.0
             if not math.isfinite(value):
                 value = None
         except Exception:  # noqa: BLE001

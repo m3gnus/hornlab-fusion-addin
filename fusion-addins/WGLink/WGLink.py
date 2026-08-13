@@ -533,7 +533,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 anchor.isVisible = False
                 inputs.addBoolValueInput(
-                    "overwrite", "Replace an existing return bundle", True, "", True
+                    "overwrite", "Replace an existing return bundle", True, "", False
                 )
                 _sync_anchor_choices(inputs)
                 changed = CommandInputChangedHandler()

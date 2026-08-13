@@ -86,6 +86,31 @@ def test_mouth_overshoot_parameter_is_created_then_updated_in_place(core):
     assert len(parameters.added) == 1
 
 
+def test_observed_parameters_convert_fusion_internal_cm_to_mm(core):
+    parameter = types.SimpleNamespace(
+        expression="25 mm",
+        value=2.5,
+        unit="mm",
+    )
+    parameters = types.SimpleNamespace(
+        itemByName=lambda name: parameter if name == "wg_horn_length" else None
+    )
+    design = types.SimpleNamespace(userParameters=parameters)
+    record = {
+        "payload": {
+            "parameter_expressions": '{"wg_horn_length": "25 mm"}',
+        },
+    }
+
+    assert core._observed_parameters(design, record) == [{
+        "name": "wg_horn_length",
+        "expected_expression": "25 mm",
+        "expression": "25 mm",
+        "value": 25.0,
+        "unit": "mm",
+    }]
+
+
 def test_body_naming_table_covers_every_insert_body_role(core):
     assert core.BODY_NAMES == {
         "cut_tool": "WGLink waveguide cut tool",

@@ -210,6 +210,43 @@ def test_send_defaults_to_wgs_live_return_folder_over_stale_fusion_history(
     assert module._default_return_folder({"last_return_folder": "/Users/old"}) == str(expected)
 
 
+def test_manual_send_defaults_overwrite_checkbox_to_off(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_send_overwrite_default",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    bool_inputs: list[tuple[object, ...]] = []
+    selection = types.SimpleNamespace(
+        addSelectionFilter=lambda _value: None,
+        setSelectionLimits=lambda _minimum, _maximum: None,
+    )
+    anchor = types.SimpleNamespace(isVisible=True)
+    inputs = types.SimpleNamespace(
+        addSelectionInput=lambda *_args: selection,
+        addStringValueInput=lambda *_args: None,
+        addBoolValueInput=lambda *args: bool_inputs.append(args),
+        addDropDownCommandInput=lambda *_args: anchor,
+    )
+    command = types.SimpleNamespace(
+        commandInputs=inputs,
+        inputChanged=types.SimpleNamespace(add=lambda _handler: None),
+    )
+    module.adsk.core.DropDownStyles = types.SimpleNamespace(
+        TextListDropDownStyle="text-list"
+    )
+    monkeypatch.setattr(module, "_load_settings", lambda: {})
+    monkeypatch.setattr(module, "_default_return_folder", lambda _settings: "/returns")
+    monkeypatch.setattr(module, "_sync_anchor_choices", lambda _inputs: None)
+
+    module.CommandCreatedHandler("send").notify(
+        types.SimpleNamespace(command=command)
+    )
+
+    overwrite = next(args for args in bool_inputs if args[0] == "overwrite")
+    assert overwrite[-1] is False
+
+
 def test_load_ignores_an_incompatible_workspace_module_cached_by_fusion(
     monkeypatch,
 ) -> None:

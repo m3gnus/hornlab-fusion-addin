@@ -213,7 +213,9 @@ def test_shape_fingerprint_includes_source_roles_and_face_geometry(send_module):
     assert fingerprint["faces"][0]["area_mm2"] == pytest.approx(250.0)
 
 
-def test_full_unlinked_send_writes_valid_atomic_bundle(send_module, tmp_path, monkeypatch):
+def test_full_unlinked_send_avoids_collisions_unless_overwrite_is_explicit(
+    send_module, tmp_path, monkeypatch
+):
     painted = face("LF", area=2.5)
     exterior = body("cabinet", faces=[painted])
     root = component("Speaker", [exterior])
@@ -255,8 +257,18 @@ def test_full_unlinked_send_writes_valid_atomic_bundle(send_module, tmp_path, mo
     assert manifest["files"]["assembly.step"]["sha256"] == expected
     assert not list(tmp_path.glob(".My Speaker.wgreturn.tmp-*"))
 
-    with pytest.raises(send_module.wglink_core.WgLinkError, match="already exists"):
-        send_module.send(app, {"output_folder": str(tmp_path)})
+    collision_report = send_module.send(app, {"output_folder": str(tmp_path)})
+    assert Path(collision_report["bundle_path"]) == tmp_path / "My Speaker-2.wgreturn"
+    assert target.is_dir()
+
+    marker = target / "old-bundle-marker"
+    marker.write_text("replace me", encoding="utf-8")
+    replacement_report = send_module.send(
+        app, {"output_folder": str(tmp_path), "overwrite": True}
+    )
+    assert Path(replacement_report["bundle_path"]) == target
+    assert replacement_report["return_id"] != report["return_id"]
+    assert not marker.exists()
 
 
 def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch):

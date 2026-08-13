@@ -352,6 +352,44 @@ def test_adopted_instance_runs_presence_without_a_second_export_watcher(
     assert first._watch_thread is None
 
 
+def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
+    monkeypatch,
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_parameter_drift", ui, app)
+    record = {"payload": {}, "body": None}
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_link_records",
+        lambda _design: {"instance-a": record},
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_parameter_drift",
+        lambda _design, _record: [
+            {"name": "wg_mouth_thickness"},
+            {"name": "wg_length"},
+        ],
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_local_body_state",
+        lambda _record: "unchanged",
+    )
+    monkeypatch.setattr(module.wglink_send, "return_state", lambda *_args: {})
+
+    links = module._document_links()
+
+    assert links[0]["drifted_parameters"] == ["wg_length", "wg_mouth_thickness"]
+    assert int(links[0]["parameter_drift_count"]) == len(
+        links[0]["drifted_parameters"]
+    )
+
+
 def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) -> None:
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)

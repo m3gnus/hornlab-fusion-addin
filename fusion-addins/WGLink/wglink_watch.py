@@ -218,10 +218,17 @@ def write_fusion_status(
             record["parameterCount"] = int(record["parameterCount"] or 0)
         except (TypeError, ValueError):
             record["parameterCount"] = 0
-        try:
-            record["parameterDriftCount"] = int(record["parameterDriftCount"] or 0)
-        except (TypeError, ValueError):
-            record["parameterDriftCount"] = 0
+        raw_drifted_parameters = link.get("drifted_parameters")
+        record["driftedParameters"] = sorted(
+            name
+            for name in (
+                raw_drifted_parameters
+                if isinstance(raw_drifted_parameters, list)
+                else []
+            )
+            if isinstance(name, str)
+        )
+        record["parameterDriftCount"] = len(record["driftedParameters"])
         try:
             record["documentBodyCount"] = int(record["documentBodyCount"] or 0)
         except (TypeError, ValueError):

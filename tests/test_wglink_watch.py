@@ -100,7 +100,8 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
             "formula": "r-osse",
             "config_present": "true",
             "parameter_count": "14",
-            "parameter_drift_count": "2",
+            "parameter_drift_count": "99",
+            "drifted_parameters": ["wg_mouth_thickness", "wg_length"],
             "local_body_state": "modified",
             "body_fingerprint_hash": "sha256:body",
             "document_signature_hash": "sha256:return-state",
@@ -127,16 +128,39 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         "lineageId": None,
         "parameterCount": 14,
         "parameterDriftCount": 2,
+        "driftedParameters": ["wg_length", "wg_mouth_thickness"],
         "localBodyState": "modified",
         "bodyFingerprintHash": "sha256:body",
         "documentSignatureHash": "sha256:return-state",
         "documentBodyCount": 3,
         "sourceStateHash": "sha256:sources",
     }
+    link = payload["document"]["links"][0]
+    assert link["parameterDriftCount"] == len(link["driftedParameters"])
     assert list(tmp_path.glob(f"{wglink_watch.FUSION_STATUS_FILENAME}.*")) == []
     assert wglink_watch.remove_fusion_status(tmp_path, session_id="other") is False
     assert wglink_watch.remove_fusion_status(tmp_path, session_id="session-a") is True
     assert not marker.exists()
+
+
+def test_fusion_status_publishes_no_parameter_drift_as_an_empty_list(
+    tmp_path: Path,
+) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="Tritonia V",
+        links=[{
+            "instance_id": "instance-a",
+            "parameter_drift_count": "2",
+            "drifted_parameters": [],
+        }],
+    )
+
+    link = json.loads(marker.read_text())["document"]["links"][0]
+    assert link["driftedParameters"] == []
+    assert link["parameterDriftCount"] == 0
+    assert link["parameterDriftCount"] == len(link["driftedParameters"])
 
 
 def test_return_request_is_targeted_to_one_addin_session_and_acknowledged(tmp_path: Path) -> None:

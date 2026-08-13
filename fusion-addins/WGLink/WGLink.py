@@ -600,7 +600,7 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
-def _document_links() -> list[dict[str, str]]:
+def _document_links() -> list[dict[str, object]]:
     """Copy each managed link's identity out of the document as plain strings.
 
     Called on Fusion's main thread only. What it returns is deliberately inert
@@ -618,7 +618,7 @@ def _document_links() -> list[dict[str, str]]:
         records = wglink_core._link_records(design)
     except Exception:  # noqa: BLE001 - a document we cannot read has no links
         return []
-    links: list[dict[str, str]] = []
+    links: list[dict[str, object]] = []
     first_instance = next(iter(sorted(records)), None)
     try:
         return_state = wglink_send.return_state(
@@ -654,14 +654,17 @@ def _document_links() -> list[dict[str, str]]:
         except (TypeError, ValueError):
             parameter_count = 0
         try:
-            parameter_drift_count = len(wglink_core._parameter_drift(design, record))
+            parameter_drift = wglink_core._parameter_drift(design, record)
+            drifted_parameters = sorted(
+                str(item["name"]) for item in parameter_drift
+            )
             local_body_state = wglink_core._local_body_state(record)
             body = record.get("body")
             body_fingerprint = (
                 wglink_core._body_fingerprint(body) if body is not None else None
             )
         except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
-            parameter_drift_count = 0
+            drifted_parameters = []
             local_body_state = "unknown"
             body_fingerprint = None
         links.append({
@@ -675,7 +678,8 @@ def _document_links() -> list[dict[str, str]]:
             "formula": str(payload.get("formula") or ""),
             "config_present": "true" if config_present else "false",
             "parameter_count": str(parameter_count),
-            "parameter_drift_count": str(parameter_drift_count),
+            "parameter_drift_count": str(len(drifted_parameters)),
+            "drifted_parameters": drifted_parameters,
             "local_body_state": str(local_body_state),
             "body_fingerprint_hash": (
                 _fingerprint_hash(body_fingerprint) if body_fingerprint else ""
@@ -714,7 +718,7 @@ def _publish_fusion_status() -> None:
     active_document = getattr(app, "activeDocument", None) if app else None
     if active_document is None and product is None:
         document_name = None
-        links: list[dict[str, str]] = []
+        links: list[dict[str, object]] = []
     else:
         document_name = str(getattr(active_document, "name", "") or "Untitled")
         links = _document_links()

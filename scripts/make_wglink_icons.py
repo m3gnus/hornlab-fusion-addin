@@ -108,6 +108,16 @@ def draw_detach(draw: ImageDraw.ImageDraw) -> None:
     draw.rounded_rectangle(_box(37, 4, 55, 20), radius=_s(8), outline=NEGATIVE, width=_w(4.0))
 
 
+def draw_manage(draw: ImageDraw.ImageDraw) -> None:
+    _mouth(draw)
+    draw.line([(_s(18), _s(4)), (_s(46), _s(4))], fill=INK, width=_w(3.2))
+    draw.ellipse(_box(22, 0, 30, 8), fill=ACCENT)
+    draw.line([(_s(18), _s(12)), (_s(46), _s(12))], fill=INK, width=_w(3.2))
+    draw.ellipse(_box(34, 8, 42, 16), fill=ACCENT)
+    draw.line([(_s(18), _s(20)), (_s(46), _s(20))], fill=INK, width=_w(3.2))
+    draw.ellipse(_box(26, 16, 34, 24), fill=ACCENT)
+
+
 # --- compact variants -------------------------------------------------------
 # At 16 px the nested mouth collapses into a grey blob and the accent mark that
 # actually names the command disappears. The compact glyph drops the mouth to a
@@ -160,6 +170,16 @@ def compact_detach(draw: ImageDraw.ImageDraw) -> None:
     draw.arc(_box(34, 10, 64, 38), start=270, end=90, fill=NEGATIVE, width=_w(7.5))
 
 
+def compact_manage(draw: ImageDraw.ImageDraw) -> None:
+    _bar(draw)
+    draw.line([(_s(6), _s(8)), (_s(58), _s(8))], fill=INK, width=_w(6))
+    draw.ellipse(_box(14, 2, 26, 14), fill=ACCENT)
+    draw.line([(_s(6), _s(23)), (_s(58), _s(23))], fill=INK, width=_w(6))
+    draw.ellipse(_box(38, 17, 50, 29), fill=ACCENT)
+    draw.line([(_s(6), _s(38)), (_s(58), _s(38))], fill=INK, width=_w(6))
+    draw.ellipse(_box(24, 32, 36, 44), fill=ACCENT)
+
+
 GLYPHS = {
     "solve": (draw_solve, compact_solve),
     "insert": (draw_insert, compact_insert),
@@ -168,6 +188,7 @@ GLYPHS = {
     "send": (draw_send, compact_send),
     "relink": (draw_relink, compact_relink),
     "detach": (draw_detach, compact_detach),
+    "manage": (draw_manage, compact_manage),
 }
 
 

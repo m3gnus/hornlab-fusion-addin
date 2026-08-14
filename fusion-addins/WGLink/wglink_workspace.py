@@ -4,11 +4,13 @@ The workspace is WG's setting. Asking for it a second time in Fusion made every
 first insert a two-place setup, and left the two free to disagree -- pick the
 wrong folder here and WGLink inserts a bundle WG is no longer writing to.
 
-So this reads WG's own ``workspace_settings.json`` rather than storing a second
+So this reads WG's own ``cadlink_settings.json`` rather than storing a second
 copy. That is a deliberate coupling to another repository's file, kept honest by
 three rules: the file is versioned (``schemaVersion``), nothing is ever written
 back to it, and every failure degrades to ``None`` so the manual picker still
-works for bundles from another machine.
+works for bundles from another machine. ``workspace_settings.json`` remains a
+read-only upgrade fallback for the release where CAD and run exports shared one
+folder.
 
 Path resolution mirrors ``server/platform/paths.resolve_data_dir``, including
 the ``WG2_DATA_DIR`` override; keep the two in step.
@@ -26,7 +28,10 @@ from typing import Any, Mapping
 
 DATA_DIR_ENV = "WG2_DATA_DIR"
 APP_DIRECTORY = "WaveguideGenerator"
-SETTINGS_NAME = "workspace_settings.json"
+SETTINGS_NAME = "cadlink_settings.json"
+SETTINGS_KEY = "cadLinkPath"
+LEGACY_SETTINGS_NAME = "workspace_settings.json"
+LEGACY_SETTINGS_KEY = "workspacePath"
 BUNDLE_SUBDIRECTORY = "wglink"
 BUNDLE_SUFFIX = ".wglink"
 RETURN_SUBDIRECTORY = "wgreturn"
@@ -76,25 +81,39 @@ def data_dir(
 def workspace_root(**kwargs: Any) -> Path | None:
     """The folder WG is writing bundles into, or None if it cannot be read.
 
-    Falls back to WG's default workspace when no folder has been selected, which
-    is where WG itself writes until the user picks one.
+    A folder must be selected in WG's CAD Link settings. There is no implicit
+    application-data fallback: hiding the exchange there makes first-time setup
+    impossible to understand and lets output-folder changes disconnect CAD.
     """
 
     root = data_dir(**kwargs)
     if root is None:
         return None
-    try:
-        payload = json.loads((root / SETTINGS_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        payload = None
-    if isinstance(payload, Mapping):
-        raw = str(payload.get("workspacePath") or "").strip()
+    current = root / SETTINGS_NAME
+    candidates = (
+        ((SETTINGS_NAME, SETTINGS_KEY, False),)
+        if current.exists()
+        else ((LEGACY_SETTINGS_NAME, LEGACY_SETTINGS_KEY, True),)
+    )
+    for settings_name, key, legacy in candidates:
+        try:
+            payload = json.loads((root / settings_name).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        raw = str(payload.get(key) or "").strip()
         if raw:
             selected = Path(raw).expanduser()
-            if selected.is_dir():
-                return selected.resolve()
-    default = root / "workspace"
-    return default.resolve() if default.is_dir() else None
+            if not selected.is_dir():
+                return None
+            if legacy and not any(
+                (selected / child).is_dir()
+                for child in (BUNDLE_SUBDIRECTORY, RETURN_SUBDIRECTORY)
+            ):
+                return None
+            return selected.resolve()
+    return None
 
 
 def bundle_folder(**kwargs: Any) -> Path | None:

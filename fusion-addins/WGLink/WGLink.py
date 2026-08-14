@@ -728,6 +728,8 @@ def _publish_fusion_status() -> None:
             session_id=_watch_session_id,
             document_name=document_name,
             document_id=_active_document_id(),
+            adapter_version=wglink_send.ADAPTER_VERSION,
+            workspace_root=wglink_workspace.workspace_root(),
             links=links,
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands

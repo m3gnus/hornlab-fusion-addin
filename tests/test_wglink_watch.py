@@ -93,6 +93,8 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         tmp_path,
         session_id="session-a",
         document_name="Tritonia V",
+        adapter_version="1.2.3",
+        workspace_root=tmp_path / "exchange",
         links=[{
             "instance_id": "instance-a",
             "design_id": "wgd_a",
@@ -113,6 +115,8 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
     )
 
     payload = json.loads(marker.read_text())
+    assert payload["adapterVersion"] == "1.2.3"
+    assert payload["workspaceRoot"] == str((tmp_path / "exchange").resolve())
     assert payload["document"]["name"] == "Tritonia V"
     assert payload["document"]["links"][0] == {
         "bundlePath": None,

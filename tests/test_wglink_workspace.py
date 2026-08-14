@@ -20,7 +20,7 @@ def _wg_data_dir(tmp_path: Path, workspace: Path | None) -> Path:
     data.mkdir(parents=True, exist_ok=True)
     if workspace is not None:
         (data / ws.SETTINGS_NAME).write_text(
-            json.dumps({"schemaVersion": 1, "workspacePath": str(workspace)}),
+            json.dumps({"schemaVersion": 1, ws.SETTINGS_KEY: str(workspace)}),
             encoding="utf-8",
         )
     return data
@@ -76,10 +76,54 @@ def test_the_selected_workspace_is_read_from_wg(tmp_path: Path) -> None:
     assert ws.ipc_folder(create=True, environ={ws.DATA_DIR_ENV: str(data)}) == data / "ipc" / "wglink"
 
 
-def test_wg_default_workspace_is_used_when_none_was_selected(tmp_path: Path) -> None:
+def test_no_selected_wglink_folder_has_no_implicit_default(tmp_path: Path) -> None:
     data = _wg_data_dir(tmp_path, None)
     (data / "workspace").mkdir()
-    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) == (data / "workspace").resolve()
+    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) is None
+
+
+def test_the_legacy_output_workspace_is_an_upgrade_fallback(tmp_path: Path) -> None:
+    workspace = tmp_path / "old shared folder"
+    workspace.mkdir()
+    (workspace / ws.BUNDLE_SUBDIRECTORY).mkdir()
+    data = _wg_data_dir(tmp_path, None)
+    (data / ws.LEGACY_SETTINGS_NAME).write_text(
+        json.dumps({"schemaVersion": 1, ws.LEGACY_SETTINGS_KEY: str(workspace)}),
+        encoding="utf-8",
+    )
+    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) == workspace.resolve()
+
+
+def test_an_output_only_legacy_workspace_is_not_treated_as_wglink(tmp_path: Path) -> None:
+    workspace = tmp_path / "output only"
+    workspace.mkdir()
+    data = _wg_data_dir(tmp_path, None)
+    (data / ws.LEGACY_SETTINGS_NAME).write_text(
+        json.dumps({ws.LEGACY_SETTINGS_KEY: str(workspace)}), encoding="utf-8"
+    )
+    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) is None
+
+
+def test_the_dedicated_setting_wins_when_both_files_exist(tmp_path: Path) -> None:
+    cad = tmp_path / "cad"
+    output = tmp_path / "output"
+    cad.mkdir(); output.mkdir()
+    data = _wg_data_dir(tmp_path, cad)
+    (data / ws.LEGACY_SETTINGS_NAME).write_text(
+        json.dumps({ws.LEGACY_SETTINGS_KEY: str(output)}), encoding="utf-8"
+    )
+    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) == cad.resolve()
+
+
+def test_a_corrupt_dedicated_setting_never_falls_back_to_output(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    data = _wg_data_dir(tmp_path, None)
+    (data / ws.SETTINGS_NAME).write_text("not json", encoding="utf-8")
+    (data / ws.LEGACY_SETTINGS_NAME).write_text(
+        json.dumps({ws.LEGACY_SETTINGS_KEY: str(output)}), encoding="utf-8"
+    )
+    assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) is None
 
 
 def test_a_workspace_that_has_gone_away_reads_as_unknown(tmp_path: Path) -> None:
@@ -87,7 +131,7 @@ def test_a_workspace_that_has_gone_away_reads_as_unknown(tmp_path: Path) -> None
     assert ws.workspace_root(environ={ws.DATA_DIR_ENV: str(data)}) is None
 
 
-@pytest.mark.parametrize("payload", ["not json", "[]", '{"workspacePath": ""}', '{}'])
+@pytest.mark.parametrize("payload", ["not json", "[]", '{"cadLinkPath": ""}', '{}'])
 def test_an_unusable_settings_file_reads_as_unknown(tmp_path: Path, payload: str) -> None:
     data = tmp_path / "WaveguideGenerator"
     data.mkdir()

@@ -176,6 +176,8 @@ def write_fusion_status(
     session_id: str,
     document_name: str | None,
     document_id: str | None = None,
+    adapter_version: str | None = None,
+    workspace_root: Path | None = None,
     links: Iterable[Mapping[str, Any]],
     updated_at: datetime | None = None,
 ) -> Path:
@@ -239,6 +241,12 @@ def write_fusion_status(
         "schemaVersion": 1,
         "cadApplication": "fusion360",
         "sessionId": str(session_id),
+        "adapterVersion": str(adapter_version or "") or None,
+        "workspaceRoot": (
+            str(workspace_root.expanduser().resolve())
+            if workspace_root is not None
+            else None
+        ),
         "updatedAt": timestamp.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "document": (
             {"name": document_name, "id": document_id, "links": copied}

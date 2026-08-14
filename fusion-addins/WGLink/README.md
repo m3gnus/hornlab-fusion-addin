@@ -83,13 +83,14 @@ The supported reference layer is:
 
 ## The workspace is WG's setting
 
-The workspace folder is chosen once, in Waveguide Generator. WGLink reads it
-from WG's own `workspace_settings.json` — resolved the way WG resolves it,
+The WGLink folder is chosen once, under **Settings → CAD Link** in Waveguide
+Generator. It is separate from WG's run-output folder. WGLink reads it from
+WG's own `cadlink_settings.json` — resolved the way WG resolves it,
 `WG2_DATA_DIR` included — and lists the bundles in `<workspace>/wglink` in the
 Insert and Relink dropdowns, newest first, labelled by design name and export
 sequence. Nothing is ever written back to that file.
 
-There is deliberately no second copy of the folder here. Storing one made the
+There is deliberately no second copy of the folder in Fusion. Storing one made the
 first insert a two-place setup and let the two settings disagree, which inserts
 a bundle WG is no longer writing to. When the workspace cannot be read — WG
 never ran, the folder is on a disconnected drive, the bundle came from another

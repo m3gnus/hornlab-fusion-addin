@@ -69,6 +69,11 @@ BROWSE_FOLDER = "Browse for a bundle folder…"
 BROWSE_ZIP = "Browse for a zipped .wglink file…"
 SETTINGS_PATH = Path.home() / ".hornlab" / "WGLink" / "settings.json"
 COMMANDS = {
+    "solve": (
+        "hornlab_wglink_solve",
+        "Solve in WG",
+        "Export the assembly and ask Waveguide Generator to prepare and solve it.",
+    ),
     "insert": (
         "hornlab_wglink_insert",
         "Insert",
@@ -233,32 +238,6 @@ def _choose_bundle(title: str, source_kind: str) -> str | None:
     return str(selected)
 
 
-def _choose_return_folder(command_inputs: object) -> None:
-    ui = _ui()
-    if ui is None:
-        return
-    current = Path(str(_input_value(command_inputs, "output_folder") or Path.home())).expanduser()
-    dialog = ui.createFolderDialog()
-    dialog.title = "Select the WG return output folder"
-    initial = current if current.is_dir() else current.parent
-    if initial.exists():
-        dialog.initialDirectory = str(initial)
-    if dialog.showDialog() != adsk.core.DialogResults.DialogOK:
-        return
-    target = _input(command_inputs, "output_folder")
-    if target is not None:
-        target.value = str(dialog.folder)
-
-
-def _default_return_folder(settings: dict[str, object]) -> str:
-    """Prefer WG's live workspace over Fusion's historical picker value."""
-
-    workspace_return = wglink_workspace.return_folder()
-    if workspace_return is not None:
-        return str(workspace_return)
-    return str(settings.get("last_return_folder", Path.home()))
-
-
 def _input(command_inputs: object, name: str) -> object | None:
     try:
         return command_inputs.itemById(name)
@@ -279,17 +258,26 @@ def _selected_name(command_inputs: object, name: str, default: str) -> str:
         return default
 
 
+def _document_link_choices() -> list[tuple[str, str]]:
+    """``(label, instance_id)`` for every managed link in the active document."""
+
+    choices = []
+    for link in _document_links():
+        instance_id = str(link.get("instance_id") or "")
+        if not instance_id:
+            continue
+        name = str(link.get("design_name") or "").strip()
+        choices.append((f"{name} · {instance_id}" if name else instance_id, instance_id))
+    return choices
+
+
 def _command_options(command_inputs: object) -> dict[str, object]:
     result: dict[str, object] = {}
-    instance = str(_input_value(command_inputs, "instance_id") or "").strip()
-    if instance:
-        result["instance_id"] = instance
-    force = _input_value(command_inputs, "force")
-    if force is not None:
-        result["force"] = bool(force)
-    fallback = _input_value(command_inputs, "allow_root_fallback")
-    if fallback is not None:
-        result["allow_root_fallback"] = bool(fallback)
+    chosen = _selected_name(command_inputs, "instance_choice", "")
+    if chosen:
+        # The label carries the design name for recognition; the id is the part
+        # the head-less API takes.
+        result["instance_id"] = chosen.rsplit(" · ", 1)[-1].strip()
     return result
 
 
@@ -304,10 +292,20 @@ def _send_selection(command_inputs: object) -> object:
 
 
 def _send_options(command_inputs: object) -> dict[str, object]:
+    # WG only ingests from its own workspace, so there is one correct
+    # destination and the UI no longer asks. Collision-safe naming is kept:
+    # a return WG has not ingested yet is not in content-addressed storage,
+    # so overwriting one loses evidence.
+    output = wglink_workspace.return_folder()
+    if output is None:
+        raise wglink_core.WgLinkError(
+            "Waveguide Generator has no selected CAD Link workspace. Choose one in "
+            "WG under Settings → CAD Link, then send again."
+        )
     options: dict[str, object] = {
         "selection": _send_selection(command_inputs),
-        "output_folder": str(_input_value(command_inputs, "output_folder") or "").strip(),
-        "overwrite": bool(_input_value(command_inputs, "overwrite")),
+        "output_folder": str(output),
+        "overwrite": False,
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -393,15 +391,21 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             f"{report.get('direct_reference_limit', '')}"
             f"{_warnings(report)}"
         )
-    if operation == "send":
+    if operation in {"send", "solve"}:
         scope = report.get("scope", {})
         status = scope.get("status", "?") if isinstance(scope, dict) else "?"
+        closing = (
+            "Waveguide Generator will prepare this model and start solving it. "
+            "It stops and asks if the ingestion reports something blocking."
+            if report.get("solve_requested")
+            else "Waveguide Generator will detect and open this return automatically."
+        )
         message = (
             f"Return bundle written: {report.get('bundle_path', '?')}\n"
             f"Return ID: {report.get('return_id', '?')}\n"
             f"Scope: {status}\n"
             f"Sources: {len(report.get('sources', []))}\n\n"
-            "Waveguide Generator will detect and open this return automatically."
+            f"{closing}"
         )
         if status == "degraded" and isinstance(scope, dict):
             skipped = scope.get("skipped", [])
@@ -427,6 +431,30 @@ def _summary(operation: str, report: dict[str, object]) -> str:
         "Bodies and features changed: 0"
         f"{_warnings(report)}"
     )
+
+
+def _request_wg_solve(report: dict[str, object]) -> bool:
+    """Ask WG to prepare and solve the bundle this send just published.
+
+    Written after the bundle, and only ever by this command: a plain Send must
+    never start an expensive solve as a side effect, which is also why there is
+    no remembered "solve next time" preference.
+    """
+
+    ipc = wglink_workspace.ipc_folder(create=True)
+    workspace = wglink_workspace.workspace_root()
+    if ipc is None or workspace is None:
+        raise wglink_core.WgLinkError(
+            "Waveguide Generator has no selected CAD Link workspace, so it cannot be asked to solve."
+        )
+    wglink_watch.write_solve_request(
+        ipc,
+        command_id=str(uuid.uuid4()),
+        return_id=str(report.get("return_id") or ""),
+        bundle_path=Path(str(report.get("bundle_path") or "")),
+        workspace_root=workspace,
+    )
+    return True
 
 
 class CommandExecuteHandler(adsk.core.CommandEventHandler):
@@ -458,14 +486,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 report = wglink_core.update(_app(), None, options)
             elif self.operation == "audit":
                 report = wglink_core.audit(_app(), options)
-            elif self.operation == "send":
-                send_options = _send_options(inputs)
-                output_folder = str(send_options.get("output_folder", ""))
-                if output_folder:
-                    settings = _load_settings()
-                    settings["last_return_folder"] = output_folder
-                    _save_settings(settings)
-                report = wglink_send.send(_app(), send_options)
+            elif self.operation in {"send", "solve"}:
+                report = wglink_send.send(_app(), _send_options(inputs))
+                if self.operation == "solve":
+                    report = dict(report)
+                    report["solve_requested"] = _request_wg_solve(report)
             elif self.operation == "relink":
                 kind, chosen = _resolve_source(
                     _selected_name(inputs, "bundle_source", BROWSE_FOLDER)
@@ -496,10 +521,7 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             changed = getattr(args, "input", None)
             input_id = str(getattr(changed, "id", ""))
             inputs = args.inputs
-            if input_id == "browse_output_folder":
-                _choose_return_folder(inputs)
-                changed.value = False
-            elif input_id == "send_selection":
+            if input_id == "send_selection":
                 _sync_anchor_choices(inputs)
         except Exception:  # noqa: BLE001 - execute remains the validation boundary
             pass
@@ -513,7 +535,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
     def notify(self, args: object) -> None:
         try:
             inputs = args.command.commandInputs
-            if self.operation == "send":
+            if self.operation in {"send", "solve"}:
                 selection = inputs.addSelectionInput(
                     "send_selection",
                     "Assembly scope",
@@ -521,23 +543,16 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 selection.addSelectionFilter("Occurrences")
                 selection.setSelectionLimits(0, 1)
-                settings = _load_settings()
-                default_folder = _default_return_folder(settings)
-                inputs.addStringValueInput(
-                    "output_folder", "WG return folder", default_folder
-                )
-                inputs.addBoolValueInput(
-                    "browse_output_folder", "Browse output folder", False, "", False
-                )
+                # The return folder is WG's setting, like the bundle folder:
+                # WG only ingests from its own workspace, so a return written
+                # anywhere else is invisible to it. Head-less callers may still
+                # pass output_folder and overwrite.
                 anchor = inputs.addDropDownCommandInput(
                     "anchor_instance_id",
                     "Solver anchor instance",
                     adsk.core.DropDownStyles.TextListDropDownStyle,
                 )
                 anchor.isVisible = False
-                inputs.addBoolValueInput(
-                    "overwrite", "Replace an existing return bundle", True, "", False
-                )
                 _sync_anchor_choices(inputs)
                 changed = CommandInputChangedHandler()
                 args.command.inputChanged.add(changed)
@@ -556,28 +571,21 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     source.listItems.add(bundle.label(), index == 0)
                 source.listItems.add(BROWSE_FOLDER, not discovered)
                 source.listItems.add(BROWSE_ZIP, False)
-            if self.operation not in {"insert", "send"}:
-                inputs.addStringValueInput(
-                    "instance_id",
-                    "Instance ID (optional)",
-                    "",
-                )
-            if self.operation in {"update", "relink"}:
-                inputs.addBoolValueInput(
-                    "force",
-                    "Force identity/sequence refusal",
-                    True,
-                    "",
-                    False,
-                )
-            if self.operation == "insert":
-                inputs.addBoolValueInput(
-                    "allow_root_fallback",
-                    "Allow Part Design root fallback",
-                    True,
-                    "",
-                    True,
-                )
+            if self.operation not in {"insert", "send", "solve"}:
+                # A document with one link needs no choice, and the old free
+                # text field required running Audit first just to learn the id.
+                links = _document_link_choices()
+                if len(links) > 1:
+                    chooser = inputs.addDropDownCommandInput(
+                        "instance_choice",
+                        "Managed link",
+                        adsk.core.DropDownStyles.TextListDropDownStyle,
+                    )
+                    for index, (label, _instance_id) in enumerate(links):
+                        chooser.listItems.add(label, index == 0)
+            # force and allow_root_fallback stay head-less-only: every refusal
+            # names the UI path that resolves it (Relink, Detach, or undoing a
+            # body move), and the root fallback already warns in its report.
             handler = CommandExecuteHandler(self.operation)
             args.command.execute.add(handler)
             _handlers.append(handler)

@@ -56,6 +56,22 @@ The supported reference layer is:
 
 ## Commands
 
+The two everyday commands are **Solve in WG** and **Send to WG**. Insert and
+Update are ordinarily automatic — WG's *Send to CAD* publishes a handoff the
+add-in applies on its own — so they, along with Audit, Relink and Detach, are
+maintenance and recovery tools rather than the normal workflow.
+
+- **Solve in WG** writes the same validated `.wgreturn` bundle as Send to WG,
+  then asks Waveguide Generator to prepare that exact bundle and start the
+  solve, so WG is already solving when you switch to it. The request is a
+  one-shot marker carrying its own command id, deliberately separate from
+  `wgreturn.json`: WG re-reads returns whenever it re-lists the workspace, so
+  intent recorded inside the immutable geometry evidence would be re-observed
+  and re-solved. WG records each command id as spent, refuses a bundle whose
+  manifest hash changed after the request, and stops at its own ingestion
+  gates — unacknowledged blocking findings never solve automatically. There is
+  no remembered "solve next time" preference: an expensive solve should not be
+  a side effect of a later plain send.
 - **Insert** offers the bundles already sitting in Waveguide Generator's
   workspace, validates the chosen one before Fusion mutation, and builds the
   full WG viewport model. **Send to CAD** in Waveguide Generator also publishes
@@ -73,7 +89,11 @@ The supported reference layer is:
   body is unmodified, modified, missing, or unknown.
 - **Send to WG** observes the root or one occurrence subtree without changing
   the document, applies the explicit return-scope policy, and writes an atomic,
-  checksummed `.wgreturn` bundle. A body can carry the `WGLink` attribute
+  checksummed `.wgreturn` bundle into WG's own workspace. The destination is
+  not a dialog choice: WG only ingests from `<workspace>/wgreturn`, so a
+  return written anywhere else is invisible to it. Names are collision-safe
+  rather than overwriting, because a return WG has not ingested yet is not in
+  content-addressed storage. A body can carry the `WGLink` attribute
   `return_declaration=exterior-shell` or `return_declaration=exclude` when its
   surface/exclusion intent cannot be inferred safely.
 - **Relink** records a moved or renamed bundle path. The design id must match
@@ -97,9 +117,9 @@ never ran, the folder is on a disconnected drive, the bundle came from another
 machine — the dropdown falls back to the browse entries and the manual picker
 behaves as it always did.
 
-Insert and Relink remember the last bundle folder; Send remembers its last
-output folder. When a document has multiple links, enter the instance id in the
-command dialog so the command does not have to guess. Send instead exposes an
+Insert and Relink remember the last bundle folder. When a document has several
+managed links, Update, Audit, Relink and Detach show a **Managed link**
+dropdown listing them by design name; a single-link document is not asked. Send instead exposes an
 anchor choice only when its selected scope contains several linked instances.
 
 ## Update atomicity and recovery
@@ -208,7 +228,7 @@ the scientific interpolation stack. A copied install can still work when
 passes `repo_root` and `python_path` options.
 
 Restart Fusion and use the WGLink toolbar panel under **Utilities**. The
-manifest sets `runOnStartup` to `true`: start-up only registers a panel and six
+manifest sets `runOnStartup` to `true`: start-up only registers a panel and its
 command definitions, and every piece of geometry work happens when a command is
 executed, so there is nothing heavy to defer. Leaving it `false` meant the panel
 was gone after each Fusion restart until it was started by hand, which also kept

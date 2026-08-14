@@ -86,6 +86,14 @@ def draw_send(draw: ImageDraw.ImageDraw) -> None:
     _arrow_up(draw, POSITIVE)
 
 
+def draw_solve(draw: ImageDraw.ImageDraw) -> None:
+    # Solve in WG is a send that also starts a run: the send arrow, with the
+    # play mark that names the difference.
+    _mouth(draw)
+    _arrow_up(draw, POSITIVE)
+    draw.polygon([(_s(44), _s(2)), (_s(44), _s(22)), (_s(60), _s(12))], fill=ACCENT)
+
+
 def draw_relink(draw: ImageDraw.ImageDraw) -> None:
     _mouth(draw)
     # Two interlocking links, drawn as capsules that overlap at the centre.
@@ -134,6 +142,12 @@ def compact_send(draw: ImageDraw.ImageDraw) -> None:
     draw.polygon([(_s(17), _s(24)), (_s(47), _s(24)), (_s(32), _s(4))], fill=POSITIVE)
 
 
+def compact_solve(draw: ImageDraw.ImageDraw) -> None:
+    _bar(draw)
+    draw.polygon([(_s(6), _s(4)), (_s(6), _s(40)), (_s(34), _s(22))], fill=POSITIVE)
+    draw.polygon([(_s(36), _s(4)), (_s(36), _s(40)), (_s(62), _s(22))], fill=ACCENT)
+
+
 def compact_relink(draw: ImageDraw.ImageDraw) -> None:
     _bar(draw)
     draw.rounded_rectangle(_box(4, 10, 36, 38), radius=_s(14), outline=ACCENT, width=_w(7))
@@ -147,6 +161,7 @@ def compact_detach(draw: ImageDraw.ImageDraw) -> None:
 
 
 GLYPHS = {
+    "solve": (draw_solve, compact_solve),
     "insert": (draw_insert, compact_insert),
     "update": (draw_update, compact_update),
     "audit": (draw_audit, compact_audit),

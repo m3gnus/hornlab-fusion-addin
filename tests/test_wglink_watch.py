@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -332,3 +333,53 @@ def test_prompt_text_lists_every_link_when_several_moved(tmp_path: Path) -> None
     text = wglink_watch.prompt_text(announcements)
     assert "instance-one" in text and "instance-two" in text
     assert "sequence 5" in text and "sequence 7" in text
+
+
+def test_a_solve_request_names_the_bundle_and_pins_its_manifest(tmp_path) -> None:
+    """The intent is a separate marker, not a field in the geometry manifest.
+
+    WG re-reads returns whenever it re-lists the workspace, so an intent flag
+    inside the evidence would be re-observed and re-solved; a command id can be
+    spent exactly once. The manifest hash lets WG refuse a bundle that changed
+    between the publish and this write.
+    """
+
+    workspace = tmp_path / "workspace"
+    bundle = workspace / "wgreturn" / "speaker.wgreturn"
+    bundle.mkdir(parents=True)
+    (bundle / "wgreturn.json").write_bytes(b'{"document": {}}')
+
+    marker = wglink_watch.write_solve_request(
+        tmp_path / "ipc",
+        command_id="cmd-1",
+        return_id="wgr_1",
+        bundle_path=bundle,
+        workspace_root=workspace,
+    )
+
+    payload = json.loads(marker.read_text())
+    assert marker.name == wglink_watch.SOLVE_REQUEST_FILENAME
+    assert payload["target"] == "waveguide-generator"
+    assert payload["commandId"] == "cmd-1"
+    # Workspace-relative, so WG resolves it inside its own selected folder.
+    assert payload["bundlePath"] == "wgreturn/speaker.wgreturn"
+    assert payload["manifestSha256"] == (
+        "sha256:" + hashlib.sha256(b'{"document": {}}').hexdigest()
+    )
+
+
+def test_a_solve_request_refuses_a_bundle_outside_the_workspace(tmp_path) -> None:
+    outside = tmp_path / "elsewhere" / "speaker.wgreturn"
+    outside.mkdir(parents=True)
+    (outside / "wgreturn.json").write_bytes(b"{}")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(OSError):
+        wglink_watch.write_solve_request(
+            tmp_path / "ipc",
+            command_id="cmd-1",
+            return_id="wgr_1",
+            bundle_path=outside,
+            workspace_root=workspace,
+        )

@@ -196,26 +196,49 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     return module
 
 
-def test_send_defaults_to_wgs_live_return_folder_over_stale_fusion_history(
-    monkeypatch, tmp_path: Path,
-) -> None:
+def test_send_writes_to_wgs_workspace_and_never_overwrites(monkeypatch, tmp_path: Path) -> None:
+    """WG only ingests from its own workspace, so the destination is not a choice.
+
+    Collision-safe naming is not optional either: a return WG has not ingested
+    yet is not in content-addressed storage, so replacing one loses evidence.
+    """
+
     module = _load_instance(
         monkeypatch,
-        "WGLink_return_default",
+        "WGLink_send_destination",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
     expected = tmp_path / "selected-workspace" / "wgreturn"
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: expected)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
 
-    assert module._default_return_folder({"last_return_folder": "/Users/old"}) == str(expected)
+    options = module._send_options(types.SimpleNamespace())
+
+    assert options["output_folder"] == str(expected)
+    assert options["overwrite"] is False
 
 
-def test_manual_send_defaults_overwrite_checkbox_to_off(monkeypatch) -> None:
+def test_send_refuses_when_wg_has_no_selected_workspace(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch,
-        "WGLink_send_overwrite_default",
+        "WGLink_send_no_workspace",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: None)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+
+    with pytest.raises(module.wglink_core.WgLinkError) as refusal:
+        module._send_options(types.SimpleNamespace())
+    assert "Settings" in str(refusal.value)
+
+
+def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_send_inputs",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    string_inputs: list[tuple[object, ...]] = []
     bool_inputs: list[tuple[object, ...]] = []
     selection = types.SimpleNamespace(
         addSelectionFilter=lambda _value: None,
@@ -224,27 +247,113 @@ def test_manual_send_defaults_overwrite_checkbox_to_off(monkeypatch) -> None:
     anchor = types.SimpleNamespace(isVisible=True)
     inputs = types.SimpleNamespace(
         addSelectionInput=lambda *_args: selection,
-        addStringValueInput=lambda *_args: None,
+        addStringValueInput=lambda *args: string_inputs.append(args),
         addBoolValueInput=lambda *args: bool_inputs.append(args),
         addDropDownCommandInput=lambda *_args: anchor,
     )
     command = types.SimpleNamespace(
         commandInputs=inputs,
         inputChanged=types.SimpleNamespace(add=lambda _handler: None),
+        execute=types.SimpleNamespace(add=lambda _handler: None),
     )
     module.adsk.core.DropDownStyles = types.SimpleNamespace(
         TextListDropDownStyle="text-list"
     )
-    monkeypatch.setattr(module, "_load_settings", lambda: {})
-    monkeypatch.setattr(module, "_default_return_folder", lambda _settings: "/returns")
     monkeypatch.setattr(module, "_sync_anchor_choices", lambda _inputs: None)
 
-    module.CommandCreatedHandler("send").notify(
-        types.SimpleNamespace(command=command)
+    module.CommandCreatedHandler("send").notify(types.SimpleNamespace(command=command))
+
+    # No output folder, no browse button, no overwrite checkbox.
+    assert string_inputs == []
+    assert bool_inputs == []
+
+
+def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_solve_inputs",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    added: list[str] = []
+    selection = types.SimpleNamespace(
+        addSelectionFilter=lambda _value: None,
+        setSelectionLimits=lambda _minimum, _maximum: None,
+    )
+    anchor = types.SimpleNamespace(isVisible=True)
+    inputs = types.SimpleNamespace(
+        addSelectionInput=lambda *args: (added.append(args[0]), selection)[1],
+        addStringValueInput=lambda *args: added.append(args[0]),
+        addBoolValueInput=lambda *args: added.append(args[0]),
+        addDropDownCommandInput=lambda *args: (added.append(args[0]), anchor)[1],
+    )
+    command = types.SimpleNamespace(
+        commandInputs=inputs,
+        inputChanged=types.SimpleNamespace(add=lambda _handler: None),
+        execute=types.SimpleNamespace(add=lambda _handler: None),
+    )
+    module.adsk.core.DropDownStyles = types.SimpleNamespace(
+        TextListDropDownStyle="text-list"
+    )
+    monkeypatch.setattr(module, "_sync_anchor_choices", lambda _inputs: None)
+
+    module.CommandCreatedHandler("solve").notify(types.SimpleNamespace(command=command))
+
+    assert added == ["send_selection", "anchor_instance_id"]
+
+
+def test_the_link_chooser_appears_only_with_several_links(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_link_chooser",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    module.adsk.core.DropDownStyles = types.SimpleNamespace(
+        TextListDropDownStyle="text-list"
     )
 
-    overwrite = next(args for args in bool_inputs if args[0] == "overwrite")
-    assert overwrite[-1] is False
+    def build() -> list[str]:
+        added: list[str] = []
+        chooser = types.SimpleNamespace(
+            listItems=types.SimpleNamespace(add=lambda *args: added.append(args[0])),
+        )
+        inputs = types.SimpleNamespace(
+            addStringValueInput=lambda *args: added.append(args[0]),
+            addDropDownCommandInput=lambda *_args: chooser,
+        )
+        module.CommandCreatedHandler("update").notify(types.SimpleNamespace(
+            command=types.SimpleNamespace(
+                commandInputs=inputs,
+                execute=types.SimpleNamespace(add=lambda _handler: None),
+            ),
+        ))
+        return added
+
+    monkeypatch.setattr(module, "_document_links", lambda: [
+        {"instance_id": "wgi_one", "design_name": "Tritonia"},
+    ])
+    assert build() == []
+
+    monkeypatch.setattr(module, "_document_links", lambda: [
+        {"instance_id": "wgi_one", "design_name": "Tritonia"},
+        {"instance_id": "wgi_two", "design_name": "asro68"},
+    ])
+    # The label carries the design name; _command_options recovers the id.
+    assert build() == ["Tritonia · wgi_one", "asro68 · wgi_two"]
+
+
+def test_the_chosen_link_label_resolves_back_to_its_instance_id(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_link_choice_options",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    inputs = types.SimpleNamespace(
+        itemById=lambda name: types.SimpleNamespace(
+            selectedItem=types.SimpleNamespace(name="asro68 · wgi_two"),
+        ) if name == "instance_choice" else None,
+    )
+
+    assert module._command_options(inputs) == {"instance_id": "wgi_two"}
 
 
 def test_load_ignores_an_incompatible_workspace_module_cached_by_fusion(

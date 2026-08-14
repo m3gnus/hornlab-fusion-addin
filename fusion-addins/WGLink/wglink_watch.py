@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,67 @@ from typing import Any, Iterable, Mapping
 HANDOFF_FILENAME = ".fusion-handoff.json"
 FUSION_STATUS_FILENAME = ".fusion-status.json"
 RETURN_REQUEST_FILENAME = ".fusion-return-request.json"
+SOLVE_REQUEST_FILENAME = ".wg-solve-request.json"
+
+
+def write_solve_request(
+    ipc_folder: Path,
+    *,
+    command_id: str,
+    return_id: str,
+    bundle_path: Path,
+    workspace_root: Path,
+    requested_at: datetime | None = None,
+) -> Path:
+    """Ask WG to ingest one exact return bundle and start a solve.
+
+    Deliberately separate from ``wgreturn.json``: that manifest is immutable
+    geometry evidence which WG re-reads whenever it re-lists the workspace, so
+    an intent flag inside it would be re-observed and re-solved. A marker with
+    its own command id can be spent exactly once.
+
+    The manifest hash is recorded here, after the bundle has been published, so
+    WG can refuse a bundle that changed between the publish and this write.
+    """
+
+    bundle = bundle_path.expanduser().resolve()
+    root = workspace_root.expanduser().resolve()
+    try:
+        relative = bundle.relative_to(root)
+    except ValueError as exc:
+        raise OSError(
+            f"Return bundle {bundle} is not inside the WGLink workspace {root}."
+        ) from exc
+    digest = hashlib.sha256((bundle / "wgreturn.json").read_bytes()).hexdigest()
+    payload = {
+        "schemaVersion": 1,
+        "target": "waveguide-generator",
+        "commandId": str(command_id),
+        "returnId": str(return_id),
+        "bundlePath": relative.as_posix(),
+        "manifestSha256": f"sha256:{digest}",
+        "requestedAt": (requested_at or datetime.now(timezone.utc))
+        .astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+    folder = ipc_folder.expanduser().resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    marker = folder / SOLVE_REQUEST_FILENAME
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{SOLVE_REQUEST_FILENAME}.", dir=folder
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return marker
 
 
 @dataclass(frozen=True)

@@ -98,8 +98,27 @@ class _Controls:
         self._items.append(control)
         return control
 
+    def addDropDown(self, text: str, resource_folder: str, control_id: str) -> "_DropDown":
+        dropdown = _DropDown(text, resource_folder, control_id)
+        self._items.append(dropdown)
+        return dropdown
+
+    def itemById(self, control_id: str) -> object | None:
+        return next((item for item in self._items if getattr(item, "id", None) == control_id), None)
+
     def clear(self) -> None:
         self._items.clear()
+
+
+class _DropDown:
+    """A panel dropdown, which owns its own control collection."""
+
+    def __init__(self, text: str, resource_folder: str, control_id: str) -> None:
+        self.text, self.resourceFolder, self.id = text, resource_folder, control_id
+        self.isValid, self.controls = True, _Controls()
+
+    def deleteMe(self) -> None:
+        self.isValid = False
 
 
 class _Panel:
@@ -387,7 +406,11 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     first.run(None)
     panel = panels.itemById(first.PANEL_ID)
     assert panel is not None
-    assert panel.controls.count == len(first.COMMANDS)
+    # Two promoted commands plus the Manage dropdown holding the rest.
+    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
+    manage = panel.controls.itemById(first.MANAGE_DROPDOWN_ID)
+    assert manage is not None
+    assert manage.controls.count == len(first.COMMANDS) - len(first.PROMOTED_COMMANDS)
     assert first._owned is True
     # Every command ships an icon folder holding the 16 px art Fusion draws in
     # the panel dropdown; a missing folder would silently give a blank button.
@@ -403,7 +426,7 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     # command id reserved.
     assert ui.messages == []
     assert panels.itemById(first.PANEL_ID) is panel
-    assert panel.controls.count == len(first.COMMANDS)
+    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
     assert second._owned is False
     assert second._definitions == []
 
@@ -411,7 +434,7 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     second.stop(None)
     assert ui.messages == []
     assert panel.isValid
-    assert panel.controls.count == len(first.COMMANDS)
+    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
     assert [d.id for d in definitions.items.values() if d.isValid] == [
         command_id for command_id, _name, _description in first.COMMANDS.values()
     ]

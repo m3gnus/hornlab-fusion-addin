@@ -56,10 +56,12 @@ The supported reference layer is:
 
 ## Commands
 
-The two everyday commands are **Solve in WG** and **Send to WG**. Insert and
-Update are ordinarily automatic — WG's *Send to CAD* publishes a handoff the
-add-in applies on its own — so they, along with Audit, Relink and Detach, are
-maintenance and recovery tools rather than the normal workflow.
+The panel promotes the two everyday commands, **Solve in WG** and **Send to
+WG**, and collects the rest under **Manage WG Link…**. Insert and Update are
+ordinarily automatic — WG's *Send to CAD* publishes a handoff the add-in
+applies on its own — so they, along with Audit, Relink and Detach, are
+maintenance and recovery tools rather than the normal workflow. Every command
+keeps its full head-less API.
 
 - **Solve in WG** writes the same validated `.wgreturn` bundle as Send to WG,
   then asks Waveguide Generator to prepare that exact bundle and start the

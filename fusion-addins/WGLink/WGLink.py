@@ -105,6 +105,10 @@ COMMANDS = {
         "Remove WGLink attributes without changing bodies or features.",
     ),
 }
+# The two commands a user starts. Everything else is maintenance or recovery
+# and lives under one dropdown; the automatic handoff already covers the
+# ordinary Insert and Update.
+PROMOTED_COMMANDS = ("solve", "send")
 
 _handlers: list[object] = []
 _definitions: list[object] = []
@@ -1152,6 +1156,25 @@ def _icon_folder(operation: str) -> str:
     return str(folder) if (folder / "16x16.png").is_file() else ""
 
 
+MANAGE_DROPDOWN_ID = "hornlab_wglink_manage"
+MANAGE_DROPDOWN_NAME = "Manage WG Link…"
+
+
+def _manage_dropdown(panel: object) -> object | None:
+    """The container for the maintenance and recovery commands.
+
+    An older Fusion without ``addDropDown`` degrades to the flat panel every
+    command used to live on, which is worse looking but never broken.
+    """
+
+    try:
+        return panel.controls.addDropDown(
+            MANAGE_DROPDOWN_NAME, _icon_folder("manage"), MANAGE_DROPDOWN_ID
+        )
+    except Exception:  # noqa: BLE001 - fall back to the flat panel
+        return None
+
+
 def _installed_control_count(panel: object) -> int:
     try:
         controls = panel.controls
@@ -1197,6 +1220,11 @@ def run(_context: object) -> None:
         # Claimed before the buttons go on, so a start that fails partway still
         # tears its own half-built panel down on stop.
         _owned = True
+        # Insert and Update are ordinarily automatic: WG's Send to CAD writes a
+        # handoff this add-in applies on its own. They, and the recovery
+        # commands, are demoted under one dropdown so the panel reads as the two
+        # actions a user actually starts.
+        manage = None
         for operation, (command_id, name, description) in COMMANDS.items():
             stale = ui.commandDefinitions.itemById(command_id)
             if stale:
@@ -1211,8 +1239,15 @@ def run(_context: object) -> None:
             definition.commandCreated.add(created)
             _handlers.append(created)
             _definitions.append(definition)
-            control = _panel.controls.addCommand(definition)
-            _controls.append(control)
+            if operation in PROMOTED_COMMANDS:
+                _controls.append(_panel.controls.addCommand(definition))
+                continue
+            if manage is None:
+                manage = _manage_dropdown(_panel)
+                if manage is not None:
+                    _controls.append(manage)
+            target = manage.controls if manage is not None else _panel.controls
+            _controls.append(target.addCommand(definition))
         _start_watch(app)
     except Exception:  # noqa: BLE001
         _message(traceback.format_exc(), "WGLink start error")

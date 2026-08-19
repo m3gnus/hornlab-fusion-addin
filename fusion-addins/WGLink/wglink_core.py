@@ -2771,8 +2771,12 @@ def update(
     if stored_slug != incoming_slug:
         raise WgLinkError(
             f"WGLink parameter namespace mismatch: the document owns {stored_slug!r}, "
-            f"while the bundle owns {incoming_slug!r}. Recreate the link; force cannot "
-            "retarget existing datum and enclosure expressions to another namespace."
+            f"while the bundle owns {incoming_slug!r}. Force cannot retarget the "
+            "existing datum and enclosure expressions to another namespace. To "
+            "recover: Detach this link and delete its component, then Insert the "
+            f"bundle -- that rebuilds the body, its datums and its wg_{incoming_slug}_* "
+            "parameters from the bundle, and every WG setting travels in the bundle. "
+            "Only your own features built on the old parameters need repointing."
         )
     parameter_prefix = str(
         record["payload"].get("parameter_prefix") or f"wg_{stored_slug}_"

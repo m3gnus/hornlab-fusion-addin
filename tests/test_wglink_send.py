@@ -468,3 +468,128 @@ def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch)
 
     assert not (tmp_path / "Mismatch.wgreturn").exists()
     assert not list(tmp_path.glob(".Mismatch.wgreturn.tmp-*"))
+
+
+def _capture_design(root, *, archive: bool | str = True):
+    """A design whose STEP export works and whose archive export is switchable."""
+
+    class ExportManager:
+        def createSTEPExportOptions(self, path, geometry=None):
+            return path, geometry
+
+        def execute(self, options):
+            Path(options[0]).write_text(
+                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
+                encoding="utf-8",
+            )
+            return True
+
+    class ArchivingExportManager(ExportManager):
+        def createFusionArchiveExportOptions(self, path):
+            if archive == "raise":
+                raise RuntimeError("archive export is unavailable")
+            return ("archive", path)
+
+        def execute(self, options):
+            if options[0] != "archive":
+                return super().execute(options)
+            if archive == "refuse":
+                return False
+            Path(options[1]).write_bytes(b"fusion-archive-bytes")
+            return True
+
+    manager = ArchivingExportManager() if archive is not False else ExportManager()
+    return types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=manager,
+        findAttributes=lambda _group, _name: Collection(),
+    )
+
+
+def _capture_app(name):
+    return types.SimpleNamespace(
+        version="2704.1.53", activeDocument=types.SimpleNamespace(name=name)
+    )
+
+
+def test_a_return_carries_the_fusion_document_it_came_from(
+    send_module, tmp_path, monkeypatch
+):
+    root = component("Captured", [body("cabinet", faces=[face("LF")])])
+    monkeypatch.setattr(
+        send_module.wglink_core, "_design", lambda _app: _capture_design(root)
+    )
+
+    report = send_module.send(_capture_app("Captured"), {"output_folder": str(tmp_path)})
+
+    bundle = Path(report["bundle_path"])
+    document = bundle / "document.f3d"
+    assert report["document_captured"] is True
+    assert report["document_capture_error"] is None
+    assert document.read_bytes() == b"fusion-archive-bytes"
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (bundle / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    record = manifest["files"]["document.f3d"]
+    assert record["purpose"] == "cad-document"
+    assert record["media_type"] == "application/vnd.autodesk.fusion360"
+    assert record["sha256"] == "sha256:" + __import__("hashlib").sha256(
+        document.read_bytes()
+    ).hexdigest()
+    # The document is the user's copy, not solver input: the assembly the mesher
+    # reads is still the only geometry the return declares.
+    assert manifest["assembly"]["file"] == "assembly.step"
+
+
+def test_the_capture_can_be_declined_and_leaves_the_bundle_as_it_was(
+    send_module, tmp_path, monkeypatch
+):
+    root = component("Declined", [body("cabinet", faces=[face("LF")])])
+    monkeypatch.setattr(
+        send_module.wglink_core, "_design", lambda _app: _capture_design(root)
+    )
+
+    report = send_module.send(
+        _capture_app("Declined"),
+        {"output_folder": str(tmp_path), "capture_document": False},
+    )
+
+    bundle = Path(report["bundle_path"])
+    assert report["document_captured"] is False
+    assert report["document_capture_error"] is None
+    assert not (bundle / "document.f3d").exists()
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (bundle / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert set(manifest["files"]) == {"assembly.step"}
+
+
+@pytest.mark.parametrize(
+    ("archive", "reason"),
+    [
+        (False, "this Fusion build has no archive export"),
+        ("raise", "archive export is unavailable"),
+        ("refuse", "Fusion reported no archive file"),
+    ],
+)
+def test_a_failed_capture_reports_why_instead_of_costing_the_return(
+    send_module, tmp_path, monkeypatch, archive, reason
+):
+    root = component("Degraded", [body("cabinet", faces=[face("LF")])])
+    monkeypatch.setattr(
+        send_module.wglink_core,
+        "_design",
+        lambda _app: _capture_design(root, archive=archive),
+    )
+
+    report = send_module.send(_capture_app("Degraded"), {"output_folder": str(tmp_path)})
+
+    bundle = Path(report["bundle_path"])
+    assert bundle.is_dir()
+    assert report["document_captured"] is False
+    assert reason in report["document_capture_error"]
+    assert not (bundle / "document.f3d").exists()
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (bundle / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert set(manifest["files"]) == {"assembly.step"}

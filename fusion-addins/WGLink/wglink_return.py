@@ -978,7 +978,10 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
             raise WgReturnError(f"files[{name!r}].sha256 must use sha256:<hex>")
         _integer(record["size_bytes"], label=f"files[{name!r}].size_bytes")
         _string(record["media_type"], label=f"files[{name!r}].media_type")
-        if record["purpose"] not in {"exterior-assembly", "fem-air-volume"}:
+        # ``cad-document`` is the user's own copy of the model a return came
+        # from. WG files it in the run archive and never solves from it, so it
+        # is additive: a bundle without one is exactly as valid as before.
+        if record["purpose"] not in {"exterior-assembly", "fem-air-volume", "cad-document"}:
             raise WgReturnError(f"files[{name!r}].purpose is invalid")
     if assembly_file not in files:
         raise WgReturnError("assembly.file is not present in files")

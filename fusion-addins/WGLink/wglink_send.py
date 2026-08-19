@@ -1254,7 +1254,13 @@ def _export_step(design: object, path: Path, geometry: object | None) -> None:
         raise wglink_core.WgLinkError(f"Fusion STEP export failed for {path.name}.")
 
 
-def _file_record(path: Path, purpose: str) -> dict[str, Any]:
+CAD_DOCUMENT_MEMBER = "document.f3d"
+CAD_DOCUMENT_MEDIA_TYPE = "application/vnd.autodesk.fusion360"
+
+
+def _file_record(
+    path: Path, purpose: str, media_type: str = "model/step"
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -1262,9 +1268,37 @@ def _file_record(path: Path, purpose: str) -> dict[str, Any]:
     return {
         "sha256": "sha256:" + digest.hexdigest(),
         "size_bytes": path.stat().st_size,
-        "media_type": "model/step",
+        "media_type": media_type,
         "purpose": purpose,
     }
+
+
+def _export_fusion_archive(design: object, path: Path) -> str | None:
+    """Export the whole document as a native Fusion archive.
+
+    STEP records the geometry a solve needs; it does not record the timeline,
+    the parameters, or anything a person would reopen and edit. The archive is
+    the user's own copy of the model a run was solved from, which is why WG
+    files it in the run archive rather than treating it as solver input.
+
+    It is a convenience, not evidence, so a failure returns its reason instead
+    of costing the user an otherwise complete return. The caller reports the
+    reason rather than dropping it: a capture that quietly never happens is
+    worse than one that says why.
+    """
+
+    manager = getattr(design, "exportManager", None)
+    create = getattr(manager, "createFusionArchiveExportOptions", None)
+    if create is None:
+        return "this Fusion build has no archive export"
+    try:
+        options = create(str(path))
+        ok = options is not None and manager.execute(options)
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+    if not ok or not path.is_file():
+        return "Fusion reported no archive file"
+    return None
 
 
 def _bbox(bodies: list[object]) -> list[list[float]]:
@@ -1406,6 +1440,11 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     suffix = f"-{_safe_document_name(str(request_id))}" if request_id else ""
     target = output / f"{_safe_document_name(document_name)}{suffix}.wgreturn"
     overwrite = bool(options.get("overwrite", False))
+    # Capturing the document costs seconds and tens of megabytes per return, so
+    # the caller decides. Default on: a run whose model cannot be reopened is
+    # the gap the archive exists to close.
+    capture_document = bool(options.get("capture_document", True))
+    document_capture_error: str | None = None
     if not overwrite:
         target = _available_target(target)
     if target.exists() and not target.is_dir():
@@ -1430,6 +1469,15 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
                 f"STEP body count gate refused the export: inventory expects {expected_count}, but assembly.step contains {observed_count}."
             )
         files = {"assembly.step": _file_record(assembly_path, "exterior-assembly")}
+        if capture_document:
+            document_path = temp / CAD_DOCUMENT_MEMBER
+            document_capture_error = _export_fusion_archive(design, document_path)
+            if document_capture_error is None:
+                files[CAD_DOCUMENT_MEMBER] = _file_record(
+                    document_path, "cad-document", CAD_DOCUMENT_MEDIA_TYPE
+                )
+            else:
+                document_path.unlink(missing_ok=True)
         for fem in scope["fem_air_volumes"]:
             component = walk["fem_components"].get(fem.get("object_id"))
             if component is None:
@@ -1496,6 +1544,8 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     return {
         "return_id": manifest["return"]["id"],
         "bundle_path": str(target),
+        "document_captured": capture_document and document_capture_error is None,
+        "document_capture_error": document_capture_error,
         "scope": manifest["scope"],
         "instances": manifest["instances"],
         "sources": manifest["sources"],

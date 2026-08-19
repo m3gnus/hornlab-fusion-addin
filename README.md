@@ -19,7 +19,8 @@ meshing and solves run:
 
 ## Docs
 
-- [User guide](docs/USER-GUIDE.md)
+- [WGLink user guide](docs/WGLINK-GUIDE.md) — the WG-linked add-in
+- [WG Metal Pipeline user guide](docs/WGMETAL-PIPELINE-GUIDE.md) — the standalone solver add-in
 - [Headless reruns, sweeps, and A/B compare](docs/HEADLESS.md)
 - [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)
 

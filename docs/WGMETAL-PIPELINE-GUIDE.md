@@ -1,5 +1,10 @@
 # WG Metal Pipeline User Guide
 
+This guide covers **WGMetalPipeline**, the standalone add-in that solves a
+Fusion design directly without the Waveguide Generator app. For **WGLink** —
+the add-in that links Fusion to Waveguide Generator — see
+[WGLINK-GUIDE.md](WGLINK-GUIDE.md).
+
 ## 1. Install
 
 From this repository:

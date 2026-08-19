@@ -7,7 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_dependency_docs_require_active_environment_packages():
-    for rel_path in ("README.md", "docs/USER-GUIDE.md", "requirements.txt"):
+    for rel_path in (
+        "README.md",
+        "docs/WGMETAL-PIPELINE-GUIDE.md",
+        "docs/WGLINK-GUIDE.md",
+        "requirements.txt",
+    ):
         text = (ROOT / rel_path).read_text(encoding="utf-8")
         normalized = " ".join(text.split())
         assert "active environment" in normalized

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import re
+import json
 import sys
 import types
 
@@ -593,3 +594,34 @@ def test_a_failed_capture_reports_why_instead_of_costing_the_return(
         (bundle / "wgreturn.json").read_text(encoding="utf-8")
     )
     assert set(manifest["files"]) == {"assembly.step"}
+
+
+def test_the_capture_setting_is_wgs_and_is_read_from_wgs_own_settings_file(
+    send_module, tmp_path, monkeypatch
+):
+    """One switch, set in WG, read where the add-in already looks.
+
+    Offering the same choice in both applications is how two settings for one
+    thing start disagreeing, so the add-in never stores its own copy.
+    """
+
+    workspace = sys.modules["wglink_workspace"]
+    data = tmp_path / "WaveguideGenerator"
+    data.mkdir()
+    monkeypatch.setattr(workspace, "data_dir", lambda **_kwargs: data)
+
+    # No settings file at all, and an unreadable one, both mean capture: an
+    # add-in that quietly stopped capturing would be the harder failure to see.
+    assert workspace.capture_document() is True
+    (data / "cadlink_settings.json").write_text("{not json", encoding="utf-8")
+    assert workspace.capture_document() is True
+
+    (data / "cadlink_settings.json").write_text(
+        json.dumps({"schemaVersion": 1, "captureDocument": False}), encoding="utf-8"
+    )
+    assert workspace.capture_document() is False
+
+    (data / "cadlink_settings.json").write_text(
+        json.dumps({"schemaVersion": 1, "cadLinkPath": str(tmp_path)}), encoding="utf-8"
+    )
+    assert workspace.capture_document() is True

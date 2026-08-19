@@ -30,6 +30,7 @@ DATA_DIR_ENV = "WG2_DATA_DIR"
 APP_DIRECTORY = "WaveguideGenerator"
 SETTINGS_NAME = "cadlink_settings.json"
 SETTINGS_KEY = "cadLinkPath"
+CAPTURE_KEY = "captureDocument"
 LEGACY_SETTINGS_NAME = "workspace_settings.json"
 LEGACY_SETTINGS_KEY = "workspacePath"
 BUNDLE_SUBDIRECTORY = "wglink"
@@ -114,6 +115,28 @@ def workspace_root(**kwargs: Any) -> Path | None:
                 return None
             return selected.resolve()
     return None
+
+
+def capture_document(**kwargs: Any) -> bool:
+    """Whether WG wants a copy of the document carried out with the return.
+
+    The switch belongs to WG, and this file is the one the add-in already reads,
+    so there is one setting rather than the same choice offered in two
+    applications. Anything unreadable means capture: an add-in that quietly
+    stopped capturing because a settings file was missing would be far harder to
+    explain than one extra file in a bundle.
+    """
+
+    root = data_dir(**kwargs)
+    if root is None:
+        return True
+    try:
+        payload = json.loads((root / SETTINGS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return True
+    if not isinstance(payload, Mapping):
+        return True
+    return payload.get(CAPTURE_KEY) is not False
 
 
 def bundle_folder(**kwargs: Any) -> Path | None:

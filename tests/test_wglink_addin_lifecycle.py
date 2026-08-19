@@ -1217,6 +1217,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
         "overwrite": True,
         "request_id": "request-a",
         "anchor_instance_id": "instance-a",
+        "capture_document": True,
     }]
     assert acknowledged == [request]
     assert ui.messages == []

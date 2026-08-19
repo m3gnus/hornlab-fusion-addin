@@ -360,6 +360,7 @@ def _send_options(command_inputs: object) -> dict[str, object]:
         "selection": _send_selection(command_inputs),
         "output_folder": str(output),
         "overwrite": False,
+        "capture_document": wglink_workspace.capture_document(),
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -1132,6 +1133,7 @@ def _apply_pending_return_request() -> bool:
             "overwrite": True,
             "request_id": request.request_id,
             "anchor_instance_id": request.instance_id,
+            "capture_document": wglink_workspace.capture_document(),
         }
         wglink_send.send(_app(), options)
         wglink_watch.acknowledge_return_request(request)

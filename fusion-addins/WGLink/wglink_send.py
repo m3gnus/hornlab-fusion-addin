@@ -24,6 +24,7 @@ import uuid
 import adsk.core
 import adsk.fusion
 
+import wglink_author
 import wglink_core
 from wglink_return import (
     WgReturnError,
@@ -34,9 +35,11 @@ from wglink_return import (
 
 
 DECLARATION_ATTRIBUTE = "return_declaration"
-DECLARATIONS = frozenset({"exterior-shell", "exclude"})
+DECLARATIONS = frozenset(wglink_author.BODY_DECLARATIONS)
 FEM_COMPONENT_NAME = "FEM_MF_AIR"
-SOURCE_ROLES = ("LF", "MF", "HF", "PORT_EXIT")
+# One definition, shared with the authoring commands: the dialog that paints a
+# role and the export that reads it back must never drift apart.
+SOURCE_ROLES = wglink_author.SOURCE_ROLES
 SOURCE_RESOLUTION_MM = {"HF": 4.0, "MF": 15.0, "LF": 30.0, "PORT_EXIT": 25.0}
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _STEP_BODY = re.compile(r"\b(?:MANIFOLD_SOLID_BREP|SHELL_BASED_SURFACE_MODEL)\s*\(", re.I)
@@ -103,6 +106,25 @@ def declare_body(body: object, declaration: str) -> None:
         choices = ", ".join(sorted(DECLARATIONS))
         raise wglink_core.WgLinkError(f"body declaration must be one of: {choices}")
     wglink_core._set_attribute(body, DECLARATION_ATTRIBUTE, value)
+
+
+def clear_declaration(body: object) -> None:
+    """Remove an explicit classification, restoring automatic scoping.
+
+    The Declare Body command needs an undo for itself: a body left declared
+    ``exclude`` by mistake is invisible to every later export, and there was no
+    way to take the declaration back off.
+    """
+
+    attribute = wglink_core._attribute(body, DECLARATION_ATTRIBUTE)
+    if attribute is None:
+        return
+    try:
+        attribute.deleteMe()
+    except Exception as exc:  # noqa: BLE001 - surfaced as an actionable refusal
+        raise wglink_core.WgLinkError(
+            f"Could not clear the WG declaration on this body: {exc}."
+        ) from exc
 
 
 def read_declaration(body: object) -> str | None:
@@ -532,6 +554,159 @@ def inspect_scope(app: object, options: dict[str, Any] | None = None) -> dict[st
         "selection": walk["selection"],
         "instance_ids": [record["instance_id"] for record in records],
     }
+
+
+def _merge_bounds(
+    bounds: dict[str, list[float]] | None, entity: object
+) -> dict[str, list[float]] | None:
+    """Grow a millimetre bounding box by one body's or face's own box."""
+
+    try:
+        box = entity.boundingBox
+        low = [
+            float(box.minPoint.x) * 10.0,
+            float(box.minPoint.y) * 10.0,
+            float(box.minPoint.z) * 10.0,
+        ]
+        high = [
+            float(box.maxPoint.x) * 10.0,
+            float(box.maxPoint.y) * 10.0,
+            float(box.maxPoint.z) * 10.0,
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable box only narrows the advice
+        return bounds
+    if not all(math.isfinite(value) for value in (*low, *high)):
+        return bounds
+    if bounds is None:
+        return {"min": low, "max": high}
+    return {
+        "min": [min(bounds["min"][axis], low[axis]) for axis in range(3)],
+        "max": [max(bounds["max"][axis], high[axis]) for axis in range(3)],
+    }
+
+
+def _source_faces(
+    records: list[dict[str, Any]], included_bodies: list[object]
+) -> list[object]:
+    """Every face the export would treat as a source, linked or painted."""
+
+    faces: list[object] = []
+    seen: set[tuple[str, object]] = set()
+    for record in records:
+        try:
+            claimed = _throat_faces(record)
+        except wglink_core.WgLinkError:
+            continue
+        for face in claimed:
+            key = _face_key(face)
+            if key not in seen:
+                seen.add(key)
+                faces.append(face)
+    for body in included_bodies:
+        for face in wglink_core._items(getattr(body, "faces", None)):
+            if _face_role(face) is None:
+                continue
+            key = _face_key(face)
+            if key not in seen:
+                seen.add(key)
+                faces.append(face)
+    return faces
+
+
+def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Gather what the Send and Solve dialogs preview, without exporting.
+
+    Deliberately fail-soft: a scope or source problem is reported as text for
+    the dialog to warn about *before* OK, rather than raised as the dead-end
+    modal the user used to meet only after asking for an export.  Everything
+    returned is plain JSON-ish data -- ``wglink_author.preflight_summary``
+    composes the wording and never sees a Fusion object.
+    """
+
+    opts = dict(options or {})
+    design = wglink_core._design(app)
+    walk = _scope_walk(design, opts.get("selection"))
+    records = _records_in_scope(design, walk)
+    instance_ids = [str(record["instance_id"]) for record in records]
+    requested_anchor = _nullable(opts.get("anchor_instance_id"))
+    if len(instance_ids) == 1:
+        anchor = instance_ids[0]
+    elif instance_ids:
+        # The dialog's anchor dropdown may not have been touched yet; a preview
+        # picks the first rather than refusing the way an export has to.
+        anchor = (
+            str(requested_anchor)
+            if requested_anchor is not None and str(requested_anchor) in instance_ids
+            else instance_ids[0]
+        )
+    else:
+        anchor = None
+    report: dict[str, Any] = {
+        "selection": walk["selection"],
+        "instance_ids": instance_ids,
+        "included": [],
+        "sources": [],
+        "scope_error": None,
+        "source_error": None,
+        "bounds_mm": None,
+        "source_bounds_mm": None,
+    }
+    for candidate in walk["candidates"]:
+        candidate["contains_solver_anchor"] = bool(
+            anchor and candidate.get("wglink_instance_id") == anchor
+        )
+    try:
+        scope = plan_export_scope(walk["selection"], walk["candidates"]).manifest_scope()
+    except WgReturnError as exc:
+        report["scope_error"] = str(exc)
+        return report
+
+    included_pairs = [
+        (item, walk["bodies"][item["object_id"]])
+        for item in scope["included"]
+        if item["object_id"] in walk["bodies"]
+    ]
+    included_bodies = [body for _item, body in included_pairs]
+    report["included"] = [
+        {
+            "name": str(item.get("path") or item.get("name") or "unnamed body"),
+            "body_kind": str(item.get("body_kind") or "solid"),
+        }
+        for item, _body in included_pairs
+    ]
+    for record in records:
+        instance_body = next(
+            (
+                body
+                for included, body in included_pairs
+                if included.get("wglink_instance_id") == record["instance_id"]
+            ),
+            None,
+        )
+        if instance_body is not None:
+            record["source_body"] = instance_body
+    try:
+        sources = _sources(records, included_bodies)
+    except wglink_core.WgLinkError as exc:
+        report["source_error"] = str(exc)
+        sources = []
+    for source in sources:
+        observed = source.get("observed", {})
+        report["sources"].append({
+            "role": str(source.get("role") or "?"),
+            "area_mm2": float(observed.get("total_area_mm2") or 0.0),
+            "face_count": int(observed.get("face_count") or 0),
+            "instance_id": source.get("instance_id"),
+        })
+    bounds = None
+    for body in included_bodies:
+        bounds = _merge_bounds(bounds, body)
+    report["bounds_mm"] = bounds
+    source_bounds = None
+    for face in _source_faces(records, included_bodies):
+        source_bounds = _merge_bounds(source_bounds, face)
+    report["source_bounds_mm"] = source_bounds
+    return report
 
 
 def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str, Any]:

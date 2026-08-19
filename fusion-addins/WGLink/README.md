@@ -56,13 +56,21 @@ The supported reference layer is:
 
 ## Commands
 
-The panel promotes the two everyday commands, **Solve in WG** and **Send to
-WG**, and collects the rest under **Manage WG Link…**. Insert and Update are
-ordinarily automatic — WG's *Send to CAD* publishes a handoff the add-in
-applies on its own — so they, along with Audit, Relink and Detach, are
-maintenance and recovery tools rather than the normal workflow. Every command
-keeps its full head-less API.
+The panel promotes the three everyday commands, **Set WG Source…**, **Solve in
+WG** and **Send to WG**, and collects the rest under **Manage WG Link…**.
+Insert and Update are ordinarily automatic — WG's *Send to CAD* publishes a
+handoff the add-in applies on its own — so they, along with Declare Body, Audit,
+Relink and Detach, are maintenance, authoring-remedy and recovery tools rather
+than the normal workflow. Every command keeps its full head-less API.
 
+- **Set WG Source…** marks the selected faces as the `LF`, `MF`, `HF` or
+  `PORT_EXIT` drive source by creating (or reusing) an appearance named exactly
+  after the role and painting it on. That appearance name *is* the convention
+  the export reads, and it is the one thing a model built from scratch in Fusion
+  cannot be sent without; before this command it had to be authored by renaming
+  a Fusion appearance by hand. The same dialog clears a role, which strips only
+  faces that actually carry one of the four roles — a face painted with your own
+  material is left alone.
 - **Solve in WG** writes the same validated `.wgreturn` bundle as Send to WG,
   then asks Waveguide Generator to prepare that exact bundle and start the
   solve, so WG is already solving when you switch to it. The request is a
@@ -97,7 +105,12 @@ keeps its full head-less API.
   rather than overwriting, because a return WG has not ingested yet is not in
   content-addressed storage. A body can carry the `WGLink` attribute
   `return_declaration=exterior-shell` or `return_declaration=exclude` when its
-  surface/exclusion intent cannot be inferred safely.
+  surface/exclusion intent cannot be inferred safely; **Declare Body…** writes
+  and clears it.
+- **Declare Body…** classifies the selected bodies as `exterior-shell` or
+  `exclude`, or clears the declaration. A visible surface body with no
+  declaration refuses the export outright, so this is the in-product remedy for
+  modelling a horn as a loft surface rather than a solid.
 - **Relink** records a moved or renamed bundle path. The design id must match
   unless the caller explicitly forces the operation.
 - **Detach** removes `WGLink` attributes only. Bodies, sketches, features, and
@@ -118,6 +131,20 @@ a bundle WG is no longer writing to. When the workspace cannot be read — WG
 never ran, the folder is on a disconnected drive, the bundle came from another
 machine — the dropdown falls back to the browse entries and the manual picker
 behaves as it always did.
+
+## The Send and Solve pre-flight
+
+Both export dialogs state what is about to happen before OK: bodies included,
+WG links in scope, and each source with its role and measured area. A model
+with no drivable source is named there rather than at the dead end after OK.
+
+A return with no WG links in scope is legal — a model built from scratch in
+Fusion is exported as an *unlinked* return — but it carries no throat frame, so
+WG solves it in the assembly frame exactly as modelled: radiation along +Z,
+throat at z = 0, bounding box centred on x = 0 and y = 0. Nothing enforces that
+convention on either side, and a mis-framed model simply yields wrong
+directivity, so the pre-flight measures the model against it and says which of
+the three assumptions the model breaks. It never refuses.
 
 Insert and Relink remember the last bundle folder. When a document has several
 managed links, Update, Audit, Relink and Detach show a **Managed link**

@@ -108,6 +108,23 @@ def draw_detach(draw: ImageDraw.ImageDraw) -> None:
     draw.rounded_rectangle(_box(37, 4, 55, 20), radius=_s(8), outline=NEGATIVE, width=_w(4.0))
 
 
+def draw_source(draw: ImageDraw.ImageDraw) -> None:
+    # Setting a source is painting one face, so the mouth's inner face is
+    # filled rather than outlined: the icon shows the result, not a tool.
+    _mouth(draw)
+    # No accent mark on top: an arrow here would read as Insert, and the filled
+    # face is already the only solid shape in the family.
+    draw.rounded_rectangle(_box(19, 30, 45, 46), radius=_s(4), fill=ACCENT)
+
+
+def draw_declare(draw: ImageDraw.ImageDraw) -> None:
+    # A body plus a verdict: the tick says "this one is classified".
+    _mouth(draw)
+    draw.rounded_rectangle(_box(14, 1, 40, 21), radius=_s(4), outline=INK, width=_w(3.2))
+    draw.line([(_s(38), _s(16)), (_s(46), _s(4))], fill=POSITIVE, width=_w(4.6))
+    draw.line([(_s(33), _s(11)), (_s(38), _s(16))], fill=POSITIVE, width=_w(4.6))
+
+
 def draw_manage(draw: ImageDraw.ImageDraw) -> None:
     _mouth(draw)
     draw.line([(_s(18), _s(4)), (_s(46), _s(4))], fill=INK, width=_w(3.2))
@@ -170,6 +187,20 @@ def compact_detach(draw: ImageDraw.ImageDraw) -> None:
     draw.arc(_box(34, 10, 64, 38), start=270, end=90, fill=NEGATIVE, width=_w(7.5))
 
 
+def compact_source(draw: ImageDraw.ImageDraw) -> None:
+    # The only solid disc in the set: at 16 px "a painted face" has to be a
+    # filled shape, because an outline of one is indistinguishable from Audit.
+    _bar(draw)
+    draw.ellipse(_box(14, 4, 50, 40), fill=ACCENT)
+
+
+def compact_declare(draw: ImageDraw.ImageDraw) -> None:
+    _bar(draw)
+    draw.rounded_rectangle(_box(2, 8, 38, 40), radius=_s(6), outline=INK, width=_w(6))
+    draw.line([(_s(38), _s(34)), (_s(60), _s(4))], fill=POSITIVE, width=_w(8))
+    draw.line([(_s(26), _s(22)), (_s(38), _s(34))], fill=POSITIVE, width=_w(8))
+
+
 def compact_manage(draw: ImageDraw.ImageDraw) -> None:
     _bar(draw)
     draw.line([(_s(6), _s(8)), (_s(58), _s(8))], fill=INK, width=_w(6))
@@ -181,6 +212,8 @@ def compact_manage(draw: ImageDraw.ImageDraw) -> None:
 
 
 GLYPHS = {
+    "source": (draw_source, compact_source),
+    "declare": (draw_declare, compact_declare),
     "solve": (draw_solve, compact_solve),
     "insert": (draw_insert, compact_insert),
     "update": (draw_update, compact_update),

@@ -59,13 +59,32 @@ class Collection(list):
         return next((item for item in self if getattr(item, "name", None) == name), None)
 
 
+class Attribute:
+    """Fusion's attribute handle: it writes through, and it can delete itself."""
+
+    def __init__(self, owner, key):
+        self._owner, self._key = owner, key
+
+    @property
+    def value(self):
+        return self._owner.values.get(self._key)
+
+    @value.setter
+    def value(self, value):
+        self._owner.values[self._key] = value
+
+    def deleteMe(self):
+        self._owner.values.pop(self._key, None)
+        return True
+
+
 class Attributes:
     def __init__(self):
         self.values = {}
 
     def itemByName(self, group, name):
-        value = self.values.get((group, name))
-        return types.SimpleNamespace(value=value) if value is not None else None
+        key = (group, name)
+        return Attribute(self, key) if self.values.get(key) is not None else None
 
     def add(self, group, name, value):
         self.values[(group, name)] = value
@@ -126,6 +145,89 @@ def test_declaration_round_trip_and_validation(send_module):
     assert send_module.read_declaration(candidate) == "exterior-shell"
     with pytest.raises(send_module.wglink_core.WgLinkError, match="declaration"):
         send_module.declare_body(candidate, "helper")
+
+
+def test_a_declaration_can_be_taken_back_off(send_module):
+    """Declare Body needs an undo: a body left 'exclude' by mistake is
+    invisible to every later export, and nothing could remove the attribute."""
+
+    candidate = body("shell", solid=False)
+    send_module.declare_body(candidate, "exclude")
+
+    send_module.clear_declaration(candidate)
+
+    assert send_module.read_declaration(candidate) is None
+    assert candidate.attributes.values == {}
+    # Clearing a body that never carried one is a no-op, not a refusal.
+    send_module.clear_declaration(candidate)
+
+
+def _design_of(root, monkeypatch, send_module):
+    design = types.SimpleNamespace(
+        rootComponent=root, findAttributes=lambda _group, _name: Collection()
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    return types.SimpleNamespace(version="2704.1.53")
+
+
+def test_preflight_gathers_the_numbers_the_send_dialog_previews(
+    send_module, monkeypatch
+):
+    """No Fusion object leaves this function: the wording is composed by
+    wglink_author from exactly these plain values."""
+
+    painted = face("LF", area=2.5)
+    horn = body("horn", faces=[painted, face("Steel - Satin")])
+    app = _design_of(component("Speaker", [horn]), monkeypatch, send_module)
+
+    report = send_module.preflight_scope(app, {"selection": "root"})
+
+    assert report["selection"] == "root"
+    assert report["instance_ids"] == []
+    assert report["included"] == [{"name": "Speaker/horn", "body_kind": "solid"}]
+    assert report["sources"] == [
+        {"role": "LF", "area_mm2": 250.0, "face_count": 1, "instance_id": None}
+    ]
+    assert report["scope_error"] is None and report["source_error"] is None
+    # Fusion reports centimetres; every number here is millimetres.
+    assert report["bounds_mm"] == {"min": [0.0, 0.0, 0.0], "max": [10.0, 10.0, 10.0]}
+    assert report["source_bounds_mm"] == {
+        "min": [0.0, 0.0, 0.0], "max": [10.0, 10.0, 0.0]
+    }
+
+
+def test_preflight_reports_a_missing_source_instead_of_raising_it(
+    send_module, monkeypatch
+):
+    """The refusal used to reach the user only after they pressed OK."""
+
+    plain = body("horn", faces=[face("Steel - Satin")])
+    app = _design_of(component("Speaker", [plain]), monkeypatch, send_module)
+
+    report = send_module.preflight_scope(app)
+
+    assert report["sources"] == []
+    assert "no drivable source" in report["source_error"]
+    assert report["source_bounds_mm"] is None
+
+
+def test_preflight_reports_an_unclassified_surface_body_as_scope_text(
+    send_module, monkeypatch
+):
+    shell = body("Shell", solid=False, faces=[face("HF")])
+    app = _design_of(component("Speaker", [shell]), monkeypatch, send_module)
+
+    report = send_module.preflight_scope(app)
+
+    assert "unclassified" in report["scope_error"]
+    assert report["included"] == [] and report["sources"] == []
+
+    # Declare Body is the remedy, and it unblocks the same scope.
+    send_module.declare_body(shell, "exterior-shell")
+    cleared = send_module.preflight_scope(app)
+    assert cleared["scope_error"] is None
+    assert cleared["included"] == [{"name": "Speaker/Shell", "body_kind": "surface"}]
+    assert [source["role"] for source in cleared["sources"]] == ["HF"]
 
 
 def test_step_body_counter_handles_solid_shell_mixed_and_ignores_names(send_module):

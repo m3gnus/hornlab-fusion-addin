@@ -175,10 +175,26 @@ class _Definitions:
         return definition
 
 
+class _Palette:
+    """Fusion's Text Commands palette, which is where tracebacks belong."""
+
+    def __init__(self) -> None:
+        self.written: list[str] = []
+
+    def writeText(self, text: str) -> None:
+        self.written.append(text)
+
+
 class _UI:
     def __init__(self, panels: _Panels, definitions: _Definitions) -> None:
         self.commandDefinitions = definitions
         self.messages: list[tuple[str, str]] = []
+        self.text_palette = _Palette()
+        self.palettes = types.SimpleNamespace(
+            itemById=lambda palette_id: (
+                self.text_palette if palette_id == "TextCommands" else None
+            )
+        )
         self.workspaces = types.SimpleNamespace(
             itemById=lambda _id: types.SimpleNamespace(toolbarPanels=panels)
         )
@@ -264,11 +280,15 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
         setSelectionLimits=lambda _minimum, _maximum: None,
     )
     anchor = types.SimpleNamespace(isVisible=True)
+    text_boxes: list[tuple[object, ...]] = []
     inputs = types.SimpleNamespace(
         addSelectionInput=lambda *_args: selection,
         addStringValueInput=lambda *args: string_inputs.append(args),
         addBoolValueInput=lambda *args: bool_inputs.append(args),
         addDropDownCommandInput=lambda *_args: anchor,
+        addTextBoxCommandInput=lambda *args: (
+            text_boxes.append(args), types.SimpleNamespace(formattedText="")
+        )[1],
     )
     command = types.SimpleNamespace(
         commandInputs=inputs,
@@ -285,6 +305,9 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
     # No output folder, no browse button, no overwrite checkbox.
     assert string_inputs == []
     assert bool_inputs == []
+    # One read-only box that states the export before the user commits to it.
+    assert [args[0] for args in text_boxes] == ["preflight"]
+    assert text_boxes[0][-1] is True
 
 
 def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
@@ -304,6 +327,9 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
         addStringValueInput=lambda *args: added.append(args[0]),
         addBoolValueInput=lambda *args: added.append(args[0]),
         addDropDownCommandInput=lambda *args: (added.append(args[0]), anchor)[1],
+        addTextBoxCommandInput=lambda *args: (
+            added.append(args[0]), types.SimpleNamespace(formattedText="")
+        )[1],
     )
     command = types.SimpleNamespace(
         commandInputs=inputs,
@@ -317,7 +343,337 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
 
     module.CommandCreatedHandler("solve").notify(types.SimpleNamespace(command=command))
 
-    assert added == ["send_selection", "anchor_instance_id"]
+    assert added == ["send_selection", "anchor_instance_id", "preflight"]
+
+
+class _SelectionInput:
+    """A Fusion selection input, read back the way the handlers read it."""
+
+    def __init__(self, entities: list[object]) -> None:
+        self._entities = list(entities)
+        self.filters: list[str] = []
+        self.limits: tuple[int, int] | None = None
+
+    @property
+    def selectionCount(self) -> int:
+        return len(self._entities)
+
+    def selection(self, index: int) -> object:
+        return types.SimpleNamespace(entity=self._entities[index])
+
+    def addSelectionFilter(self, value: str) -> None:
+        self.filters.append(value)
+
+    def setSelectionLimits(self, minimum: int, maximum: int) -> None:
+        self.limits = (minimum, maximum)
+
+
+class _Attributes:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], str] = {}
+
+    def itemByName(self, group: str, name: str) -> object | None:
+        key = (group, name)
+        if self.values.get(key) is None:
+            return None
+        owner = self
+
+        class _Attribute:
+            @property
+            def value(self) -> str:
+                return owner.values[key]
+
+            @value.setter
+            def value(self, text: str) -> None:
+                owner.values[key] = text
+
+            def deleteMe(self) -> bool:
+                owner.values.pop(key, None)
+                return True
+
+        return _Attribute()
+
+    def add(self, group: str, name: str, value: str) -> None:
+        self.values[(group, name)] = value
+
+
+def _fake_face(role: str | None, area: float = 5.0) -> object:
+    return types.SimpleNamespace(
+        area=area,
+        appearance=None if role is None else types.SimpleNamespace(name=role),
+    )
+
+
+def _fake_body(name: str, *, solid: bool = True) -> object:
+    return types.SimpleNamespace(
+        name=name, isSolid=solid, attributes=_Attributes(), objectType="adsk::fusion::BRepBody"
+    )
+
+
+def _dialog_inputs(**items: object) -> object:
+    return types.SimpleNamespace(itemById=lambda name: items.get(name))
+
+
+def _chosen(name: str) -> object:
+    return types.SimpleNamespace(selectedItem=types.SimpleNamespace(name=name))
+
+
+def _build_dialog(module, operation: str) -> tuple[list[str], dict[str, list[object]]]:
+    """Run one CommandCreatedHandler and record what it put on the dialog."""
+
+    added: list[str] = []
+    listed: dict[str, list[object]] = {}
+
+    def drop_down(input_id: str, *_args: object) -> object:
+        listed[input_id] = []
+        added.append(input_id)
+        return types.SimpleNamespace(
+            listItems=types.SimpleNamespace(
+                add=lambda label, selected: listed[input_id].append((label, selected))
+            ),
+        )
+
+    def text_box(input_id: str, _name: str, text: str, *_args: object) -> object:
+        listed[input_id] = [text]
+        added.append(input_id)
+        return types.SimpleNamespace(formattedText=text)
+
+    selections: dict[str, _SelectionInput] = {}
+
+    def selection_input(input_id: str, *_args: object) -> object:
+        added.append(input_id)
+        selections[input_id] = _SelectionInput([])
+        return selections[input_id]
+
+    inputs = types.SimpleNamespace(
+        addSelectionInput=selection_input,
+        addDropDownCommandInput=drop_down,
+        addTextBoxCommandInput=text_box,
+    )
+    module.adsk.core.DropDownStyles = types.SimpleNamespace(
+        TextListDropDownStyle="text-list"
+    )
+    module.CommandCreatedHandler(operation).notify(types.SimpleNamespace(
+        command=types.SimpleNamespace(
+            commandInputs=inputs,
+            inputChanged=types.SimpleNamespace(add=lambda _handler: None),
+            execute=types.SimpleNamespace(add=lambda _handler: None),
+        ),
+    ))
+    listed["_selections"] = list(selections.values())
+    return added, listed
+
+
+def test_set_wg_source_offers_the_four_roles_and_a_clear(monkeypatch) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_source_dialog", ui)
+
+    added, listed = _build_dialog(module, "source")
+
+    assert added == ["source_faces", "source_role", "source_help"]
+    assert [label for label, _selected in listed["source_role"]] == [
+        "LF", "MF", "HF", "PORT_EXIT", "Clear WG source",
+    ]
+    assert [label for label, selected in listed["source_role"] if selected] == ["HF"]
+    # The dialog teaches the convention rather than assuming it is known.
+    assert "HF" in listed["source_help"][0] and "WG solves" in listed["source_help"][0]
+    faces = listed["_selections"][0]
+    assert faces.filters == ["Faces"] and faces.limits == (1, 0)
+    # No managed-link chooser: authoring a source has nothing to do with links.
+    assert "instance_choice" not in added
+    assert ui.messages == []
+
+
+def test_declare_body_offers_shell_exclude_and_clear(monkeypatch) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_declare_dialog", ui)
+
+    added, listed = _build_dialog(module, "declare")
+
+    assert added == ["declare_bodies", "declaration", "declaration_help"]
+    assert [selected for _label, selected in listed["declaration"]] == [True, False, False]
+    labels = [label for label, _selected in listed["declaration"]]
+    assert module.wglink_author.resolve_declaration_choice(labels[0]) == "exterior-shell"
+    assert module.wglink_author.resolve_declaration_choice(labels[1]) == "exclude"
+    assert module.wglink_author.resolve_declaration_choice(labels[2]) is None
+    bodies = listed["_selections"][0]
+    assert bodies.filters == ["SolidBodies", "SurfaceBodies", "MeshBodies"]
+    assert bodies.limits == (1, 0)
+    assert ui.messages == []
+
+
+def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_apply_source", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: "design")
+    minted: list[str] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_named_appearance",
+        lambda _app, _design, name: (minted.append(name), types.SimpleNamespace(name=name))[1],
+    )
+    blank, wrong, already = _fake_face(None), _fake_face("MF"), _fake_face("HF")
+    inputs = _dialog_inputs(
+        source_faces=_SelectionInput([blank, wrong, already]),
+        source_role=_chosen("HF"),
+    )
+
+    report = module._apply_source_role(inputs)
+
+    assert minted == ["HF"]
+    assert blank.appearance.name == "HF" and wrong.appearance.name == "HF"
+    assert already.appearance.name == "HF"
+    assert "3 faces now drive the HF source" in report["summary"]
+    # Fusion reports square centimetres; the summary states square millimetres.
+    assert "1500.0 mm²" in report["summary"]
+
+
+def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_clear_source", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: "design")
+    minted: list[str] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_named_appearance",
+        lambda _app, _design, name: minted.append(name),
+    )
+    role, painted = _fake_face("PORT_EXIT"), _fake_face("Steel - Satin")
+    inputs = _dialog_inputs(
+        source_faces=_SelectionInput([role, painted]),
+        source_role=_chosen(module.wglink_author.CLEAR_SOURCE_LABEL),
+    )
+
+    report = module._apply_source_role(inputs)
+
+    # No appearance is minted for a clear, and the user's own material survives.
+    assert minted == []
+    assert role.appearance is None
+    assert painted.appearance.name == "Steel - Satin"
+    assert "Cleared the WG source role from 1 face" in report["summary"]
+
+
+def test_declaring_bodies_writes_the_attribute_the_export_scope_reads(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_apply_declare", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    shell, scaffold = _fake_body("Shell", solid=False), _fake_body("Jig", solid=False)
+    labels = module.wglink_author.declaration_choices()
+
+    module._apply_body_declaration(_dialog_inputs(
+        declare_bodies=_SelectionInput([shell, scaffold]), declaration=_chosen(labels[0])
+    ))
+
+    assert module.wglink_send.read_declaration(shell) == "exterior-shell"
+    assert module.wglink_send.read_declaration(scaffold) == "exterior-shell"
+
+    module._apply_body_declaration(_dialog_inputs(
+        declare_bodies=_SelectionInput([scaffold]), declaration=_chosen(labels[1])
+    ))
+    assert module.wglink_send.read_declaration(scaffold) == "exclude"
+
+    report = module._apply_body_declaration(_dialog_inputs(
+        declare_bodies=_SelectionInput([shell, scaffold]), declaration=_chosen(labels[2])
+    ))
+    assert shell.attributes.values == {} and scaffold.attributes.values == {}
+    assert "Cleared the WG declaration on 2 bodies" in report["summary"]
+
+
+def test_a_declaration_is_written_on_the_native_body_not_the_proxy(
+    monkeypatch,
+) -> None:
+    """An occurrence proxy exposes no attributes, and the export reads the
+    native object, so a proxy write would be silently lost."""
+
+    module = _load_instance(
+        monkeypatch, "WGLink_declare_proxy", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    native = _fake_body("Shell", solid=False)
+    proxy = types.SimpleNamespace(
+        name="Shell", isSolid=False, attributes=_Attributes(), nativeObject=native
+    )
+
+    module._apply_body_declaration(_dialog_inputs(
+        declare_bodies=_SelectionInput([proxy]),
+        declaration=_chosen(module.wglink_author.declaration_choices()[1]),
+    ))
+
+    assert module.wglink_send.read_declaration(native) == "exclude"
+    assert proxy.attributes.values == {}
+
+
+def test_the_send_dialog_states_the_export_before_ok(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_preflight_sync", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    box = types.SimpleNamespace(formattedText="")
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+    monkeypatch.setattr(module.wglink_send, "preflight_scope", lambda _app, _options: {
+        "selection": "root",
+        "instance_ids": [],
+        "included": [{"name": "horn", "body_kind": "solid"}],
+        "sources": [],
+        "scope_error": None,
+        "source_error": None,
+        "bounds_mm": {"min": [-100.0, -100.0, -180.0], "max": [100.0, 100.0, 0.0]},
+        "source_bounds_mm": None,
+    })
+
+    module._sync_preflight(_dialog_inputs(preflight=box))
+
+    assert "1 solid" in box.formattedText
+    assert "unlinked (Fusion-first) return" in box.formattedText
+    # Both the missing source and the wrong-way frame are stated before OK.
+    assert box.formattedText.count("<b>⚠") == 2
+
+
+def test_a_model_that_cannot_be_surveyed_leaves_the_dialog_usable(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_preflight_failure", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    box = types.SimpleNamespace(formattedText="")
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+
+    def refuse(_app: object, _options: object) -> None:
+        raise RuntimeError("No active Fusion design")
+
+    monkeypatch.setattr(module.wglink_send, "preflight_scope", refuse)
+
+    module._sync_preflight(_dialog_inputs(preflight=box))
+
+    assert box.formattedText == "Pre-flight unavailable: No active Fusion design"
+
+
+def test_an_unexpected_failure_shows_one_line_and_logs_the_traceback(
+    monkeypatch,
+) -> None:
+    """A raw traceback in a modal states the add-in's internals and nothing the
+    user can act on, and buries the sentence that identifies the failure."""
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_error_copy", ui)
+
+    try:
+        raise RuntimeError("Fusion refused the appearance")
+    except RuntimeError as exc:
+        module._report_error("Set WG Source…", "WGLink error", exc)
+
+    (title, text), = ui.messages
+    assert title == "WGLink error"
+    assert text.startswith("Set WG Source… hit an unexpected error: ")
+    assert "Fusion refused the appearance" in text
+    assert "Traceback" not in text
+    assert "Text Commands" in text
+    logged, = ui.text_palette.written
+    assert "Traceback" in logged and "RuntimeError" in logged
 
 
 def test_the_link_chooser_appears_only_with_several_links(monkeypatch) -> None:

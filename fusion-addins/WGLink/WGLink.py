@@ -56,6 +56,7 @@ def _load_local_workspace_module():
         raise
     return module
 
+import wglink_author  # noqa: E402
 import wglink_core  # noqa: E402
 import wglink_send  # noqa: E402
 import wglink_watch  # noqa: E402
@@ -69,6 +70,16 @@ BROWSE_FOLDER = "Browse for a bundle folder…"
 BROWSE_ZIP = "Browse for a zipped .wglink file…"
 SETTINGS_PATH = Path.home() / ".hornlab" / "WGLink" / "settings.json"
 COMMANDS = {
+    "source": (
+        "hornlab_wglink_set_source",
+        "Set WG Source…",
+        "Mark the selected faces as the LF, MF, HF, or PORT_EXIT drive source.",
+    ),
+    "declare": (
+        "hornlab_wglink_declare_body",
+        "Declare Body…",
+        "Classify a body as the exterior WG solves, or leave it out of the return.",
+    ),
     "solve": (
         "hornlab_wglink_solve",
         "Solve in WG",
@@ -105,10 +116,18 @@ COMMANDS = {
         "Remove WGLink attributes without changing bodies or features.",
     ),
 }
-# The two commands a user starts. Everything else is maintenance or recovery
-# and lives under one dropdown; the automatic handoff already covers the
-# ordinary Insert and Update.
-PROMOTED_COMMANDS = ("solve", "send")
+# The commands a user starts. Everything else is maintenance or recovery and
+# lives under one dropdown; the automatic handoff already covers the ordinary
+# Insert and Update.
+#
+# Set WG Source is promoted even though it is authoring rather than an export:
+# a model with no painted source face cannot be sent at all, and the convention
+# is invisible -- it used to be "rename a Fusion appearance to exactly HF".
+# Filed under a dropdown named "Manage WG Link…" it would read as maintenance
+# for an existing link, which is exactly what a from-scratch model does not
+# have. Declare Body stays in the dropdown: it is the remedy for one refusal,
+# and that refusal names it.
+PROMOTED_COMMANDS = ("source", "solve", "send")
 
 _handlers: list[object] = []
 _definitions: list[object] = []
@@ -163,6 +182,37 @@ def _message(text: str, title: str = PANEL_NAME) -> None:
     ui = _ui()
     if ui:
         ui.messageBox(text, title)
+
+
+def _log(text: str) -> None:
+    """Put diagnostics where diagnostics belong: Fusion's Text Commands palette."""
+
+    try:
+        palette = _ui().palettes.itemById("TextCommands")
+    except Exception:  # noqa: BLE001 - an unavailable palette must not raise
+        palette = None
+    if palette is not None:
+        try:
+            palette.writeText(text)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        print(text)
+    except Exception:  # noqa: BLE001 - logging is never worth a second failure
+        pass
+
+
+def _report_error(action: str, title: str, exc: BaseException | None = None) -> None:
+    """Log the traceback, show one human line.
+
+    A raw ``traceback.format_exc()`` in a modal states the add-in's internals
+    and nothing the user can act on, and the one sentence that identifies the
+    failure is buried in the middle of it.
+    """
+
+    _log(f"[{PANEL_NAME}] {action}\n{traceback.format_exc()}")
+    _message(wglink_author.failure_message(action, exc), title)
 
 
 def _load_settings() -> dict[str, object]:
@@ -346,6 +396,165 @@ def _sync_anchor_choices(command_inputs: object) -> None:
         pass
 
 
+def _sync_preflight(command_inputs: object) -> None:
+    """Refresh the read-only summary the Send and Solve dialogs show.
+
+    Everything Fusion-specific happens here, on the main thread; the wording is
+    composed by wglink_author from plain numbers.
+    """
+
+    box = _input(command_inputs, "preflight")
+    if box is None:
+        return
+    try:
+        options: dict[str, object] = {"selection": _send_selection(command_inputs)}
+        anchor = _input(command_inputs, "anchor_instance_id")
+        try:
+            if anchor is not None and anchor.isVisible and anchor.selectedItem:
+                options["anchor_instance_id"] = str(anchor.selectedItem.name)
+        except Exception:  # noqa: BLE001 - an untouched dropdown has no choice yet
+            pass
+        text = wglink_author.preflight_summary(
+            wglink_send.preflight_scope(_app(), options)
+        ).html()
+    except Exception as exc:  # noqa: BLE001 - a preview never blocks the dialog
+        text = wglink_author.preflight_unavailable(exc)
+    for attribute in ("formattedText", "text"):
+        try:
+            setattr(box, attribute, text)
+            return
+        except Exception:  # noqa: BLE001 - older text boxes expose only one
+            continue
+
+
+def _sync_help(command_inputs: object, box_id: str, choice_id: str, text_of) -> None:
+    box = _input(command_inputs, box_id)
+    if box is None:
+        return
+    try:
+        text = text_of(_selected_name(command_inputs, choice_id, ""))
+    except wglink_author.AuthorError as exc:
+        text = str(exc)
+    for attribute in ("formattedText", "text"):
+        try:
+            setattr(box, attribute, text)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _add_selection_filters(selection: object, *names: str) -> None:
+    """Apply what this Fusion knows, rather than failing the whole dialog.
+
+    A filter name an older Fusion does not recognise would otherwise raise
+    before the execute handler is attached, leaving a button that does nothing.
+    """
+
+    for name in names:
+        try:
+            selection.addSelectionFilter(name)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _selected_entities(command_inputs: object, name: str) -> list[object]:
+    item = _input(command_inputs, name)
+    entities: list[object] = []
+    try:
+        for index in range(item.selectionCount):
+            entities.append(item.selection(index).entity)
+    except Exception:  # noqa: BLE001 - an empty selection is refused by the plan
+        pass
+    return entities
+
+
+def _face_descriptors(faces: list[object]) -> list[dict[str, object]]:
+    """Copy what the plan needs off live faces. Main thread only."""
+
+    descriptors = []
+    for index, face in enumerate(faces):
+        try:
+            area = float(face.area) * 100.0
+        except Exception:  # noqa: BLE001 - an unread area only drops the total
+            area = None
+        descriptors.append({
+            "index": index,
+            "current_role": wglink_send._face_role(face),
+            "area_mm2": area,
+        })
+    return descriptors
+
+
+def _native(entity: object) -> object:
+    # An occurrence proxy exposes an empty attribute collection, so a
+    # declaration has to be written on the native body, which is also where the
+    # export reads it back from.
+    return getattr(entity, "nativeObject", None) or entity
+
+
+def _body_descriptors(bodies: list[object]) -> list[dict[str, object]]:
+    """Copy what the plan needs off live bodies. Main thread only."""
+
+    descriptors = []
+    for index, body in enumerate(bodies):
+        descriptors.append({
+            "index": index,
+            "name": str(getattr(body, "name", "") or f"body {index + 1}"),
+            "current": wglink_send.read_declaration(_native(body)),
+            "body_kind": "solid" if bool(getattr(body, "isSolid", False)) else "surface",
+        })
+    return descriptors
+
+
+def _apply_source_role(command_inputs: object) -> dict[str, object]:
+    """Paint or strip the appearance that WG reads a source role from."""
+
+    app = _app()
+    design = wglink_core._design(app)
+    faces = _selected_entities(command_inputs, "source_faces")
+    plan = wglink_author.plan_source_assignment(
+        _face_descriptors(faces),
+        _selected_name(command_inputs, "source_role", wglink_author.DEFAULT_SOURCE_ROLE),
+    )
+    appearance = (
+        wglink_core._named_appearance(app, design, plan.appearance_name)
+        if plan.paint
+        else None
+    )
+    for index in plan.paint:
+        try:
+            faces[index].appearance = appearance
+        except Exception as exc:  # noqa: BLE001
+            raise wglink_core.WgLinkError(
+                f"Could not paint the {plan.role} appearance onto a selected face: {exc}."
+            ) from exc
+    for index in plan.clear:
+        try:
+            # None is how wglink_core strips a stray tag too: the face falls
+            # back to the appearance its body carries.
+            faces[index].appearance = None
+        except Exception as exc:  # noqa: BLE001
+            raise wglink_core.WgLinkError(
+                f"Could not clear the WG source appearance from a selected face: {exc}."
+            ) from exc
+    return {"summary": plan.summary}
+
+
+def _apply_body_declaration(command_inputs: object) -> dict[str, object]:
+    """Write or remove the return classification the export scope reads."""
+
+    bodies = _selected_entities(command_inputs, "declare_bodies")
+    plan = wglink_author.plan_body_declaration(
+        _body_descriptors(bodies),
+        _selected_name(command_inputs, "declaration", ""),
+    )
+    for index in plan.write:
+        wglink_send.declare_body(_native(bodies[index]), plan.declaration)
+    for index in plan.clear:
+        wglink_send.clear_declaration(_native(bodies[index]))
+    return {"summary": plan.summary}
+
+
 def _tag_summary(tag: object) -> str:
     if not isinstance(tag, dict):
         return "Tag: not reported"
@@ -363,6 +572,9 @@ def _warnings(report: dict[str, object]) -> str:
 
 
 def _summary(operation: str, report: dict[str, object]) -> str:
+    if operation in {"source", "declare"}:
+        # The plan already states what changed, in the plan's own words.
+        return str(report.get("summary", ""))
     if operation == "insert":
         deviation = report.get("deviation", {})
         return (
@@ -495,6 +707,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 if self.operation == "solve":
                     report = dict(report)
                     report["solve_requested"] = _request_wg_solve(report)
+            elif self.operation == "source":
+                report = _apply_source_role(inputs)
+            elif self.operation == "declare":
+                report = _apply_body_declaration(inputs)
             elif self.operation == "relink":
                 kind, chosen = _resolve_source(
                     _selected_name(inputs, "bundle_source", BROWSE_FOLDER)
@@ -508,10 +724,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             else:
                 report = wglink_core.detach(_app(), options)
             _message(_summary(self.operation, report))
-        except wglink_core.WgLinkError as exc:
+        except (wglink_core.WgLinkError, wglink_author.AuthorError) as exc:
             _message(str(exc), "WGLink refused")
-        except Exception:  # noqa: BLE001 - UI boundary; core remains head-less
-            _message(traceback.format_exc(), "WGLink error")
+        except Exception as exc:  # noqa: BLE001 - UI boundary; core remains head-less
+            _report_error(COMMANDS[self.operation][1], "WGLink error", exc)
         finally:
             _command_busy = False
             # This command may have moved the link on; re-survey from scratch so
@@ -527,6 +743,20 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
             inputs = args.inputs
             if input_id == "send_selection":
                 _sync_anchor_choices(inputs)
+                _sync_preflight(inputs)
+            elif input_id == "anchor_instance_id":
+                _sync_preflight(inputs)
+            elif input_id == "source_role":
+                _sync_help(
+                    inputs, "source_help", "source_role", wglink_author.source_help_text
+                )
+            elif input_id == "declaration":
+                _sync_help(
+                    inputs,
+                    "declaration_help",
+                    "declaration",
+                    wglink_author.declaration_help_text,
+                )
         except Exception:  # noqa: BLE001 - execute remains the validation boundary
             pass
 
@@ -558,6 +788,69 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 anchor.isVisible = False
                 _sync_anchor_choices(inputs)
+                # State the export before it happens: what goes in, whether it
+                # is linked, which sources drive it, and -- for an unlinked
+                # model, whose assembly frame WG solves as-is -- how far the
+                # model sits from that frame. A missing source used to be a
+                # dead-end modal raised after the user pressed OK.
+                inputs.addTextBoxCommandInput("preflight", "Pre-flight", "", 8, True)
+                _sync_preflight(inputs)
+                changed = CommandInputChangedHandler()
+                args.command.inputChanged.add(changed)
+                _handlers.append(changed)
+            if self.operation == "source":
+                faces = inputs.addSelectionInput(
+                    "source_faces",
+                    "Faces",
+                    "Select the face or faces that drive this source.",
+                )
+                _add_selection_filters(faces, "Faces")
+                faces.setSelectionLimits(1, 0)
+                role = inputs.addDropDownCommandInput(
+                    "source_role",
+                    "Source role",
+                    adsk.core.DropDownStyles.TextListDropDownStyle,
+                )
+                for choice in wglink_author.source_choices():
+                    role.listItems.add(
+                        choice, choice == wglink_author.DEFAULT_SOURCE_ROLE
+                    )
+                inputs.addTextBoxCommandInput(
+                    "source_help",
+                    "",
+                    wglink_author.source_help_text(wglink_author.DEFAULT_SOURCE_ROLE),
+                    2,
+                    True,
+                )
+                changed = CommandInputChangedHandler()
+                args.command.inputChanged.add(changed)
+                _handlers.append(changed)
+            if self.operation == "declare":
+                bodies = inputs.addSelectionInput(
+                    "declare_bodies",
+                    "Bodies",
+                    "Select the bodies to classify for the WG return.",
+                )
+                _add_selection_filters(
+                    bodies, "SolidBodies", "SurfaceBodies", "MeshBodies"
+                )
+                bodies.setSelectionLimits(1, 0)
+                declaration = inputs.addDropDownCommandInput(
+                    "declaration",
+                    "Declaration",
+                    adsk.core.DropDownStyles.TextListDropDownStyle,
+                )
+                for index, choice in enumerate(wglink_author.declaration_choices()):
+                    declaration.listItems.add(choice, index == 0)
+                inputs.addTextBoxCommandInput(
+                    "declaration_help",
+                    "",
+                    wglink_author.declaration_help_text(
+                        wglink_author.declaration_choices()[0]
+                    ),
+                    3,
+                    True,
+                )
                 changed = CommandInputChangedHandler()
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)
@@ -575,7 +868,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     source.listItems.add(bundle.label(), index == 0)
                 source.listItems.add(BROWSE_FOLDER, not discovered)
                 source.listItems.add(BROWSE_ZIP, False)
-            if self.operation not in {"insert", "send", "solve"}:
+            if self.operation not in {"insert", "send", "solve", "source", "declare"}:
                 # A document with one link needs no choice, and the old free
                 # text field required running Audit first just to learn the id.
                 links = _document_link_choices()
@@ -593,8 +886,8 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             handler = CommandExecuteHandler(self.operation)
             args.command.execute.add(handler)
             _handlers.append(handler)
-        except Exception:  # noqa: BLE001
-            _message(traceback.format_exc(), "WGLink command error")
+        except Exception as exc:  # noqa: BLE001
+            _report_error("Building a WGLink dialog", "WGLink command error", exc)
 
 
 def _delete_quietly(entity: object) -> None:
@@ -844,8 +1137,8 @@ def _apply_pending_return_request() -> bool:
         wglink_watch.acknowledge_return_request(request)
     except wglink_core.WgLinkError as exc:
         _message(str(exc), "WGLink return to WG refused")
-    except Exception:  # noqa: BLE001 - main-thread add-in boundary
-        _message(traceback.format_exc(), "WGLink return to WG error")
+    except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
+        _report_error("Returning this model to WG", "WGLink return to WG error", exc)
     finally:
         _command_busy = False
     return True
@@ -961,9 +1254,11 @@ def _apply_pending_handoff() -> bool:
     except wglink_core.WgLinkError as exc:
         operation = "update" if linked else "insert"
         _message(str(exc), f"WGLink automatic {operation} refused")
-    except Exception:  # noqa: BLE001 - main-thread add-in boundary
+    except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
         operation = "update" if linked else "insert"
-        _message(traceback.format_exc(), f"WGLink automatic {operation} error")
+        _report_error(
+            f"The automatic {operation}", f"WGLink automatic {operation} error", exc
+        )
     finally:
         _command_busy = False
     return True
@@ -997,8 +1292,8 @@ def _on_watch_tick() -> None:
             )
             if answer == adsk.core.DialogResults.DialogYes:
                 _apply_announced_updates(announcements)
-        except Exception:  # noqa: BLE001
-            _message(traceback.format_exc(), "WGLink watch error")
+        except Exception as exc:  # noqa: BLE001
+            _report_error("Offering a newer export", "WGLink watch error", exc)
         finally:
             _command_busy = False
     finally:
@@ -1009,8 +1304,8 @@ class WatchEventHandler(adsk.core.CustomEventHandler):
     def notify(self, _args: object) -> None:
         try:
             _on_watch_tick()
-        except Exception:  # noqa: BLE001
-            _message(traceback.format_exc(), "WGLink watch error")
+        except Exception as exc:  # noqa: BLE001
+            _report_error("Watching for WG exports", "WGLink watch error", exc)
 
 
 class PresenceEventHandler(adsk.core.CustomEventHandler):
@@ -1249,8 +1544,8 @@ def run(_context: object) -> None:
             target = manage.controls if manage is not None else _panel.controls
             _controls.append(target.addCommand(definition))
         _start_watch(app)
-    except Exception:  # noqa: BLE001
-        _message(traceback.format_exc(), "WGLink start error")
+    except Exception as exc:  # noqa: BLE001
+        _report_error("Starting WGLink", "WGLink start error", exc)
 
 
 def stop(_context: object) -> None:
@@ -1279,5 +1574,5 @@ def stop(_context: object) -> None:
         _panel = None
         _owned = False
         _handlers.clear()
-    except Exception:  # noqa: BLE001
-        _message(traceback.format_exc(), "WGLink stop error")
+    except Exception as exc:  # noqa: BLE001
+        _report_error("Stopping WGLink", "WGLink stop error", exc)

@@ -474,3 +474,133 @@ def test_mouth_overshoot_extrude_joins_face_using_parameter_expression(core, mon
         "extent": ("distance", ("expression", "wg_tiny_mouth_overshoot")),
         "direction": "positive",
     }
+
+
+def _stub_no_op_update(core, monkeypatch, record, observed_paths):
+    design = types.SimpleNamespace()
+    monkeypatch.setattr(core, "_design", lambda _app: design)
+    monkeypatch.setattr(core, "_resolve_link", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(
+        core, "_link_frame_report", lambda *_args: {"verdict": "in_frame"}
+    )
+    monkeypatch.setattr(core, "_refuse_bad_link_frame", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        core, "link_state", lambda *_args: types.SimpleNamespace(verdict="same_export")
+    )
+    monkeypatch.setattr(core, "parameter_slug", lambda _bundle: "horn")
+    monkeypatch.setattr(core, "_validate_enclosure_placement", lambda _bundle: None)
+    monkeypatch.setattr(core, "_validate_mouth_outline", lambda _bundle: None)
+    monkeypatch.setattr(
+        core,
+        "_resample_payload",
+        lambda path, _topology, _options: (observed_paths.append(path), {})[1],
+    )
+    monkeypatch.setattr(core, "_ring_sketches", lambda *_args: [])
+    monkeypatch.setattr(core, "_interface_sketches", lambda *_args: {})
+    monkeypatch.setattr(core, "_validate_rebuild_topology", lambda *_args: (0, 0))
+    monkeypatch.setattr(
+        core,
+        "_no_op_update_report",
+        lambda _app, _design, _record, bundle, _options, _frame: {
+            "updated_export_sequence": bundle.identity.export_sequence,
+        },
+    )
+    return design
+
+
+def _update_bundle(design_id: str, sequence: int) -> object:
+    return types.SimpleNamespace(
+        identity=types.SimpleNamespace(
+            design_id=design_id,
+            export_sequence=sequence,
+        ),
+        manifest={"design": {"build_mode": "freestanding"}},
+        grid={},
+    )
+
+
+def test_update_self_heals_a_missing_bundle_path_by_design_identity(
+    core, monkeypatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "moved-away.wglink"
+    old_match = tmp_path / "old-match.wglink"
+    newest_match = tmp_path / "newest-match.wglink"
+    other_design = tmp_path / "other-design.wglink"
+    for path in (old_match, newest_match, other_design):
+        path.mkdir()
+    record = {
+        "instance_id": "wgi_one",
+        "payload": {
+            "bundle_path": str(missing),
+            "build_mode": "freestanding",
+            "design_id": "wgd_target",
+            "slug": "horn",
+            "topology": "{}",
+        },
+    }
+    observed_paths: list[Path] = []
+    design = _stub_no_op_update(core, monkeypatch, record, observed_paths)
+    discovered = [
+        types.SimpleNamespace(path=old_match, modified_at=300.0),
+        types.SimpleNamespace(path=newest_match, modified_at=100.0),
+        types.SimpleNamespace(path=other_design, modified_at=500.0),
+    ]
+    bundles = {
+        old_match: _update_bundle("wgd_target", 3),
+        newest_match: _update_bundle("wgd_target", 7),
+        other_design: _update_bundle("wgd_other", 99),
+    }
+    monkeypatch.setattr(core.wglink_workspace, "discover_bundles", lambda: discovered)
+    monkeypatch.setattr(core, "_read_owned_bundle", lambda path: bundles[Path(path)])
+    rewritten: list[tuple[object, str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        core,
+        "_update_payload_attributes",
+        lambda target, instance_id, updates: rewritten.append(
+            (target, instance_id, updates)
+        ),
+    )
+
+    report = core.update(object(), None)
+
+    assert report == {"updated_export_sequence": 7}
+    assert observed_paths == [newest_match]
+    assert rewritten == [
+        (design, "wgi_one", {"bundle_path": str(newest_match.resolve())})
+    ]
+
+
+def test_update_refuses_when_design_is_not_discoverable_in_the_wg_workspace(
+    core, monkeypatch, tmp_path: Path
+) -> None:
+    missing = tmp_path / "moved-away.wglink"
+    other_design = tmp_path / "other-design.wglink"
+    other_design.mkdir()
+    record = {
+        "instance_id": "wgi_one",
+        "payload": {
+            "bundle_path": str(missing),
+            "build_mode": "freestanding",
+            "design_id": "wgd_target",
+            "slug": "horn",
+            "topology": "{}",
+        },
+    }
+    _stub_no_op_update(core, monkeypatch, record, [])
+    monkeypatch.setattr(
+        core.wglink_workspace,
+        "discover_bundles",
+        lambda: [types.SimpleNamespace(path=other_design, modified_at=1.0)],
+    )
+    monkeypatch.setattr(
+        core,
+        "_read_owned_bundle",
+        lambda _path: _update_bundle("wgd_other", 10),
+    )
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        core.update(object(), None)
+
+    message = str(refusal.value)
+    assert "could not be found in the current WG workspace" in message
+    assert "headless wglink_core.relink API" in message

@@ -186,9 +186,16 @@ class _Palette:
 
 
 class _UI:
-    def __init__(self, panels: _Panels, definitions: _Definitions) -> None:
+    def __init__(
+        self,
+        panels: _Panels,
+        definitions: _Definitions,
+        *,
+        dialog_result: object | None = None,
+    ) -> None:
         self.commandDefinitions = definitions
         self.messages: list[tuple[str, str]] = []
+        self.dialog_result = dialog_result
         self.text_palette = _Palette()
         self.palettes = types.SimpleNamespace(
             itemById=lambda palette_id: (
@@ -199,8 +206,11 @@ class _UI:
             itemById=lambda _id: types.SimpleNamespace(toolbarPanels=panels)
         )
 
-    def messageBox(self, text: str, title: str = "") -> None:
+    def messageBox(
+        self, text: str, title: str = "", *_args: object
+    ) -> object | None:
         self.messages.append((title, text))
+        return self.dialog_result
 
 
 def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = None):
@@ -213,6 +223,12 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     resolved = app if app is not None else _Application(ui)
     core.Application = types.SimpleNamespace(get=lambda: resolved)
     core.DocumentTypes = types.SimpleNamespace(FusionDesignDocumentType="fusion-design")
+    core.MessageBoxButtonTypes = types.SimpleNamespace(YesNoButtonType="yes-no")
+    core.MessageBoxIconTypes = types.SimpleNamespace(QuestionIconType="question")
+    core.DialogResults = types.SimpleNamespace(
+        DialogOK="ok", DialogYes="yes", DialogNo="no"
+    )
+    adsk.doEvents = lambda: None  # type: ignore[attr-defined]
     adsk.core, adsk.fusion = core, fusion  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "adsk", adsk)
     monkeypatch.setitem(sys.modules, "adsk.core", core)
@@ -508,6 +524,47 @@ def test_declare_body_offers_shell_exclude_and_clear(monkeypatch) -> None:
     assert bodies.filters == ["SolidBodies", "SurfaceBodies", "MeshBodies"]
     assert bodies.limits == (1, 0)
     assert ui.messages == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "detaches"),
+    [("yes", True), ("no", False)],
+    ids=["accepted", "declined"],
+)
+def test_detach_requires_confirmation_before_calling_the_core_api(
+    monkeypatch, answer: str, detaches: bool
+) -> None:
+    ui = _UI(
+        _Panels(),
+        _Definitions(reserve_ids=False),
+        dialog_result=answer,
+    )
+    module = _load_instance(monkeypatch, f"WGLink_detach_{answer}", ui)
+    calls: list[dict[str, object]] = []
+
+    def detach(_app: object, options: dict[str, object]) -> dict[str, object]:
+        calls.append(options)
+        return {
+            "instance_id": "wgi_one",
+            "attributes_removed": 5,
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(module.wglink_core, "detach", detach)
+    module.CommandExecuteHandler("detach").notify(
+        types.SimpleNamespace(
+            command=types.SimpleNamespace(commandInputs=_dialog_inputs()),
+        )
+    )
+
+    assert bool(calls) is detaches
+    title, text = ui.messages[0]
+    assert title == "WGLink — confirm Detach"
+    assert "permanently removes" in text
+    assert "Geometry stays" in text
+    assert "cannot be re-attached" in text
+    assert "fresh copy from Waveguide Generator" in text
+    assert len(ui.messages) == (2 if detaches else 1)
 
 
 def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
@@ -824,15 +881,41 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     first.run(None)
     panel = panels.itemById(first.PANEL_ID)
     assert panel is not None
-    # Two promoted commands plus the Manage dropdown holding the rest.
-    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
+    assert list(first.COMMANDS) == [
+        "source",
+        "declare",
+        "solve",
+        "insert",
+        "update",
+        "send",
+        "detach",
+    ]
+    assert first.PROMOTED_COMMANDS == ("source", "solve", "send")
+    assert {"audit", "relink"} <= set(first.wglink_core.__all__)
+    # Three promoted commands plus Manage, whose four entries are the complete
+    # maintenance UI. Audit and Relink remain head-less APIs only.
+    assert panel.controls.count == 4
     manage = panel.controls.itemById(first.MANAGE_DROPDOWN_ID)
     assert manage is not None
-    assert manage.controls.count == len(first.COMMANDS) - len(first.PROMOTED_COMMANDS)
+    assert [control.definition.id for control in manage.controls._items] == [
+        "hornlab_wglink_declare_body",
+        "hornlab_wglink_insert",
+        "hornlab_wglink_update",
+        "hornlab_wglink_detach",
+    ]
+    assert [
+        control.definition.id
+        for control in panel.controls._items
+        if isinstance(control, _Control)
+    ] == [
+        "hornlab_wglink_set_source",
+        "hornlab_wglink_solve",
+        "hornlab_wglink_send",
+    ]
     assert first._owned is True
     # Every command ships an icon folder holding the 16 px art Fusion draws in
     # the panel dropdown; a missing folder would silently give a blank button.
-    assert len(definitions.resource_folders) == len(first.COMMANDS)
+    assert len(definitions.resource_folders) == 7
     for folder in definitions.resource_folders:
         assert folder and (Path(folder) / "16x16.png").is_file()
 
@@ -844,7 +927,7 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     # command id reserved.
     assert ui.messages == []
     assert panels.itemById(first.PANEL_ID) is panel
-    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
+    assert panel.controls.count == 4
     assert second._owned is False
     assert second._definitions == []
 
@@ -852,7 +935,7 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     second.stop(None)
     assert ui.messages == []
     assert panel.isValid
-    assert panel.controls.count == len(first.PROMOTED_COMMANDS) + 1
+    assert panel.controls.count == 4
     assert [d.id for d in definitions.items.values() if d.isValid] == [
         command_id for command_id, _name, _description in first.COMMANDS.values()
     ]

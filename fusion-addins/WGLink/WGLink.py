@@ -56,11 +56,11 @@ def _load_local_workspace_module():
         raise
     return module
 
+wglink_workspace = _load_local_workspace_module()
 import wglink_author  # noqa: E402
 import wglink_core  # noqa: E402
 import wglink_send  # noqa: E402
 import wglink_watch  # noqa: E402
-wglink_workspace = _load_local_workspace_module()
 from wglink_bundle import format_measurement_mm  # noqa: E402
 
 
@@ -95,20 +95,10 @@ COMMANDS = {
         "Update",
         "Rebuild a managed link in place from its current bundle.",
     ),
-    "audit": (
-        "hornlab_wglink_audit",
-        "Audit",
-        "Inspect link identity, parameter drift, tag state, and feature health.",
-    ),
     "send": (
         "hornlab_wglink_send",
         "Send to WG",
         "Export the displayed acoustic assembly as a validated .wgreturn bundle.",
-    ),
-    "relink": (
-        "hornlab_wglink_relink",
-        "Relink",
-        "Point a managed link at a moved or renamed .wglink bundle.",
     ),
     "detach": (
         "hornlab_wglink_detach",
@@ -182,6 +172,33 @@ def _message(text: str, title: str = PANEL_NAME) -> None:
     ui = _ui()
     if ui:
         ui.messageBox(text, title)
+
+
+def _confirm_detach() -> bool:
+    """Ask before irreversibly removing the selected link's WG identity."""
+
+    ui = _ui()
+    message_box = getattr(ui, "messageBox", None) if ui is not None else None
+    try:
+        yes_no = adsk.core.MessageBoxButtonTypes.YesNoButtonType
+        question = adsk.core.MessageBoxIconTypes.QuestionIconType
+        accepted = adsk.core.DialogResults.DialogYes
+    except AttributeError:
+        # A command shell without Fusion's modal API must fail closed. The
+        # head-less core API remains available to callers that explicitly ask
+        # for detach without going through this UI flow.
+        return False
+    if not callable(message_box):
+        return False
+    answer = message_box(
+        "Detach permanently removes this link's WG identity. Geometry stays in "
+        "the Fusion document, but it cannot be re-attached. The only way back "
+        "is to insert a fresh copy from Waveguide Generator.\n\nDetach this link?",
+        f"{PANEL_NAME} — confirm Detach",
+        yes_no,
+        question,
+    )
+    return answer == accepted
 
 
 def _log(text: str) -> None:
@@ -597,17 +614,6 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             f"Deviation max: {format_measurement_mm(deviation.get('max_mm'))}"
             f"{_warnings(report)}"
         )
-    if operation == "audit":
-        return (
-            "WGLink audit finished.\n"
-            f"Link state: {report.get('link_state', '?')}\n"
-            f"Local body evidence: {report.get('local_body_state', '?')}\n"
-            f"Parameter drift: {len(report.get('parameter_drift', []))}\n"
-            f"Unhealthy features: {len(report.get('regressed', []))}\n"
-            f"{_tag_summary(report.get('tag'))}\n\n"
-            f"{report.get('direct_reference_limit', '')}"
-            f"{_warnings(report)}"
-        )
     if operation in {"send", "solve"}:
         scope = report.get("scope", {})
         status = scope.get("status", "?") if isinstance(scope, dict) else "?"
@@ -636,12 +642,6 @@ def _summary(operation: str, report: dict[str, object]) -> str:
                     )
             message += "\n\nDEGRADED EXPORT — skipped bodies:\n- " + "\n- ".join(names or ["none reported"])
         return message
-    if operation == "relink":
-        return (
-            f"Relinked WGLink instance {report.get('instance_id', '?')}.\n"
-            f"Bundle: {report.get('bundle_path', '?')}"
-            f"{_warnings(report)}"
-        )
     return (
         f"Detached WGLink instance {report.get('instance_id', '?')}.\n"
         f"Attributes removed: {report.get('attributes_removed', 0)}\n"
@@ -701,8 +701,6 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 report = wglink_core.insert(_app(), path, options)
             elif self.operation == "update":
                 report = wglink_core.update(_app(), None, options)
-            elif self.operation == "audit":
-                report = wglink_core.audit(_app(), options)
             elif self.operation in {"send", "solve"}:
                 report = wglink_send.send(_app(), _send_options(inputs))
                 if self.operation == "solve":
@@ -712,18 +710,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 report = _apply_source_role(inputs)
             elif self.operation == "declare":
                 report = _apply_body_declaration(inputs)
-            elif self.operation == "relink":
-                kind, chosen = _resolve_source(
-                    _selected_name(inputs, "bundle_source", BROWSE_FOLDER)
-                )
-                path = chosen or _choose_bundle(
-                    "Select the relocated .wglink bundle", kind
-                )
-                if path is None:
+            elif self.operation == "detach":
+                if not _confirm_detach():
                     return
-                report = wglink_core.relink(_app(), path, options)
-            else:
                 report = wglink_core.detach(_app(), options)
+            else:
+                raise RuntimeError(f"Unknown WGLink operation: {self.operation}")
             _message(_summary(self.operation, report))
         except (wglink_core.WgLinkError, wglink_author.AuthorError) as exc:
             _message(str(exc), "WGLink refused")
@@ -873,7 +865,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 changed = CommandInputChangedHandler()
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)
-            if self.operation in {"insert", "relink"}:
+            if self.operation == "insert":
                 source = inputs.addDropDownCommandInput(
                     "bundle_source",
                     "Bundle source",
@@ -889,7 +881,8 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 source.listItems.add(BROWSE_ZIP, False)
             if self.operation not in {"insert", "send", "solve", "source", "declare"}:
                 # A document with one link needs no choice, and the old free
-                # text field required running Audit first just to learn the id.
+                # text field required a separate diagnostic call just to learn
+                # the id.
                 links = _document_link_choices()
                 if len(links) > 1:
                     chooser = inputs.addDropDownCommandInput(
@@ -900,8 +893,8 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     for index, (label, _instance_id) in enumerate(links):
                         chooser.listItems.add(label, index == 0)
             # force and allow_root_fallback stay head-less-only: every refusal
-            # names the UI path that resolves it (Relink, Detach, or undoing a
-            # body move), and the root fallback already warns in its report.
+            # names the recovery path, and the root fallback already warns in
+            # its report.
             handler = CommandExecuteHandler(self.operation)
             args.command.execute.add(handler)
             _handlers.append(handler)

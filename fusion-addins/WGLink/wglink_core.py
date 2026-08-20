@@ -21,6 +21,7 @@ import uuid
 
 import adsk.core
 import adsk.fusion
+import wglink_workspace
 
 from wglink_bundle import (
     IDENTITY_MATRIX,
@@ -342,16 +343,17 @@ def _resolve_link(
     records = _link_records(design)
     if not records:
         raise WgLinkError(
-            "No complete WGLink attributes were found. Use Relink to recover a "
-            "known link, or Detach to keep the geometry unmanaged."
+            "No complete WGLink attributes were found. Insert a fresh copy from "
+            "WG to create a managed link; existing geometry was not changed."
         )
     requested = options.get("instance_id")
     if requested is not None:
         requested = str(requested)
         if requested not in records:
             raise WgLinkError(
-                f"WGLink instance {requested!r} was not found. Audit the document "
-                "and choose an existing instance id."
+                f"WGLink instance {requested!r} was not found. Choose an instance "
+                "id published in .fusion-status.json or returned by the headless "
+                "wglink_core.audit API."
             )
         record = records[requested]
     elif len(records) == 1:
@@ -397,7 +399,8 @@ def _resolve_link(
     if not record["payload"].get("topology"):
         raise WgLinkError(
             f"WGLink instance {record['instance_id']!r} is missing its topology "
-            "attributes. Use Relink if the bundle is known, or Detach the geometry."
+            "attributes. Its incomplete metadata cannot be repaired; insert a "
+            "fresh copy from WG to create a managed link."
         )
     if record["body"] is None and not allow_missing_body:
         raise WgLinkError(
@@ -2680,20 +2683,94 @@ def insert(
         raise WgLinkError(f"Fusion refused WGLink Insert: {exc}.{remedy}") from exc
 
 
-def _bundle_path_for_update(record: dict[str, Any], bundle_path: object) -> Path:
-    raw = bundle_path if bundle_path is not None else record.get("payload", {}).get("bundle_path")
-    if not raw:
+def _relink_record(
+    design: object,
+    record: dict[str, Any],
+    path: Path,
+    bundle: object,
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    """Rewrite one record's bundle path after applying Relink's identity guard."""
+
+    stored_design = record["payload"].get("design_id")
+    if stored_design != bundle.identity.design_id and not force:
         raise WgLinkError(
-            "This link has no bundle path. Use Relink to locate the .wglink bundle, "
-            "then run Update again."
+            f"Relink requires design.id {stored_design!r}, but the selected bundle is "
+            f"{bundle.identity.design_id!r}. Select this design's moved bundle, or "
+            "pass force=True only if intentionally repointing the link."
         )
-    path = Path(str(raw)).expanduser()
-    if not path.exists():
-        raise WgLinkError(
-            f"The linked bundle path is missing: {path}. Use Relink to select its "
-            "new or renamed location."
+    resolved = str(path.resolve())
+    _update_payload_attributes(
+        design,
+        record["instance_id"],
+        {"bundle_path": resolved},
+    )
+    return {
+        "instance_id": record["instance_id"],
+        "bundle_path": resolved,
+        "design_id": bundle.identity.design_id,
+        "forced": bool(force and stored_design != bundle.identity.design_id),
+        "warnings": [],
+    }
+
+
+def _bundle_for_update(
+    design: object,
+    record: dict[str, Any],
+    bundle_path: object,
+) -> tuple[Path, object]:
+    """Resolve Update's bundle, repairing a stale stored path by design id."""
+
+    raw = (
+        bundle_path
+        if bundle_path is not None
+        else record.get("payload", {}).get("bundle_path")
+    )
+    path = Path(str(raw)).expanduser() if raw else None
+    if path is not None and path.exists():
+        return path, _read_owned_bundle(path)
+
+    design_id = str(record.get("payload", {}).get("design_id") or "")
+    matches: list[tuple[int, float, Path, object]] = []
+    try:
+        discovered = wglink_workspace.discover_bundles()
+    except Exception:  # noqa: BLE001 - a missing workspace becomes one refusal below
+        discovered = []
+    for candidate in discovered:
+        try:
+            candidate_bundle = _read_owned_bundle(candidate.path)
+        except Exception:  # noqa: BLE001 - skip incomplete/corrupt workspace entries
+            continue
+        if candidate_bundle.identity.design_id != design_id:
+            continue
+        matches.append(
+            (
+                int(candidate_bundle.identity.export_sequence),
+                float(candidate.modified_at),
+                Path(candidate.path),
+                candidate_bundle,
+            )
         )
-    return path
+    if matches:
+        _sequence, _modified, resolved_path, resolved_bundle = max(
+            matches, key=lambda item: (item[0], item[1])
+        )
+        _relink_record(
+            design,
+            record,
+            resolved_path,
+            resolved_bundle,
+            force=False,
+        )
+        return resolved_path, resolved_bundle
+
+    missing = f" (last recorded as {path})" if path is not None else ""
+    raise WgLinkError(
+        f"The linked bundle could not be found in the current WG workspace{missing}. "
+        "If the bundle was moved manually, re-point it with the headless "
+        "wglink_core.relink API, then run Update again."
+    )
 
 
 def _no_op_update_report(
@@ -2758,8 +2835,7 @@ def update(
     record = _resolve_link(design, opts)
     link_frame = _link_frame_report(design, record)
     _refuse_bad_link_frame(link_frame, force=bool(opts.get("force")))
-    source_path = _bundle_path_for_update(record, bundle_path)
-    bundle = _read_owned_bundle(source_path)
+    source_path, bundle = _bundle_for_update(design, record, bundle_path)
     state = link_state(record["payload"], bundle)
     stored_mode = record["payload"].get("build_mode")
     incoming_mode = bundle.manifest["design"]["build_mode"]
@@ -2796,12 +2872,14 @@ def update(
             "WGLink export identity is corrupt: stored sequence "
             f"{state.stored_sequence} names export {state.stored_export_id!r}, but "
             f"the selected bundle names {state.bundle_export_id!r}. One sequence "
-            "must identify one export; Relink to the correct bundle or re-export from WG."
+            "must identify one export; use the headless wglink_core.relink API "
+            "for the correct bundle, or re-export from WG."
         )
     if state.verdict in {"different_design", "different_lineage", "older_export"} and not opts.get("force"):
         remedy = (
-            "Choose the bundle exported from this design or use Relink; pass force=True "
-            "only after confirming the replacement."
+            "Choose the bundle exported from this design or use the headless "
+            "wglink_core.relink API; pass force=True only after confirming the "
+            "replacement."
         )
         raise WgLinkError(f"WGLink refuses {state.verdict}: {remedy}")
     no_op = state.verdict == "same_export" and not opts.get("force")
@@ -3169,11 +3247,15 @@ def audit(
     bundle = None
     if not stored_path:
         state = "missing_bundle_path"
-        warnings.append("The bundle path is missing. Use Relink to locate the bundle.")
+        warnings.append(
+            "The bundle path is missing. Update will search the current WG workspace "
+            "by design identity."
+        )
     elif not Path(stored_path).expanduser().exists():
         state = "missing_bundle"
         warnings.append(
-            f"The bundle path no longer exists: {stored_path}. Use Relink to select its new location."
+            f"The bundle path no longer exists: {stored_path}. Update will search "
+            "the current WG workspace by design identity."
         )
     else:
         bundle = _read_owned_bundle(Path(stored_path).expanduser())
@@ -3274,26 +3356,13 @@ def relink(
     if not path.exists():
         raise WgLinkError(f"Relink bundle path does not exist: {path}")
     bundle = _read_owned_bundle(path)
-    stored_design = record["payload"].get("design_id")
-    if stored_design != bundle.identity.design_id and not opts.get("force"):
-        raise WgLinkError(
-            f"Relink requires design.id {stored_design!r}, but the selected bundle is "
-            f"{bundle.identity.design_id!r}. Select this design's moved bundle, or "
-            "pass force=True only if intentionally repointing the link."
-        )
-    resolved = str(path.resolve())
-    _update_payload_attributes(
+    return _relink_record(
         design,
-        record["instance_id"],
-        {"bundle_path": resolved},
+        record,
+        path,
+        bundle,
+        force=bool(opts.get("force")),
     )
-    return {
-        "instance_id": record["instance_id"],
-        "bundle_path": resolved,
-        "design_id": bundle.identity.design_id,
-        "forced": bool(opts.get("force") and stored_design != bundle.identity.design_id),
-        "warnings": [],
-    }
 
 
 def _delete_attribute(attribute: object) -> bool:

@@ -37,20 +37,23 @@ Send need no folder dialogs afterwards.
 
 ## 2. The panel
 
-Three everyday commands sit directly on the WGLink panel; the rest are under
-**Manage WG Link…**.
+Three everyday commands sit directly on the WGLink panel. **Manage WG Link…**
+contains only **Declare Body…**, **Insert**, **Update**, and **Detach**.
 
 | Command | What it does |
 |---|---|
 | **Set WG Source…** | Mark the selected faces as the `LF`, `MF`, `HF`, or `PORT_EXIT` drive source (applies an appearance with that exact name; Clear removes it). |
 | **Solve in WG** | Export the assembly and ask WG to prepare and solve it, so WG is already solving when you switch windows. |
 | **Send to WG** | Export the assembly as a validated `.wgreturn` bundle without asking for a solve. |
-| Insert | Insert a WG `.wglink` bundle as a managed link. Ordinarily unneeded: WG's Send to CAD offers the insert automatically. |
-| Update | Rebuild a managed link in place from its current bundle. Also offered automatically when WG exports a newer bundle. |
-| Audit | Inspect link identity, parameter drift, tag state, and feature health. |
 | Declare Body… | Classify a body for the return: `exterior-shell` includes an open surface body, `exclude` leaves a body out, Clear restores automatic scoping. |
-| Relink | Point a managed link at a moved or renamed `.wglink` bundle. |
-| Detach | Remove WGLink attributes without changing bodies or features. |
+| Insert | Insert a WG `.wglink` bundle as a managed link. Ordinarily unneeded: WG's Send to CAD offers the insert automatically. |
+| Update | Rebuild a managed link in place from its current bundle. If its stored bundle moved, Update finds the newest export of the same design in WG's current workspace and repairs the path automatically. |
+| Detach | Permanently remove WGLink identity without changing geometry. Fusion asks for confirmation because the only way back is to insert a fresh copy from WG. |
+
+Audit and Relink remain available through the headless `wglink_core.audit` and
+`wglink_core.relink` APIs. Audit's document/link data is also published
+continuously to WG in `.fusion-status.json`, so it does not need a panel
+command.
 
 ## 3. The linked round trip
 
@@ -96,6 +99,10 @@ mesh sizing and drive channels in the CAD Link panel, and solve.
   names the recovery: Detach and delete the component, then Insert; the
   rebuild restores the managed bodies, datums and parameters, and only
   user-authored features on the old parameters need repointing.
+- **"The linked bundle could not be found in the current WG workspace"** —
+  Update already searched the selected WG workspace by design identity. Put the
+  bundle back under that workspace and run Update again. If it was deliberately
+  moved elsewhere, re-point it with the headless `wglink_core.relink` API.
 - **Nothing arrives in WG after Solve in WG** — WG must be running; the
   request survives until it next runs, and the WG window still has to be
   brought forward by hand.

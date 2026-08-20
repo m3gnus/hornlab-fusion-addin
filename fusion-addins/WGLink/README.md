@@ -57,11 +57,12 @@ The supported reference layer is:
 ## Commands
 
 The panel promotes the three everyday commands, **Set WG Source…**, **Solve in
-WG** and **Send to WG**, and collects the rest under **Manage WG Link…**.
+WG** and **Send to WG**. **Manage WG Link…** contains **Declare Body…**,
+**Insert**, **Update**, and **Detach**.
 Insert and Update are ordinarily automatic — WG's *Send to CAD* publishes a
-handoff the add-in applies on its own — so they, along with Declare Body, Audit,
-Relink and Detach, are maintenance, authoring-remedy and recovery tools rather
-than the normal workflow. Every command keeps its full head-less API.
+handoff the add-in applies on its own — so the dropdown is maintenance,
+authoring-remedy, and recovery UI rather than the normal workflow. Audit and
+Relink remain full head-less APIs but are not panel commands.
 
 - **Set WG Source…** marks the selected faces as the `LF`, `MF`, `HF` or
   `PORT_EXIT` drive source by creating (or reusing) an appearance named exactly
@@ -93,10 +94,16 @@ than the normal workflow. Every command keeps its full head-less API.
   Fusion, validates the existing sketch topology, rolls the timeline back, and
   moves fit points in place. Before its first mutation it also verifies that
   the tagged throat face remains in the component-local link frame. It creates
-  and deletes no document features.
-- **Audit** reports bundle/link state, pushed-parameter drift, source tag state,
-  feature health, the measured link-frame offset, and evidence that the managed
-  body is unmodified, modified, missing, or unknown.
+  and deletes no document features. If the stored path is missing, Update
+  searches WG's current workspace for the same design id, selects its highest
+  export sequence, records that path using the same identity guard as Relink,
+  and continues. A manually moved bundle outside the workspace can still be
+  selected through the head-less `wglink_core.relink` API.
+- The head-less **`audit` API** reports bundle/link state, pushed-parameter
+  drift, source tag state, feature health, the measured link-frame offset, and
+  evidence that the managed body is unmodified, modified, missing, or unknown.
+  The add-in continuously publishes the same document/link inventory to WG in
+  `.fusion-status.json`, so Audit has no panel command.
 - **Send to WG** observes the root or one occurrence subtree without changing
   the document, applies the explicit return-scope policy, and writes an atomic,
   checksummed `.wgreturn` bundle into WG's own workspace. The destination is
@@ -111,10 +118,13 @@ than the normal workflow. Every command keeps its full head-less API.
   `exclude`, or clears the declaration. A visible surface body with no
   declaration refuses the export outright, so this is the in-product remedy for
   modelling a horn as a loft surface rather than a solid.
-- **Relink** records a moved or renamed bundle path. The design id must match
-  unless the caller explicitly forces the operation.
+- The head-less **`relink` API** records a manually moved or renamed bundle
+  path outside the current WG workspace. The design id must match unless the
+  caller explicitly forces the operation.
 - **Detach** removes `WGLink` attributes only. Bodies, sketches, features, and
-  appearances remain in the document.
+  appearances remain in the document. The panel command requires confirmation:
+  identity removal is permanent, and inserting a fresh WG copy is the only way
+  to obtain a managed link again.
 
 ## The workspace is WG's setting
 
@@ -122,14 +132,15 @@ The WGLink folder is chosen once, under **Settings → CAD Link** in Waveguide
 Generator. It is separate from WG's run-output folder. WGLink reads it from
 WG's own `cadlink_settings.json` — resolved the way WG resolves it,
 `WG2_DATA_DIR` included — and lists the bundles in `<workspace>/wglink` in the
-Insert and Relink dropdowns, newest first, labelled by design name and export
-sequence. Nothing is ever written back to that file.
+Insert dropdown, newest first, labelled by design name and export sequence.
+Update also searches those bundles by design identity when a stored path no
+longer exists. Nothing is ever written back to WG's settings file.
 
 There is deliberately no second copy of the folder in Fusion. Storing one made the
 first insert a two-place setup and let the two settings disagree, which inserts
 a bundle WG is no longer writing to. When the workspace cannot be read — WG
 never ran, the folder is on a disconnected drive, the bundle came from another
-machine — the dropdown falls back to the browse entries and the manual picker
+machine — the Insert dropdown falls back to the browse entries and manual picker
 behaves as it always did.
 
 ## The Send and Solve pre-flight
@@ -146,10 +157,11 @@ convention on either side, and a mis-framed model simply yields wrong
 directivity, so the pre-flight measures the model against it and says which of
 the three assumptions the model breaks. It never refuses.
 
-Insert and Relink remember the last bundle folder. When a document has several
-managed links, Update, Audit, Relink and Detach show a **Managed link**
-dropdown listing them by design name; a single-link document is not asked. Send instead exposes an
-anchor choice only when its selected scope contains several linked instances.
+Insert remembers the last bundle folder. When a document has several managed
+links, Update and Detach show a **Managed link** dropdown listing them by design
+name; a single-link document is not asked. Head-less Audit and Relink callers
+choose with `options['instance_id']`. Send instead exposes an anchor choice only
+when its selected scope contains several linked instances.
 
 ## Update atomicity and recovery
 
@@ -168,14 +180,14 @@ written after every ring.
 The frame guard is deliberately component-local. Moving the whole wrapper
 component moves its body and managed datums together, is a legitimate assembly
 placement, and still passes. The guard only detects a body moved relative to
-those datums. Audit never refuses: it reports the offset and marks the local
-body state `modified` when the invariant fails.
+those datums. The head-less Audit API never refuses: it reports the offset and
+marks the local body state `modified` when the invariant fails.
 
 That is the strongest honest boundary Fusion exposes; it is not a database
 transaction. If a rebuild fails after mutation begins, use **Undo** to recover
 the document. Do not continue modelling on a partially failed rebuild.
 
-## What Audit can and cannot prove
+## What the head-less Audit API can and cannot prove
 
 Audit is evidence, not a freshness authority. CAD cannot author WG freshness.
 It can observe a missing or changed body, parameter drift, the geometric source

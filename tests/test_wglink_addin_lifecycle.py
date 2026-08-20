@@ -205,12 +205,34 @@ class _UI:
         self.workspaces = types.SimpleNamespace(
             itemById=lambda _id: types.SimpleNamespace(toolbarPanels=panels)
         )
+        self.progress_dialogs: list[object] = []
 
     def messageBox(
         self, text: str, title: str = "", *_args: object
     ) -> object | None:
         self.messages.append((title, text))
         return self.dialog_result
+
+    def createProgressDialog(self) -> object:
+        events: list[tuple[object, ...]] = []
+        dialog = types.SimpleNamespace(
+            isCancelButtonShown=True,
+            isBackgroundTranslucent=True,
+            message="",
+            progressValue=0,
+            events=events,
+        )
+
+        def show(*args: object) -> None:
+            events.append(("show", *args))
+
+        def hide() -> None:
+            events.append(("hide", dialog.progressValue, dialog.message))
+
+        dialog.show = show
+        dialog.hide = hide
+        self.progress_dialogs.append(dialog)
+        return dialog
 
 
 def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = None):
@@ -565,6 +587,53 @@ def test_detach_requires_confirmation_before_calling_the_core_api(
     assert "cannot be re-attached" in text
     assert "fresh copy from Waveguide Generator" in text
     assert len(ui.messages) == (2 if detaches else 1)
+
+
+def test_send_shows_and_closes_progress_around_the_slow_export(
+    monkeypatch,
+) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_send_progress", ui)
+    monkeypatch.setattr(module, "_send_options", lambda _inputs: {"selection": "root"})
+    observed: list[tuple[int, str]] = []
+
+    def send(_app: object, _options: dict[str, object]) -> dict[str, object]:
+        dialog = ui.progress_dialogs[0]
+        observed.append((dialog.progressValue, dialog.message))
+        return {
+            "bundle_path": "/workspace/wgreturn/test.wgreturn",
+            "return_id": "wgr_test",
+            "scope": {"status": "clean"},
+            "sources": [],
+        }
+
+    monkeypatch.setattr(module.wglink_send, "send", send)
+
+    module.CommandExecuteHandler("send").notify(
+        types.SimpleNamespace(
+            command=types.SimpleNamespace(commandInputs=_dialog_inputs()),
+        )
+    )
+
+    assert observed == [
+        (1, "Exporting STEP and validating the return bundle…"),
+    ]
+    dialog = ui.progress_dialogs[0]
+    assert dialog.isCancelButtonShown is False
+    assert dialog.isBackgroundTranslucent is False
+    assert dialog.events[0] == (
+        "show",
+        "Send to WG",
+        "Surveying the assembly…",
+        0,
+        3,
+        0,
+    )
+    assert dialog.events[-1] == (
+        "hide",
+        3,
+        "Return ready in Waveguide Generator.",
+    )
 
 
 def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(

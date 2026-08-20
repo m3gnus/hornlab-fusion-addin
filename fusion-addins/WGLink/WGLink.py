@@ -674,6 +674,49 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
     return True
 
 
+def _show_export_progress(operation: str) -> object | None:
+    """Open Fusion's modeless progress surface for the slow return path."""
+
+    ui = _ui()
+    factory = getattr(ui, "createProgressDialog", None) if ui is not None else None
+    if not callable(factory):
+        return None
+    try:
+        dialog = factory()
+        dialog.isCancelButtonShown = False
+        dialog.isBackgroundTranslucent = False
+        dialog.show(
+            "Solve in WG" if operation == "solve" else "Send to WG",
+            "Surveying the assembly…",
+            0,
+            3,
+            0,
+        )
+        return dialog
+    except Exception:  # noqa: BLE001 - progress is advisory, export is not
+        return None
+
+
+def _update_export_progress(dialog: object | None, value: int, message: str) -> None:
+    if dialog is None:
+        return
+    try:
+        dialog.message = message
+        dialog.progressValue = value
+        adsk.doEvents()
+    except Exception:  # noqa: BLE001 - an old Fusion progress API must not abort export
+        pass
+
+
+def _hide_export_progress(dialog: object | None) -> None:
+    if dialog is None:
+        return
+    try:
+        dialog.hide()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class CommandExecuteHandler(adsk.core.CommandEventHandler):
     def __init__(self, operation: str):
         super().__init__()
@@ -681,6 +724,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
 
     def notify(self, args: object) -> None:
         global _command_busy
+        progress = None
         # Hold the watcher off: it must not open a prompt over a running
         # command, and an operation that rewrites a link's stored export id
         # would otherwise be surveyed halfway through.
@@ -702,10 +746,18 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             elif self.operation == "update":
                 report = wglink_core.update(_app(), None, options)
             elif self.operation in {"send", "solve"}:
+                progress = _show_export_progress(self.operation)
+                _update_export_progress(
+                    progress, 1, "Exporting STEP and validating the return bundle…"
+                )
                 report = wglink_send.send(_app(), _send_options(inputs))
                 if self.operation == "solve":
+                    _update_export_progress(
+                        progress, 2, "Return written. Asking Waveguide Generator to solve…"
+                    )
                     report = dict(report)
                     report["solve_requested"] = _request_wg_solve(report)
+                _update_export_progress(progress, 3, "Return ready in Waveguide Generator.")
             elif self.operation == "source":
                 report = _apply_source_role(inputs)
             elif self.operation == "declare":
@@ -722,6 +774,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         except Exception as exc:  # noqa: BLE001 - UI boundary; core remains head-less
             _report_error(COMMANDS[self.operation][1], "WGLink error", exc)
         finally:
+            _hide_export_progress(progress)
             _command_busy = False
             # This command may have moved the link on; re-survey from scratch so
             # a stale announcement cannot re-offer what was just applied.

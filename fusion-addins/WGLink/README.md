@@ -109,7 +109,12 @@ Relink remain full head-less APIs but are not panel commands.
   drift, source tag state, feature health, the measured link-frame offset, and
   evidence that the managed body is unmodified, modified, missing, or unknown.
   The add-in continuously publishes the same document/link inventory to WG in
-  `.fusion-status.json`, so Audit has no panel command.
+  `.fusion-status.json`, so Audit has no panel command. Each live link also
+  publishes the exact body entity tokens, assembly-transform hash, source ids,
+  and drive-channel ids that its next validated return would use. Those fields
+  are optional: if Fusion cannot resolve a stable entity token, strict
+  transform, or complete source contract, WGLink omits that identity instead
+  of inventing a name or defaulting a transform.
 - **Send to WG** observes the root or one occurrence subtree without changing
   the document, applies the explicit return-scope policy, and writes an atomic,
   checksummed `.wgreturn` bundle into WG's own workspace. The destination is

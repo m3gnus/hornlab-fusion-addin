@@ -306,6 +306,67 @@ def test_strict_transform_refuses_instead_of_using_identity(send_module):
         send_module._strict_matrix_rows(Broken(), "instance-7")
 
 
+def test_heartbeat_identity_summary_uses_exact_return_ids_and_entity_tokens(
+    send_module,
+):
+    managed = body("managed")
+    matrix = [
+        [1.0, 0.0, 0.0, 25.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+    summaries = send_module._instance_identity_summaries(
+        included_pairs=[({
+            "object_id": managed.entityToken,
+            "wglink_instance_id": "instance-a",
+        }, managed)],
+        instances=[{
+            "instance_id": "instance-a",
+            "assembly_from_link": matrix,
+        }],
+        sources=[{
+            "instance_id": "instance-a",
+            "id": "source-hf",
+            "default_drive_channel_id": "drive-hf",
+        }],
+    )
+
+    assert summaries == {
+        "instance-a": {
+            "body_object_ids": ["token-managed"],
+            "transform_hash": send_module._canonical_hash(matrix),
+            "source_ids": ["source-hf"],
+            "drive_channel_ids": ["drive-hf"],
+        }
+    }
+
+
+def test_heartbeat_identity_summary_never_promotes_fallback_body_labels(
+    send_module,
+):
+    managed = body("managed")
+
+    summaries = send_module._instance_identity_summaries(
+        included_pairs=[({
+            "object_id": "body-0001",
+            "wglink_instance_id": "instance-a",
+        }, managed)],
+        instances=[{
+            "instance_id": "instance-a",
+            "assembly_from_link": [[1.0, 0.0, 0.0, 0.0]],
+        }],
+        sources=[{
+            "instance_id": "instance-a",
+            "id": "source-hf",
+            "default_drive_channel_id": "",
+        }],
+    )
+
+    assert "instance-a" not in summaries
+
+
 def test_ulid_shape_uniqueness_and_time_prefix(send_module):
     first = send_module.generate_return_id(1_000)
     second = send_module.generate_return_id(2_000)

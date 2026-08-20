@@ -1105,10 +1105,17 @@ def _document_links() -> list[dict[str, object]]:
         document_signature_hash = str(return_state.get("hash") or "")
         document_body_count = str(return_state.get("body_count") or "")
         source_state_hash = str(return_state.get("source_hash") or "")
+        raw_instance_identities = return_state.get("instance_identities")
+        instance_identities = (
+            raw_instance_identities
+            if isinstance(raw_instance_identities, dict)
+            else {}
+        )
     except Exception:  # noqa: BLE001 - advisory heartbeat may omit the token
         document_signature_hash = ""
         document_body_count = ""
         source_state_hash = ""
+        instance_identities = {}
     for instance_id, record in records.items():
         payload = record.get("payload") or {}
         try:
@@ -1141,7 +1148,7 @@ def _document_links() -> list[dict[str, object]]:
             drifted_parameters = []
             local_body_state = "unknown"
             body_fingerprint = None
-        links.append({
+        link = {
             "instance_id": str(instance_id),
             "bundle_path": str(payload.get("bundle_path") or ""),
             "design_id": str(payload.get("design_id") or ""),
@@ -1163,7 +1170,17 @@ def _document_links() -> list[dict[str, object]]:
             "source_state_hash": source_state_hash,
             "export_id": str(payload.get("export_id") or ""),
             "export_sequence": str(payload.get("export_sequence") or ""),
-        })
+        }
+        identity = instance_identities.get(str(instance_id))
+        if isinstance(identity, dict):
+            for name in ("body_object_ids", "source_ids", "drive_channel_ids"):
+                value = identity.get(name)
+                if isinstance(value, list):
+                    link[name] = value
+            transform_hash = identity.get("transform_hash")
+            if isinstance(transform_hash, str) and transform_hash:
+                link["transform_hash"] = transform_hash
+        links.append(link)
     return links
 
 

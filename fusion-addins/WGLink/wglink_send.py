@@ -796,6 +796,11 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         "expected_connected_components": source["expected_connected_components"],
         "observed": source["observed"],
     } for source in sources]
+    instance_identities = _instance_identity_summaries(
+        included_pairs=included_pairs,
+        instances=instances,
+        sources=sources,
+    )
     state = {
         "selection": scope["selection"],
         "bodies": bodies,
@@ -808,7 +813,80 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         "body_count": len(bodies),
         "source_hash": _canonical_hash(source_state),
         "state": state,
+        # These are the exact identities the next return export would carry.
+        # Keep them beside, rather than inside, ``state`` so adding advisory
+        # heartbeat detail never changes the established return-state hash.
+        "instance_identities": instance_identities,
     }
+
+
+def _instance_identity_summaries(
+    *,
+    included_pairs: list[tuple[dict[str, Any], object]],
+    instances: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Summarize only identities that the live return path actually resolved.
+
+    Fusion entity tokens are published only when the scope walk's object id is
+    that same token. A fake or fallback ``body-0001`` label is useful inside a
+    one-shot export plan, but it must not be advertised as persistent CAD
+    identity. Transform, source, and drive ids come directly from the strict
+    return records; this helper never derives plausible substitutes.
+    """
+
+    body_ids: dict[str, list[str]] = {}
+    incomplete_body_ids: set[str] = set()
+    for item, body in included_pairs:
+        instance_id = str(item.get("wglink_instance_id") or "")
+        if not instance_id:
+            continue
+        token = wglink_core._entity_token(body)
+        if not token or str(item.get("object_id") or "") != token:
+            incomplete_body_ids.add(instance_id)
+            continue
+        body_ids.setdefault(instance_id, []).append(token)
+
+    source_pairs: dict[str, list[tuple[str, str]]] = {}
+    incomplete_sources: set[str] = set()
+    for source in sources:
+        instance_id = str(source.get("instance_id") or "")
+        if not instance_id:
+            continue
+        source_id = str(source.get("id") or "")
+        drive_id = str(source.get("default_drive_channel_id") or "")
+        if not source_id or not drive_id:
+            incomplete_sources.add(instance_id)
+            continue
+        source_pairs.setdefault(instance_id, []).append((source_id, drive_id))
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for instance in instances:
+        instance_id = str(instance.get("instance_id") or "")
+        if not instance_id:
+            continue
+        summary: dict[str, Any] = {}
+        matrix = instance.get("assembly_from_link")
+        if (
+            isinstance(matrix, list)
+            and len(matrix) == 4
+            and all(isinstance(row, list) and len(row) == 4 for row in matrix)
+        ):
+            try:
+                values = [[float(value) for value in row] for row in matrix]
+                if all(math.isfinite(value) for row in values for value in row):
+                    summary["transform_hash"] = _canonical_hash(values)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if instance_id not in incomplete_body_ids and body_ids.get(instance_id):
+            summary["body_object_ids"] = sorted(set(body_ids[instance_id]))
+        if instance_id not in incomplete_sources and source_pairs.get(instance_id):
+            pairs = source_pairs[instance_id]
+            summary["source_ids"] = sorted({source_id for source_id, _drive_id in pairs})
+            summary["drive_channel_ids"] = sorted({drive_id for _source_id, drive_id in pairs})
+        if summary:
+            summaries[instance_id] = summary
+    return summaries
 
 
 def _strict_matrix_rows(matrix: object, instance_id: str) -> list[list[float]]:

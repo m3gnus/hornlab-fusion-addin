@@ -60,7 +60,11 @@ contains only **Declare Body…**, **Insert**, **Update**, and **Detach**.
 Audit and Relink remain available through the headless `wglink_core.audit` and
 `wglink_core.relink` APIs. Audit's document/link data is also published
 continuously to WG in `.fusion-status.json`, so it does not need a panel
-command.
+command. Newer heartbeats add optional `bodyObjectIds`, `transformHash`,
+`sourceIds`, and `driveChannelIds` members to each managed link. They come from
+the same strict observation used by Send to WG; an unavailable or fallback
+identity is omitted, while older WG clients can continue ignoring the added
+members under heartbeat schema 1.
 
 ## 3. The linked round trip
 

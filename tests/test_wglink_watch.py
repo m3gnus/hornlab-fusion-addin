@@ -112,6 +112,10 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
             "document_signature_hash": "sha256:return-state",
             "document_body_count": "3",
             "source_state_hash": "sha256:sources",
+            "body_object_ids": ["body-b", "body-a", "body-a"],
+            "transform_hash": "sha256:transform",
+            "source_ids": ["source-hf"],
+            "drive_channel_ids": ["drive-hf"],
             "export_id": "wge_a",
         }],
         updated_at=datetime(2026, 8, 12, 15, 30, tzinfo=timezone.utc),
@@ -141,6 +145,10 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         "documentSignatureHash": "sha256:return-state",
         "documentBodyCount": 3,
         "sourceStateHash": "sha256:sources",
+        "bodyObjectIds": ["body-a", "body-b"],
+        "transformHash": "sha256:transform",
+        "sourceIds": ["source-hf"],
+        "driveChannelIds": ["drive-hf"],
     }
     link = payload["document"]["links"][0]
     assert link["parameterDriftCount"] == len(link["driftedParameters"])
@@ -168,6 +176,29 @@ def test_fusion_status_publishes_no_parameter_drift_as_an_empty_list(
     assert link["driftedParameters"] == []
     assert link["parameterDriftCount"] == 0
     assert link["parameterDriftCount"] == len(link["driftedParameters"])
+
+
+def test_fusion_status_omits_unproven_or_malformed_optional_identities(
+    tmp_path: Path,
+) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="Tritonia V",
+        links=[{
+            "instance_id": "instance-a",
+            "body_object_ids": [],
+            "transform_hash": "",
+            "source_ids": ["source-hf", ""],
+            "drive_channel_ids": "drive-hf",
+        }],
+    )
+
+    link = json.loads(marker.read_text())["document"]["links"][0]
+    assert "bodyObjectIds" not in link
+    assert "transformHash" not in link
+    assert "sourceIds" not in link
+    assert "driveChannelIds" not in link
 
 
 def test_return_request_is_targeted_to_one_addin_session_and_acknowledged(tmp_path: Path) -> None:

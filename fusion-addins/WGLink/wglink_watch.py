@@ -299,6 +299,21 @@ def write_fusion_status(
             record["documentBodyCount"] = int(record["documentBodyCount"] or 0)
         except (TypeError, ValueError):
             record["documentBodyCount"] = 0
+        transform_hash = link.get("transform_hash")
+        if isinstance(transform_hash, str) and transform_hash:
+            record["transformHash"] = transform_hash
+        for source_name, wire_name in (
+            ("body_object_ids", "bodyObjectIds"),
+            ("source_ids", "sourceIds"),
+            ("drive_channel_ids", "driveChannelIds"),
+        ):
+            values = link.get(source_name)
+            if (
+                isinstance(values, list)
+                and values
+                and all(isinstance(value, str) and bool(value) for value in values)
+            ):
+                record[wire_name] = sorted(set(values))
         copied.append(record)
     timestamp = (updated_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
     payload = {

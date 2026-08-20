@@ -1213,6 +1213,49 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     )
 
 
+def test_document_links_attach_exact_live_return_identities(monkeypatch) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_live_identities", ui, app)
+    record = {"payload": {}, "body": None}
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_link_records",
+        lambda _design: {"instance-a": record},
+    )
+    monkeypatch.setattr(module.wglink_core, "_parameter_drift", lambda *_args: [])
+    monkeypatch.setattr(
+        module.wglink_core, "_local_body_state", lambda _record: "unchanged"
+    )
+    monkeypatch.setattr(
+        module.wglink_send,
+        "return_state",
+        lambda *_args: {
+            "hash": "sha256:return-state",
+            "body_count": 1,
+            "source_hash": "sha256:sources",
+            "instance_identities": {
+                "instance-a": {
+                    "body_object_ids": ["body-token"],
+                    "transform_hash": "sha256:transform",
+                    "source_ids": ["source-hf"],
+                    "drive_channel_ids": ["drive-hf"],
+                }
+            },
+        },
+    )
+
+    link = module._document_links()[0]
+
+    assert link["body_object_ids"] == ["body-token"]
+    assert link["transform_hash"] == "sha256:transform"
+    assert link["source_ids"] == ["source-hf"]
+    assert link["drive_channel_ids"] == ["drive-hf"]
+
+
 def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) -> None:
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)

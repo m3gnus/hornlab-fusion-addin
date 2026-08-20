@@ -66,6 +66,10 @@ command.
 
 1. In WG, **Send to CAD** writes the bundle and raises Fusion; the add-in
    offers the Insert (first time) or Update (afterwards) — one click.
+   If the Fusion document contains multiple managed placements of the same WG
+   design, choose the instance in WG first. The handoff names that exact
+   instance; WGLink refuses missing, stale, or ambiguous placement identity
+   rather than updating whichever copy happens to appear first.
 2. Edit in Fusion: move and joint the **wrapper occurrence**, not the managed
    bodies inside it. WG parameters appear as `wg_<name>_*` user parameters.
 3. **Solve in WG** sends the geometry back and starts the solve. WG switches

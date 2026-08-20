@@ -89,7 +89,13 @@ Relink remain full head-less APIs but are not panel commands.
   a one-shot handoff beside the completed bundle: WGLink inserts a new link into
   the active Fusion design automatically, including after a cold start. If that
   bundle is already linked in the active document, the existing watcher offers
-  the normal in-place Update instead of inserting a duplicate.
+  the normal in-place Update instead of inserting a duplicate. For assemblies
+  containing repeated placements of one design, WG includes the chosen
+  `expectedInstanceId` beside the expected document id. WGLink updates only the
+  uniquely matching managed instance. A missing selection for repeated links,
+  a stale id, a duplicated id, or an instance target without its document target
+  leaves the handoff unacknowledged and changes no geometry. Legacy and current
+  single-instance handoffs still resolve automatically.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
   moves fit points in place. Before its first mutation it also verifies that

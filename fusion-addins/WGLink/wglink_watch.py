@@ -116,6 +116,7 @@ class PendingHandoff:
     sequence: str
     design_id: str
     expected_document_id: str
+    expected_instance_id: str
     expected_return_state_hash: str
 
 
@@ -211,6 +212,7 @@ def read_pending_handoff(
         sequence="" if sequence is None else str(sequence),
         design_id=str(payload.get("designId") or ""),
         expected_document_id=str(payload.get("expectedDocumentId") or ""),
+        expected_instance_id=str(payload.get("expectedInstanceId") or ""),
         expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
     )
 

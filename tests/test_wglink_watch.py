@@ -51,6 +51,7 @@ def _handoff(root: Path, bundle: Path, export_id: str = "wge_2") -> Path:
             "sequence": 2,
             "designId": "wgd_a",
             "expectedDocumentId": "fusion:doc-a",
+            "expectedInstanceId": "instance-b",
             "expectedReturnStateHash": "sha256:return-state",
         }),
         encoding="utf-8",
@@ -70,6 +71,7 @@ def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> No
     assert handoff.sequence == "2"
     assert handoff.design_id == "wgd_a"
     assert handoff.expected_document_id == "fusion:doc-a"
+    assert handoff.expected_instance_id == "instance-b"
     assert handoff.expected_return_state_hash == "sha256:return-state"
     assert wglink_watch.acknowledge_handoff(handoff) is True
     assert not marker.exists()

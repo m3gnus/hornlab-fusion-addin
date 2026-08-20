@@ -1452,6 +1452,155 @@ def test_a_pending_update_targets_design_identity_after_bundle_move(
     assert not marker.exists()
 
 
+def test_a_pending_update_targets_the_exact_selected_duplicate_instance(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, "WGLink_pending_exact_instance", ui, app)
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_5",
+        "exportId": "wge_5",
+        "sequence": 5,
+        "designId": "wgd-shared",
+        "expectedDocumentId": "fusion:doc-a",
+        "expectedInstanceId": "instance-b",
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(
+        module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root
+    )
+    updated: list[tuple[str, dict[str, str]]] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "update",
+        lambda _app, path, options: updated.append((path, options)),
+    )
+    snapshot = {
+        "document_id": "fusion:doc-a",
+        "links": [
+            {
+                "instance_id": "instance-a",
+                "design_id": "wgd-shared",
+                "export_id": "wge_4",
+            },
+            {
+                "instance_id": "instance-b",
+                "design_id": "wgd-shared",
+                "export_id": "wge_4",
+            },
+        ],
+    }
+
+    assert module._apply_pending_handoff(snapshot) is True
+
+    assert updated == [(str(bundle), {"instance_id": "instance-b"})]
+    assert not marker.exists()
+    assert ui.messages == []
+
+
+@pytest.mark.parametrize(
+    ("expected_instance_id", "instance_ids", "message_fragment"),
+    [
+        (
+            None,
+            ["instance-a", "instance-b"],
+            "WG did not select an exact instance",
+        ),
+        (
+            "instance-stale",
+            ["instance-a", "instance-b"],
+            "no longer contains exactly one WG link with the instance selected in WG",
+        ),
+        (
+            "instance-b",
+            ["instance-b", "instance-b"],
+            "no longer contains exactly one WG link with the instance selected in WG",
+        ),
+    ],
+)
+def test_a_duplicate_pending_update_refuses_missing_stale_or_ambiguous_identity(
+    monkeypatch,
+    tmp_path: Path,
+    expected_instance_id: str | None,
+    instance_ids: list[str],
+    message_fragment: str,
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(
+        monkeypatch,
+        f"WGLink_pending_refuse_{expected_instance_id or 'missing'}",
+        ui,
+        app,
+    )
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    payload = {
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_5",
+        "exportId": "wge_5",
+        "sequence": 5,
+        "designId": "wgd-shared",
+        "expectedDocumentId": "fusion:doc-a",
+    }
+    if expected_instance_id is not None:
+        payload["expectedInstanceId"] = expected_instance_id
+    marker.write_text(json.dumps(payload))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(
+        module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root
+    )
+    mutations: list[str] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "update",
+        lambda *_args, **_kwargs: mutations.append("update"),
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "insert",
+        lambda *_args, **_kwargs: mutations.append("insert"),
+    )
+    snapshot = {
+        "document_id": "fusion:doc-a",
+        "links": [
+            {
+                "instance_id": instance_id,
+                "design_id": "wgd-shared",
+                "export_id": "wge_4",
+            }
+            for instance_id in instance_ids
+        ],
+    }
+
+    assert module._apply_pending_handoff(snapshot) is True
+
+    assert mutations == []
+    assert marker.exists()
+    assert len(ui.messages) == 1
+    assert message_fragment in ui.messages[0][1]
+
+
 def test_a_targeted_return_refuses_if_the_active_document_changed(
     monkeypatch, tmp_path: Path
 ) -> None:

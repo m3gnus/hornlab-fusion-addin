@@ -1398,6 +1398,11 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
     _handoff_attempted_id = handoff.export_id
     _command_busy = True
     try:
+        if handoff.expected_instance_id and not handoff.expected_document_id:
+            raise wglink_core.WgLinkError(
+                "WG prepared an instance-specific update without an exact Fusion "
+                "document target. Refresh CAD Link and try again."
+            )
         if handoff.expected_document_id:
             document_id = (
                 snapshot["document_id"]
@@ -1408,14 +1413,31 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
                 raise wglink_core.WgLinkError(
                     "The active Fusion document changed after WG prepared this update. Refresh CAD Link and try again."
                 )
-            if len(linked) != 1:
+        if handoff.expected_instance_id:
+            selected = [
+                link
+                for link in linked
+                if link.get("instance_id") == handoff.expected_instance_id
+            ]
+            if len(selected) != 1:
                 raise wglink_core.WgLinkError(
-                    "The active Fusion document no longer contains exactly one matching WG link. Refresh CAD Link and try again."
+                    "The active Fusion document no longer contains exactly one WG "
+                    "link with the instance selected in WG. Refresh CAD Link and "
+                    "try again."
                 )
+            linked = selected
+        elif len(linked) > 1:
+            raise wglink_core.WgLinkError(
+                "The active Fusion document contains more than one matching WG "
+                "link, but WG did not select an exact instance. Refresh CAD Link, "
+                "choose the managed instance, and try again."
+            )
+        elif handoff.expected_document_id and len(linked) != 1:
+            raise wglink_core.WgLinkError(
+                "The active Fusion document no longer contains exactly one matching "
+                "WG link. Refresh CAD Link and try again."
+            )
         if linked:
-            # One design identity can appear more than once in an assembly.
-            # An explicit WG update targets the first active-document instance;
-            # never silently rewrite every copy.
             link = linked[0]
             current_state_hash = str(link.get("document_signature_hash") or "")
             if (

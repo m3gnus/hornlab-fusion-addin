@@ -1908,7 +1908,12 @@ def _python_for_resampler(repo_root: Path, options: dict[str, Any]) -> Path:
     else:
         runtime = _packaged_runtime()
         if runtime is not None and runtime[0] == repo_root:
-            candidates.append(runtime[1])
+            if runtime[1].is_file():
+                return runtime[1]
+            raise WgLinkError(
+                "Waveguide Generator's managed Python interpreter is missing: "
+                f"{runtime[1]}. Re-run Waveguide Generator's platform installer."
+            )
     candidates.extend(
         [
             repo_root / ".venv" / "bin" / "python",

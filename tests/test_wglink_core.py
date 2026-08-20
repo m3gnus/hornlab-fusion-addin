@@ -521,6 +521,17 @@ def test_headless_runtime_options_override_packaged_defaults(
     ) == developer_python
 
 
+def test_packaged_copy_does_not_fall_back_to_an_unmanaged_python(
+    core, monkeypatch, tmp_path: Path
+):
+    runtime, python = _packaged_runtime_fixture(core, monkeypatch, tmp_path)
+    python.unlink()
+    monkeypatch.setattr(core.shutil, "which", lambda _name: "/unmanaged/python3")
+
+    with pytest.raises(core.WgLinkError, match="managed Python interpreter is missing"):
+        core._python_for_resampler(runtime, {})
+
+
 def test_invalid_packaged_runtime_names_the_reinstall_remedy(
     core, monkeypatch, tmp_path: Path
 ):

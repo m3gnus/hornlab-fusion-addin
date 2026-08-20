@@ -1077,12 +1077,9 @@ def _active_document_id() -> str | None:
     return f"local:{_watch_session_id}:{id(document)}"
 
 
-def _publish_fusion_status() -> None:
-    """Best-effort presence for WG; every Fusion read stays on this thread."""
+def _fusion_snapshot() -> dict[str, object]:
+    """Read the active document and managed-link state once on the main thread."""
 
-    folder = wglink_workspace.ipc_folder(create=True)
-    if folder is None:
-        return
     app = _app()
     product = app.activeProduct if app else None
     active_document = getattr(app, "activeDocument", None) if app else None
@@ -1092,15 +1089,29 @@ def _publish_fusion_status() -> None:
     else:
         document_name = str(getattr(active_document, "name", "") or "Untitled")
         links = _document_links()
+    return {
+        "document_name": document_name,
+        "document_id": _active_document_id(),
+        "links": links,
+    }
+
+
+def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
+    """Best-effort presence for WG; every Fusion read stays on this thread."""
+
+    folder = wglink_workspace.ipc_folder(create=True)
+    if folder is None:
+        return
+    current = snapshot if snapshot is not None else _fusion_snapshot()
     try:
         wglink_watch.write_fusion_status(
             folder,
             session_id=_watch_session_id,
-            document_name=document_name,
-            document_id=_active_document_id(),
+            document_name=current["document_name"],
+            document_id=current["document_id"],
             adapter_version=wglink_send.ADAPTER_VERSION,
             workspace_root=wglink_workspace.workspace_root(),
-            links=links,
+            links=current["links"],
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
         pass
@@ -1149,7 +1160,9 @@ def _pending_return_request() -> wglink_watch.PendingReturnRequest | None:
     )
 
 
-def _apply_pending_return_request() -> bool:
+def _apply_pending_return_request(
+    snapshot: dict[str, object] | None = None,
+) -> bool:
     """Export the current Fusion body/tags after an explicit WG request."""
 
     global _command_busy, _return_request_attempted_id
@@ -1165,12 +1178,16 @@ def _apply_pending_return_request() -> bool:
             raise wglink_core.WgLinkError(
                 "WG return request is missing an exact document and link target. Refresh CAD Link and try again."
             )
-        if request.document_id != _active_document_id():
+        document_id = (
+            snapshot["document_id"] if snapshot is not None else _active_document_id()
+        )
+        if request.document_id != document_id:
             raise wglink_core.WgLinkError(
                 "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again."
             )
+        links = snapshot["links"] if snapshot is not None else _document_links()
         matching = [
-            link for link in _document_links()
+            link for link in links
             if link.get("design_id") == request.design_id
             and link.get("instance_id") == request.instance_id
         ]
@@ -1233,7 +1250,7 @@ def _ensure_design_ready() -> bool:
     return _design_ready()
 
 
-def _apply_pending_handoff() -> bool:
+def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
     """Insert or update the bundle named by WG's explicit CAD action."""
 
     global _command_busy, _handoff_attempted_id
@@ -1252,7 +1269,7 @@ def _apply_pending_handoff() -> bool:
     if not ready:
         return False
 
-    links = _document_links()
+    links = snapshot["links"] if snapshot is not None else _document_links()
     try:
         pending_path = Path(handoff.bundle_path).resolve()
         linked = [
@@ -1275,7 +1292,12 @@ def _apply_pending_handoff() -> bool:
     _command_busy = True
     try:
         if handoff.expected_document_id:
-            if handoff.expected_document_id != _active_document_id():
+            document_id = (
+                snapshot["document_id"]
+                if snapshot is not None
+                else _active_document_id()
+            )
+            if handoff.expected_document_id != document_id:
                 raise wglink_core.WgLinkError(
                     "The active Fusion document changed after WG prepared this update. Refresh CAD Link and try again."
                 )
@@ -1336,13 +1358,13 @@ def _on_watch_tick() -> None:
     global _command_busy
     if _command_busy:
         return
-    _publish_fusion_status()
+    snapshot = _fusion_snapshot()
     try:
-        if _apply_pending_handoff():
+        if _apply_pending_handoff(snapshot):
             return
-        if _apply_pending_return_request():
+        if _apply_pending_return_request(snapshot):
             return
-        announcements = _watcher.survey(_document_links())
+        announcements = _watcher.survey(snapshot["links"])
         if not announcements:
             return
         ui = _ui()
@@ -1363,7 +1385,7 @@ def _on_watch_tick() -> None:
         finally:
             _command_busy = False
     finally:
-        _publish_fusion_status()
+        _publish_fusion_status(snapshot)
 
 
 class WatchEventHandler(adsk.core.CustomEventHandler):

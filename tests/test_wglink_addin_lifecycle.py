@@ -1124,9 +1124,17 @@ def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> Non
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     module = _load_instance(monkeypatch, "WGLink_busy", ui, app)
 
     surveyed: list[object] = []
+    snapshots: list[list[dict[str, str]]] = []
+    links = [{"instance_id": "instance-a"}]
+    monkeypatch.setattr(
+        module,
+        "_document_links",
+        lambda: snapshots.append(links) or links,
+    )
     monkeypatch.setattr(
         module._watcher, "survey", lambda links: surveyed.append(links) or []
     )
@@ -1136,7 +1144,8 @@ def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> Non
 
     module._command_busy = False
     module._on_watch_tick()
-    assert len(surveyed) == 1
+    assert surveyed == [links]
+    assert snapshots == [links]
 
 
 def test_a_pending_new_bundle_is_inserted_once_and_acknowledged(

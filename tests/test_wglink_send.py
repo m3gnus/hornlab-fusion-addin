@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import re
 import json
@@ -411,6 +412,7 @@ def test_full_unlinked_send_avoids_collisions_and_uses_full_request_ids(
     expected = "sha256:" + __import__("hashlib").sha256(step.read_bytes()).hexdigest()
     assert manifest["files"]["assembly.step"]["sha256"] == expected
     assert not list(tmp_path.glob(".My Speaker.wgreturn.tmp-*"))
+    assert not list(tmp_path.glob("*.reserve"))
 
     collision_report = send_module.send(app, {"output_folder": str(tmp_path)})
     assert Path(collision_report["bundle_path"]) == tmp_path / "My Speaker-2.wgreturn"
@@ -442,6 +444,58 @@ def test_full_unlinked_send_avoids_collisions_and_uses_full_request_ids(
     assert Path(request_b_report["bundle_path"]) == (
         tmp_path / f"My Speaker-{request_b}.wgreturn"
     )
+
+
+def test_return_name_reservation_is_atomic_without_a_published_target(
+    send_module, tmp_path: Path,
+) -> None:
+    target = tmp_path / "Speaker.wgreturn"
+
+    first, first_reservation = send_module._reserve_target(target, overwrite=False)
+    second, second_reservation = send_module._reserve_target(target, overwrite=False)
+
+    assert first == target
+    assert second == tmp_path / "Speaker-2.wgreturn"
+    assert first_reservation.is_file()
+    assert second_reservation.is_file()
+    first_reservation.unlink()
+    second_reservation.unlink()
+
+
+def test_stale_publish_cleanup_recovers_backup_and_removes_debris(
+    send_module, tmp_path: Path,
+) -> None:
+    target = tmp_path / "Speaker.wgreturn"
+    backup = tmp_path / ".Speaker.wgreturn.old-deadbeef"
+    backup.mkdir()
+    (backup / "wgreturn.json").write_text("recovered", encoding="utf-8")
+    temporary = tmp_path / ".Speaker.wgreturn.tmp-deadbeef"
+    temporary.mkdir()
+    reservation = tmp_path / ".Speaker-2.wgreturn.reserve"
+    reservation.write_text("abandoned", encoding="ascii")
+    for candidate in (backup, temporary, reservation):
+        os.utime(candidate, (0, 0))
+
+    send_module._cleanup_stale_publish_artifacts(
+        tmp_path,
+        now=100_000,
+        stale_after_seconds=1,
+    )
+
+    assert (target / "wgreturn.json").read_text(encoding="utf-8") == "recovered"
+    assert not backup.exists()
+    assert not temporary.exists()
+    assert not reservation.exists()
+
+    completed_backup = tmp_path / ".Speaker.wgreturn.old-complete"
+    completed_backup.mkdir()
+    os.utime(completed_backup, (0, 0))
+    send_module._cleanup_stale_publish_artifacts(
+        tmp_path,
+        now=100_000,
+        stale_after_seconds=1,
+    )
+    assert not completed_backup.exists()
 
 
 def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch):

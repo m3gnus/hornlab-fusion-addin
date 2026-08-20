@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 from typing import Any
 import uuid
 
@@ -1328,18 +1329,86 @@ def _safe_document_name(name: str) -> str:
     return value or "Untitled"
 
 
-def _available_target(target: Path) -> Path:
-    """Return the first unused numbered variant of a return bundle path."""
+_STALE_PUBLISH_SECONDS = 24 * 60 * 60
 
-    if not target.exists():
-        return target
+
+def _reservation_path(target: Path) -> Path:
+    return target.with_name(f".{target.name}.reserve")
+
+
+def _reserve_target(target: Path, *, overwrite: bool) -> tuple[Path, Path]:
+    """Atomically reserve an immutable bundle name across Fusion processes."""
+
     stem = target.name.removesuffix(".wgreturn")
-    index = 2
+    index = 1
     while True:
-        candidate = target.with_name(f"{stem}-{index}.wgreturn")
-        if not candidate.exists():
-            return candidate
+        candidate = target if index == 1 else target.with_name(f"{stem}-{index}.wgreturn")
+        reservation = _reservation_path(candidate)
+        try:
+            descriptor = os.open(
+                reservation,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            if overwrite:
+                raise wglink_core.WgLinkError(
+                    f"Another WGLink export is already publishing {candidate.name}."
+                ) from None
+            index += 1
+            continue
+        try:
+            os.write(
+                descriptor,
+                f"pid={os.getpid()} created={_utc_timestamp()}\n".encode("ascii"),
+            )
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if overwrite or not candidate.exists():
+            return candidate, reservation
+        reservation.unlink(missing_ok=True)
         index += 1
+
+
+def _cleanup_stale_publish_artifacts(
+    output: Path,
+    *,
+    now: float | None = None,
+    stale_after_seconds: float = _STALE_PUBLISH_SECONDS,
+) -> None:
+    """Recover or remove publish debris that cannot belong to a live export."""
+
+    cutoff = (time.time() if now is None else now) - stale_after_seconds
+    try:
+        candidates = list(output.iterdir())
+    except OSError:
+        return
+    for candidate in candidates:
+        name = candidate.name
+        if not name.startswith("."):
+            continue
+        try:
+            if candidate.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        if name.endswith(".reserve"):
+            candidate.unlink(missing_ok=True)
+            continue
+        backup_match = re.match(r"^\.(.+\.wgreturn)\.old-[^.]+$", name)
+        if backup_match and candidate.is_dir():
+            target = output / backup_match.group(1)
+            if target.exists():
+                shutil.rmtree(candidate, ignore_errors=True)
+            else:
+                try:
+                    os.replace(candidate, target)
+                except OSError:
+                    pass
+            continue
+        if ".wgreturn.tmp-" in name and candidate.is_dir():
+            shutil.rmtree(candidate, ignore_errors=True)
 
 
 def _publish(temp: Path, target: Path, overwrite: bool) -> None:
@@ -1436,6 +1505,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         raise wglink_core.WgLinkError(
             f"Could not create return output folder {output}: {exc}."
         ) from exc
+    _cleanup_stale_publish_artifacts(output)
     request_id = _nullable(options.get("request_id"))
     suffix = f"-{_safe_document_name(str(request_id))}" if request_id else ""
     target = output / f"{_safe_document_name(document_name)}{suffix}.wgreturn"
@@ -1445,20 +1515,19 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     # the gap the archive exists to close.
     capture_document = bool(options.get("capture_document", True))
     document_capture_error: str | None = None
-    if not overwrite:
-        target = _available_target(target)
-    if target.exists() and not target.is_dir():
-        raise wglink_core.WgLinkError(
-            f"Return target exists but is not a bundle folder: {target}."
-        )
-
+    target, reservation = _reserve_target(target, overwrite=overwrite)
+    temp: Path | None = None
     try:
-        temp = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=output))
-    except Exception as exc:  # noqa: BLE001
-        raise wglink_core.WgLinkError(
-            f"Could not create a temporary return bundle beside {target}: {exc}."
-        ) from exc
-    try:
+        if target.exists() and not target.is_dir():
+            raise wglink_core.WgLinkError(
+                f"Return target exists but is not a bundle folder: {target}."
+            )
+        try:
+            temp = Path(tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=output))
+        except Exception as exc:  # noqa: BLE001
+            raise wglink_core.WgLinkError(
+                f"Could not create a temporary return bundle beside {target}: {exc}."
+            ) from exc
         assembly_path = temp / "assembly.step"
         export_geometry = None if walk["selection"] == "root" else walk["geometry"]
         _export_step(design, assembly_path, export_geometry)
@@ -1530,16 +1599,21 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         )
         _publish(temp, target, overwrite)
     except WgReturnError as exc:
-        shutil.rmtree(temp, ignore_errors=True)
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
         raise wglink_core.WgLinkError(str(exc)) from exc
     except wglink_core.WgLinkError:
-        shutil.rmtree(temp, ignore_errors=True)
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
         raise
     except Exception as exc:  # noqa: BLE001 - one head-less filesystem boundary
-        shutil.rmtree(temp, ignore_errors=True)
+        if temp is not None:
+            shutil.rmtree(temp, ignore_errors=True)
         raise wglink_core.WgLinkError(
             f"Could not publish return bundle {target}: {exc}."
         ) from exc
+    finally:
+        reservation.unlink(missing_ok=True)
 
     return {
         "return_id": manifest["return"]["id"],

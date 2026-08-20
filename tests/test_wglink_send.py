@@ -164,6 +164,49 @@ def test_a_declaration_can_be_taken_back_off(send_module):
     send_module.clear_declaration(candidate)
 
 
+def test_occurrence_proxy_uses_native_attributes_but_remains_geometry_handle(
+    send_module,
+):
+    """Match Fusion's measured proxy split instead of putting tags on fakes.
+
+    A BRepBody proxy has the occurrence-frame geometry that STEP export needs,
+    but its attribute collection is empty; WG identity and declarations live
+    only on ``nativeObject``.
+    """
+
+    native = body("Horn", faces=[face("HF")])
+    send_module.wglink_core._set_attribute(native, "instance_id", "wgi-proxy")
+    send_module.wglink_core._set_attribute(native, "role", "waveguide")
+    send_module.declare_body(native, "exterior-shell")
+    native_component = component("Horn component", [native])
+    proxy = body("Horn", faces=[face("HF")])
+    proxy.attributes = Attributes()  # measured Fusion behavior: zero attributes
+    proxy.nativeObject = native
+    proxy.parentComponent = native_component
+    occurrence = types.SimpleNamespace(
+        name="Horn:1",
+        fullPathName="Speaker/Horn:1",
+        component=native_component,
+        bRepBodies=Collection([proxy]),
+        meshBodies=Collection(),
+        childOccurrences=Collection(),
+        transform2=object(),
+        isVisible=True,
+        isSuppressed=False,
+        objectType="adsk::fusion::Occurrence",
+    )
+    design = types.SimpleNamespace(rootComponent=component("Speaker"))
+
+    walk = send_module._scope_walk(design, occurrence)
+
+    candidate = next(item for item in walk["candidates"] if item["kind"] == "body")
+    assert candidate["wglink_instance_id"] == "wgi-proxy"
+    assert candidate["wglink_role"] == "waveguide"
+    assert candidate["declaration"] == "exterior-shell"
+    assert walk["bodies"][candidate["object_id"]] is proxy
+    assert proxy.attributes.values == {}
+
+
 def _design_of(root, monkeypatch, send_module):
     design = types.SimpleNamespace(
         rootComponent=root, findAttributes=lambda _group, _name: Collection()

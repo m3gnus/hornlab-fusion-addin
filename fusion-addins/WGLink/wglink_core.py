@@ -21,30 +21,54 @@ import uuid
 
 import adsk.core
 import adsk.fusion
-import wglink_workspace
-
-from wglink_bundle import (
-    IDENTITY_MATRIX,
-    TAG_AREA_TOLERANCE,
-    WgLinkError,
-    attribute_payload,
-    effective_parameters,
-    enclosure_plan,
-    format_expression,
-    fusion_matrix_to_mm,
-    health_regressions,
-    instance_parameter_prefix,
-    link_state,
-    mm_to_internal,
-    parameter_slug,
-    plan_sections,
-    read_bundle,
-    refreshed_body_evidence,
-    rollback_target,
-    tag_verdict,
-    throat_area_mm2,
-    transform_points,
-)
+if __package__:
+    from . import wglink_workspace
+    from .wglink_bundle import (
+        IDENTITY_MATRIX,
+        TAG_AREA_TOLERANCE,
+        WgLinkError,
+        attribute_payload,
+        effective_parameters,
+        enclosure_plan,
+        format_expression,
+        fusion_matrix_to_mm,
+        health_regressions,
+        instance_parameter_prefix,
+        link_state,
+        mm_to_internal,
+        parameter_slug,
+        plan_sections,
+        read_bundle,
+        refreshed_body_evidence,
+        rollback_target,
+        tag_verdict,
+        throat_area_mm2,
+        transform_points,
+    )
+else:
+    import wglink_workspace
+    from wglink_bundle import (
+        IDENTITY_MATRIX,
+        TAG_AREA_TOLERANCE,
+        WgLinkError,
+        attribute_payload,
+        effective_parameters,
+        enclosure_plan,
+        format_expression,
+        fusion_matrix_to_mm,
+        health_regressions,
+        instance_parameter_prefix,
+        link_state,
+        mm_to_internal,
+        parameter_slug,
+        plan_sections,
+        read_bundle,
+        refreshed_body_evidence,
+        rollback_target,
+        tag_verdict,
+        throat_area_mm2,
+        transform_points,
+    )
 
 
 ATTRIBUTE_GROUP = "WGLink"

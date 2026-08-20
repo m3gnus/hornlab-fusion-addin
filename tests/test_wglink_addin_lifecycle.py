@@ -919,23 +919,40 @@ def test_the_chosen_link_label_resolves_back_to_its_instance_id(monkeypatch) -> 
     assert module._command_options(inputs) == {"instance_id": "wgi_two"}
 
 
-def test_load_ignores_an_incompatible_workspace_module_cached_by_fusion(
+def test_every_helper_loads_under_a_registration_unique_package(
     monkeypatch,
 ) -> None:
     stale = types.ModuleType("wglink_workspace")
     stale.__file__ = "/old/WGLink/wglink_workspace.py"
     monkeypatch.setitem(sys.modules, "wglink_workspace", stale)
 
-    module = _load_instance(
-        monkeypatch,
-        "WGLink_with_stale_workspace",
-        _UI(_Panels(), _Definitions(reserve_ids=False)),
-    )
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    first = _load_instance(monkeypatch, "WGLink_local_package_one", ui)
+    second = _load_instance(monkeypatch, "WGLink_local_package_two", ui)
 
-    assert module.wglink_workspace is not stale
-    assert Path(module.wglink_workspace.__file__).resolve() == (
+    assert first.wglink_workspace is not stale
+    assert Path(first.wglink_workspace.__file__).resolve() == (
         ADDIN.parent / "wglink_workspace.py"
     ).resolve()
+    assert first._registration_package_name != second._registration_package_name
+    for name in (
+        "wglink_workspace",
+        "wglink_author",
+        "wglink_bundle",
+        "wglink_core",
+        "wglink_return",
+        "wglink_send",
+        "wglink_watch",
+    ):
+        first_helper = first._registration_modules[name]
+        second_helper = second._registration_modules[name]
+        assert first_helper is not second_helper
+        assert first_helper.__name__.startswith(first._registration_package_name + ".")
+        assert second_helper.__name__.startswith(second._registration_package_name + ".")
+    assert first.wglink_core.wglink_workspace is first.wglink_workspace
+    assert second.wglink_core.wglink_workspace is second.wglink_workspace
+    assert first.wglink_send.wglink_core is first.wglink_core
+    assert second.wglink_send.wglink_core is second.wglink_core
 
 
 @pytest.mark.parametrize("reserve_ids", [True, False], ids=["id-reserved", "id-freed"])
@@ -1015,10 +1032,10 @@ def test_a_second_registration_adopts_the_panel_instead_of_rebuilding_it(
     assert [d for d in definitions.items.values() if d.isValid] == []
 
 
-def test_adopted_instance_runs_presence_without_a_second_export_watcher(
+def test_adopted_instance_waits_without_publishing_an_unserviceable_session(
     monkeypatch,
 ) -> None:
-    """A stale owner cannot suppress presence, but prompts remain single-owner."""
+    """Only the registration that consumes requests may advertise its id."""
 
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)
@@ -1035,23 +1052,127 @@ def test_adopted_instance_runs_presence_without_a_second_export_watcher(
     monkeypatch.setattr(second, "_publish_fusion_status", lambda: published.append(True))
     second.run(None)
     assert second._watch_thread is None
-    assert second._presence_thread is not None and second._presence_thread.is_alive()
-    assert published == [True]
-    assert set(app.events) == {first.WATCH_EVENT_ID, second._presence_event_id}
+    assert second._candidate_thread is not None and second._candidate_thread.is_alive()
+    assert published == []
+    assert set(app.events) == {first.WATCH_EVENT_ID, second._candidate_event_id}
+    assert second._ipc_lease_snapshot()["owner"] == first._watch_session_id
 
-    second._presence_handler.notify(None)
-    assert published == [True, True]
-
-    # The adopted instance stops only its private heartbeat and leaves the
-    # owner's export watcher registered.
+    # The standby stops only its private candidate event and leaves the owner.
     second.stop(None)
     assert first.WATCH_EVENT_ID in app.events
-    assert second._presence_event_id not in app.events
+    assert second._candidate_event_id not in app.events
     assert first._watch_thread.is_alive()
 
     first.stop(None)
     assert first.WATCH_EVENT_ID not in app.events
     assert first._watch_thread is None
+
+
+def test_owner_first_stop_promotes_the_surviving_registration(
+    monkeypatch, tmp_path: Path
+) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    first = _load_instance(monkeypatch, "WGLink_owner_first", ui, app)
+    second = _load_instance(monkeypatch, "WGLink_owner_survivor", ui, app)
+    monkeypatch.setattr(first.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(second.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+
+    first.run(None)
+    second.run(None)
+    candidate = second._candidate_handler
+    old_panel = panels.itemById(first.PANEL_ID)
+    assert candidate is not None and old_panel is not None
+    status = tmp_path / first.wglink_watch.FUSION_STATUS_FILENAME
+    assert json.loads(status.read_text())["sessionId"] == first._watch_session_id
+
+    first.stop(None)
+    assert panels.itemById(first.PANEL_ID) is None
+    assert not status.exists()
+    candidate.notify(None)
+
+    replacement = panels.itemById(second.PANEL_ID)
+    assert replacement is not None and replacement is not old_panel
+    assert second._owned is True
+    assert second._watch_thread is not None and second._watch_thread.is_alive()
+    assert second._candidate_thread is None
+    assert second._ipc_lease_snapshot()["owner"] == second._watch_session_id
+    assert json.loads(status.read_text())["sessionId"] == second._watch_session_id
+    second.stop(None)
+
+
+def test_three_registrations_promote_one_at_a_time(monkeypatch) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    registrations = [
+        _load_instance(monkeypatch, f"WGLink_three_{index}", ui, app)
+        for index in range(3)
+    ]
+    for registration in registrations:
+        monkeypatch.setattr(
+            registration.wglink_workspace, "ipc_folder", lambda **_kwargs: None
+        )
+        registration.run(None)
+
+    first, second, third = registrations
+    second_candidate = second._candidate_handler
+    third_candidate = third._candidate_handler
+    assert second_candidate is not None and third_candidate is not None
+    assert [registration._owned for registration in registrations] == [True, False, False]
+
+    first.stop(None)
+    second_candidate.notify(None)
+    third_candidate.notify(None)
+    assert [registration._owned for registration in registrations] == [False, True, False]
+    assert third._candidate_thread is not None and third._candidate_thread.is_alive()
+    assert second._ipc_lease_snapshot()["owner"] == second._watch_session_id
+
+    second.stop(None)
+    third_candidate.notify(None)
+    assert third._owned is True
+    assert third._ipc_lease_snapshot()["owner"] == third._watch_session_id
+    third.stop(None)
+
+
+def test_expired_owner_is_replaced_and_cannot_tear_successor_down(monkeypatch) -> None:
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    first = _load_instance(monkeypatch, "WGLink_expired_owner", ui, app)
+    second = _load_instance(monkeypatch, "WGLink_expired_successor", ui, app)
+    monkeypatch.setattr(first.wglink_workspace, "ipc_folder", lambda **_kwargs: None)
+    monkeypatch.setattr(second.wglink_workspace, "ipc_folder", lambda **_kwargs: None)
+    first.run(None)
+    second.run(None)
+    candidate = second._candidate_handler
+    assert candidate is not None
+
+    # Model an owner whose worker vanished without Fusion delivering stop().
+    assert first._watch_stop is not None and first._watch_thread is not None
+    first._watch_stop.set()
+    first._watch_thread.join(timeout=1)
+    with first._ipc_owner_runtime.lock:
+        first._ipc_owner_runtime.renewed_at = (
+            first._lease_now() - first.OWNER_LEASE_SECONDS - 1
+        )
+    candidate.notify(None)
+    replacement = panels.itemById(second.PANEL_ID)
+    assert replacement is not None and second._owned is True
+    assert first._owns_ipc_lease() is False
+    assert first.WATCH_EVENT_ID not in app.events
+    assert second.WATCH_EVENT_ID in app.events
+
+    # A delayed Fusion stop callback from the expired registration sees that
+    # its authority is gone and leaves the successor's controls/event intact.
+    first.stop(None)
+    assert panels.itemById(second.PANEL_ID) is replacement
+    assert second.WATCH_EVENT_ID in app.events
+    second.stop(None)
 
 
 def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
@@ -1112,11 +1233,12 @@ def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) 
         "_app",
         lambda: (_ for _ in ()).throw(AssertionError("worker called Application.get()")),
     )
+    monkeypatch.setattr(module, "_renew_ipc_lease", lambda: True)
 
     module._watch_loop(app, OneTick())
-    module._presence_loop(app, OneTick())
+    module._candidate_loop(app, OneTick())
 
-    assert app.fired == [module.WATCH_EVENT_ID, module._presence_event_id]
+    assert app.fired == [module.WATCH_EVENT_ID, module._candidate_event_id]
 
 
 def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> None:
@@ -1487,7 +1609,7 @@ def test_a_refused_automatic_insert_is_not_retried_every_tick(
     assert ui.messages == [("WGLink automatic insert refused", "bad bundle")]
 
 
-def test_a_start_that_fails_partway_still_owns_its_half_built_panel(
+def test_a_start_that_fails_partway_rolls_back_panel_and_lease(
     monkeypatch,
 ) -> None:
     panels = _Panels()
@@ -1498,16 +1620,31 @@ def test_a_start_that_fails_partway_still_owns_its_half_built_panel(
     calls = {"n": 0}
     real_add = definitions.addButtonDefinition
 
-    def failing_add(definition_id: str, name: str, description: str):
+    def failing_add(
+        definition_id: str,
+        name: str,
+        description: str,
+        resource_folder: str = "",
+    ):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("Fusion refused the definition")
-        return real_add(definition_id, name, description)
+        return real_add(definition_id, name, description, resource_folder)
 
     monkeypatch.setattr(definitions, "addButtonDefinition", failing_add)
     module.run(None)
 
-    assert module._owned is True
+    assert calls["n"] == 2
+    assert module._owned is False
     assert ui.messages and ui.messages[0][0] == "WGLink start error"
-    module.stop(None)
     assert panels.itemById(module.PANEL_ID) is None
+    assert not [definition for definition in definitions.items.values() if definition.isValid]
+    assert module._ipc_lease_snapshot()["owner"] is None
+
+    # The failed registration did not strand either toolbar or lease, so a
+    # clean registration can start immediately without a Fusion restart.
+    recovery = _load_instance(monkeypatch, "WGLink_partial_recovery", ui)
+    recovery.run(None)
+    assert recovery._owned is True
+    assert panels.itemById(recovery.PANEL_ID) is not None
+    recovery.stop(None)

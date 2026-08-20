@@ -3,65 +3,61 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
+import importlib
 import json
 from pathlib import Path
 import sys
 import threading
+import time
 import traceback
+import types
 import uuid
 
 import adsk.core
 
 
 ADDIN_DIR = Path(__file__).resolve().parent
-try:
-    sys.path.remove(str(ADDIN_DIR))
-except ValueError:
-    pass
-sys.path.insert(0, str(ADDIN_DIR))
+_watch_session_id = str(uuid.uuid4())
+_registration_package_name = (
+    f"_hornlab_wglink_registration_{_watch_session_id.replace('-', '_')}"
+)
 
 
-def _load_local_workspace_module():
-    """Load this registration's workspace helper, not Fusion's cached copy.
+def _load_registration_package() -> dict[str, types.ModuleType]:
+    """Load every helper under this registration's private package namespace.
 
-    Fusion can load two WGLink registrations in one Python process.  Bare
-    imports are cached by module name, so a newer registration could otherwise
-    inherit an older ``wglink_workspace`` that does not implement its API.
+    Fusion caches ordinary imports process-wide even though it loads every
+    registered add-in entry point as a separate module. A private package keeps
+    a newer or older WGLink checkout from borrowing any executable helper from
+    the registration that happened to start first.
     """
 
-    name = "wglink_workspace"
-    path = ADDIN_DIR / f"{name}.py"
-    cached = sys.modules.get(name)
-    try:
-        cached_path = Path(str(getattr(cached, "__file__", ""))).resolve()
-    except (OSError, RuntimeError, ValueError):
-        cached_path = None
-    if cached_path == path.resolve() and hasattr(cached, "ipc_folder"):
-        return cached
+    package = types.ModuleType(_registration_package_name)
+    package.__file__ = str(ADDIN_DIR / "__init__.py")
+    package.__package__ = _registration_package_name
+    package.__path__ = [str(ADDIN_DIR)]  # type: ignore[attr-defined]
+    sys.modules[_registration_package_name] = package
+    loaded: dict[str, types.ModuleType] = {}
+    for name in (
+        "wglink_workspace",
+        "wglink_author",
+        "wglink_bundle",
+        "wglink_core",
+        "wglink_return",
+        "wglink_send",
+        "wglink_watch",
+    ):
+        loaded[name] = importlib.import_module(f"{_registration_package_name}.{name}")
+    return loaded
 
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    previous = sys.modules.get(name)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        if previous is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = previous
-        raise
-    return module
 
-wglink_workspace = _load_local_workspace_module()
-import wglink_author  # noqa: E402
-import wglink_core  # noqa: E402
-import wglink_send  # noqa: E402
-import wglink_watch  # noqa: E402
-from wglink_bundle import format_measurement_mm  # noqa: E402
+_registration_modules = _load_registration_package()
+wglink_workspace = _registration_modules["wglink_workspace"]
+wglink_author = _registration_modules["wglink_author"]
+wglink_core = _registration_modules["wglink_core"]
+wglink_send = _registration_modules["wglink_send"]
+wglink_watch = _registration_modules["wglink_watch"]
+format_measurement_mm = _registration_modules["wglink_bundle"].format_measurement_mm
 
 
 PANEL_ID = "hornlab_wglink_panel"
@@ -123,25 +119,42 @@ _handlers: list[object] = []
 _definitions: list[object] = []
 _controls: list[object] = []
 _panel = None
-# False while another registration of this add-in owns the panel. Fusion loads
-# each registered path as its own module with its own globals, so two
-# registrations of one add-in are two instances that cannot see each other's
-# state -- only the panel they share.
+# True only after this registration committed a complete panel + watcher
+# transaction. The process-wide lease is separately checked before touching
+# shared UI during shutdown, because an expired owner may already be replaced.
 _owned = False
 
-WATCH_EVENT_ID = "hornlab_wglink_export_available"
 WATCH_INTERVAL_SECONDS = 4.0
+OWNER_LEASE_SECONDS = WATCH_INTERVAL_SECONDS * 3
+WATCH_EVENT_ID = f"hornlab_wglink_export_available_{_watch_session_id}"
+_candidate_event_id = f"hornlab_wglink_owner_candidate_{_watch_session_id}"
+
+# Executable add-in modules are registration-local. This deliberately tiny
+# data-only broker is the one shared object: it serializes which registration
+# may service WGLink's machine-local IPC inside this Fusion process. The lease
+# is renewed by the owner's worker without making Fusion API calls.
+_RUNTIME_MODULE_NAME = "_hornlab_wglink_ipc_owner_runtime_v1"
+_runtime_candidate = types.ModuleType(_RUNTIME_MODULE_NAME)
+_runtime_candidate.lock = threading.RLock()  # type: ignore[attr-defined]
+_runtime_candidate.owner = None  # type: ignore[attr-defined]
+_runtime_candidate.phase = None  # type: ignore[attr-defined]
+_runtime_candidate.renewed_at = 0.0  # type: ignore[attr-defined]
+_runtime_candidate.generation = 0  # type: ignore[attr-defined]
+_runtime_candidate.watch_event_id = None  # type: ignore[attr-defined]
+_ipc_owner_runtime = sys.modules.setdefault(_RUNTIME_MODULE_NAME, _runtime_candidate)
+if not hasattr(_ipc_owner_runtime, "watch_event_id"):
+    _ipc_owner_runtime.watch_event_id = None
+
 _watcher = wglink_watch.ExportWatcher()
 _watch_event = None
 _watch_handler = None
 _watch_stop: threading.Event | None = None
 _watch_thread: threading.Thread | None = None
-_watch_session_id = str(uuid.uuid4())
-_presence_event_id = f"hornlab_wglink_presence_{_watch_session_id}"
-_presence_event = None
-_presence_handler = None
-_presence_stop: threading.Event | None = None
-_presence_thread: threading.Thread | None = None
+_candidate_event = None
+_candidate_handler = None
+_candidate_stop: threading.Event | None = None
+_candidate_thread: threading.Thread | None = None
+_replaced_watch_event_id: str | None = None
 # Set while a WGLink command runs. The heartbeat keeps ticking, but the handler
 # refuses to raise a prompt over a command that is mid-execution.
 _command_busy = False
@@ -152,6 +165,97 @@ _handoff_attempted_id: str | None = None
 # A refused return request also remains on disk. Suppress repeated attempts for
 # that exact request while allowing a later request id through normally.
 _return_request_attempted_id: str | None = None
+
+
+def _lease_now() -> float:
+    return time.monotonic()
+
+
+def _claim_ipc_lease() -> bool:
+    """Atomically claim an absent or expired process-local IPC lease."""
+
+    global _replaced_watch_event_id
+    now = _lease_now()
+    with _ipc_owner_runtime.lock:
+        owner = _ipc_owner_runtime.owner
+        expired = (
+            owner is not None
+            and now - float(_ipc_owner_runtime.renewed_at) > OWNER_LEASE_SECONDS
+        )
+        if owner not in (None, _watch_session_id) and not expired:
+            return False
+        if owner != _watch_session_id:
+            _ipc_owner_runtime.generation += 1
+            _replaced_watch_event_id = (
+                str(_ipc_owner_runtime.watch_event_id)
+                if _ipc_owner_runtime.watch_event_id
+                else None
+            )
+        _ipc_owner_runtime.owner = _watch_session_id
+        _ipc_owner_runtime.phase = "constructing"
+        _ipc_owner_runtime.renewed_at = now
+        _ipc_owner_runtime.watch_event_id = None
+        return True
+
+
+def _activate_ipc_lease() -> bool:
+    """Commit the lease after panel construction and watcher registration."""
+
+    with _ipc_owner_runtime.lock:
+        if _ipc_owner_runtime.owner != _watch_session_id:
+            return False
+        _ipc_owner_runtime.phase = "active"
+        _ipc_owner_runtime.renewed_at = _lease_now()
+        _ipc_owner_runtime.watch_event_id = WATCH_EVENT_ID
+        return True
+
+
+def _renew_ipc_lease() -> bool:
+    with _ipc_owner_runtime.lock:
+        if (
+            _ipc_owner_runtime.owner != _watch_session_id
+            or _ipc_owner_runtime.phase != "active"
+        ):
+            return False
+        _ipc_owner_runtime.renewed_at = _lease_now()
+        return True
+
+
+def _owns_ipc_lease() -> bool:
+    with _ipc_owner_runtime.lock:
+        return _ipc_owner_runtime.owner == _watch_session_id
+
+
+def _owns_active_ipc_lease() -> bool:
+    with _ipc_owner_runtime.lock:
+        return (
+            _ipc_owner_runtime.owner == _watch_session_id
+            and _ipc_owner_runtime.phase == "active"
+        )
+
+
+def _release_ipc_lease() -> bool:
+    with _ipc_owner_runtime.lock:
+        if _ipc_owner_runtime.owner != _watch_session_id:
+            return False
+        _ipc_owner_runtime.owner = None
+        _ipc_owner_runtime.phase = None
+        _ipc_owner_runtime.renewed_at = 0.0
+        _ipc_owner_runtime.watch_event_id = None
+        return True
+
+
+def _ipc_lease_snapshot() -> dict[str, object]:
+    """A deterministic diagnostic surface for lifecycle tests and support."""
+
+    with _ipc_owner_runtime.lock:
+        return {
+            "owner": _ipc_owner_runtime.owner,
+            "phase": _ipc_owner_runtime.phase,
+            "renewed_at": _ipc_owner_runtime.renewed_at,
+            "generation": _ipc_owner_runtime.generation,
+            "watch_event_id": _ipc_owner_runtime.watch_event_id,
+        }
 
 
 def _fingerprint_hash(value: object) -> str:
@@ -1097,7 +1201,10 @@ def _fusion_snapshot() -> dict[str, object]:
 
 
 def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
-    """Best-effort presence for WG; every Fusion read stays on this thread."""
+    """Best-effort owner presence for WG; every Fusion read stays on this thread."""
+
+    if not _owns_active_ipc_lease():
+        return
 
     folder = wglink_workspace.ipc_folder(create=True)
     if folder is None:
@@ -1391,99 +1498,96 @@ def _on_watch_tick() -> None:
 class WatchEventHandler(adsk.core.CustomEventHandler):
     def notify(self, _args: object) -> None:
         try:
+            # A queued event from an expired owner must not service a request
+            # after a candidate has promoted and replaced its panel.
+            if not _owns_active_ipc_lease():
+                return
             _on_watch_tick()
         except Exception as exc:  # noqa: BLE001
             _report_error("Watching for WG exports", "WGLink watch error", exc)
 
 
-class PresenceEventHandler(adsk.core.CustomEventHandler):
-    """Publish status for a registration that adopted another one's panel."""
+class CandidateEventHandler(adsk.core.CustomEventHandler):
+    """Try to promote an adopted registration after lease loss."""
 
     def notify(self, _args: object) -> None:
         try:
-            _publish_fusion_status()
-        except Exception:  # noqa: BLE001 - presence is advisory
-            pass
+            _attempt_promotion()
+        except Exception as exc:  # noqa: BLE001
+            _report_error("Promoting a standby WGLink", "WGLink recovery error", exc)
 
 
 def _watch_loop(app: object, stop: threading.Event) -> None:
-    """Heartbeat only. Every Fusion call belongs to the event handler."""
+    """Renew the lease and raise the owner's event without reading Fusion."""
 
     while not stop.wait(WATCH_INTERVAL_SECONDS):
+        if not _renew_ipc_lease():
+            return
         try:
             app.fireCustomEvent(WATCH_EVENT_ID)
         except Exception:  # noqa: BLE001 - a torn-down event ends the thread
             return
 
 
-def _presence_loop(app: object, stop: threading.Event) -> None:
-    """Raise only this registration's private presence event."""
+def _candidate_loop(app: object, stop: threading.Event) -> None:
+    """Raise only this registration's private promotion event."""
 
     while not stop.wait(WATCH_INTERVAL_SECONDS):
         try:
-            app.fireCustomEvent(_presence_event_id)
+            app.fireCustomEvent(_candidate_event_id)
         except Exception:  # noqa: BLE001 - a torn-down event ends the thread
             return
 
 
-def _start_presence(app: object) -> None:
-    """Keep WG online when an older duplicate owns the command panel."""
+def _start_candidate(app: object) -> None:
+    """Wait without publishing an unserviceable Fusion session id."""
 
-    global _presence_event, _presence_handler, _presence_stop, _presence_thread
-    _presence_event = app.registerCustomEvent(_presence_event_id)
-    if _presence_event is None:
+    global _candidate_event, _candidate_handler, _candidate_stop, _candidate_thread
+    if _candidate_event is not None:
         return
-    _presence_handler = PresenceEventHandler()
-    _presence_event.add(_presence_handler)
-    _presence_stop = threading.Event()
-    _presence_thread = threading.Thread(
-        target=_presence_loop,
-        args=(app, _presence_stop),
-        name="WGLinkPresence",
+    _candidate_event = app.registerCustomEvent(_candidate_event_id)
+    if _candidate_event is None:
+        return
+    _candidate_handler = CandidateEventHandler()
+    _candidate_event.add(_candidate_handler)
+    _candidate_stop = threading.Event()
+    _candidate_thread = threading.Thread(
+        target=_candidate_loop,
+        args=(app, _candidate_stop),
+        name="WGLinkOwnerCandidate",
         daemon=True,
     )
-    _presence_thread.start()
-    _publish_fusion_status()
+    _candidate_thread.start()
 
 
-def _stop_presence(app: object) -> None:
-    global _presence_event, _presence_handler, _presence_stop, _presence_thread
-    if _presence_stop is not None:
-        _presence_stop.set()
-    if _presence_thread is not None and _presence_thread.is_alive():
-        _presence_thread.join(timeout=WATCH_INTERVAL_SECONDS + 1)
-    if _presence_event is not None and _presence_handler is not None:
+def _stop_candidate(app: object) -> None:
+    global _candidate_event, _candidate_handler, _candidate_stop, _candidate_thread
+    if _candidate_stop is not None:
+        _candidate_stop.set()
+    if _candidate_thread is not None and _candidate_thread.is_alive():
+        _candidate_thread.join(timeout=WATCH_INTERVAL_SECONDS + 1)
+    if _candidate_event is not None and _candidate_handler is not None:
         try:
-            _presence_event.remove(_presence_handler)
+            _candidate_event.remove(_candidate_handler)
         except Exception:  # noqa: BLE001
             pass
     try:
         if app:
-            app.unregisterCustomEvent(_presence_event_id)
+            app.unregisterCustomEvent(_candidate_event_id)
     except Exception:  # noqa: BLE001
         pass
-    folder = wglink_workspace.ipc_folder()
-    if folder is not None:
-        try:
-            wglink_watch.remove_fusion_status(folder, session_id=_watch_session_id)
-        except Exception:  # noqa: BLE001 - shutdown cleanup is best effort
-            pass
-    _presence_event = _presence_handler = _presence_stop = _presence_thread = None
+    _candidate_event = _candidate_handler = _candidate_stop = _candidate_thread = None
 
 
-def _start_watch(app: object) -> None:
+def _start_watch(app: object) -> bool:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
     global _handoff_attempted_id, _return_request_attempted_id
     _watcher.reset()
     _handoff_attempted_id = None
     _return_request_attempted_id = None
-    try:
-        app.unregisterCustomEvent(WATCH_EVENT_ID)
-    except Exception:  # noqa: BLE001 - no stale registration to clear
-        pass
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
-        return
+        return False
     _watch_handler = WatchEventHandler()
     _watch_event.add(_watch_handler)
     _watch_stop = threading.Event()
@@ -1494,7 +1598,7 @@ def _start_watch(app: object) -> None:
         daemon=True,
     )
     _watch_thread.start()
-    _publish_fusion_status()
+    return True
 
 
 def _stop_watch(app: object) -> None:
@@ -1558,51 +1662,60 @@ def _manage_dropdown(panel: object) -> object | None:
         return None
 
 
-def _installed_control_count(panel: object) -> int:
-    try:
-        controls = panel.controls
-    except Exception:  # noqa: BLE001 - an unreadable panel counts as not installed
-        return 0
-    # Fusion exposes count as an int property; a list-like collection exposes it
-    # as a method, so only trust the attribute when it is already a number.
-    count = getattr(controls, "count", None)
-    if isinstance(count, int):
-        return count
-    try:
-        return len(controls)  # type: ignore[arg-type]
-    except Exception:  # noqa: BLE001
-        return 0
+def _clear_registration_state() -> None:
+    """Forget local handles without mutating UI another lease owner may own."""
 
-
-def run(_context: object) -> None:
     global _panel, _owned
+    _controls.clear()
+    _definitions.clear()
+    _handlers.clear()
+    _panel = None
+    _owned = False
+
+
+def _delete_owned_ui(ui: object | None) -> None:
+    """Delete the panel transaction while this registration holds the lease."""
+
+    global _panel, _owned
+    for control in reversed(_controls):
+        _delete_quietly(control)
+    _controls.clear()
+    for definition in reversed(_definitions):
+        _delete_quietly(definition)
+    _definitions.clear()
+    if ui:
+        for command_id, _name, _description in COMMANDS.values():
+            _delete_quietly(ui.commandDefinitions.itemById(command_id))
+    _delete_quietly(_panel)
+    _panel = None
+    _owned = False
+    _handlers.clear()
+
+
+def _build_owner(app: object, ui: object) -> None:
+    """Build panel + watcher, then commit the already-claimed owner lease."""
+
+    global _panel, _owned, _replaced_watch_event_id
+    if _replaced_watch_event_id:
+        try:
+            app.unregisterCustomEvent(_replaced_watch_event_id)
+        except Exception:  # noqa: BLE001 - the expired event may already be gone
+            pass
+        _replaced_watch_event_id = None
+    workspace = _workspace(ui)
+    stale_panel = workspace.toolbarPanels.itemById(PANEL_ID)
+    if stale_panel:
+        # This is either an orderly owner's incomplete panel or the dead panel
+        # left by an expired lease. The claimant is the only registration
+        # allowed to replace it.
+        _delete_quietly(stale_panel)
+    _panel = workspace.toolbarPanels.add(
+        PANEL_ID,
+        PANEL_NAME,
+        "SolidScriptsAddinsPanel",
+        False,
+    )
     try:
-        app = _app()
-        ui = app.userInterface if app else None
-        if ui is None:
-            return
-        workspace = _workspace(ui)
-        stale_panel = workspace.toolbarPanels.itemById(PANEL_ID)
-        if stale_panel and _installed_control_count(stale_panel):
-            # Another registration of this same add-in already built the panel.
-            # Rebuilding it here would delete definitions that instance owns and
-            # leave the toolbar holding dead buttons, so adopt it and stay out of
-            # the way. Nothing is torn down on stop either -- see _owned.
-            _panel = stale_panel
-            _owned = False
-            _start_presence(app)
-            return
-        if stale_panel:
-            _delete_quietly(stale_panel)
-        _panel = workspace.toolbarPanels.add(
-            PANEL_ID,
-            PANEL_NAME,
-            "SolidScriptsAddinsPanel",
-            False,
-        )
-        # Claimed before the buttons go on, so a start that fails partway still
-        # tears its own half-built panel down on stop.
-        _owned = True
         # Insert and Update are ordinarily automatic: WG's Send to CAD writes a
         # handoff this add-in applies on its own. They, and the recovery
         # commands, are demoted under one dropdown so the panel reads as the two
@@ -1618,6 +1731,8 @@ def run(_context: object) -> None:
                 description,
                 _icon_folder(operation),
             )
+            if definition is None:
+                raise RuntimeError(f"Fusion refused command definition {command_id!r}")
             created = CommandCreatedHandler(operation)
             definition.commandCreated.add(created)
             _handlers.append(created)
@@ -1631,36 +1746,75 @@ def run(_context: object) -> None:
                     _controls.append(manage)
             target = manage.controls if manage is not None else _panel.controls
             _controls.append(target.addCommand(definition))
-        _start_watch(app)
+        if not _start_watch(app):
+            raise RuntimeError("Fusion refused the WGLink owner event")
+        if not _activate_ipc_lease():
+            raise RuntimeError("WGLink's IPC owner lease was lost during startup")
+        _owned = True
+        _publish_fusion_status()
+    except Exception:
+        _stop_watch(app)
+        _delete_owned_ui(ui)
+        raise
+
+
+def _attempt_promotion() -> None:
+    """Promote this standby after an orderly release or expired heartbeat."""
+
+    if _owned or not _claim_ipc_lease():
+        return
+    app = _app()
+    ui = app.userInterface if app else None
+    if ui is None:
+        _release_ipc_lease()
+        return
+    try:
+        _build_owner(app, ui)
+    except Exception:
+        _release_ipc_lease()
+        raise
+    _stop_candidate(app)
+
+
+def run(_context: object) -> None:
+    global _panel, _owned
+    try:
+        app = _app()
+        ui = app.userInterface if app else None
+        if ui is None:
+            return
+        if _owned and _owns_active_ipc_lease():
+            return
+        if not _claim_ipc_lease():
+            _panel = _workspace(ui).toolbarPanels.itemById(PANEL_ID)
+            _owned = False
+            _start_candidate(app)
+            return
+        try:
+            _build_owner(app, ui)
+        except Exception:
+            _release_ipc_lease()
+            raise
     except Exception as exc:  # noqa: BLE001
         _report_error("Starting WGLink", "WGLink start error", exc)
 
 
 def stop(_context: object) -> None:
-    global _panel, _owned
     try:
-        if not _owned:
-            # A panel this instance adopted belongs to another registration.
-            # Deleting the command definitions by id would strip that instance's
-            # live buttons, which is how a duplicate registration used to leave
-            # WGLink showing a panel whose commands did nothing.
-            _stop_presence(_app())
-            _panel = None
-            return
-        _stop_watch(_app())
-        for control in reversed(_controls):
-            _delete_quietly(control)
-        _controls.clear()
-        for definition in reversed(_definitions):
-            _delete_quietly(definition)
-        _definitions.clear()
-        ui = _ui()
-        if ui:
-            for command_id, _name, _description in COMMANDS.values():
-                _delete_quietly(ui.commandDefinitions.itemById(command_id))
-        _delete_quietly(_panel)
-        _panel = None
-        _owned = False
-        _handlers.clear()
+        app = _app()
+        _stop_candidate(app)
+        lease_owner = _owns_ipc_lease()
+        try:
+            _stop_watch(app)
+            if _owned and lease_owner:
+                _delete_owned_ui(app.userInterface if app else None)
+            else:
+                # An expired former owner may retain handles to objects already
+                # replaced by its promoted successor. Never delete shared UI unless
+                # the lease still proves authority.
+                _clear_registration_state()
+        finally:
+            if lease_owner:
+                _release_ipc_lease()
     except Exception as exc:  # noqa: BLE001
         _report_error("Stopping WGLink", "WGLink stop error", exc)

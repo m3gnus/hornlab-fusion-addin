@@ -25,14 +25,23 @@ import uuid
 import adsk.core
 import adsk.fusion
 
-import wglink_author
-import wglink_core
-from wglink_return import (
-    WgReturnError,
-    build_return_manifest,
-    dumps_return_manifest,
-    plan_export_scope,
-)
+if __package__:
+    from . import wglink_author, wglink_core
+    from .wglink_return import (
+        WgReturnError,
+        build_return_manifest,
+        dumps_return_manifest,
+        plan_export_scope,
+    )
+else:
+    import wglink_author
+    import wglink_core
+    from wglink_return import (
+        WgReturnError,
+        build_return_manifest,
+        dumps_return_manifest,
+        plan_export_scope,
+    )
 
 
 DECLARATION_ATTRIBUTE = "return_declaration"

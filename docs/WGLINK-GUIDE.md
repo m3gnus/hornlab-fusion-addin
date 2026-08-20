@@ -28,8 +28,9 @@ Restart Fusion and confirm **Run on Startup** is ticked for WGLink under
 **Utilities → Scripts and Add-Ins**. Fusion's own record of that toggle
 overrides the add-in manifest, so a copy once started by hand stays manual
 until the box is ticked. Install from exactly one location: a second copy
-loads a second module instance, and the two fight over the panel and the
-export watcher.
+loads a second module instance. WGLink elects one active copy and keeps the
+others as recovery standbys, but duplicate installations still make upgrades
+and support needlessly ambiguous.
 
 One-time setup on the WG side: choose a **WGLink folder** in WG under
 **Settings → CAD Link**. The add-in reads the same setting, so Insert and
@@ -106,5 +107,7 @@ mesh sizing and drive channels in the CAD Link panel, and solve.
 - **Nothing arrives in WG after Solve in WG** — WG must be running; the
   request survives until it next runs, and the WG window still has to be
   brought forward by hand.
-- **Two panels, or commands firing twice** — the add-in is installed from two
-  locations; remove one and restart Fusion.
+- **Duplicate WGLink installations** — remove the extra registration and
+  restart Fusion. Current copies elect one active panel/watcher and promote a
+  surviving standby if the owner stops, but a mixed-version duplicate remains
+  an unsupported installation to diagnose.

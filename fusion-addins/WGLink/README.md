@@ -143,6 +143,42 @@ never ran, the folder is on a disconnected drive, the bundle came from another
 machine — the Insert dropdown falls back to the browse entries and manual picker
 behaves as it always did.
 
+## Duplicate-registration ownership and recovery
+
+Fusion may load several registered WGLink paths into one Python process. Each
+entry point now loads **all** of its executable `wglink_*` helpers beneath a
+registration-unique package name; no registration borrows a helper module that
+another checkout put in Python's ordinary import cache.
+
+One deliberately shared, data-only broker elects the registration allowed to
+own WGLink's machine-local IPC in that Fusion process. The model is a renewable
+lease with two phases:
+
+1. A registration atomically claims an absent or expired lease as
+   `constructing`. It replaces any stale panel, creates every command/control,
+   registers its private watch event, and only then commits the lease as
+   `active`. Any exception rolls back the entire panel/watch transaction and
+   releases the claim.
+2. Only the active lease owner publishes `.fusion-status.json`, consumes
+   handoff/return-request markers, or owns the command panel. Its background
+   worker renews the lease without reading Fusion objects; all Fusion API work
+   remains in the custom-event handler on Fusion's main thread.
+3. Other registrations register only a private candidate event. They publish no
+   session id, because they cannot service session-scoped requests. An orderly
+   owner removes its panel/status before releasing. If its worker disappears,
+   the lease expires after three watch intervals; exactly one candidate claims
+   it, transactionally rebuilds the panel/watcher, and becomes the IPC owner.
+   A delayed stop from the former owner sees that its lease is gone and cannot
+   delete its successor's UI or event.
+
+The broker is process-local by design: two Fusion processes have independent
+sessions, while duplicate registrations inside either process must expose one
+serviceable session. Fake-backed lifecycle tests cover rollback, two- and
+three-registration promotion, orderly owner-first stop, expired-owner takeover,
+and realistic occurrence-proxy attribute behavior. The same cases still need
+verification in a live Fusion process before this recovery path is considered
+field-validated.
+
 ## The Send and Solve pre-flight
 
 Both export dialogs state what is about to happen before OK: bodies included,

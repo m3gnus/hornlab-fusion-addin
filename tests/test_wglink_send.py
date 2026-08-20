@@ -471,6 +471,93 @@ def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch)
     assert not list(tmp_path.glob(".Mismatch.wgreturn.tmp-*"))
 
 
+def test_visible_excluded_body_refuses_before_step_export(
+    send_module, tmp_path, monkeypatch
+):
+    exterior = body("cabinet", faces=[face("LF")])
+    excluded = body("measurement jig", visible=True)
+    send_module.declare_body(excluded, "exclude")
+    root = component("ExcludedVisible", [exterior, excluded])
+
+    class ExportManager:
+        def __init__(self):
+            self.create_calls = []
+            self.execute_calls = []
+
+        def createSTEPExportOptions(self, path, geometry=None):
+            self.create_calls.append((path, geometry))
+            return path, geometry
+
+        def execute(self, options):
+            self.execute_calls.append(options)
+            raise AssertionError("policy must refuse before Fusion STEP export")
+
+    manager = ExportManager()
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=manager,
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    app = types.SimpleNamespace(
+        version="1", activeDocument=types.SimpleNamespace(name="ExcludedVisible")
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match="measurement jig.*still visible.*hide the body.*clear the 'exclude' declaration",
+    ):
+        send_module.send(app, {"output_folder": str(tmp_path)})
+
+    assert manager.create_calls == []
+    assert manager.execute_calls == []
+    assert excluded.isVisible is True
+    assert not (tmp_path / "ExcludedVisible.wgreturn").exists()
+
+
+def test_hidden_excluded_body_remains_allowed_without_visibility_mutation(
+    send_module, tmp_path, monkeypatch
+):
+    exterior = body("cabinet", faces=[face("LF")])
+    excluded = body("measurement jig", visible=False)
+    send_module.declare_body(excluded, "exclude")
+    root = component("ExcludedHidden", [exterior, excluded])
+
+    class ExportManager:
+        def __init__(self):
+            self.execute_calls = []
+
+        def createSTEPExportOptions(self, path, geometry=None):
+            return path, geometry
+
+        def execute(self, options):
+            self.execute_calls.append(options)
+            Path(options[0]).write_text(
+                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
+                encoding="utf-8",
+            )
+            return True
+
+    manager = ExportManager()
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=manager,
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    app = types.SimpleNamespace(
+        version="1", activeDocument=types.SimpleNamespace(name="ExcludedHidden")
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    assert Path(report["bundle_path"]).is_dir()
+    assert len(manager.execute_calls) == 1
+    assert excluded.isVisible is False
+
+
 def _capture_design(root, *, archive: bool | str = True):
     """A design whose STEP export works and whose archive export is switchable."""
 

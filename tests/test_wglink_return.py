@@ -249,7 +249,7 @@ def test_explicit_body_exclusion_is_a_recorded_degradation():
                 "object_id": "body-jig",
                 "name": "measurement jig",
                 "component": "Speaker",
-                "visible": True,
+                "visible": False,
                 "declaration": "exclude",
             }
         ],
@@ -257,6 +257,30 @@ def test_explicit_body_exclusion_is_a_recorded_degradation():
 
     assert plan.status == "degraded"
     assert plan.skipped[0]["kind"] == "excluded_body"
+
+
+def test_visible_explicit_body_exclusion_refuses_with_visibility_recovery():
+    plan = plan_export_scope(
+        "root",
+        [
+            {
+                "kind": "body",
+                "body_kind": "solid",
+                "object_id": "body-jig",
+                "name": "measurement jig",
+                "component": "Speaker",
+                "visible": True,
+                "declaration": "exclude",
+            }
+        ],
+    )
+
+    with pytest.raises(
+        WgReturnError,
+        match="measurement jig.*still visible.*hide the body.*clear the 'exclude' declaration",
+    ) as exc:
+        plan.manifest_scope()
+    assert exc.value.reasons[0]["decision"] == "refuse"
 
 
 def test_section_2_6_worked_example_round_trips_exactly():

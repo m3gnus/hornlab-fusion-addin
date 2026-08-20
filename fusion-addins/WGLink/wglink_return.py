@@ -262,6 +262,34 @@ def plan_export_scope(
             degraded = True
             continue
 
+        if (
+            candidate.get("declaration") == "exclude"
+            and body_kind in {"solid", "surface"}
+        ):
+            if candidate.get("visible") is not False:
+                refusals.append(
+                    _refusal_record(
+                        candidate,
+                        index,
+                        reason=(
+                            f"body {name!r} is declared 'exclude' but is still visible; "
+                            "hide the body or its occurrence in Fusion before return "
+                            "export, or clear the 'exclude' declaration to include it"
+                        ),
+                    )
+                )
+                continue
+            record = _skipped_record(
+                candidate,
+                index,
+                kind="excluded_body",
+                reason="body is explicitly excluded from the acoustic exterior",
+                severity="degraded",
+            )
+            skipped.append((record, candidate))
+            degraded = True
+            continue
+
         if external == "unresolved":
             refusals.append(
                 _refusal_record(
@@ -376,18 +404,6 @@ def plan_export_scope(
                 }
             )
             fem_air_volumes.append(record)
-            continue
-
-        if candidate.get("declaration") == "exclude":
-            record = _skipped_record(
-                candidate,
-                index,
-                kind="excluded_body",
-                reason="body is explicitly excluded from the acoustic exterior",
-                severity="degraded",
-            )
-            skipped.append((record, candidate))
-            degraded = True
             continue
 
         managed = candidate.get("wglink_managed") is True

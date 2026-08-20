@@ -10,7 +10,14 @@ WG side of the workflow in WG's own user guide.
 
 ## 1. Install
 
-From this repository's checkout:
+The ordinary Waveguide Generator platform installer installs or updates WGLink
+on macOS and Windows. It also connects Update to WG's existing pinned Python
+environment, so the Fusion add-in needs neither this source checkout nor a
+second virtual environment. Restart Fusion after installing WG and confirm
+**Run on Startup** is ticked for WGLink under **Utilities → Scripts and
+Add-Ins**.
+
+For add-in development, install from this repository's checkout instead:
 
 ```bash
 python3 -m venv .venv
@@ -18,14 +25,13 @@ python3 -m venv .venv
 .venv/bin/python scripts/install_fusion_wg_metal_addin.py --addin WGLink --symlink
 ```
 
-Use the symlink install. Update resamples spline profiles by invoking this
+Use the symlink install for development. Update resamples spline profiles by invoking this
 repository's `.venv` and `scripts/wglink_resample.py`; Fusion's embedded Python
 does not have the scientific stack. Those packages come from the add-in
 checkout's own active environment — the installer never probes sibling
 checkouts for them.
 
-Restart Fusion and confirm **Run on Startup** is ticked for WGLink under
-**Utilities → Scripts and Add-Ins**. Fusion's own record of that toggle
+Fusion's own record of the Run on Startup toggle
 overrides the add-in manifest, so a copy once started by hand stays manual
 until the box is ticked. Install from exactly one location: a second copy
 loads a second module instance, and the two fight over the panel and the

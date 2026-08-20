@@ -48,6 +48,7 @@ from wglink_bundle import (
 
 
 ATTRIBUTE_GROUP = "WGLink"
+PACKAGED_RUNTIME_FILE = "wglink_runtime.json"
 ADDIN_DIR = Path(__file__).resolve().parent
 MOUTH_OVERSHOOT_SUFFIX = "mouth_overshoot"
 LINK_FRAME_TOLERANCE_MM = 0.01
@@ -1843,16 +1844,59 @@ def _refuse_bad_link_frame(frame: dict[str, object], *, force: bool) -> None:
     )
 
 
+def _packaged_runtime() -> tuple[Path, Path] | None:
+    """Return the runtime installed beside a packaged WGLink copy.
+
+    A developer checkout deliberately has no such file and continues to resolve
+    its own ``scripts/wglink_resample.py`` and ``.venv`` as before.  Waveguide
+    Generator's platform installer writes this file into the copied add-in so
+    Update can reuse WG's already-pinned scientific environment instead of
+    asking an end user to maintain a second source checkout and virtualenv.
+    """
+
+    path = ADDIN_DIR / PACKAGED_RUNTIME_FILE
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WgLinkError(f"Packaged WGLink runtime metadata is unreadable: {exc}") from exc
+    if not isinstance(value, dict) or value.get("schema") != 1:
+        raise WgLinkError(
+            "Packaged WGLink runtime metadata has an unsupported schema; "
+            "re-run Waveguide Generator's platform installer."
+        )
+    raw_root = value.get("root")
+    raw_python = value.get("python")
+    if not isinstance(raw_root, str) or not raw_root.strip():
+        raise WgLinkError("Packaged WGLink runtime metadata has no runtime root.")
+    if not isinstance(raw_python, str) or not raw_python.strip():
+        raise WgLinkError("Packaged WGLink runtime metadata has no Python interpreter.")
+    root = Path(raw_root).expanduser()
+    python = Path(raw_python).expanduser()
+    if not root.is_absolute() or not python.is_absolute():
+        raise WgLinkError(
+            "Packaged WGLink runtime paths must be absolute; re-run Waveguide "
+            "Generator's platform installer."
+        )
+    return root.resolve(), python.resolve()
+
+
 def _repo_root(options: dict[str, Any]) -> Path:
     explicit = options.get("repo_root") or os.environ.get("HORNLAB_FUSION_ADDIN_REPO")
     candidates = [Path(explicit).expanduser()] if explicit else []
+    if not explicit:
+        runtime = _packaged_runtime()
+        if runtime is not None:
+            candidates.append(runtime[0])
     candidates.extend([ADDIN_DIR.parents[1], Path.cwd(), *Path.cwd().parents])
     for candidate in candidates:
         if (candidate / "scripts" / "wglink_resample.py").is_file():
             return candidate.resolve()
     raise WgLinkError(
-        "Could not locate scripts/wglink_resample.py. Install WGLink by symlink "
-        "from the repository, or set HORNLAB_FUSION_ADDIN_REPO to the checkout."
+        "Could not locate scripts/wglink_resample.py. Re-run Waveguide Generator's "
+        "platform installer, install WGLink by symlink from its developer repository, "
+        "or set HORNLAB_FUSION_ADDIN_REPO to that checkout."
     )
 
 
@@ -1861,6 +1905,10 @@ def _python_for_resampler(repo_root: Path, options: dict[str, Any]) -> Path:
     candidates = []
     if explicit:
         candidates.append(Path(str(explicit)).expanduser())
+    else:
+        runtime = _packaged_runtime()
+        if runtime is not None and runtime[0] == repo_root:
+            candidates.append(runtime[1])
     candidates.extend(
         [
             repo_root / ".venv" / "bin" / "python",
@@ -1874,8 +1922,9 @@ def _python_for_resampler(repo_root: Path, options: dict[str, Any]) -> Path:
         if candidate.is_file():
             return candidate
     raise WgLinkError(
-        "No Python interpreter for WGLink resampling was found. Create the "
-        "repository .venv or pass options['python_path']."
+        "No Python interpreter for WGLink resampling was found. Re-run Waveguide "
+        "Generator's platform installer, create the developer repository .venv, "
+        "or pass options['python_path']."
     )
 
 

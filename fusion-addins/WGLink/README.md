@@ -255,7 +255,11 @@ in the UI and pressing Update is therefore still an unchecked path.
 
 ## Install
 
-Run from the repository checkout:
+Waveguide Generator's macOS and Windows platform installers install a packaged
+copy and point it at WG's own pinned scientific runtime. That is the end-user
+path: it needs no hornlab-fusion-addin checkout and no second virtualenv.
+
+For development, run from this repository checkout:
 
 ```sh
 .venv/bin/python scripts/install_fusion_wg_metal_addin.py \

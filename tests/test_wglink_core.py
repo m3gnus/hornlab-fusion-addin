@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import types
@@ -474,6 +475,65 @@ def test_mouth_overshoot_extrude_joins_face_using_parameter_expression(core, mon
         "extent": ("distance", ("expression", "wg_tiny_mouth_overshoot")),
         "direction": "positive",
     }
+
+
+def _packaged_runtime_fixture(core, monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    addin = tmp_path / "Fusion AddIns" / "WGLink"
+    runtime = tmp_path / "Waveguide Generator" / "wglink-runtime"
+    python = tmp_path / "Waveguide Generator" / ".venv" / "bin" / "python"
+    addin.mkdir(parents=True)
+    (runtime / "scripts").mkdir(parents=True)
+    (runtime / "scripts" / "wglink_resample.py").touch()
+    python.parent.mkdir(parents=True)
+    python.touch()
+    (addin / core.PACKAGED_RUNTIME_FILE).write_text(
+        json.dumps({"schema": 1, "root": str(runtime), "python": str(python)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "ADDIN_DIR", addin)
+    return runtime.resolve(), python.resolve()
+
+
+def test_packaged_copy_uses_wgs_existing_runtime(core, monkeypatch, tmp_path: Path):
+    runtime, python = _packaged_runtime_fixture(core, monkeypatch, tmp_path)
+
+    resolved_root = core._repo_root({})
+
+    assert resolved_root == runtime
+    assert core._python_for_resampler(resolved_root, {}) == python
+
+
+def test_headless_runtime_options_override_packaged_defaults(
+    core, monkeypatch, tmp_path: Path
+):
+    _packaged_runtime_fixture(core, monkeypatch, tmp_path)
+    developer = tmp_path / "developer checkout"
+    developer_python = developer / "custom-python"
+    (developer / "scripts").mkdir(parents=True)
+    (developer / "scripts" / "wglink_resample.py").touch()
+    developer_python.touch()
+
+    resolved_root = core._repo_root({"repo_root": developer})
+
+    assert resolved_root == developer.resolve()
+    assert core._python_for_resampler(
+        resolved_root, {"python_path": developer_python}
+    ) == developer_python
+
+
+def test_invalid_packaged_runtime_names_the_reinstall_remedy(
+    core, monkeypatch, tmp_path: Path
+):
+    addin = tmp_path / "WGLink"
+    addin.mkdir()
+    (addin / core.PACKAGED_RUNTIME_FILE).write_text(
+        '{"schema": 99, "root": "/tmp/nope", "python": "/tmp/nope"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(core, "ADDIN_DIR", addin)
+
+    with pytest.raises(core.WgLinkError, match="re-run Waveguide Generator"):
+        core._repo_root({})
 
 
 def _stub_no_op_update(core, monkeypatch, record, observed_paths):

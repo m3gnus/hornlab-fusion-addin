@@ -302,9 +302,12 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
 
     module.CommandCreatedHandler("send").notify(types.SimpleNamespace(command=command))
 
-    # No output folder, no browse button, no overwrite checkbox.
+    # No output folder, no browse button, no overwrite checkbox. The one button
+    # re-surveys Fusion state without changing it.
     assert string_inputs == []
-    assert bool_inputs == []
+    assert bool_inputs == [
+        ("refresh_preflight", "Refresh body inventory", False, "", False)
+    ]
     # One read-only box that states the export before the user commits to it.
     assert [args[0] for args in text_boxes] == ["preflight"]
     assert text_boxes[0][-1] is True
@@ -343,7 +346,12 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
 
     module.CommandCreatedHandler("solve").notify(types.SimpleNamespace(command=command))
 
-    assert added == ["send_selection", "anchor_instance_id", "preflight"]
+    assert added == [
+        "send_selection",
+        "anchor_instance_id",
+        "preflight",
+        "refresh_preflight",
+    ]
 
 
 class _SelectionInput:
@@ -633,6 +641,60 @@ def test_the_send_dialog_states_the_export_before_ok(monkeypatch) -> None:
     assert "unlinked (Fusion-first) return" in box.formattedText
     # Both the missing source and the wrong-way frame are stated before OK.
     assert box.formattedText.count("<b>⚠") == 2
+
+
+def test_refresh_body_inventory_resurveys_visibility_while_dialog_is_open(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_preflight_visibility_refresh",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    box = types.SimpleNamespace(formattedText="")
+    inputs = _dialog_inputs(preflight=box)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+    anchor_refreshes: list[object] = []
+    monkeypatch.setattr(
+        module, "_sync_anchor_choices", lambda value: anchor_refreshes.append(value)
+    )
+    visible = {"jig": True}
+    surveys: list[bool] = []
+
+    def survey(_app: object, _options: object) -> dict[str, object]:
+        surveys.append(visible["jig"])
+        included = [{"name": "cabinet", "body_kind": "solid"}]
+        if visible["jig"]:
+            included.append({"name": "measurement jig", "body_kind": "solid"})
+        return {
+            "selection": "root",
+            "instance_ids": [],
+            "included": included,
+            "sources": [],
+            "scope_error": None,
+            "source_error": None,
+            "bounds_mm": None,
+            "source_bounds_mm": None,
+        }
+
+    monkeypatch.setattr(module.wglink_send, "preflight_scope", survey)
+    module._sync_preflight(inputs)
+    assert "Bodies included: 2 solids" in box.formattedText
+
+    # The user hides a body in Fusion's browser while the command stays open.
+    # Clicking Refresh must replace, not preserve, the stale inventory summary.
+    visible["jig"] = False
+    refresh = types.SimpleNamespace(id="refresh_preflight", value=True)
+    module.CommandInputChangedHandler().notify(types.SimpleNamespace(
+        input=refresh,
+        inputs=inputs,
+    ))
+
+    assert surveys == [True, False]
+    assert anchor_refreshes == [inputs]
+    assert refresh.value is False
+    assert "Bodies included: 1 solid" in box.formattedText
+    assert "2 solids" not in box.formattedText
 
 
 def test_a_model_that_cannot_be_surveyed_leaves_the_dialog_usable(monkeypatch) -> None:

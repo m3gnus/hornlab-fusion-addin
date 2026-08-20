@@ -747,6 +747,17 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 _sync_preflight(inputs)
             elif input_id == "anchor_instance_id":
                 _sync_preflight(inputs)
+            elif input_id == "refresh_preflight":
+                # Fusion body/occurrence visibility can change while this modal
+                # is open without producing a command-input event. Re-survey on
+                # an explicit read-only action so the displayed body inventory
+                # and anchor choices cannot remain stale.
+                _sync_anchor_choices(inputs)
+                _sync_preflight(inputs)
+                try:
+                    changed.value = False
+                except Exception:  # noqa: BLE001 - old Fusion buttons may be write-only
+                    pass
             elif input_id == "source_role":
                 _sync_help(
                     inputs, "source_help", "source_role", wglink_author.source_help_text
@@ -796,6 +807,13 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 # dead-end modal raised after the user pressed OK.
                 inputs.addTextBoxCommandInput("preflight", "Pre-flight", "", 8, True)
                 _sync_preflight(inputs)
+                inputs.addBoolValueInput(
+                    "refresh_preflight",
+                    "Refresh body inventory",
+                    False,
+                    "",
+                    False,
+                )
                 changed = CommandInputChangedHandler()
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)

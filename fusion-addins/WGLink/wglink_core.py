@@ -2343,11 +2343,19 @@ def _validate_enclosure_placement(bundle: object) -> None:
         return
     x0, y0, _x1, _y1 = plan.rectangle_mm
     if x0 >= 0.0 or y0 >= 0.0:
+        vertical_offset = float(bundle.grid.get("vertical_offset_mm", 0.0))
+        vertical_recovery = (
+            " The realized enc_y0 already includes the "
+            f"{vertical_offset:g} mm vertical offset; reduce that offset or "
+            "increase the bottom enclosure margin until enc_y0 is negative."
+            if y0 >= 0.0
+            else ""
+        )
         raise WgLinkError(
             "WGLink refuses enclosure placement because the realized origin values "
             f"do not straddle the waveguide axis: enc_x0={x0:g} mm and "
             f"enc_y0={y0:g} mm; both must be negative. Correct the WG enclosure "
-            "bounds and export again."
+            f"bounds and export again.{vertical_recovery}"
         )
 
 

@@ -400,6 +400,23 @@ def test_mouth_cap_face_requires_unique_planar_face_at_mouth_with_plus_z_normal(
         )
 
 
+def test_enclosure_refusal_explains_vertical_offset_recovery(core, monkeypatch):
+    monkeypatch.setattr(
+        core,
+        "enclosure_plan",
+        lambda _bundle: types.SimpleNamespace(rectangle_mm=(-172.0, 12.0, 172.0, 359.0)),
+    )
+    bundle = types.SimpleNamespace(grid={"vertical_offset_mm": 80.0})
+
+    with pytest.raises(core.WgLinkError) as caught:
+        core._validate_enclosure_placement(bundle)
+
+    message = str(caught.value)
+    assert "enc_y0=12 mm" in message
+    assert "80 mm vertical offset" in message
+    assert "reduce that offset or increase the bottom enclosure margin" in message
+
+
 def test_mouth_overshoot_extrude_joins_face_using_parameter_expression(core, monkeypatch):
     face = object()
     body = object()

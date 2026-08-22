@@ -158,9 +158,10 @@ Start with per-driver files in `sources/`:
 - `<SOURCE>_directivity_heatmap.png`: normalized directivity over the solved
   polar grid.
 - `derived/<SOURCE>_directivity_index_power_response.*`: DI and power-response
-  PNG, CSV, and JSON from solid-angle-weighted polar-cut intensity integration.
-  The report text notes that this is an approximation because the stored cuts
-  are not full-sphere samples.
+  PNG, CSV, and JSON from solid-angle-weighted full-sphere balloon integration
+  when supported by the installed solver and plotting packages. Older package
+  combinations and saved runs without a balloon retain the polar-cut estimate.
+  The plot footnote and the CSV/JSON `method` field identify the path used.
 - `derived/<SOURCE>_beamwidth.*`: per-plane -6 dB beamwidth vs frequency as
   PNG, CSV, and JSON.
 - `derived/<SOURCE>_group_delay.*`: on-axis group delay vs frequency as PNG,
@@ -184,7 +185,9 @@ Then read combined outputs in `combined/`:
 - `derived/combined_time_aligned_directivity_index_power_response.*`,
   `derived/combined_time_aligned_beamwidth.*`, and
   `derived/combined_time_aligned_group_delay.*`: the same DI/power,
-  beamwidth, and group-delay sidecars for the aligned crossover sum.
+  beamwidth, and group-delay sidecars for the aligned crossover sum. The DI
+  and power response use the combined balloons when every member has one,
+  otherwise they use the compatible polar-cut estimate.
 - `combined/combined_interference_heatmap_time_aligned.png`: coherent vs incoherent
   interaction between drivers.
 - `combined/combined_frequency_response_off_axis_<plane>.png`: off-axis aligned sum

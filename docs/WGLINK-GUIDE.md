@@ -49,7 +49,7 @@ contains only **Declare Body…**, **Insert**, **Update**, and **Detach**.
 
 | Command | What it does |
 |---|---|
-| **Set WG Source…** | Mark the selected faces as the `LF`, `MF`, `HF`, or `PORT_EXIT` drive source (applies an appearance with that exact name; Clear removes it). |
+| **Set WG Source…** | Mark the selected faces as the `LF`, `MF`, `HF`, or `PASSIVE_CARDIOID` drive source (applies an appearance with that exact name; Clear removes it). A face already painted `PORT_EXIT`, the role's old name, is still recognised. |
 | **Solve in WG** | Export the assembly and ask WG to prepare and solve it, so WG is already solving when you switch windows. |
 | **Send to WG** | Export the assembly as a validated `.wgreturn` bundle without asking for a solve. |
 | Declare Body… | Classify a body for the return: `exterior-shell` includes an open surface body, `exclude` leaves a body out, Clear restores automatic scoping. |
@@ -90,7 +90,7 @@ requirements:
 
 1. **A drive source.** Mark the throat or diaphragm face with
    **Set WG Source…**. Hand-painting an appearance named exactly `LF`, `MF`,
-   `HF`, or `PORT_EXIT` onto the face does the same thing.
+   `HF`, or `PASSIVE_CARDIOID` onto the face does the same thing.
 2. **Closed solids.** An open surface body must be classified with
    **Declare Body…** (`exterior-shell` or `exclude`), or the export refuses
    it as unclassified.

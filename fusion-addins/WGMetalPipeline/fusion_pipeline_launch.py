@@ -36,8 +36,14 @@ APP_SUPPORT_DIR = (
 )
 DEFAULT_PRESETS_DIR = APP_SUPPORT_DIR / "presets"
 USER_DRIVER_DATABASE_DIR = APP_SUPPORT_DIR / "driver-databases"
+# The one CSV drop folder every HornLab tool reads; Waveguide Generator's
+# driver library documents and indexes the same place.
+SHARED_DRIVER_DATABASE_DIR = APP_SUPPORT_DIR.parent / "driver-databases"
 FUSION_ADDIN_REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = FUSION_ADDIN_REPO_ROOT.parent
+# Never existed on any machine (the sibling checkout is not called HornLab),
+# so the bundled-database branch below it silently loaded nothing. Kept as a
+# last candidate for a hypothetical layout that does have it.
 HORNLAB_DRIVER_DATABASE_DIR = WORKSPACE_ROOT / "HornLab" / "MEH-Lab" / "data"
 RUN_MANIFESTS_DIR_NAME = "manifests"
 DEFAULT_DRIVER_DATABASE_FILENAMES = (
@@ -342,11 +348,20 @@ def build_driver_lem_cli_entry(name: str, raw_payload: str | None) -> str | None
 
 def _driver_database_candidate_paths() -> list[Path]:
     paths: list[Path] = []
-    if USER_DRIVER_DATABASE_DIR.is_dir():
-        paths.extend(sorted(USER_DRIVER_DATABASE_DIR.glob("*.csv")))
+    seen: set[Path] = set()
+    # The add-in's own folder first (existing installs), then the shared
+    # HornLab folder, so a CSV present in both is read from the specific one.
+    for directory in (USER_DRIVER_DATABASE_DIR, SHARED_DRIVER_DATABASE_DIR):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.csv")):
+            if path.name in {existing.name for existing in seen}:
+                continue
+            paths.append(path)
+            seen.add(path)
     for filename in DEFAULT_DRIVER_DATABASE_FILENAMES:
         path = HORNLAB_DRIVER_DATABASE_DIR / filename
-        if path.is_file():
+        if path.is_file() and filename not in {existing.name for existing in seen}:
             paths.append(path)
     return paths
 

@@ -3476,3 +3476,28 @@ def test_build_pipeline_command_can_request_vituixcad_export():
     assert "--export-vituixcad" not in _helper_command(helper)
     cmd = _helper_command(helper, export_vituixcad=True)
     assert "--export-vituixcad" in cmd
+
+
+def test_driver_database_candidates_read_the_shared_hornlab_folder(monkeypatch, tmp_path):
+    # The bundled-database path never existed on any machine, so before the
+    # shared folder was added the dropdown silently loaded user CSVs only.
+    fusion_pipeline_launch = _load_helper()
+    own = tmp_path / "WGMetalPipeline" / "driver-databases"
+    shared = tmp_path / "driver-databases"
+    own.mkdir(parents=True)
+    shared.mkdir()
+    (own / "mine.csv").write_text("Brand,Model\n", encoding="utf-8")
+    (own / "both.csv").write_text("Brand,Model\n", encoding="utf-8")
+    (shared / "both.csv").write_text("Brand,Model\n", encoding="utf-8")
+    (shared / "shared.csv").write_text("Brand,Model\n", encoding="utf-8")
+    monkeypatch.setattr(fusion_pipeline_launch, "USER_DRIVER_DATABASE_DIR", own)
+    monkeypatch.setattr(fusion_pipeline_launch, "SHARED_DRIVER_DATABASE_DIR", shared)
+    monkeypatch.setattr(
+        fusion_pipeline_launch, "HORNLAB_DRIVER_DATABASE_DIR", tmp_path / "absent"
+    )
+
+    paths = fusion_pipeline_launch._driver_database_candidate_paths()
+
+    assert [path.name for path in paths] == ["both.csv", "mine.csv", "shared.csv"]
+    # The name collision is read from the add-in's own folder, not the shared one.
+    assert paths[0].parent == own

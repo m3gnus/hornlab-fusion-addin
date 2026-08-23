@@ -48,9 +48,20 @@ DECLARATION_ATTRIBUTE = "return_declaration"
 DECLARATIONS = frozenset(wglink_author.BODY_DECLARATIONS)
 FEM_COMPONENT_NAME = "FEM_MF_AIR"
 # One definition, shared with the authoring commands: the dialog that paints a
-# role and the export that reads it back must never drift apart.
+# role and the export that reads it back must never drift apart. SOURCE_ROLES
+# is what a *new* paint offers; RECOGNISED_SOURCE_ROLES is what an *existing*
+# painted face is accepted as, which also covers retired spellings such as
+# PORT_EXIT so an old export keeps recognising -- and reporting -- its
+# original role.
 SOURCE_ROLES = wglink_author.SOURCE_ROLES
-SOURCE_RESOLUTION_MM = {"HF": 4.0, "MF": 15.0, "LF": 30.0, "PORT_EXIT": 25.0}
+RECOGNISED_SOURCE_ROLES = wglink_author.RECOGNISED_SOURCE_ROLES
+SOURCE_RESOLUTION_MM = {
+    "HF": 4.0,
+    "MF": 15.0,
+    "LF": 30.0,
+    "PASSIVE_CARDIOID": 25.0,
+    "PORT_EXIT": 25.0,  # legacy spelling; same physical role
+}
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _STEP_BODY = re.compile(r"\b(?:MANIFOLD_SOLID_BREP|SHELL_BASED_SURFACE_MODEL)\s*\(", re.I)
 
@@ -286,11 +297,19 @@ def _instance_id(body: object) -> str | None:
 
 
 def _face_role(face: object) -> str | None:
+    """The role a painted face carries, as its literal appearance name.
+
+    Accepts every recognised role, current or retired, but never rewrites the
+    name: a face painted ``PORT_EXIT`` reports ``PORT_EXIT`` here, which is
+    what keeps an unchanged return's exported role identical across the
+    rename.
+    """
+
     value = wglink_core._appearance_name(face)
     if not isinstance(value, str):
         return None
     canonical = value.strip().upper()
-    return canonical if canonical in SOURCE_ROLES else None
+    return canonical if canonical in RECOGNISED_SOURCE_ROLES else None
 
 
 def _has_source_face(body: object) -> bool:
@@ -1159,7 +1178,7 @@ def _throat_faces(record: dict[str, Any]) -> list[object]:
     role = str(_nullable(payload.get("source_role")) or "").upper()
     expected = _float_echo(payload, "expected_throat_area_mm2")
     throat_z = _float_echo(payload, "throat_z_mm")
-    if role not in SOURCE_ROLES or expected is None or throat_z is None:
+    if role not in RECOGNISED_SOURCE_ROLES or expected is None or throat_z is None:
         raise wglink_core.WgLinkError(
             f"WGLink instance {record['instance_id']!r} lacks a complete required throat selector."
         )
@@ -1276,13 +1295,13 @@ def _sources(records: list[dict[str, Any]], included_bodies: list[object]) -> li
             }
         )
 
-    painted: dict[str, list[object]] = {role: [] for role in SOURCE_ROLES}
+    painted: dict[str, list[object]] = {role: [] for role in RECOGNISED_SOURCE_ROLES}
     for body in included_bodies:
         for face in wglink_core._items(getattr(body, "faces", None)):
             role = _face_role(face)
             if role and _face_key(face) not in claimed:
                 painted[role].append(face)
-    for role in SOURCE_ROLES:
+    for role in RECOGNISED_SOURCE_ROLES:
         faces = painted[role]
         if not faces:
             continue
@@ -1303,7 +1322,7 @@ def _sources(records: list[dict[str, Any]], included_bodies: list[object]) -> li
         )
     if not sources:
         raise wglink_core.WgLinkError(
-            "Return export has no drivable source. Paint an included face LF, MF, HF, or PORT_EXIT and try again."
+            "Return export has no drivable source. Paint an included face LF, MF, HF, or PASSIVE_CARDIOID and try again."
         )
     return sources
 

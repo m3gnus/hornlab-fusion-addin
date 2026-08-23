@@ -89,7 +89,8 @@ ROLE_COLOURS = {
     "MF": (255, 187, 0, 255),
     "LF": (0, 76, 255, 255),
     "DAMP": (21, 255, 0, 255),
-    "PORT_EXIT": (68, 150, 72, 0),
+    "PASSIVE_CARDIOID": (68, 150, 72, 0),
+    "PORT_EXIT": (68, 150, 72, 0),  # legacy role name, same colour
 }
 _PAYLOAD_KEYS = {
     "assembly_from_link",

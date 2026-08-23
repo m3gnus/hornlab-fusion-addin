@@ -518,7 +518,7 @@ def test_set_wg_source_offers_the_four_roles_and_a_clear(monkeypatch) -> None:
 
     assert added == ["source_faces", "source_role", "source_help"]
     assert [label for label, _selected in listed["source_role"]] == [
-        "LF", "MF", "HF", "PORT_EXIT", "Clear WG source",
+        "LF", "MF", "HF", "PASSIVE_CARDIOID", "Clear WG source",
     ]
     assert [label for label, selected in listed["source_role"] if selected] == ["HF"]
     # The dialog teaches the convention rather than assuming it is known.
@@ -678,6 +678,8 @@ def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
         "_named_appearance",
         lambda _app, _design, name: minted.append(name),
     )
+    # PORT_EXIT is the retired spelling of PASSIVE_CARDIOID; Clear still has
+    # to recognise -- and strip -- a face painted under the old name.
     role, painted = _fake_face("PORT_EXIT"), _fake_face("Steel - Satin")
     inputs = _dialog_inputs(
         source_faces=_SelectionInput([role, painted]),

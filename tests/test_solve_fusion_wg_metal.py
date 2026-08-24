@@ -827,6 +827,13 @@ def test_pressure_basis_npz_embeds_surface_avg_area_and_normalization(tmp_path):
         observation_angles_deg=np.array([0.0, 90.0]),
         observation_planes=np.array(["horizontal"]),
         pressure_complex=np.ones((2, 1, 2), dtype=np.complex128),
+        sphere_pressure_complex=np.full(
+            (2, 12),
+            1.0 + 0.25j,
+            dtype=np.complex128,
+        ),
+        sphere_theta_deg=np.repeat(np.array([0.0, 90.0, 180.0]), 4),
+        sphere_phi_deg=np.tile(np.array([0.0, 90.0, 180.0, 270.0]), 3),
         surface_pressure_avg={3: np.array([1.0 + 0.5j, 2.0 + 0.25j])},
     )
     path = tmp_path / "MF_pressure_basis.npz"
@@ -849,6 +856,17 @@ def test_pressure_basis_npz_embeds_surface_avg_area_and_normalization(tmp_path):
             data["surface_pressure_avg_solver"],
             np.array([1.0 + 0.5j, 2.0 + 0.25j]),
         )
+        np.testing.assert_allclose(data["sphere_pressure_complex"], 1.0 - 0.25j)
+        np.testing.assert_array_equal(
+            data["sphere_theta_deg"],
+            result.sphere_theta_deg,
+        )
+        np.testing.assert_array_equal(data["sphere_phi_deg"], result.sphere_phi_deg)
+
+    loaded = module._load_pressure_basis(path)
+    np.testing.assert_allclose(loaded.sphere_pressure_complex, 1.0 - 0.25j)
+    np.testing.assert_array_equal(loaded.sphere_theta_deg, result.sphere_theta_deg)
+    np.testing.assert_array_equal(loaded.sphere_phi_deg, result.sphere_phi_deg)
 
 
 def _load_regen_driver():
@@ -1236,6 +1254,8 @@ def test_solver_is_canonical_hornlab_metal_bem():
     assert cfg.velocity_sources == {4: 1.0}
     assert cfg.formulation == "complex_k"
     assert cfg.complex_k_shift == 0.005
+    assert cfg.observation.sphere_grid == (37, 72)
+    assert cfg.observation.sphere_theta_max_deg == 180.0
     # Default keeps the strict cut-plane open-edge guard.
     assert cfg.native_check_open_edges is True
 
@@ -3629,6 +3649,149 @@ def test_directivity_power_integration_monopole_and_dipole():
         10.0 * np.log10(3.0),
         atol=2.0e-4,
     )
+
+
+def test_directivity_power_prefers_balloon_and_records_full_sphere_method(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script()
+    freqs = np.array([100.0, 500.0], dtype=np.float64)
+    angles = np.array([0.0, 90.0, 180.0], dtype=np.float64)
+    planes = np.array(["horizontal", "vertical"], dtype=str)
+    cut_pressure = np.ones((freqs.size, planes.size, angles.size), dtype=np.complex128)
+    theta = np.repeat(np.array([0.0, 90.0, 180.0]), 4)
+    phi = np.tile(np.array([0.0, 90.0, 180.0, 270.0]), 3)
+    sphere_pressure = np.ones((freqs.size, theta.size), dtype=np.complex128)
+    calls = []
+
+    def fake_sphere_power_metrics(pressure, theta_deg, phi_deg, **kwargs):
+        calls.append((pressure, theta_deg, phi_deg, kwargs))
+        count = np.asarray(pressure).shape[0]
+        return {
+            "directivity_index_db": np.full(count, 1.25),
+            "power_response_db": np.full(count, 88.0),
+            "on_axis_spl_db": np.full(count, 89.25),
+            "acoustic_power_w": np.full(count, 0.5),
+            "spatial_average_intensity_w_m2": np.full(count, 0.01),
+            "solid_angle_sum_sr": 4.0 * np.pi,
+            "solid_angle_coverage_fraction": 1.0,
+            "polar_angles_deg": np.array([0.0, 90.0, 180.0]),
+            "polar_weights_sr": np.array([1.0, 2.0, 1.0]) * np.pi,
+            "approximation": module.FULL_SPHERE_POWER_NOTE,
+            "method": module.FULL_SPHERE_POWER_NOTE,
+        }
+
+    monkeypatch.setattr(
+        module,
+        "HORNLAB_PLOTS_MODULE",
+        SimpleNamespace(sphere_power_metrics=fake_sphere_power_metrics),
+    )
+    result = SimpleNamespace(
+        pressure_complex=cut_pressure,
+        observation_angles_deg=angles,
+        sphere_pressure_complex=sphere_pressure,
+        sphere_theta_deg=theta,
+        sphere_phi_deg=phi,
+    )
+
+    metrics = module._directivity_power_metrics_from_result(
+        result,
+        polar_distance_m=2.0,
+    )
+
+    assert metrics["method"] == module.FULL_SPHERE_POWER_NOTE
+    np.testing.assert_allclose(metrics["directivity_index_db"], 1.25)
+    assert len(calls) == 1
+    assert calls[0][3]["distance_m"] == 2.0
+
+    plot_kwargs = {}
+
+    def capture_plot(*_args, **kwargs):
+        plot_kwargs.update(kwargs)
+
+    monkeypatch.setattr(module, "save_directivity_power_plot", capture_plot)
+    monkeypatch.setattr(module, "save_beamwidth_plot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "save_group_delay_plot", lambda *_args, **_kwargs: None)
+    module._write_pressure_grid_derived_artifacts(
+        tmp_path,
+        "MF",
+        label="MF",
+        frequencies_hz=freqs,
+        angles_deg=angles,
+        planes=planes,
+        pressure_complex=cut_pressure,
+        sphere_pressure_complex=sphere_pressure,
+        sphere_theta_deg=theta,
+        sphere_phi_deg=phi,
+        polar_distance_m=2.0,
+        mesh_valid_hz=None,
+        mesh_valid_radiating_hz=None,
+    )
+
+    assert plot_kwargs["footnote"] == module.FULL_SPHERE_POWER_NOTE
+    payload = json.loads(
+        (tmp_path / "MF_directivity_index_power_response.json").read_text()
+    )
+    assert payload["method"] == module.FULL_SPHERE_POWER_NOTE
+    with (tmp_path / "MF_directivity_index_power_response.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["method"] == module.FULL_SPHERE_POWER_NOTE
+
+
+def test_directivity_power_without_balloon_preserves_polar_cut_numbers():
+    module = _load_script()
+    angles = np.linspace(0.0, 180.0, 181)
+    pressure = np.cos(np.deg2rad(angles))[None, None, :].astype(np.complex128)
+    expected = module._directivity_power_metrics_from_pressure(
+        pressure,
+        angles,
+        polar_distance_m=1.0,
+    )
+
+    actual = module._directivity_power_metrics_from_available_pressure(
+        pressure,
+        angles,
+        polar_distance_m=1.0,
+    )
+
+    for key in (
+        "directivity_index_db",
+        "power_response_db",
+        "on_axis_spl_db",
+        "acoustic_power_w",
+        "spatial_average_intensity_w_m2",
+        "solid_angle_sum_sr",
+        "solid_angle_coverage_fraction",
+        "polar_angles_deg",
+        "polar_weights_sr",
+    ):
+        np.testing.assert_array_equal(actual[key], expected[key])
+    assert actual["method"] == module.POLAR_POWER_APPROXIMATION_NOTE
+
+
+def test_directivity_power_without_new_plots_api_falls_back(monkeypatch):
+    module = _load_script()
+    angles = np.array([0.0, 90.0, 180.0])
+    pressure = np.ones((1, 1, angles.size), dtype=np.complex128)
+    theta = np.repeat(angles, 4)
+    phi = np.tile(np.array([0.0, 90.0, 180.0, 270.0]), angles.size)
+    monkeypatch.setattr(module, "HORNLAB_PLOTS_MODULE", SimpleNamespace())
+
+    metrics = module._directivity_power_metrics_from_available_pressure(
+        pressure,
+        angles,
+        polar_distance_m=1.0,
+        sphere_pressure_complex=np.ones((1, theta.size), dtype=np.complex128),
+        sphere_theta_deg=theta,
+        sphere_phi_deg=phi,
+    )
+
+    assert metrics["method"] == module.POLAR_POWER_APPROXIMATION_NOTE
+    np.testing.assert_allclose(metrics["directivity_index_db"], 0.0, atol=1.0e-12)
 
 
 def test_beamwidth_minus6_db_synthetic_beam_per_plane():

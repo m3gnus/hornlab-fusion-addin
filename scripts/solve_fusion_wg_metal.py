@@ -87,6 +87,7 @@ from hornlab_metal_bem import (  # noqa: E402
 
 # Recorded in manifests: where the helper packages actually resolved from.
 HORNLAB_SIM_DIR = Path(sys.modules["hornlab_sim"].__file__).resolve().parent
+HORNLAB_PLOTS_MODULE = sys.modules["hornlab_plots"]
 HORNLAB_PLOTS_DIR = Path(sys.modules["hornlab_plots"].__file__).resolve().parent
 METAL_BEM_DIR = Path(sys.modules["hornlab_metal_bem"].__file__).resolve().parent
 
@@ -318,6 +319,9 @@ class PressureBasis:
         observation_angles_deg: np.ndarray,
         observation_planes: np.ndarray,
         pressure_complex: np.ndarray,
+        sphere_pressure_complex: np.ndarray | None = None,
+        sphere_theta_deg: np.ndarray | None = None,
+        sphere_phi_deg: np.ndarray | None = None,
         source_normalization: str = "unit_normal_acceleration",
         surface_pressure_avg_solver: np.ndarray | None = None,
         source_area_m2: float | None = None,
@@ -329,6 +333,9 @@ class PressureBasis:
         self.observation_angles_deg = observation_angles_deg
         self.observation_planes = observation_planes
         self.pressure_complex = pressure_complex
+        self.sphere_pressure_complex = sphere_pressure_complex
+        self.sphere_theta_deg = sphere_theta_deg
+        self.sphere_phi_deg = sphere_phi_deg
         self.source_normalization = source_normalization
         self.surface_pressure_avg_solver = surface_pressure_avg_solver
         self.source_area_m2 = source_area_m2
@@ -702,6 +709,19 @@ def _write_pressure_basis_npz(
         "phase_convention": np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
         "source_normalization": np.asarray("unit_normal_acceleration"),
     }
+    sphere_pressure = getattr(result, "sphere_pressure_complex", None)
+    sphere_theta = getattr(result, "sphere_theta_deg", None)
+    sphere_phi = getattr(result, "sphere_phi_deg", None)
+    if sphere_pressure is not None and sphere_theta is not None and sphere_phi is not None:
+        arrays.update(
+            {
+                "sphere_pressure_complex": np.conjugate(
+                    np.asarray(sphere_pressure, dtype=np.complex128)
+                ),
+                "sphere_theta_deg": np.asarray(sphere_theta, dtype=np.float64),
+                "sphere_phi_deg": np.asarray(sphere_phi, dtype=np.float64),
+            }
+        )
     if str(source_motion) != "normal":
         arrays["source_motion"] = np.asarray(str(source_motion))
     surface_pressure_avg = _surface_pressure_avg_for_tag(result, source_tag)
@@ -723,6 +743,14 @@ def _pressure_basis_from_result(
     source_area_m2: float | None = None,
     source_motion: str = "normal",
 ) -> PressureBasis:
+    sphere_pressure = getattr(result, "sphere_pressure_complex", None)
+    sphere_theta = getattr(result, "sphere_theta_deg", None)
+    sphere_phi = getattr(result, "sphere_phi_deg", None)
+    has_sphere = (
+        sphere_pressure is not None
+        and sphere_theta is not None
+        and sphere_phi is not None
+    )
     return PressureBasis(
         source_name=source_name,
         source_tag=source_tag,
@@ -734,6 +762,17 @@ def _pressure_basis_from_result(
         observation_planes=np.asarray(result.observation_planes, dtype=str),
         pressure_complex=np.conjugate(
             np.asarray(result.pressure_complex, dtype=np.complex128)
+        ),
+        sphere_pressure_complex=(
+            np.conjugate(np.asarray(sphere_pressure, dtype=np.complex128))
+            if has_sphere
+            else None
+        ),
+        sphere_theta_deg=(
+            np.asarray(sphere_theta, dtype=np.float64) if has_sphere else None
+        ),
+        sphere_phi_deg=(
+            np.asarray(sphere_phi, dtype=np.float64) if has_sphere else None
         ),
         source_normalization="unit_normal_acceleration",
         surface_pressure_avg_solver=_surface_pressure_avg_for_tag(result, source_tag),
@@ -749,6 +788,7 @@ def _write_active_pressure_npz(
     *,
     source_normalization: str,
     source_area_m2: float | None = None,
+    sphere_pressure_complex: np.ndarray | None = None,
 ) -> None:
     arrays: dict[str, Any] = {
         "source_name": np.asarray(basis.source_name),
@@ -763,6 +803,27 @@ def _write_active_pressure_npz(
         "phase_convention": np.asarray(PRESSURE_NPZ_PHASE_CONVENTION),
         "source_normalization": np.asarray(source_normalization),
     }
+    if (
+        sphere_pressure_complex is not None
+        and basis.sphere_theta_deg is not None
+        and basis.sphere_phi_deg is not None
+    ):
+        arrays.update(
+            {
+                "sphere_pressure_complex": np.asarray(
+                    sphere_pressure_complex,
+                    dtype=np.complex128,
+                ),
+                "sphere_theta_deg": np.asarray(
+                    basis.sphere_theta_deg,
+                    dtype=np.float64,
+                ),
+                "sphere_phi_deg": np.asarray(
+                    basis.sphere_phi_deg,
+                    dtype=np.float64,
+                ),
+            }
+        )
     area = source_area_m2 if source_area_m2 is not None else basis.source_area_m2
     if area is not None:
         arrays["source_area_m2"] = np.asarray(float(area), dtype=np.float64)
@@ -777,6 +838,7 @@ def _active_pressure_basis(
     *,
     source_normalization: str,
     source_area_m2: float | None = None,
+    sphere_pressure_complex: np.ndarray | None = None,
 ) -> PressureBasis:
     return PressureBasis(
         source_name=basis.source_name,
@@ -785,6 +847,13 @@ def _active_pressure_basis(
         observation_angles_deg=basis.observation_angles_deg,
         observation_planes=basis.observation_planes,
         pressure_complex=np.asarray(pressure_complex, dtype=np.complex128),
+        sphere_pressure_complex=(
+            None
+            if sphere_pressure_complex is None
+            else np.asarray(sphere_pressure_complex, dtype=np.complex128)
+        ),
+        sphere_theta_deg=basis.sphere_theta_deg,
+        sphere_phi_deg=basis.sphere_phi_deg,
         source_normalization=source_normalization,
         surface_pressure_avg_solver=basis.surface_pressure_avg_solver,
         source_area_m2=source_area_m2 if source_area_m2 is not None else basis.source_area_m2,
@@ -823,6 +892,23 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
         source_motion = "normal"
         if "source_motion" in data:
             source_motion = str(np.asarray(data["source_motion"]).item())
+        sphere_pressure = None
+        sphere_theta = None
+        sphere_phi = None
+        if all(
+            name in data
+            for name in (
+                "sphere_pressure_complex",
+                "sphere_theta_deg",
+                "sphere_phi_deg",
+            )
+        ):
+            sphere_pressure = np.asarray(
+                data["sphere_pressure_complex"],
+                dtype=np.complex128,
+            )
+            sphere_theta = np.asarray(data["sphere_theta_deg"], dtype=np.float64)
+            sphere_phi = np.asarray(data["sphere_phi_deg"], dtype=np.float64)
         return PressureBasis(
             source_name=str(data["source_name"].item()),
             source_tag=int(data["source_tag"]),
@@ -833,6 +919,9 @@ def _load_pressure_basis(path: Path) -> PressureBasis:
             ),
             observation_planes=np.asarray(data["observation_planes"], dtype=str),
             pressure_complex=_pressure_complex_from_npz(data, path=path),
+            sphere_pressure_complex=sphere_pressure,
+            sphere_theta_deg=sphere_theta,
+            sphere_phi_deg=sphere_phi,
             source_normalization=source_normalization,
             surface_pressure_avg_solver=surface_pressure_avg,
             source_area_m2=source_area_m2,
@@ -1026,7 +1115,7 @@ def _interp_pressure_grid(
     *,
     common_delay_s: float = 0.0,
 ) -> np.ndarray:
-    """Interpolate a ``(nf, n_plane, n_angle)`` complex grid onto ``freqs_dst``.
+    """Interpolate a complex direction grid onto ``freqs_dst``.
 
     Magnitude and unwrapped residual phase are interpolated separately after
     removing the shared propagation delay. Frequencies above the source
@@ -1034,30 +1123,36 @@ def _interp_pressure_grid(
     solve contributes nothing beyond its solved band (where its crossover
     filter weight is negligible anyway).
     """
-    nf, n_planes, n_angles = pressure.shape
-    out = np.zeros((freqs_dst.size, n_planes, n_angles), dtype=np.complex128)
+    values = np.asarray(pressure, dtype=np.complex128)
+    if values.ndim < 2 or values.shape[0] != freqs_src.size:
+        raise ValueError("pressure grid must begin with its frequency dimension")
+    direction_shape = values.shape[1:]
+    flat_values = values.reshape(values.shape[0], -1)
+    flat_out = np.zeros(
+        (freqs_dst.size, flat_values.shape[1]),
+        dtype=np.complex128,
+    )
     inside = freqs_dst <= float(freqs_src[-1]) * (1.0 + 1.0e-9)
     if not np.any(inside):
-        return out
+        return flat_out.reshape((freqs_dst.size, *direction_shape))
     delay_removed = np.exp(
         1j * 2.0 * np.pi * freqs_src * float(common_delay_s)
     )
     delay_restored = np.exp(
         -1j * 2.0 * np.pi * freqs_dst[inside] * float(common_delay_s)
     )
-    for plane in range(n_planes):
-        for angle in range(n_angles):
-            values = pressure[:, plane, angle]
-            mag = np.interp(freqs_dst[inside], freqs_src, np.abs(values))
-            phase = np.interp(
-                freqs_dst[inside],
-                freqs_src,
-                np.unwrap(np.angle(values * delay_removed)),
-            )
-            out[inside, plane, angle] = (
-                mag * np.exp(1j * phase) * delay_restored
-            )
-    return out
+    for direction in range(flat_values.shape[1]):
+        direction_values = flat_values[:, direction]
+        mag = np.interp(freqs_dst[inside], freqs_src, np.abs(direction_values))
+        phase = np.interp(
+            freqs_dst[inside],
+            freqs_src,
+            np.unwrap(np.angle(direction_values * delay_removed)),
+        )
+        flat_out[inside, direction] = (
+            mag * np.exp(1j * phase) * delay_restored
+        )
+    return flat_out.reshape((freqs_dst.size, *direction_shape))
 
 
 def _harmonize_bases(
@@ -1113,6 +1208,78 @@ def _harmonize_bases(
                 common_delay_s=common_delay_s,
             )
     return master, grids, solved_top
+
+
+def _harmonize_sphere_bases(
+    bases: dict[str, PressureBasis],
+    master_frequencies_hz: np.ndarray,
+    *,
+    common_delay_s: float = 0.0,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray] | None:
+    """Harmonize optional balloon grids, returning ``None`` if unavailable."""
+    names = list(bases)
+    reference = bases[names[0]]
+    if any(
+        getattr(reference, attr) is None
+        for attr in (
+            "sphere_pressure_complex",
+            "sphere_theta_deg",
+            "sphere_phi_deg",
+        )
+    ):
+        return None
+    theta = np.asarray(reference.sphere_theta_deg, dtype=np.float64)
+    phi = np.asarray(reference.sphere_phi_deg, dtype=np.float64)
+    for name in names[1:]:
+        basis = bases[name]
+        if any(
+            getattr(basis, attr) is None
+            for attr in (
+                "sphere_pressure_complex",
+                "sphere_theta_deg",
+                "sphere_phi_deg",
+            )
+        ):
+            return None
+        other_theta = np.asarray(basis.sphere_theta_deg, dtype=np.float64)
+        other_phi = np.asarray(basis.sphere_phi_deg, dtype=np.float64)
+        if (
+            other_theta.shape != theta.shape
+            or other_phi.shape != phi.shape
+            or not np.allclose(other_theta, theta, rtol=1.0e-8, atol=1.0e-10)
+            or not np.allclose(other_phi, phi, rtol=1.0e-8, atol=1.0e-10)
+        ):
+            LOGGER.warning(
+                "Sphere grids differ between %s and %s; combined DI/power "
+                "will use the polar-cut estimate.",
+                reference.source_name,
+                basis.source_name,
+            )
+            return None
+
+    sphere_grids: dict[str, np.ndarray] = {}
+    for name in names:
+        basis = bases[name]
+        freqs = np.asarray(basis.frequencies_hz, dtype=np.float64)
+        sphere_pressure = np.asarray(
+            basis.sphere_pressure_complex,
+            dtype=np.complex128,
+        )
+        if freqs.shape == master_frequencies_hz.shape and np.allclose(
+            freqs,
+            master_frequencies_hz,
+            rtol=1.0e-8,
+            atol=1.0e-10,
+        ):
+            sphere_grids[name] = sphere_pressure
+        else:
+            sphere_grids[name] = _interp_pressure_grid(
+                freqs,
+                sphere_pressure,
+                master_frequencies_hz,
+                common_delay_s=common_delay_s,
+            )
+    return sphere_grids, theta, phi
 
 
 def _directivity_payload_from_pressure(
@@ -2130,6 +2297,11 @@ def _write_crossover_alignment_outputs(
             "status": "skipped",
             "reason": f"pressure grids are not summable: {exc}",
         }
+    sphere_harmonized = _harmonize_sphere_bases(
+        bases,
+        freqs,
+        common_delay_s=float(polar_distance_m) / SPEED_OF_SOUND_M_S,
+    )
 
     angles_deg = bases[members[0]].observation_angles_deg
     planes = bases[members[0]].observation_planes
@@ -2300,6 +2472,20 @@ def _write_crossover_alignment_outputs(
         for name in members
     }
     combined_pressure_grid = sum(aligned_grids[name] for name in members)
+    combined_sphere_pressure = None
+    sphere_theta_deg = None
+    sphere_phi_deg = None
+    if sphere_harmonized is not None:
+        sphere_grids, sphere_theta_deg, sphere_phi_deg = sphere_harmonized
+        aligned_sphere_grids = {}
+        for name in members:
+            sphere_grid = sphere_grids[name]
+            scale = weights[name] * level_gain_linear[name] * delay_phase[name]
+            scale_shape = (scale.size,) + (1,) * (sphere_grid.ndim - 1)
+            aligned_sphere_grids[name] = sphere_grid * scale.reshape(scale_shape)
+        combined_sphere_pressure = sum(
+            aligned_sphere_grids[name] for name in members
+        )
     heatmap_png = out_dir / "combined_directivity_heatmap_time_aligned.png"
     save_directivity_plot(
         heatmap_png,
@@ -2324,6 +2510,9 @@ def _write_crossover_alignment_outputs(
             angles_deg=angles_deg,
             planes=planes,
             pressure_complex=combined_pressure_grid,
+            sphere_pressure_complex=combined_sphere_pressure,
+            sphere_theta_deg=sphere_theta_deg,
+            sphere_phi_deg=sphere_phi_deg,
             polar_distance_m=polar_distance_m,
             mesh_valid_hz=mesh_valid_hz,
             mesh_valid_radiating_hz=mesh_valid_radiating_hz,
@@ -2500,6 +2689,14 @@ POLAR_POWER_APPROXIMATION_NOTE = (
     "polar angle, solid-angle weighted, and extrapolated to 4*pi; this is not "
     "a full-sphere integration."
 )
+FULL_SPHERE_POWER_NOTE = getattr(
+    HORNLAB_PLOTS_MODULE,
+    "FULL_SPHERE_POWER_NOTE",
+    (
+        "Full-sphere integration of the solved balloon: intensity is "
+        "solid-angle weighted over n_theta x n_phi directions."
+    ),
+)
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list[float | str | None]]) -> None:
@@ -2507,6 +2704,8 @@ def _write_csv(path: Path, header: list[str], rows: list[list[float | str | None
         if value is None:
             return ""
         if isinstance(value, str):
+            if any(character in value for character in (",", '"', "\n", "\r")):
+                return '"' + value.replace('"', '""') + '"'
             return value
         number = float(value)
         if not np.isfinite(number):
@@ -2622,7 +2821,98 @@ def _directivity_power_metrics_from_pressure(
         "polar_angles_deg": np.degrees(theta),
         "polar_weights_sr": weights,
         "approximation": POLAR_POWER_APPROXIMATION_NOTE,
+        "method": POLAR_POWER_APPROXIMATION_NOTE,
     }
+
+
+def _directivity_power_metrics_from_available_pressure(
+    pressure_complex: np.ndarray,
+    angles_deg: np.ndarray,
+    *,
+    polar_distance_m: float,
+    sphere_pressure_complex: np.ndarray | None = None,
+    sphere_theta_deg: np.ndarray | None = None,
+    sphere_phi_deg: np.ndarray | None = None,
+    log_label: str = "pressure grid",
+) -> dict[str, Any]:
+    """Prefer a solved balloon and retain the polar-cut compatibility path.
+
+    Counterpart weighting: Waveguide Generator's
+    ``server/solver/directivity_index.py``. The reusable implementation lives
+    in ``hornlab_plots.derived.sphere_power_metrics`` so both callers agree.
+    """
+    sphere_power_metrics = getattr(
+        HORNLAB_PLOTS_MODULE,
+        "sphere_power_metrics",
+        None,
+    )
+    has_sphere = all(
+        value is not None
+        for value in (
+            sphere_pressure_complex,
+            sphere_theta_deg,
+            sphere_phi_deg,
+        )
+    )
+    if has_sphere and callable(sphere_power_metrics):
+        try:
+            metrics = sphere_power_metrics(
+                sphere_pressure_complex,
+                sphere_theta_deg,
+                sphere_phi_deg,
+                distance_m=polar_distance_m,
+                rho=float(radiation_impedance.RHO_AIR),
+                c=float(radiation_impedance.C_AIR),
+                p_ref=P_REF,
+            )
+        except (TypeError, ValueError) as exc:
+            LOGGER.warning(
+                "Full-sphere DI/power integration failed for %s (%s); "
+                "using the polar-cut estimate.",
+                log_label,
+                exc,
+            )
+        else:
+            note = str(metrics.get("method") or FULL_SPHERE_POWER_NOTE)
+            metrics["method"] = note
+            metrics.setdefault("approximation", note)
+            LOGGER.info("DI/power method for %s: %s", log_label, note)
+            print(f"DI/power method for {log_label}: {note}", flush=True)
+            return metrics
+
+    metrics = _directivity_power_metrics_from_pressure(
+        pressure_complex,
+        angles_deg,
+        polar_distance_m=polar_distance_m,
+    )
+    metrics["method"] = POLAR_POWER_APPROXIMATION_NOTE
+    LOGGER.info(
+        "DI/power method for %s: %s",
+        log_label,
+        POLAR_POWER_APPROXIMATION_NOTE,
+    )
+    print(
+        f"DI/power method for {log_label}: {POLAR_POWER_APPROXIMATION_NOTE}",
+        flush=True,
+    )
+    return metrics
+
+
+def _directivity_power_metrics_from_result(
+    result,
+    *,
+    polar_distance_m: float,
+) -> dict[str, Any]:
+    """Select full-sphere or polar-cut metrics directly from a solve result."""
+    return _directivity_power_metrics_from_available_pressure(
+        np.asarray(result.pressure_complex, dtype=np.complex128),
+        np.asarray(result.observation_angles_deg, dtype=np.float64),
+        polar_distance_m=polar_distance_m,
+        sphere_pressure_complex=getattr(result, "sphere_pressure_complex", None),
+        sphere_theta_deg=getattr(result, "sphere_theta_deg", None),
+        sphere_phi_deg=getattr(result, "sphere_phi_deg", None),
+        log_label="solve result",
+    )
 
 
 def _estimate_impulse_peak_delay_s(
@@ -2923,6 +3213,9 @@ def _write_pressure_grid_derived_artifacts(
     angles_deg: np.ndarray,
     planes: np.ndarray,
     pressure_complex: np.ndarray,
+    sphere_pressure_complex: np.ndarray | None = None,
+    sphere_theta_deg: np.ndarray | None = None,
+    sphere_phi_deg: np.ndarray | None = None,
     polar_distance_m: float,
     mesh_valid_hz: float | None,
     mesh_valid_radiating_hz: float | None,
@@ -2936,10 +3229,14 @@ def _write_pressure_grid_derived_artifacts(
     directivity_png = out_dir / f"{safe_stem}_directivity_index_power_response.png"
     directivity_csv = out_dir / f"{safe_stem}_directivity_index_power_response.csv"
     directivity_json = out_dir / f"{safe_stem}_directivity_index_power_response.json"
-    metrics = _directivity_power_metrics_from_pressure(
+    metrics = _directivity_power_metrics_from_available_pressure(
         pressure,
         angles,
         polar_distance_m=polar_distance_m,
+        sphere_pressure_complex=sphere_pressure_complex,
+        sphere_theta_deg=sphere_theta_deg,
+        sphere_phi_deg=sphere_phi_deg,
+        log_label=label,
     )
     save_directivity_power_plot(
         directivity_png,
@@ -2947,6 +3244,7 @@ def _write_pressure_grid_derived_artifacts(
         directivity_index_db=metrics["directivity_index_db"],
         power_response_db=metrics["power_response_db"],
         title=f"{label} Directivity Index and Power Response",
+        footnote=metrics["method"],
         mesh_valid_hz=mesh_valid_hz,
         mesh_valid_radiating_hz=mesh_valid_radiating_hz,
     )
@@ -2959,6 +3257,7 @@ def _write_pressure_grid_derived_artifacts(
             "acoustic_power_w",
             "on_axis_spl_db",
             "spatial_average_intensity_w_m2",
+            "method",
         ],
         [
             [
@@ -2968,6 +3267,7 @@ def _write_pressure_grid_derived_artifacts(
                 float(power_w),
                 float(on_axis),
                 float(avg_i),
+                metrics["method"],
             ]
             for freq, di, power_db, power_w, on_axis, avg_i in zip(
                 freqs,
@@ -2997,6 +3297,7 @@ def _write_pressure_grid_derived_artifacts(
             "solid_angle_coverage_fraction": metrics[
                 "solid_angle_coverage_fraction"
             ],
+            "method": metrics["method"],
             "polar_angles_deg": metrics["polar_angles_deg"],
             "polar_weights_sr": metrics["polar_weights_sr"],
             "approximation": metrics["approximation"],
@@ -3380,9 +3681,14 @@ def _voltage_drive_pressure(
         * np.asarray(cone_volume_velocity, dtype=np.complex128)
         / float(diaphragm_area_m2)
     )
-    return acceleration[:, None, None] * np.asarray(
-        basis_pressure, dtype=np.complex128
-    )
+    pressure = np.asarray(basis_pressure, dtype=np.complex128)
+    if pressure.ndim < 2 or pressure.shape[0] != acceleration.size:
+        raise ValueError(
+            "basis pressure must start with the same frequency dimension as "
+            "cone_volume_velocity"
+        )
+    scale_shape = (acceleration.size,) + (1,) * (pressure.ndim - 1)
+    return acceleration.reshape(scale_shape) * pressure
 
 
 def _source_result_by_name(source_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -4201,6 +4507,16 @@ def _apply_driver_lem_coupling(
             diaphragm_area_m2=source_area_m2,
             basis_pressure=basis.pressure_complex,
         )
+        sphere_pressure = (
+            None
+            if basis.sphere_pressure_complex is None
+            else _voltage_drive_pressure(
+                coupled.cone_volume_velocity,
+                frequencies_hz=basis.frequencies_hz,
+                diaphragm_area_m2=source_area_m2,
+                basis_pressure=basis.sphere_pressure_complex,
+            )
+        )
         safe_name = _safe_stem(matching_name)
         active_npz = out_dir / f"{safe_name}_driver_lem_pressure.npz"
         results_npz = out_dir / f"{safe_name}_driver_lem_results.npz"
@@ -4213,6 +4529,7 @@ def _apply_driver_lem_coupling(
             pressure,
             source_normalization="voltage_driven_driver_lem",
             source_area_m2=source_area_m2,
+            sphere_pressure_complex=sphere_pressure,
         )
         if not args.skip_driver_lem_artifacts:
             _write_active_pressure_npz(
@@ -4221,6 +4538,7 @@ def _apply_driver_lem_coupling(
                 pressure,
                 source_normalization="voltage_driven_driver_lem",
                 source_area_m2=source_area_m2,
+                sphere_pressure_complex=sphere_pressure,
             )
         directivity_db = _directivity_from_pressure_array(
             pressure,
@@ -4998,21 +5316,31 @@ def _build_config(
     freq_max_hz: float | None = None,
     source_motion: str = "normal",
 ) -> SolveConfig:
-    native_symmetry_plane = None if args.native_symmetry_plane == "none" else args.native_symmetry_plane
+    native_symmetry_plane = (
+        None
+        if args.native_symmetry_plane == "none"
+        else args.native_symmetry_plane
+    )
+    observation_kwargs: dict[str, Any] = {
+        "planes": ["horizontal", "vertical"],
+        "distance_m": args.polar_distance_m,
+        "angle_min_deg": args.polar_angle_min_deg,
+        "angle_max_deg": args.polar_angle_max_deg,
+        "angle_count": args.polar_angle_count,
+        "origin": "mouth",
+    }
+    observation_fields = getattr(ObservationConfig, "__dataclass_fields__", {})
+    if "sphere_grid" in observation_fields:
+        # Full physical sphere: native symmetry mirrors the modeled geometry;
+        # it is not an infinite-baffle/half-space radiation condition.
+        observation_kwargs["sphere_grid"] = (37, 72)
     return SolveConfig(
         freq_min_hz=args.freq_min_hz,
         freq_max_hz=args.freq_max_hz if freq_max_hz is None else freq_max_hz,
         freq_count=args.freq_count,
         freq_spacing=args.freq_spacing,
         velocity_sources={source_tag: 1.0},
-        observation=ObservationConfig(
-            planes=["horizontal", "vertical"],
-            distance_m=args.polar_distance_m,
-            angle_min_deg=args.polar_angle_min_deg,
-            angle_max_deg=args.polar_angle_max_deg,
-            angle_count=args.polar_angle_count,
-            origin="mouth",
-        ),
+        observation=ObservationConfig(**observation_kwargs),
         frame_override=frame,
         native_symmetry_plane=native_symmetry_plane,
         native_check_open_edges=args.native_check_open_edges,
@@ -5801,6 +6129,9 @@ def _apply_post_solve_derived_outputs(
                     angles_deg=basis.observation_angles_deg,
                     planes=basis.observation_planes,
                     pressure_complex=basis.pressure_complex,
+                    sphere_pressure_complex=basis.sphere_pressure_complex,
+                    sphere_theta_deg=basis.sphere_theta_deg,
+                    sphere_phi_deg=basis.sphere_phi_deg,
                     polar_distance_m=float(args.polar_distance_m),
                     mesh_valid_hz=source.get("mesh_valid_freq_max_hz"),
                     mesh_valid_radiating_hz=source.get("aperture_valid_freq_max_hz"),

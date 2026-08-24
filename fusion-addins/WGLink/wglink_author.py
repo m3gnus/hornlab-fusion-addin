@@ -11,7 +11,9 @@ Fusion.
 The two conventions this module encodes are not invented here:
 
 * a source is a face whose *appearance name* is exactly ``LF``, ``MF``, ``HF``
-  or ``PORT_EXIT`` (``wglink_send._face_role`` upper-cases and matches it), and
+  or ``PASSIVE_CARDIOID`` (``wglink_send._face_role`` upper-cases and matches
+  it against ``RECOGNISED_SOURCE_ROLES``, which also accepts the retired
+  ``PORT_EXIT`` spelling on faces painted before the rename), and
 * an unlinked ("Fusion-first") return is solved in the assembly frame itself:
   radiation along +Z, throat at z = 0, model centred on x = 0 and y = 0.  The
   solver hard-codes that identity frame; see ``assembly_frame_is_solver_frame``
@@ -37,15 +39,29 @@ class AuthorError(Exception):
 
 # ---------------------------------------------------------------- source roles
 
-SOURCE_ROLES = ("LF", "MF", "HF", "PORT_EXIT")
+SOURCE_ROLES = ("LF", "MF", "HF", "PASSIVE_CARDIOID")
 DEFAULT_SOURCE_ROLE = "HF"
 CLEAR_SOURCE_LABEL = "Clear WG source"
+
+# ``PORT_EXIT`` was the original name for the passive-cardioid port role.
+# Choosing or typing it still has to work -- and still has to land on the new
+# canonical role -- so existing habits and any saved dropdown selection do not
+# start erroring.
+LEGACY_SOURCE_ROLE_ALIASES = {"PORT_EXIT": "PASSIVE_CARDIOID"}
+
+# Every appearance name that counts as an already-painted source: the current
+# roles plus every retired spelling. Recognition (a face someone already
+# painted) has to accept this wider set; painting a *new* role only ever
+# offers ``SOURCE_ROLES``. Keeping the two separate is what lets a face
+# painted ``PORT_EXIT`` years ago keep reporting ``PORT_EXIT`` -- recognised,
+# never silently renamed.
+RECOGNISED_SOURCE_ROLES = SOURCE_ROLES + tuple(LEGACY_SOURCE_ROLE_ALIASES)
 
 _ROLE_MEANING = {
     "LF": "LF drive",
     "MF": "MF drive",
     "HF": "HF drive",
-    "PORT_EXIT": "port exit",
+    "PASSIVE_CARDIOID": "passive cardioid port",
 }
 
 
@@ -66,6 +82,7 @@ def resolve_source_choice(choice: object) -> str | None:
     if value.casefold() == CLEAR_SOURCE_LABEL.casefold():
         return None
     canonical = value.upper().replace(" ", "_").replace("-", "_")
+    canonical = LEGACY_SOURCE_ROLE_ALIASES.get(canonical, canonical)
     if canonical not in SOURCE_ROLES:
         raise AuthorError(
             f"{value!r} is not a WG source role. Choose one of "
@@ -105,12 +122,18 @@ def source_help_text(choice: object) -> str:
 
 
 def _canonical_role(value: object) -> str | None:
-    """The role a face already carries, or ``None`` for any other appearance."""
+    """The role a face already carries, or ``None`` for any other appearance.
+
+    Deliberately returns the *literal* painted name, never an alias-resolved
+    one: a face already painted ``PORT_EXIT`` is recognised as carrying a
+    role, but this never rewrites it to ``PASSIVE_CARDIOID`` on its own --
+    that only happens when the user explicitly repaints it.
+    """
 
     if not isinstance(value, str):
         return None
     canonical = value.strip().upper()
-    return canonical if canonical in SOURCE_ROLES else None
+    return canonical if canonical in RECOGNISED_SOURCE_ROLES else None
 
 
 @dataclass(frozen=True)
@@ -476,7 +499,7 @@ def frame_findings(
 
 NO_SOURCE_WARNING = (
     "No drivable source: use Set WG Source… to mark a face LF, MF, HF, or "
-    "PORT_EXIT. The export refuses without one."
+    "PASSIVE_CARDIOID. The export refuses without one."
 )
 DECLARE_BODY_HINT = "Use Declare Body… to classify it or leave it out."
 LOG_HINT = (

@@ -62,8 +62,25 @@ def test_the_appearance_name_is_the_role_spelled_exactly(author):
     for role in author.SOURCE_ROLES:
         assert author.role_appearance_name(role) == role
     assert author.role_appearance_name("hf") == "HF"
-    assert author.role_appearance_name("port exit") == "PORT_EXIT"
-    assert author.role_appearance_name("port-exit") == "PORT_EXIT"
+
+
+def test_legacy_port_exit_choice_resolves_to_the_new_role_name(author):
+    """PORT_EXIT was the old name for the passive-cardioid role.
+
+    Typing or choosing it -- in any case, with a space or a hyphen -- still
+    has to work, and has to land on the new canonical role rather than error
+    or paint the retired name onto a fresh face.
+    """
+
+    assert author.role_appearance_name("port exit") == "PASSIVE_CARDIOID"
+    assert author.role_appearance_name("port-exit") == "PASSIVE_CARDIOID"
+    assert author.role_appearance_name("PORT_EXIT") == "PASSIVE_CARDIOID"
+    assert author.resolve_source_choice("Port Exit") == "PASSIVE_CARDIOID"
+
+
+def test_recognised_source_roles_is_current_roles_plus_every_legacy_alias(author):
+    assert author.RECOGNISED_SOURCE_ROLES == author.SOURCE_ROLES + ("PORT_EXIT",)
+    assert author.LEGACY_SOURCE_ROLE_ALIASES == {"PORT_EXIT": "PASSIVE_CARDIOID"}
 
 
 def test_an_unknown_role_is_refused_rather_than_painted(author):
@@ -76,7 +93,9 @@ def test_an_unknown_role_is_refused_rather_than_painted(author):
 
 
 def test_the_dropdown_offers_four_roles_and_a_clear(author):
-    assert author.source_choices() == ("LF", "MF", "HF", "PORT_EXIT", "Clear WG source")
+    assert author.source_choices() == (
+        "LF", "MF", "HF", "PASSIVE_CARDIOID", "Clear WG source",
+    )
     assert author.DEFAULT_SOURCE_ROLE in author.SOURCE_ROLES
     assert author.resolve_source_choice(author.CLEAR_SOURCE_LABEL) is None
 
@@ -86,7 +105,11 @@ def test_the_dialog_copy_teaches_the_convention_in_one_line(author):
 
     assert "HF" in text and "WG solves" in text
     assert "\n" not in text
-    assert "appearance" in author.source_help_text("PORT_EXIT")
+    assert "appearance" in author.source_help_text("PASSIVE_CARDIOID")
+    # The legacy spelling resolves to the same help text as the new name.
+    assert author.source_help_text("PORT_EXIT") == author.source_help_text(
+        "PASSIVE_CARDIOID"
+    )
     assert "back to" in author.source_help_text(author.CLEAR_SOURCE_LABEL)
 
 
@@ -98,6 +121,19 @@ def test_painting_replaces_a_different_role_and_skips_the_matching_one(author):
     assert plan.clear == ()
     assert plan.unchanged == (2,)
     assert "300.0 mm²" in plan.summary
+
+
+def test_painting_the_cardioid_role_over_a_legacy_port_exit_face_repaints_it(author):
+    """A legacy PORT_EXIT face is recognised, but choosing the cardioid role
+    on it is an explicit user action, so it does get repainted to the new
+    appearance name -- unlike merely re-exporting, which must not rename it.
+    """
+
+    plan = author.plan_source_assignment(faces("PORT_EXIT"), "PASSIVE_CARDIOID")
+
+    assert plan.appearance_name == "PASSIVE_CARDIOID"
+    assert plan.paint == (0,)
+    assert plan.unchanged == ()
 
 
 def test_repainting_only_matching_faces_reports_that_nothing_changed(author):

@@ -69,7 +69,7 @@ COMMANDS = {
     "source": (
         "hornlab_wglink_set_source",
         "Set WG Source…",
-        "Mark the selected faces as the LF, MF, HF, or PORT_EXIT drive source.",
+        "Mark the selected faces as the LF, MF, HF, or PASSIVE_CARDIOID drive source.",
     ),
     "declare": (
         "hornlab_wglink_declare_body",

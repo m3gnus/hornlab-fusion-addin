@@ -411,6 +411,40 @@ def test_user_source_inventory_converts_area_and_excludes_claimed_throat(send_mo
     assert all("advanced_face_indices" not in source["selectors"] for source in sources)
 
 
+def test_face_role_recognises_the_new_name_and_the_legacy_one(send_module):
+    """PORT_EXIT is the retired name for PASSIVE_CARDIOID.  A face painted
+    under either name is a recognised source, and _face_role reports back
+    whichever name is literally painted -- never rewriting the legacy one.
+    """
+
+    assert send_module._face_role(face("PASSIVE_CARDIOID")) == "PASSIVE_CARDIOID"
+    assert send_module._face_role(face("PORT_EXIT")) == "PORT_EXIT"
+    assert send_module._face_role(face("Steel - Satin")) is None
+
+
+def test_a_legacy_port_exit_face_still_exports_as_port_exit(send_module):
+    """The exported role feeds the return-state identity: a face nobody
+    repainted has to keep exporting under its original name, or every
+    existing model built before the rename would read as changed.
+    """
+
+    legacy = body("port", faces=[face("PORT_EXIT", area=2.5)])
+
+    sources = send_module._sources([], [legacy])
+
+    assert [source["role"] for source in sources] == ["PORT_EXIT"]
+    assert sources[0]["suggested_resolution_mm"] == pytest.approx(25.0)
+
+
+def test_a_newly_painted_cardioid_face_exports_under_the_new_name(send_module):
+    fresh = body("port", faces=[face("PASSIVE_CARDIOID", area=2.5)])
+
+    sources = send_module._sources([], [fresh])
+
+    assert [source["role"] for source in sources] == ["PASSIVE_CARDIOID"]
+    assert sources[0]["suggested_resolution_mm"] == pytest.approx(25.0)
+
+
 def test_shape_fingerprint_includes_source_roles_and_face_geometry(send_module):
     candidate = body("speaker", faces=[face("MF", area=2.5)])
 

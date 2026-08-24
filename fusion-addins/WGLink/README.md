@@ -65,8 +65,11 @@ authoring-remedy, and recovery UI rather than the normal workflow. Audit and
 Relink remain full head-less APIs but are not panel commands.
 
 - **Set WG Source…** marks the selected faces as the `LF`, `MF`, `HF` or
-  `PORT_EXIT` drive source by creating (or reusing) an appearance named exactly
-  after the role and painting it on. That appearance name *is* the convention
+  `PASSIVE_CARDIOID` drive source by creating (or reusing) an appearance named
+  exactly after the role and painting it on. (`PASSIVE_CARDIOID` was named
+  `PORT_EXIT` before this rename; a face already painted `PORT_EXIT` is still
+  recognised as a source and keeps exporting under that name — only a newly
+  painted face gets the new name.) That appearance name *is* the convention
   the export reads, and it is the one thing a model built from scratch in Fusion
   cannot be sent without; before this command it had to be authored by renaming
   a Fusion appearance by hand. The same dialog clears a role, which strips only

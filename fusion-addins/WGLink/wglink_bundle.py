@@ -26,9 +26,24 @@ import unicodedata
 import zipfile
 
 
+SOURCE_INTERFACE_FEATURE = "source-interface-v1"
 SUPPORTED_FEATURES = frozenset(
-    {"checksummed-files-v1", "link-local-frame-v1"}
+    {"checksummed-files-v1", "link-local-frame-v1", SOURCE_INTERFACE_FEATURE}
 )
+# Mirrors hornlab_mesher.cad._SOURCE_INTERFACE_KEYS / _SOURCE_PATCH_POLICIES. The
+# writer and this reader are the two halves of one contract, so they move together.
+SOURCE_INTERFACE_KEYS = frozenset(
+    {
+        "id",
+        "role",
+        "required",
+        "default_drive_channel_id",
+        "patch_policy",
+        "expected_connected_components",
+        "suggested_resolution_mm",
+    }
+)
+SOURCE_PATCH_POLICIES = frozenset({"single-connected", "explicit-disconnected"})
 TAG_AREA_TOLERANCE = 0.01
 IDENTITY_MATRIX = (
     (1.0, 0.0, 0.0, 0.0),
@@ -468,6 +483,78 @@ def _finite_number(value: object, *, label: str) -> float:
     return number
 
 
+def _validate_source_interface(manifest: Mapping[str, Any]) -> None:
+    """Check the ``source-interface-v1`` table WG stamps onto every bundle.
+
+    The add-in does not read the table to drive geometry -- the linked throat
+    already carries its own ``source_role`` attribute -- but declaring support
+    for a feature means failing loudly on a malformed table rather than
+    silently ignoring it.
+    """
+
+    interface = manifest.get("interface")
+    raw = interface.get("sources") if isinstance(interface, Mapping) else None
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        raise WgLinkError("interface.sources must be an array")
+
+    declared = SOURCE_INTERFACE_FEATURE in manifest.get("required_features", [])
+    if bool(raw) != declared:
+        raise WgLinkError(
+            f"{SOURCE_INTERFACE_FEATURE} is required exactly when "
+            "interface.sources is non-empty"
+        )
+
+    seen: set[str] = set()
+    for index, record in enumerate(raw):
+        label = f"interface.sources[{index}]"
+        if not isinstance(record, Mapping):
+            raise WgLinkError(f"{label} must be an object")
+        unknown = sorted(set(record).difference(SOURCE_INTERFACE_KEYS))
+        missing = sorted(SOURCE_INTERFACE_KEYS.difference(record))
+        if unknown or missing:
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if unknown:
+                details.append("unknown " + ", ".join(unknown))
+            raise WgLinkError(f"{label} is invalid: {'; '.join(details)}")
+        for key in ("id", "role", "default_drive_channel_id"):
+            value = record[key]
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise WgLinkError(f"{label}.{key} must be a non-empty trimmed string")
+        source_id = str(record["id"])
+        if source_id in seen:
+            raise WgLinkError(f"interface.sources has duplicate id {source_id!r}")
+        seen.add(source_id)
+        if not isinstance(record["required"], bool):
+            raise WgLinkError(f"{label}.required must be boolean")
+        policy = record["patch_policy"]
+        if policy not in SOURCE_PATCH_POLICIES:
+            raise WgLinkError(
+                f"{label}.patch_policy must be single-connected or explicit-disconnected"
+            )
+        components = record["expected_connected_components"]
+        if (
+            isinstance(components, bool)
+            or not isinstance(components, int)
+            or components < 1
+        ):
+            raise WgLinkError(
+                f"{label}.expected_connected_components must be an integer >= 1"
+            )
+        if policy == "single-connected" and components != 1:
+            raise WgLinkError(
+                f"{label}.expected_connected_components must be 1 for single-connected"
+            )
+        resolution = _finite_number(
+            record["suggested_resolution_mm"], label=f"{label}.suggested_resolution_mm"
+        )
+        if resolution <= 0.0:
+            raise WgLinkError(f"{label}.suggested_resolution_mm must be positive")
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> LinkIdentity:
     version = manifest.get("wglink_version")
     match = re.fullmatch(r"(\d+)\.(\d+)", version) if isinstance(version, str) else None
@@ -484,6 +571,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> LinkIdentity:
         raise WgLinkError(
             "unsupported required_features: " + ", ".join(repr(value) for value in unknown)
         )
+    _validate_source_interface(manifest)
 
     coordinate_system = manifest.get("coordinate_system")
     if not isinstance(coordinate_system, Mapping):

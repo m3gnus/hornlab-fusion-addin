@@ -282,6 +282,86 @@ def test_rejects_unknown_required_feature(tmp_path):
         read_bundle(path)
 
 
+def _source() -> dict:
+    return {
+        "id": "source-hf",
+        "role": "HF",
+        "required": True,
+        "default_drive_channel_id": "drive-hf",
+        "patch_policy": "single-connected",
+        "expected_connected_components": 1,
+        "suggested_resolution_mm": 1.5,
+    }
+
+
+def _with_sources(path, sources) -> None:
+    manifest = json.loads((path / "wglink.json").read_text())
+    manifest["required_features"].append("source-interface-v1")
+    manifest["interface"] = {"sources": sources}
+    _rewrite_manifest(path, manifest)
+
+
+def test_accepts_source_interface_feature(tmp_path):
+    path = _write_bundle(tmp_path / "tiny.wglink")
+    _with_sources(path, [_source()])
+
+    assert read_bundle(path) is not None
+
+
+def test_rejects_source_interface_feature_without_sources(tmp_path):
+    path = _write_bundle(tmp_path / "tiny.wglink")
+    _with_sources(path, [])
+
+    with pytest.raises(WgLinkError, match="required exactly when"):
+        read_bundle(path)
+
+
+def test_rejects_sources_without_source_interface_feature(tmp_path):
+    path = _write_bundle(tmp_path / "tiny.wglink")
+    manifest = json.loads((path / "wglink.json").read_text())
+    manifest["interface"] = {"sources": [_source()]}
+    _rewrite_manifest(path, manifest)
+
+    with pytest.raises(WgLinkError, match="required exactly when"):
+        read_bundle(path)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda s: s.pop("role"), "missing role"),
+        (lambda s: s.update(extra=1), "unknown extra"),
+        (lambda s: s.update(role=" HF"), r"role must be a non-empty"),
+        (lambda s: s.update(required="yes"), "required must be boolean"),
+        (lambda s: s.update(patch_policy="whatever"), "patch_policy must be"),
+        (
+            lambda s: s.update(expected_connected_components=2),
+            "must be 1 for single-connected",
+        ),
+        (
+            lambda s: s.update(suggested_resolution_mm=0.0),
+            "suggested_resolution_mm must be positive",
+        ),
+    ],
+)
+def test_rejects_malformed_source_record(tmp_path, mutate, message):
+    path = _write_bundle(tmp_path / "tiny.wglink")
+    source = _source()
+    mutate(source)
+    _with_sources(path, [source])
+
+    with pytest.raises(WgLinkError, match=message):
+        read_bundle(path)
+
+
+def test_rejects_duplicate_source_ids(tmp_path):
+    path = _write_bundle(tmp_path / "tiny.wglink")
+    _with_sources(path, [_source(), _source()])
+
+    with pytest.raises(WgLinkError, match="duplicate id 'source-hf'"):
+        read_bundle(path)
+
+
 def test_rejects_nonfinite_manifest_json(tmp_path):
     path = _write_bundle(tmp_path / "tiny.wglink")
     manifest = json.loads((path / "wglink.json").read_text())

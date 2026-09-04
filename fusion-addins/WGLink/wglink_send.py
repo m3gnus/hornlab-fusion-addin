@@ -45,6 +45,10 @@ else:
 
 
 DECLARATION_ATTRIBUTE = "return_declaration"
+# The two managed roles that name a final exterior body. Every other managed
+# role is a helper WGLink built on the way there; wglink_return skips those, so
+# nothing here may mark one as a body the export depends on.
+EXTERIOR_ROLES = frozenset({"waveguide", "enclosure"})
 DECLARATIONS = frozenset(wglink_author.BODY_DECLARATIONS)
 FEM_COMPONENT_NAME = "FEM_MF_AIR"
 # One definition, shared with the authoring commands: the dialog that paints a
@@ -316,6 +320,32 @@ def _has_source_face(body: object) -> bool:
     return any(_face_role(face) is not None for face in wglink_core._items(getattr(body, "faces", None)))
 
 
+def _is_managed_helper(candidate: dict[str, Any]) -> bool:
+    """Is this a WGLink-managed body that is not the final exterior body?
+
+    Every entity ``_stamp_managed`` touches carries the instance id, including
+    the cut tool, the throat patch and the stitched shell that ``_close_and_thicken``
+    leaves behind.  ``plan_export_scope`` skips those by role, so they must not
+    also claim to hold the anchor or a required source -- a dependency flag on a
+    skipped body is a terminal refusal.
+    """
+
+    return bool(candidate.get("wglink_managed")) and candidate.get(
+        "wglink_role"
+    ) not in EXTERIOR_ROLES
+
+
+def _mark_solver_anchor(candidates: list[dict[str, Any]], anchor: str | None) -> None:
+    """Flag the one body the anchor instance solves through, not its helpers."""
+
+    for candidate in candidates:
+        candidate["contains_solver_anchor"] = bool(
+            anchor
+            and candidate.get("wglink_instance_id") == anchor
+            and not _is_managed_helper(candidate)
+        )
+
+
 def _collection(entity: object, name: str) -> list[object]:
     try:
         return wglink_core._items(getattr(entity, name))
@@ -389,11 +419,14 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
             "wglink_managed": bool(instance_id or managed_role),
             "wglink_role": managed_role,
             "wglink_instance_id": instance_id,
-            "contains_required_source": bool(instance_id) or _has_source_face(body),
+            "contains_required_source": False,
             "contains_solver_anchor": False,
             "only_enclosing_exterior": False,
             "requested_fem_air_volume": False,
         }
+        candidate["contains_required_source"] = (
+            bool(instance_id) and not _is_managed_helper(candidate)
+        ) or _has_source_face(body)
         candidates.append(candidate)
         bodies[object_id] = body
 
@@ -506,10 +539,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         if item.get("body_kind") in {"solid", "surface"}
         and item.get("kind") == "body"
         and item.get("declaration") != "exclude"
-        and not (
-            item.get("wglink_managed")
-            and item.get("wglink_role") not in {"waveguide", "enclosure"}
-        )
+        and not _is_managed_helper(item)
     ]
     if len(exterior) == 1:
         exterior[0]["only_enclosing_exterior"] = True
@@ -527,7 +557,7 @@ def _record_body(record: dict[str, Any]) -> object | None:
     bodies = [
         entity
         for entity in record.get("entities", [])
-        if _role(entity) in {"waveguide", "enclosure"}
+        if _role(entity) in EXTERIOR_ROLES
     ]
     if len(bodies) > 1:
         raise wglink_core.WgLinkError(
@@ -680,10 +710,7 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         "bounds_mm": None,
         "source_bounds_mm": None,
     }
-    for candidate in walk["candidates"]:
-        candidate["contains_solver_anchor"] = bool(
-            anchor and candidate.get("wglink_instance_id") == anchor
-        )
+    _mark_solver_anchor(walk["candidates"], anchor)
     try:
         scope = plan_export_scope(walk["selection"], walk["candidates"]).manifest_scope()
     except WgReturnError as exc:
@@ -759,10 +786,7 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         anchor = str(requested_anchor)
     else:
         anchor = None
-    for candidate in walk["candidates"]:
-        candidate["contains_solver_anchor"] = bool(
-            anchor and candidate.get("wglink_instance_id") == anchor
-        )
+    _mark_solver_anchor(walk["candidates"], anchor)
     try:
         scope = plan_export_scope(
             walk["selection"], walk["candidates"]
@@ -1565,10 +1589,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             raise wglink_core.WgLinkError("An unlinked return cannot name an anchor instance.")
         anchor = None
 
-    for candidate in walk["candidates"]:
-        candidate["contains_solver_anchor"] = bool(
-            anchor and candidate.get("wglink_instance_id") == anchor
-        )
+    _mark_solver_anchor(walk["candidates"], anchor)
     try:
         scope_plan = plan_export_scope(walk["selection"], walk["candidates"])
         scope = scope_plan.manifest_scope()

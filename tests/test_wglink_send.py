@@ -207,6 +207,95 @@ def test_occurrence_proxy_uses_native_attributes_but_remains_geometry_handle(
     assert proxy.attributes.values == {}
 
 
+def _freestanding_insertion(send_module, instance_id="wgi-free", helper_faces=()):
+    """The two bodies a freestanding insertion leaves in the document.
+
+    ``_close_and_thicken`` stitches the loft and the throat patch into one
+    surface body, thickens that into the solid, and stamps both with the same
+    instance id -- the shell keeps role ``cut_tool``.
+    """
+
+    core = send_module.wglink_core
+    final = body("WGLink freestanding waveguide", solid=True, faces=[face("HF")])
+    core._set_attribute(final, "instance_id", instance_id)
+    core._set_attribute(final, "role", "waveguide")
+    core._set_attribute(final, "face_role", "HF")
+    stitched = body(
+        "WGLink stitched waveguide body", solid=False, faces=list(helper_faces)
+    )
+    core._set_attribute(stitched, "instance_id", instance_id)
+    core._set_attribute(stitched, "role", "cut_tool")
+    root = component("waveguide v1", [final, stitched])
+    design = types.SimpleNamespace(
+        rootComponent=root, findAttributes=lambda _group, _name: Collection()
+    )
+    return design, final, stitched
+
+
+def test_managed_helper_does_not_block_the_return_it_helped_build(send_module):
+    """A cut tool carries the instance id of the body it built.
+
+    Measured 2026-09-04 from a freestanding insertion: the leftover stitched
+    shell claimed both the solver anchor and a required source, so wglink_return
+    skipped it by role and then refused the skip -- every freestanding model
+    refused its own return with "cannot skip 'waveguide v1/WGLink stitched
+    waveguide body'".
+    """
+
+    design, _final, _stitched = _freestanding_insertion(send_module)
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    assert [reason["reason"] for reason in plan.refusals] == []
+    scope = plan.manifest_scope()
+    assert [record["name"] for record in scope["included"]] == [
+        "WGLink freestanding waveguide"
+    ]
+    assert [record["kind"] for record in scope["skipped"]] == ["wglink_helper"]
+
+
+def test_the_anchor_and_the_source_land_on_the_final_body_only(send_module):
+    design, _final, _stitched = _freestanding_insertion(send_module)
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    flags = {
+        item["name"]: (
+            item["contains_solver_anchor"],
+            item["contains_required_source"],
+            item["only_enclosing_exterior"],
+        )
+        for item in walk["candidates"]
+    }
+
+    assert flags["WGLink freestanding waveguide"] == (True, True, True)
+    assert flags["WGLink stitched waveguide body"] == (False, False, False)
+
+
+def test_a_helper_that_carries_a_painted_source_still_refuses_the_skip(send_module):
+    """Role is not licence to drop a real source.
+
+    Only the bare instance id stops flagging a helper; a painted face on one is
+    evidence WG would otherwise lose silently, so it still converts the skip
+    into a refusal the user can read.
+    """
+
+    design, _final, _stitched = _freestanding_insertion(
+        send_module, helper_faces=[face("LF")]
+    )
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    with pytest.raises(
+        send_module.WgReturnError, match="stitched waveguide body.*required source"
+    ):
+        plan.manifest_scope()
+
+
 def _design_of(root, monkeypatch, send_module):
     design = types.SimpleNamespace(
         rootComponent=root, findAttributes=lambda _group, _name: Collection()

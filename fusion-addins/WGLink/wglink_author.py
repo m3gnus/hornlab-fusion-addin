@@ -281,6 +281,96 @@ _DECLARATION_HELP = {
 }
 
 
+# ------------------------------------------------------------ model domain
+
+# A domain declaration is a property of the *model being returned*, not of one
+# body, which is why it lives on the Send/Solve dialog rather than in Declare
+# Body. It says the author already cut the model and the solver must supply the
+# missing half by mirroring -- so it is only ever chosen by a person who knows
+# that, and the default is the one that is never wrong.
+DOMAIN_PLANES = ("x0", "y0")
+AXIS_FOR_DOMAIN_PLANE = {"x0": 0, "y0": 1}
+DOMAIN_PLANE_LABEL = {"x0": "x = 0", "y0": "y = 0"}
+FULL_DOMAIN_LABEL = "Full model"
+DOMAIN_CHOICES = (
+    (FULL_DOMAIN_LABEL, ()),
+    ("Half — already cut on x = 0", ("x0",)),
+    ("Half — already cut on y = 0", ("y0",)),
+    ("Quarter — already cut on x = 0 and y = 0", ("x0", "y0")),
+)
+
+_DOMAIN_HELP = {
+    (): (
+        "The exported bodies are the whole model. WG looks for mirror symmetry "
+        "itself and cuts the model down when it finds it."
+    ),
+    ("x0",): (
+        "The exported bodies are already half a model, kept on x ≥ 0. WG mirrors "
+        "them about x = 0 instead of cutting, and the open face on that plane is "
+        "the mirror — not a hole and not a baffle."
+    ),
+    ("y0",): (
+        "The exported bodies are already half a model, kept on y ≥ 0. WG mirrors "
+        "them about y = 0 instead of cutting, and the open face on that plane is "
+        "the mirror — not a hole and not a baffle."
+    ),
+    ("x0", "y0"): (
+        "The exported bodies are already a quarter model, kept on x ≥ 0 and "
+        "y ≥ 0. WG mirrors them about both planes instead of cutting."
+    ),
+}
+
+
+def domain_choices() -> tuple[str, ...]:
+    """The dropdown items of the model-domain selector, in display order."""
+
+    return tuple(label for label, _planes in DOMAIN_CHOICES)
+
+
+def resolve_domain_choice(choice: object) -> tuple[str, ...]:
+    """Turn a dropdown item -- or a plane list -- into canonical planes."""
+
+    if isinstance(choice, (list, tuple)):
+        planes = tuple(str(plane).strip().lower() for plane in choice)
+        unknown = [plane for plane in planes if plane not in DOMAIN_PLANES]
+        if unknown:
+            raise AuthorError(
+                f"{', '.join(repr(plane) for plane in unknown)} is not a symmetry "
+                f"plane. Choose from {', '.join(DOMAIN_PLANES)}."
+            )
+        return tuple(plane for plane in DOMAIN_PLANES if plane in set(planes))
+    value = str(choice if choice is not None else "").strip()
+    if not value:
+        raise AuthorError(f"Choose a model domain, or {FULL_DOMAIN_LABEL!r}.")
+    for label, planes in DOMAIN_CHOICES:
+        if value.casefold() == label.casefold():
+            return planes
+    folded = value.casefold()
+    if folded in {"full", FULL_DOMAIN_LABEL.casefold()}:
+        return ()
+    if folded in DOMAIN_PLANES:
+        return (folded,)
+    raise AuthorError(
+        f"{value!r} is not a model domain. Choose one of "
+        f"{', '.join(domain_choices())}."
+    )
+
+
+def domain_help_text(choice: object) -> str:
+    return _DOMAIN_HELP[resolve_domain_choice(choice)]
+
+
+def domain_phrase(planes: Sequence[str]) -> str:
+    """How a declared domain reads in one line of dialog copy."""
+
+    canonical = resolve_domain_choice(planes)
+    if not canonical:
+        return "full model"
+    labels = " and ".join(DOMAIN_PLANE_LABEL[plane] for plane in canonical)
+    noun = "half" if len(canonical) == 1 else "quarter"
+    return f"{noun} model, already cut on {labels}"
+
+
 def declaration_choices() -> tuple[str, ...]:
     """The dropdown items of the Declare Body command, in display order."""
 
@@ -439,14 +529,24 @@ def _bounds(value: object) -> tuple[tuple[float, float, float], tuple[float, flo
 
 
 def frame_findings(
-    bounds_mm: object, source_bounds_mm: object = None
+    bounds_mm: object,
+    source_bounds_mm: object = None,
+    domain_planes: Sequence[str] = (),
 ) -> list[FrameFinding]:
     """Compare a model's extent against WG's unlinked solver frame.
 
     Advisory only, and only meaningful for an unlinked return: a linked return
     carries its own throat frame and is transformed into the solver frame on
     ingestion.
+
+    ``domain_planes`` names the planes the export declares it was already cut
+    on. A half is *correctly* off-centre about its own cut plane -- it occupies
+    the positive side and nothing else -- so the centring advice would be
+    exactly wrong there, and telling a user to re-centre a half is telling them
+    to break it.
     """
+
+    reduced_axes = {AXIS_FOR_DOMAIN_PLANE[str(plane)] for plane in domain_planes}
 
     bounds = _bounds(bounds_mm)
     if bounds is None:
@@ -479,6 +579,8 @@ def frame_findings(
 
     offsets = []
     for axis, name in ((0, "x"), (1, "y")):
+        if axis in reduced_axes:
+            continue
         centre = 0.5 * (low[axis] + high[axis])
         extent = high[axis] - low[axis]
         tolerance = max(
@@ -574,6 +676,13 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     ]
     scope_error = str(scope.get("scope_error") or "").strip()
     source_error = str(scope.get("source_error") or "").strip()
+    domain_error = str(scope.get("domain_error") or "").strip()
+    domain = scope.get("domain")
+    domain_planes = (
+        tuple(str(plane) for plane in (domain.get("cut_planes") or []))
+        if isinstance(domain, Mapping)
+        else ()
+    )
 
     lines = [
         "Scope: root assembly" if selection == "root" else f"Scope: {selection}",
@@ -606,8 +715,12 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
             )
     else:
         lines.append("Sources: none")
+    if domain_planes:
+        lines.append(f"Domain: {domain_phrase(domain_planes)} ✓")
 
     warnings: list[str] = []
+    if domain_error:
+        warnings.append(f"Model domain: {domain_error}")
     if scope_error:
         warning = f"Export is blocked: {scope_error}"
         if "unclassified" in scope_error.casefold():
@@ -619,14 +732,22 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     findings: list[FrameFinding] = []
     if not instance_ids:
         findings = frame_findings(
-            scope.get("bounds_mm"), scope.get("source_bounds_mm")
+            scope.get("bounds_mm"),
+            scope.get("source_bounds_mm"),
+            domain_planes,
         )
         if findings:
             warnings.extend(f"Solver frame: {item.message}" for item in findings)
         elif _bounds(scope.get("bounds_mm")) is not None:
+            centred = " and ".join(
+                f"{name} = 0"
+                for axis, name in ((0, "x"), (1, "y"))
+                if axis not in {AXIS_FOR_DOMAIN_PLANE[plane] for plane in domain_planes}
+            )
             lines.append(
-                "Solver frame: axis +Z, throat at z = 0, centred on x = 0 and "
-                "y = 0 ✓"
+                "Solver frame: axis +Z, throat at z = 0"
+                + (f", centred on {centred}" if centred else "")
+                + " ✓"
             )
     return Preflight(
         lines=tuple(lines), warnings=tuple(warnings), frame=tuple(findings)

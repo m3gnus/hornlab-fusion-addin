@@ -28,8 +28,10 @@ import adsk.fusion
 if __package__:
     from . import wglink_author, wglink_core
     from .wglink_return import (
+        DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
+        canonical_domain_planes,
         dumps_return_manifest,
         plan_export_scope,
     )
@@ -37,8 +39,10 @@ else:
     import wglink_author
     import wglink_core
     from wglink_return import (
+        DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
+        canonical_domain_planes,
         dumps_return_manifest,
         plan_export_scope,
     )
@@ -207,7 +211,61 @@ def _occurrence_path(occurrence: object) -> str:
     return "unnamed occurrence"
 
 
+def _occurrence_placement(occurrence: object) -> list[list[float]] | None:
+    """The occurrence's parent-relative placement, in the contract's mm rows."""
+
+    for name in ("transform2", "transform"):
+        try:
+            matrix = getattr(occurrence, name)
+        except Exception:  # noqa: BLE001 - try the other spelling
+            continue
+        if matrix is None:
+            continue
+        try:
+            return wglink_core.fusion_matrix_to_mm(
+                [float(component) for component in matrix.asArray()]
+            )
+        except Exception:  # noqa: BLE001 - an unreadable transform is not identity
+            return None
+    return None
+
+
+def _is_identity_placement(
+    rows: list[list[float]] | None,
+    *,
+    rotation_tolerance: float = 1.0e-9,
+    translation_tolerance_mm: float = 1.0e-6,
+) -> bool:
+    if rows is None:
+        return False
+    for index, row in enumerate(rows):
+        for column, value in enumerate(row):
+            target = 1.0 if index == column else 0.0
+            tolerance = (
+                translation_tolerance_mm
+                if column == 3 and index < 3
+                else rotation_tolerance
+            )
+            if abs(float(value) - target) > tolerance:
+                return False
+    return True
+
+
 def _selection(design: object, value: object) -> tuple[object, object, object]:
+    """Resolve the selection into (scope record, export Component, occurrence).
+
+    The middle value is what Fusion's STEP export is given, so it is always a
+    Component -- see :func:`_export_step`. A Component exports in its OWN
+    frame, while ``assembly.bbox_mm`` and every ``assembly_from_link`` in the
+    manifest are in the root assembly's frame. Those two frames coincide
+    exactly when the selected occurrence sits at the assembly origin unrotated,
+    and a placed occurrence is refused rather than composed: composing the
+    chain here is the unverified arithmetic on the trust path that
+    ``_strict_assembly_from_link`` already refuses for the same reason, and a
+    STEP silently written in a frame the manifest does not describe is a wrong
+    solve rather than an error.
+    """
+
     root = design.rootComponent
     selected = _selection_items(value)
     if not selected or selected == [root]:
@@ -218,8 +276,9 @@ def _selection(design: object, value: object) -> tuple[object, object, object]:
         )
     entity = getattr(selected[0], "entity", selected[0])
     kind = wglink_core._kind(entity)
+    component = getattr(entity, "component", None)
     if kind != "Occurrence" and not (
-        getattr(entity, "component", None) is not None
+        component is not None
         and (hasattr(entity, "transform2") or hasattr(entity, "transform"))
     ):
         label = (kind or type(entity).__name__).lower()
@@ -227,7 +286,19 @@ def _selection(design: object, value: object) -> tuple[object, object, object]:
             f"Cannot export a selected {label}; select the root or exactly one occurrence subtree."
         )
     path = _occurrence_path(entity)
-    return {"kind": "occurrence", "path": path}, entity, entity
+    if component is None:
+        # An unresolved external link has no component to export. The scope walk
+        # turns this into the actionable "unresolved" refusal, so hand the
+        # occurrence back unchanged and let it get there.
+        return {"kind": "occurrence", "path": path}, entity, entity
+    if not _is_identity_placement(_occurrence_placement(entity)):
+        raise wglink_core.WgLinkError(
+            f"Occurrence {path!r} is moved or rotated relative to the assembly "
+            "origin, and Fusion can only export its component in the component's "
+            "own frame. Send the root component instead, or ground the occurrence "
+            "at the origin."
+        )
+    return {"kind": "occurrence", "path": path}, component, entity
 
 
 def _component_name(component: object) -> str:
@@ -707,6 +778,8 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         "sources": [],
         "scope_error": None,
         "source_error": None,
+        "domain": None,
+        "domain_error": None,
         "bounds_mm": None,
         "source_bounds_mm": None,
     }
@@ -754,6 +827,13 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
             "face_count": int(observed.get("face_count") or 0),
             "instance_id": source.get("instance_id"),
         })
+    try:
+        report["domain"] = plan_domain(
+            resolve_domain_planes(opts.get("domain")), included_bodies
+        )
+    except wglink_core.WgLinkError as exc:
+        # The preview's whole job is to say this before OK rather than after.
+        report["domain_error"] = str(exc)
     bounds = None
     for body in included_bodies:
         bounds = _merge_bounds(bounds, body)
@@ -1370,14 +1450,119 @@ def count_step_bodies(value: str | bytes | os.PathLike[str]) -> int:
     return len(_STEP_BODY.findall(text))
 
 
-def _export_step(design: object, path: Path, geometry: object | None) -> None:
+# A declared domain is measured against the bodies actually being exported,
+# with a tolerance that scales with the model: 1e-4 of the bounding diagonal,
+# floored so a small model still tolerates the round-off of a CAD cut that
+# lands on the plane.
+DOMAIN_TOLERANCE_REL = 1.0e-4
+DOMAIN_TOLERANCE_FLOOR_MM = 0.05
+DOMAIN_AXIS_FOR_PLANE = {"x0": 0, "y0": 1}
+DOMAIN_PLANE_LABEL = {"x0": "x = 0", "y0": "y = 0"}
+
+
+def resolve_domain_planes(value: object) -> tuple[str, ...]:
+    """Read ``options['domain']`` as an ordered, checked set of planes."""
+
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "full"}:
+            return ()
+        planes = [part for part in re.split(r"[+,\s]+", text) if part]
+    elif isinstance(value, (list, tuple)):
+        planes = [str(part).strip().lower() for part in value]
+    else:
+        raise wglink_core.WgLinkError(
+            "options['domain'] must be 'full', a plane name, or a list of plane names."
+        )
+    try:
+        return canonical_domain_planes(planes)
+    except WgReturnError as exc:
+        raise wglink_core.WgLinkError(str(exc)) from exc
+
+
+def plan_domain(planes: tuple[str, ...], bodies: list[object]) -> dict[str, Any] | None:
+    """Measure the exported bodies before letting them claim a reduced domain.
+
+    A bounding box settles one-sidedness exactly -- a box that stays on the
+    positive side of a plane cannot contain geometry on the negative side -- so
+    this is a proof, not a heuristic. It is deliberately the only thing checked
+    here: whether the *cut face* is open, and whether the rest of the boundary
+    leaks, are properties of the meshed surface, and WG re-derives both from the
+    mesh it builds. Declaring is the CAD's job; believing is not.
+    """
+
+    if not planes:
+        return None
+    boxes = [wglink_core._bbox_values(body) for body in bodies]
+    if not boxes:
+        raise wglink_core.WgLinkError(
+            "A reduced domain cannot be declared for an export with no included bodies."
+        )
+    low = [min(box[axis] for box in boxes) for axis in range(3)]
+    high = [max(box[axis + 3] for box in boxes) for axis in range(3)]
+    diagonal = math.sqrt(sum((high[axis] - low[axis]) ** 2 for axis in range(3)))
+    tolerance = max(DOMAIN_TOLERANCE_FLOOR_MM, DOMAIN_TOLERANCE_REL * diagonal)
+    evidence: dict[str, Any] = {}
+    for plane in planes:
+        axis = DOMAIN_AXIS_FOR_PLANE[plane]
+        minimum, maximum = float(low[axis]), float(high[axis])
+        label = DOMAIN_PLANE_LABEL[plane]
+        # Order matters for the remedy, not for the verdict: a model sitting
+        # wholly on the wrong side is a mirror away from being right, while one
+        # that straddles is not a half at all.
+        if maximum <= tolerance:
+            raise wglink_core.WgLinkError(
+                f"The export was declared a reduced domain about {label}, but the "
+                "included bodies have no extent on the positive side of it. WG keeps "
+                f"the positive half, so mirror the model onto {label[0]} >= 0 first."
+            )
+        if minimum < -tolerance:
+            raise wglink_core.WgLinkError(
+                f"The export was declared a reduced domain about {label}, but the "
+                f"included bodies reach {abs(minimum):.4g} mm onto the negative side "
+                f"of it (tolerance {tolerance:.4g} mm). Cut the model in CAD, or "
+                "declare the full model."
+            )
+        evidence[plane] = {
+            "min_mm": minimum,
+            "max_mm": maximum,
+            "tolerance_mm": tolerance,
+        }
+    return {
+        "kind": DOMAIN_KIND_FOR_PLANES[planes],
+        "cut_planes": list(planes),
+        "declared_by": "cad-author",
+        "evidence": evidence,
+    }
+
+
+def _export_step(design: object, path: Path, geometry: object) -> None:
+    """Export one Component to STEP, which is the only geometry Fusion takes.
+
+    ``ExportManager.createSTEPExportOptions`` documents its second argument as
+    "the geometry to export. Valid geometry for this is currently a Component
+    object". Handing it an Occurrence is what Fusion refuses with
+    ``3 : invlid argument geometry`` -- error code 3 is its invalid-argument
+    code and "invlid" is Autodesk's own spelling, so the reported message is
+    Fusion rejecting the argument type rather than anything about the model.
+
+    The Component is always passed explicitly, including for the root scope
+    where the argument is optional. That is what every Autodesk sample does,
+    and it removes one whole class of question about what an omitted optional
+    argument resolves to inside Fusion.
+    """
+
+    kind = wglink_core._kind(geometry)
+    if kind is not None and kind != "Component":
+        raise wglink_core.WgLinkError(
+            f"Cannot export {path.name} from a {kind}; Fusion's STEP export takes "
+            "a Component."
+        )
     manager = design.exportManager
     try:
-        options = (
-            manager.createSTEPExportOptions(str(path))
-            if geometry is None
-            else manager.createSTEPExportOptions(str(path), geometry)
-        )
+        options = manager.createSTEPExportOptions(str(path), geometry)
         ok = manager.execute(options)
     except Exception as exc:  # noqa: BLE001
         raise wglink_core.WgLinkError(f"Fusion STEP export failed for {path.name}: {exc}.") from exc
@@ -1567,6 +1752,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     output_value = options.get("output_folder")
     if not isinstance(output_value, (str, os.PathLike)) or not str(output_value).strip():
         raise wglink_core.WgLinkError("options['output_folder'] must name the return output folder.")
+    domain_planes = resolve_domain_planes(options.get("domain"))
     design = wglink_core._design(app)
     walk = _scope_walk(design, options.get("selection"))
     records = _records_in_scope(design, walk)
@@ -1615,6 +1801,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         )
         if instance_body is not None:
             record["source_body"] = instance_body
+    domain = plan_domain(domain_planes, included_bodies)
     observed_at = _utc_timestamp()
     instance_records = [_instance_record(design, record, observed_at) for record in records]
     sources = _sources(records, included_bodies)
@@ -1656,8 +1843,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
                 f"Could not create a temporary return bundle beside {target}: {exc}."
             ) from exc
         assembly_path = temp / "assembly.step"
-        export_geometry = None if walk["selection"] == "root" else walk["geometry"]
-        _export_step(design, assembly_path, export_geometry)
+        _export_step(design, assembly_path, walk["geometry"])
         observed_count = count_step_bodies(assembly_path)
         expected_count = len(included_bodies)
         if observed_count != expected_count:
@@ -1715,6 +1901,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
                 "n_bodies_expected": expected_count,
                 "bbox_mm": _bbox(included_bodies),
                 "signature_hash": return_state_hash,
+                **({"domain": domain} if domain is not None else {}),
             },
             files=files,
             scope=scope,
@@ -1745,6 +1932,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     return {
         "return_id": manifest["return"]["id"],
         "bundle_path": str(target),
+        "domain": domain,
         "document_captured": capture_document and document_capture_error is None,
         "document_capture_error": document_capture_error,
         "scope": manifest["scope"],

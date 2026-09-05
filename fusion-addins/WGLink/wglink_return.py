@@ -24,6 +24,7 @@ SUPPORTED_RETURN_FEATURES = frozenset(
         "assembly-frame-v1",
         "instance-records-v1",
         "fem-air-volume-v1",
+        "reduced-domain-v1",
     }
 )
 BASE_RETURN_FEATURES = (
@@ -31,6 +32,41 @@ BASE_RETURN_FEATURES = (
     "assembly-frame-v1",
     "instance-records-v1",
 )
+
+# A domain declaration says the exported bodies ARE the reduced domain: the
+# author already cut the model in CAD and the missing half is to be supplied by
+# the solver's mirror, not by WG's cutter. Only the planes the solver can mirror
+# are declarable, and the retained side is the positive one -- both to match
+# ``hornlab_mesher.step_prepare``, whose auto-cut keeps x >= 0 / y >= 0. A
+# reader that does not know this vocabulary must refuse the bundle rather than
+# solve a half as an open full-domain shell, which is what ``reduced-domain-v1``
+# in ``required_features`` is for.
+DOMAIN_PLANES = ("x0", "y0")
+DOMAIN_KIND_FOR_PLANES = {
+    (): "full",
+    ("x0",): "half",
+    ("y0",): "half",
+    ("x0", "y0"): "quarter",
+}
+DOMAIN_KINDS = ("full", "half", "quarter")
+REDUCED_DOMAIN_FEATURE = "reduced-domain-v1"
+
+
+def canonical_domain_planes(planes: Sequence[Any]) -> tuple[str, ...]:
+    """Order and check declared planes so one domain has one spelling."""
+
+    names = [str(plane) for plane in planes]
+    unknown = [name for name in names if name not in DOMAIN_PLANES]
+    if unknown:
+        raise WgReturnError(
+            "assembly.domain.cut_planes may only name "
+            + ", ".join(DOMAIN_PLANES)
+            + "; got "
+            + ", ".join(repr(name) for name in unknown)
+        )
+    if len(set(names)) != len(names):
+        raise WgReturnError("assembly.domain.cut_planes must not repeat a plane")
+    return tuple(plane for plane in DOMAIN_PLANES if plane in set(names))
 
 _ULID = re.compile(r"^wgr_[0-9A-HJKMNP-TV-Z]{26}$")
 _VERSION = re.compile(r"^(\d+)\.(\d+)$")
@@ -873,6 +909,77 @@ def _validate_source(
     return source_id, channel_id
 
 
+def validate_domain_record(value: object) -> tuple[str, ...]:
+    """Check ``assembly.domain`` and return the planes it declares.
+
+    A missing member is the full domain, so every bundle written before this
+    member existed keeps validating unchanged. ``kind`` is redundant with
+    ``cut_planes`` on purpose: it is the human-readable half of the declaration,
+    and a disagreement between the two is a broken writer rather than something
+    to resolve by preferring one.
+
+    ``evidence`` carries the measurement the declaration was accepted on, per
+    plane, in millimetres: the extent of the exported bodies along that axis.
+    It is evidence, not a verdict -- WG re-derives the domain from the meshed
+    boundary and is free to refuse this declaration.
+    """
+
+    if value is None:
+        return ()
+    domain = _mapping(value, label="assembly.domain")
+    _required(domain, ("kind", "cut_planes", "declared_by"), label="assembly.domain")
+    kind = _string(domain["kind"], label="assembly.domain.kind")
+    if kind not in DOMAIN_KINDS:
+        raise WgReturnError(
+            "assembly.domain.kind must be one of " + ", ".join(DOMAIN_KINDS)
+        )
+    planes = canonical_domain_planes(
+        _list(domain["cut_planes"], label="assembly.domain.cut_planes")
+    )
+    if DOMAIN_KIND_FOR_PLANES[planes] != kind:
+        raise WgReturnError(
+            f"assembly.domain.kind {kind!r} does not match cut_planes "
+            f"{list(planes)!r}"
+        )
+    declared_by = _string(domain["declared_by"], label="assembly.domain.declared_by")
+    if declared_by != "cad-author":
+        raise WgReturnError(
+            "assembly.domain.declared_by must be 'cad-author'; a domain nobody "
+            "declared is not a domain"
+        )
+    evidence = _mapping(domain.get("evidence", {}), label="assembly.domain.evidence")
+    if set(evidence) != set(planes):
+        raise WgReturnError(
+            "assembly.domain.evidence must measure exactly the declared planes"
+        )
+    for plane in planes:
+        record = _mapping(evidence[plane], label=f"assembly.domain.evidence[{plane!r}]")
+        _required(
+            record,
+            ("min_mm", "max_mm", "tolerance_mm"),
+            label=f"assembly.domain.evidence[{plane!r}]",
+        )
+        label = f"assembly.domain.evidence[{plane!r}]"
+        minimum = _number(record["min_mm"], label=f"{label}.min_mm")
+        maximum = _number(record["max_mm"], label=f"{label}.max_mm")
+        tolerance = _number(
+            record["tolerance_mm"], label=f"{label}.tolerance_mm", minimum=0.0
+        )
+        if minimum > maximum:
+            raise WgReturnError(f"{label}.min_mm exceeds max_mm")
+        # The measurement has to still support the claim it was written for.
+        if minimum < -tolerance:
+            raise WgReturnError(
+                f"{label} shows geometry {abs(minimum):.6g} mm on the negative "
+                f"side of {plane}, beyond the {tolerance:.6g} mm tolerance"
+            )
+        if maximum <= tolerance:
+            raise WgReturnError(
+                f"{label} shows no geometry on the positive side of {plane}"
+            )
+    return planes
+
+
 def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
     """Validate the §2 schema and evidence/verdict ownership boundary."""
 
@@ -973,6 +1080,7 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
     high = _point(bbox[1], label="assembly.bbox_mm[1]")
     if any(float(left) > float(right) for left, right in zip(low, high)):
         raise WgReturnError("assembly.bbox_mm minimum exceeds maximum")
+    domain_planes = validate_domain_record(assembly.get("domain"))
 
     files = _mapping(root["files"], label="files")
     if not files:
@@ -1083,6 +1191,16 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
         raise WgReturnError(
             "fem-air-volume-v1 is required exactly when a FEM air volume is present"
         )
+    # Paired exactly, in both directions. A reduced domain a reader silently
+    # ignores is solved as an open shell in free space -- a wrong answer, not an
+    # error -- so the feature must be present; and a feature with no reduction
+    # behind it would train readers to accept the flag as decoration.
+    has_domain_feature = REDUCED_DOMAIN_FEATURE in features
+    if bool(domain_planes) != has_domain_feature:
+        raise WgReturnError(
+            f"{REDUCED_DOMAIN_FEATURE} is required exactly when assembly.domain "
+            "declares a reduced domain"
+        )
 
     instances = _list(root["instances"], label="instances")
     instance_ids: list[str] = []
@@ -1145,6 +1263,13 @@ def build_return_manifest(
     )
     if fem_present and "fem-air-volume-v1" not in features:
         features.append("fem-air-volume-v1")
+    domain = dict(assembly).get("domain")
+    if (
+        isinstance(domain, Mapping)
+        and domain.get("cut_planes")
+        and REDUCED_DOMAIN_FEATURE not in features
+    ):
+        features.append(REDUCED_DOMAIN_FEATURE)
     manifest = {
         "wgreturn_version": wgreturn_version,
         "required_features": features,

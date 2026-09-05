@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "fusion-addins" / "WGLink"))
 from wglink_return import (  # noqa: E402
     BASE_RETURN_FEATURES,
     WgReturnError,
+    validate_domain_record,
     build_return_manifest,
     dumps_return_manifest,
     loads_return_manifest,
@@ -799,3 +800,92 @@ def test_instance_round_trip_preserves_the_wg_formula_and_exact_config() -> None
         "raw": "130",
         "value": 130.0,
     }
+
+
+# ------------------------------------------------- declared reduced domain schema
+
+
+def _domain_manifest(**domain):
+    manifest = _worked_example()
+    manifest["assembly"]["domain"] = {
+        "kind": "half",
+        "cut_planes": ["y0"],
+        "declared_by": "cad-author",
+        "evidence": {"y0": {"min_mm": 0.0, "max_mm": 90.0, "tolerance_mm": 0.05}},
+        **domain,
+    }
+    manifest["required_features"] = [
+        *manifest["required_features"],
+        "reduced-domain-v1",
+    ]
+    return manifest
+
+
+def test_a_declared_half_validates_and_names_its_planes():
+    assert validate_return_manifest(_domain_manifest()) is None
+    assert validate_domain_record(None) == ()
+    assert validate_domain_record(
+        {
+            "kind": "quarter",
+            "cut_planes": ["y0", "x0"],
+            "declared_by": "cad-author",
+            "evidence": {
+                plane: {"min_mm": 0.0, "max_mm": 90.0, "tolerance_mm": 0.05}
+                for plane in ("x0", "y0")
+            },
+        }
+    ) == ("x0", "y0")
+
+
+def test_domain_kind_and_planes_must_agree():
+    with pytest.raises(WgReturnError, match="does not match cut_planes"):
+        validate_return_manifest(_domain_manifest(kind="quarter"))
+
+
+def test_a_declared_domain_without_its_feature_is_refused():
+    manifest = _domain_manifest()
+    manifest["required_features"] = [
+        feature
+        for feature in manifest["required_features"]
+        if feature != "reduced-domain-v1"
+    ]
+    with pytest.raises(WgReturnError, match="reduced-domain-v1 is required exactly"):
+        validate_return_manifest(manifest)
+
+
+def test_the_feature_without_a_declared_domain_is_refused():
+    manifest = _worked_example()
+    manifest["required_features"] = [
+        *manifest["required_features"],
+        "reduced-domain-v1",
+    ]
+    with pytest.raises(WgReturnError, match="reduced-domain-v1 is required exactly"):
+        validate_return_manifest(manifest)
+
+
+def test_evidence_that_contradicts_the_declaration_is_refused():
+    with pytest.raises(WgReturnError, match="negative side of y0"):
+        validate_return_manifest(
+            _domain_manifest(
+                evidence={"y0": {"min_mm": -12.0, "max_mm": 90.0, "tolerance_mm": 0.05}}
+            )
+        )
+    with pytest.raises(WgReturnError, match="no geometry on the positive side"):
+        validate_return_manifest(
+            _domain_manifest(
+                evidence={"y0": {"min_mm": 0.0, "max_mm": 0.0, "tolerance_mm": 0.05}}
+            )
+        )
+    with pytest.raises(WgReturnError, match="exactly the declared planes"):
+        validate_return_manifest(_domain_manifest(evidence={}))
+
+
+def test_an_unsupported_symmetry_plane_cannot_be_declared():
+    with pytest.raises(WgReturnError, match="may only name x0, y0"):
+        validate_return_manifest(
+            _domain_manifest(
+                kind="half",
+                cut_planes=["z0"],
+                evidence={"z0": {"min_mm": 0.0, "max_mm": 1.0, "tolerance_mm": 0.05}},
+            )
+        )

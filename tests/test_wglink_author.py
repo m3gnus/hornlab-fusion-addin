@@ -437,3 +437,73 @@ def test_an_unsurveyable_model_says_so_in_the_pre_flight_box(author):
     assert author.preflight_unavailable(RuntimeError("no active design")) == (
         "Pre-flight unavailable: no active design"
     )
+
+
+# ---------------------------------------------------------- model domain copy
+
+
+def test_the_domain_dropdown_offers_full_first_and_resolves_every_spelling(author):
+    choices = author.domain_choices()
+
+    assert choices[0] == author.FULL_DOMAIN_LABEL
+    assert author.resolve_domain_choice(choices[0]) == ()
+    assert author.resolve_domain_choice(choices[1]) == ("x0",)
+    assert author.resolve_domain_choice(choices[2]) == ("y0",)
+    assert author.resolve_domain_choice(choices[3]) == ("x0", "y0")
+    # Head-less callers pass planes; the order is fixed either way.
+    assert author.resolve_domain_choice(["y0", "x0"]) == ("x0", "y0")
+    with pytest.raises(author.AuthorError, match="not a model domain"):
+        author.resolve_domain_choice("upside down")
+    with pytest.raises(author.AuthorError, match="not a symmetry plane"):
+        author.resolve_domain_choice(["z0"])
+
+
+def test_every_domain_choice_explains_what_the_solver_will_do(author):
+    for choice in author.domain_choices():
+        text = author.domain_help_text(choice)
+        assert text and text[0].isupper()
+    assert "mirrors" in author.domain_help_text(author.domain_choices()[2])
+    assert author.domain_phrase(["y0"]) == "half model, already cut on y = 0"
+    assert author.domain_phrase([]) == "full model"
+    assert author.domain_phrase(["x0", "y0"]).startswith("quarter model")
+
+
+def test_a_declared_half_is_not_told_to_re_centre_itself(author):
+    """The centring advice is exactly wrong for a half, and destructive.
+
+    A half about y = 0 occupies y >= 0 by definition. Telling its author to
+    centre it on y = 0 is telling them to undo the cut.
+    """
+
+    half = bounds((-100.0, 0.0, 0.0), (100.0, 100.0, 180.0))
+    source = bounds((-12.7, 0.0, 0.0), (12.7, 12.7, 0.0))
+
+    assert codes(author.frame_findings(half, source)) == [author.FRAME_CENTRING]
+    assert author.frame_findings(half, source, ("y0",)) == []
+    # The other axis is still judged: a declaration is not a blanket waiver.
+    off_centre = bounds((10.0, 0.0, 0.0), (210.0, 100.0, 180.0))
+    assert codes(author.frame_findings(off_centre, source, ("y0",))) == [
+        author.FRAME_CENTRING
+    ]
+
+
+def test_the_preflight_states_a_verified_domain_and_warns_about_a_refused_one(author):
+    summary = author.preflight_summary(
+        clean_scope(
+            bounds_mm=bounds((-100.0, 0.0, 0.0), (100.0, 100.0, 180.0)),
+            source_bounds_mm=bounds((-12.7, 0.0, 0.0), (12.7, 12.7, 0.0)),
+            domain={"kind": "half", "cut_planes": ["y0"]},
+        )
+    )
+
+    assert any("Domain: half model, already cut on y = 0" in line for line in summary.lines)
+    assert summary.warnings == ()
+    assert any("centred on x = 0" in line for line in summary.lines)
+
+    refused = author.preflight_summary(
+        clean_scope(domain=None, domain_error="the bodies reach 90 mm onto the negative side")
+    )
+    assert any(
+        warning.startswith("Model domain: ") for warning in refused.warnings
+    )
+    assert not any(line.startswith("Domain:") for line in refused.lines)

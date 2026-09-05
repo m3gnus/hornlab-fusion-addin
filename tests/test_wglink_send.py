@@ -123,9 +123,37 @@ def body(name, *, solid=True, visible=True, faces=()):
     )
 
 
+def transform(rows=None):
+    """A Fusion ``Matrix3D`` as the export path actually reads it.
+
+    ``Matrix3D.asArray()`` returns 16 row-major numbers whose translation
+    column is in Fusion's internal centimetres. A placeholder object with no
+    ``asArray`` is not a transform an occurrence could have, and treating one
+    as identity is what let the frame question go unasked here.
+    """
+
+    values = rows or [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    return types.SimpleNamespace(asArray=lambda: list(values))
+
+
+def moved_transform(x_cm=0.0, y_cm=0.0, z_cm=0.0):
+    return transform([
+        1.0, 0.0, 0.0, x_cm,
+        0.0, 1.0, 0.0, y_cm,
+        0.0, 0.0, 1.0, z_cm,
+        0.0, 0.0, 0.0, 1.0,
+    ])
+
+
 def component(name, bodies=()):
     value = types.SimpleNamespace(
         name=name,
+        objectType="adsk::fusion::Component",
         bRepBodies=Collection(bodies),
         meshBodies=Collection(),
         constructionPlanes=Collection(),
@@ -190,7 +218,7 @@ def test_occurrence_proxy_uses_native_attributes_but_remains_geometry_handle(
         bRepBodies=Collection([proxy]),
         meshBodies=Collection(),
         childOccurrences=Collection(),
-        transform2=object(),
+        transform2=transform(),
         isVisible=True,
         isSuppressed=False,
         objectType="adsk::fusion::Occurrence",
@@ -993,3 +1021,331 @@ def test_the_capture_setting_is_wgs_and_is_read_from_wgs_own_settings_file(
         json.dumps({"schemaVersion": 1, "cadLinkPath": str(tmp_path)}), encoding="utf-8"
     )
     assert workspace.capture_document() is True
+
+
+# --------------------------------------------------- Fusion's export contract
+
+
+class ContractExportManager:
+    """An ExportManager that enforces what Fusion documents, and nothing less.
+
+    ``ExportManager.createSTEPExportOptions(filename, geometry)`` says of its
+    second argument: "The geometry to export. Valid geometry for this is
+    currently a Component object." (Autodesk Fusion 360 API Python definitions,
+    ``adsk/fusion.py``.) The exporters that came before it -- every fake in this
+    file -- accept whatever they are handed, which is why an Occurrence reached
+    a real Fusion and came back as
+
+        Fusion STEP export failed for assembly.step: 3 : invlid argument geometry.
+
+    3 is Fusion's invalid-argument code and "invlid" is its own spelling. This
+    fake reproduces exactly that, so the contract is a test and not a comment.
+    """
+
+    def __init__(self):
+        self.geometries = []
+
+    def createSTEPExportOptions(self, path, geometry=None):
+        # An omitted argument stays legal here because Autodesk documents it as
+        # legal. This fake refuses exactly one thing -- a geometry that is not a
+        # Component -- so what it proves is the documented contract and not a
+        # stricter rule invented to make a test pass.
+        kind = None if geometry is None else getattr(geometry, "objectType", None)
+        if geometry is not None and kind != "adsk::fusion::Component":
+            raise RuntimeError("3 : invlid argument geometry.")
+        self.geometries.append(geometry)
+        return path, geometry
+
+    def execute(self, options):
+        Path(options[0]).write_text(
+            "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
+            encoding="utf-8",
+        )
+        return True
+
+
+def _contract_design(root, manager=None):
+    manager = manager or ContractExportManager()
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=manager,
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name=root.name),
+    )
+    return design, app, manager
+
+
+def _occurrence(component_value, bodies, *, placement=None, name="Horn:1"):
+    return types.SimpleNamespace(
+        name=name,
+        fullPathName=f"Speaker/{name}",
+        objectType="adsk::fusion::Occurrence",
+        component=component_value,
+        bRepBodies=Collection(bodies),
+        meshBodies=Collection(),
+        childOccurrences=Collection(),
+        occurrences=Collection(),
+        transform2=placement or transform(),
+        isVisible=True,
+        isSuppressed=False,
+    )
+
+
+def test_root_scope_export_names_the_root_component(send_module, tmp_path, monkeypatch):
+    """The optional argument is passed, not omitted.
+
+    Omitting it is documented to mean the root component and the fake accepts
+    that, so this is not a bug fix -- it is removing the one call shape no
+    Autodesk sample uses from a path that is already hard to observe.
+    """
+
+    root = component("Party", [body("shell", faces=[face("HF")])])
+    design, app, manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    assert manager.geometries == [root]
+    assert Path(report["bundle_path"]).is_dir()
+
+
+def test_selected_occurrence_exports_its_component_not_the_occurrence(
+    send_module, tmp_path, monkeypatch
+):
+    """The reported failure, reproduced and fixed in one test.
+
+    Before the fix this raised ``3 : invlid argument geometry`` from the fake
+    above, exactly as the user's Fusion did.
+    """
+
+    native = body("Horn", faces=[face("HF")])
+    inner = component("Horn component", [native])
+    proxy = body("Horn", faces=[face("HF")])
+    proxy.nativeObject = native
+    proxy.parentComponent = inner
+    occurrence = _occurrence(inner, [proxy])
+    root = component("Speaker")
+    root.occurrences = Collection([occurrence])
+    design, app, manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app,
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "selection": occurrence,
+        },
+    )
+
+    assert manager.geometries == [inner]
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["scope"]["selection"] == "Speaker/Horn:1"
+
+
+def test_export_step_refuses_a_non_component_before_calling_fusion(send_module):
+    calls = []
+
+    class Watchful(ContractExportManager):
+        def createSTEPExportOptions(self, path, geometry=None):
+            calls.append(geometry)
+            return super().createSTEPExportOptions(path, geometry)
+
+    manager = Watchful()
+    design = types.SimpleNamespace(exportManager=manager)
+    occurrence = _occurrence(component("Horn component"), [])
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match="Occurrence.*takes a Component"
+    ):
+        send_module._export_step(design, Path("assembly.step"), occurrence)
+
+    assert calls == []
+
+
+def test_a_placed_occurrence_is_refused_rather_than_exported_into_a_lost_frame(
+    send_module, tmp_path, monkeypatch
+):
+    """A Component exports in its own frame; the manifest describes the assembly's.
+
+    Fusion offers no way to export an occurrence in its assembly placement, so
+    the two frames have to coincide. They do when the occurrence sits at the
+    origin unrotated, and this is the other case.
+    """
+
+    native = body("Horn", faces=[face("HF")])
+    inner = component("Horn component", [native])
+    proxy = body("Horn", faces=[face("HF")])
+    proxy.nativeObject = native
+    proxy.parentComponent = inner
+    # 12 cm along +Y in Fusion's internal units: 120 mm in the contract.
+    occurrence = _occurrence(inner, [proxy], placement=moved_transform(y_cm=12.0))
+    root = component("Speaker")
+    root.occurrences = Collection([occurrence])
+    design, app, manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match="moved or rotated relative to the assembly origin",
+    ):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "selection": occurrence,
+            },
+        )
+
+    assert manager.geometries == []
+    assert not list(tmp_path.iterdir())
+
+
+# ------------------------------------------------------- declared pre-cut domain
+
+
+def half_body(name, *, low=(-40.0, 0.0, 0.0), high=(40.0, 90.0, 120.0), faces=()):
+    """A body whose bounding box is a half about y = 0, in millimetres.
+
+    ``_bbox_values`` reads Fusion's internal centimetres and multiplies by ten,
+    so the fixture is written in millimetres and divided back down here -- the
+    same direction the real code travels.
+    """
+
+    candidate = body(name, solid=True, faces=list(faces))
+    candidate.boundingBox = box(
+        tuple(value / 10.0 for value in low), tuple(value / 10.0 for value in high)
+    )
+    return candidate
+
+
+def test_a_declared_half_is_measured_and_recorded_with_its_feature(
+    send_module, tmp_path, monkeypatch
+):
+    shell = half_body("PartyMEH", faces=[face("HF")])
+    root = component("PartyMEH", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app,
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "domain": ["y0"],
+        },
+    )
+
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    domain = manifest["assembly"]["domain"]
+    assert domain["kind"] == "half"
+    assert domain["cut_planes"] == ["y0"]
+    assert domain["declared_by"] == "cad-author"
+    assert domain["evidence"]["y0"]["min_mm"] == pytest.approx(0.0)
+    assert domain["evidence"]["y0"]["max_mm"] == pytest.approx(90.0)
+    # The gate an older reader trips on rather than solving a half as a full
+    # model.
+    assert "reduced-domain-v1" in manifest["required_features"]
+
+
+def test_a_full_model_declaring_a_half_is_refused_with_the_measurement(
+    send_module, tmp_path, monkeypatch
+):
+    shell = half_body("Whole", low=(-40.0, -90.0, 0.0), high=(40.0, 90.0, 120.0),
+                      faces=[face("HF")])
+    root = component("Whole", [shell])
+    design, app, manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match=r"declared a reduced domain about y = 0.*reach 90 mm onto the negative side",
+    ):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "domain": "y0",
+            },
+        )
+
+    assert manager.geometries == []
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_half_kept_on_the_wrong_side_is_refused_rather_than_mirrored(
+    send_module, tmp_path, monkeypatch
+):
+    shell = half_body("Mirrored", low=(-40.0, -90.0, 0.0), high=(40.0, 0.0, 120.0),
+                      faces=[face("HF")])
+    root = component("Mirrored", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match="no extent on the positive side",
+    ):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "domain": ["y0"],
+            },
+        )
+
+
+def test_an_undeclared_return_carries_no_domain_and_no_feature(
+    send_module, tmp_path, monkeypatch
+):
+    shell = half_body("Undeclared", faces=[face("HF")])
+    root = component("Undeclared", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert "domain" not in manifest["assembly"]
+    assert "reduced-domain-v1" not in manifest["required_features"]
+    assert report["domain"] is None
+
+
+def test_a_quarter_declares_both_planes_in_a_fixed_order(send_module):
+    assert send_module.resolve_domain_planes("y0+x0") == ("x0", "y0")
+    assert send_module.resolve_domain_planes(["y0", "x0"]) == ("x0", "y0")
+    assert send_module.resolve_domain_planes("full") == ()
+    assert send_module.resolve_domain_planes(None) == ()
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="x0, y0"):
+        send_module.resolve_domain_planes("z0")
+
+
+def test_the_preflight_previews_a_domain_refusal_instead_of_raising(
+    send_module, monkeypatch
+):
+    shell = half_body("Whole", low=(-40.0, -90.0, 0.0), high=(40.0, 90.0, 120.0),
+                      faces=[face("HF")])
+    root = component("Whole", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.preflight_scope(app, {"domain": ["y0"]})
+
+    assert report["domain"] is None
+    assert "negative side" in report["domain_error"]

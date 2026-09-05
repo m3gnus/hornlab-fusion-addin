@@ -305,6 +305,32 @@ def test_send_refuses_when_wg_has_no_selected_workspace(monkeypatch) -> None:
     assert "Settings" in str(refusal.value)
 
 
+class _DropDownInput:
+    """A Fusion dropdown *command input* as the dialog builder uses it.
+
+    Distinct from ``_DropDown`` above, which is a toolbar control.
+
+    The Send dialog populates the model-domain dropdown at creation, so a stub
+    with no ``listItems`` raises inside ``CommandCreatedHandler.notify`` -- and
+    that handler swallows exceptions, which silently truncates the dialog
+    instead of failing. A fake that accepts what the real object accepts is the
+    only kind that can catch that.
+    """
+
+    def __init__(self) -> None:
+        self.isVisible = True
+        self.items: list[tuple[str, bool]] = []
+        self.listItems = types.SimpleNamespace(
+            add=lambda name, selected, *rest: self.items.append((name, selected)),
+            clear=lambda: self.items.clear(),
+        )
+
+    @property
+    def selectedItem(self) -> object:
+        chosen = next((name for name, selected in self.items if selected), None)
+        return None if chosen is None else types.SimpleNamespace(name=chosen)
+
+
 def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch,
@@ -317,7 +343,7 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
         addSelectionFilter=lambda _value: None,
         setSelectionLimits=lambda _minimum, _maximum: None,
     )
-    anchor = types.SimpleNamespace(isVisible=True)
+    anchor = _DropDownInput()
     text_boxes: list[tuple[object, ...]] = []
     inputs = types.SimpleNamespace(
         addSelectionInput=lambda *_args: selection,
@@ -346,9 +372,10 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
     assert bool_inputs == [
         ("refresh_preflight", "Refresh body inventory", False, "", False)
     ]
-    # One read-only box that states the export before the user commits to it.
-    assert [args[0] for args in text_boxes] == ["preflight"]
-    assert text_boxes[0][-1] is True
+    # Two read-only boxes: what the domain dropdown means, and what the export
+    # will do before the user commits to it.
+    assert [args[0] for args in text_boxes] == ["model_domain_help", "preflight"]
+    assert all(args[-1] is True for args in text_boxes)
 
 
 def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
@@ -362,7 +389,7 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
         addSelectionFilter=lambda _value: None,
         setSelectionLimits=lambda _minimum, _maximum: None,
     )
-    anchor = types.SimpleNamespace(isVisible=True)
+    anchor = _DropDownInput()
     inputs = types.SimpleNamespace(
         addSelectionInput=lambda *args: (added.append(args[0]), selection)[1],
         addStringValueInput=lambda *args: added.append(args[0]),
@@ -387,6 +414,8 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
     assert added == [
         "send_selection",
         "anchor_instance_id",
+        "model_domain",
+        "model_domain_help",
         "preflight",
         "refresh_preflight",
     ]

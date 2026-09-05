@@ -103,7 +103,47 @@ requirements:
 In WG the return arrives marked `unlinked`; acknowledge that one finding, set
 mesh sizing and drive channels in the CAD Link panel, and solve.
 
-## 5. Troubleshooting
+## 5. Returning a model you already cut in half
+
+WG normally finds a model's mirror symmetry and cuts it down itself. A model
+that arrives **already** cut is different: there is nothing left to remove, and
+nothing in the geometry distinguishes a deliberate half from an open shell. Left
+undeclared, the half is solved as a full model with a large hole in it — a wrong
+answer rather than an error.
+
+So say it. **Model domain** on the Send/Solve dialog offers the full model
+(the default), a half cut on x = 0 or on y = 0, and a quarter cut on both.
+
+Three requirements, and WGLink checks the first two before it exports:
+
+1. **Keep the positive side.** WG keeps x ≥ 0 and y ≥ 0, so a half that lives
+   on the negative side is refused with the remedy: mirror it first.
+2. **Do not straddle the plane.** A declaration that the exported bodies
+   contradict is refused, and the refusal states the measurement it was
+   refused on.
+3. **Leave the cut face open.** The plane is where the solver's mirror goes;
+   capping it turns the mirror into a rigid wall. WG re-derives this from the
+   mesh it builds and refuses a declaration the mesh denies, so a capped or
+   leaking half never solves silently.
+
+The declaration travels in the return manifest as `assembly.domain`, gated by
+the `reduced-domain-v1` required feature: a WG that predates the feature refuses
+the bundle instead of solving it whole.
+
+Sources need no adjustment. A half model's drive face is already half its full
+area, which is exactly what WG's own cutter would have produced, and the solver
+scales the mirrored domain the same way either way.
+
+## 6. Assembly scope
+
+**Leave Assembly scope empty** to return the root component, or select exactly
+one occurrence. An occurrence is exported as its component, in the component's
+own frame — Fusion offers no way to export one in its assembly placement — so an
+occurrence that is moved or rotated away from the assembly origin is refused
+rather than exported into a frame the manifest does not describe. Return the
+root instead, or ground the occurrence at the origin.
+
+## 7. Troubleshooting
 
 - **"Waveguide Generator has no selected CAD Link workspace"** — choose the
   WGLink folder in WG under Settings → CAD Link, then send again.

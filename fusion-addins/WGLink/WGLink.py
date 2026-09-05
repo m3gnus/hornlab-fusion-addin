@@ -466,6 +466,21 @@ def _send_selection(command_inputs: object) -> object:
     return "root"
 
 
+def _send_domain(command_inputs: object) -> tuple[str, ...]:
+    """The declared model domain, defaulting to the full model.
+
+    An unreadable dropdown falls back to the full model on purpose: that is the
+    only reading that cannot turn a full model into a half behind the user's
+    back.
+    """
+
+    item = _input(command_inputs, "model_domain")
+    try:
+        return wglink_author.resolve_domain_choice(str(item.selectedItem.name))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def _send_options(command_inputs: object) -> dict[str, object]:
     # WG only ingests from its own workspace, so there is one correct
     # destination and the UI no longer asks. Collision-safe naming is kept:
@@ -482,6 +497,7 @@ def _send_options(command_inputs: object) -> dict[str, object]:
         "output_folder": str(output),
         "overwrite": False,
         "capture_document": wglink_workspace.capture_document(),
+        "domain": list(_send_domain(command_inputs)),
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -529,7 +545,10 @@ def _sync_preflight(command_inputs: object) -> None:
     if box is None:
         return
     try:
-        options: dict[str, object] = {"selection": _send_selection(command_inputs)}
+        options: dict[str, object] = {
+            "selection": _send_selection(command_inputs),
+            "domain": list(_send_domain(command_inputs)),
+        }
         anchor = _input(command_inputs, "anchor_instance_id")
         try:
             if anchor is not None and anchor.isVisible and anchor.selectedItem:
@@ -896,6 +915,14 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 _sync_preflight(inputs)
             elif input_id == "anchor_instance_id":
                 _sync_preflight(inputs)
+            elif input_id == "model_domain":
+                _sync_help(
+                    inputs,
+                    "model_domain_help",
+                    "model_domain",
+                    wglink_author.domain_help_text,
+                )
+                _sync_preflight(inputs)
             elif input_id == "refresh_preflight":
                 # Fusion body/occurrence visibility can change while this modal
                 # is open without producing a command-input event. Re-survey on
@@ -949,6 +976,23 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 anchor.isVisible = False
                 _sync_anchor_choices(inputs)
+                # A model the author already cut has to say so: WG cannot tell a
+                # deliberate half from an open shell, and solving one as the
+                # other is a wrong answer rather than an error.
+                domain = inputs.addDropDownCommandInput(
+                    "model_domain",
+                    "Model domain",
+                    adsk.core.DropDownStyles.TextListDropDownStyle,
+                )
+                for index, choice in enumerate(wglink_author.domain_choices()):
+                    domain.listItems.add(choice, index == 0)
+                inputs.addTextBoxCommandInput(
+                    "model_domain_help",
+                    "",
+                    wglink_author.domain_help_text(wglink_author.domain_choices()[0]),
+                    3,
+                    True,
+                )
                 # State the export before it happens: what goes in, whether it
                 # is linked, which sources drive it, and -- for an unlinked
                 # model, whose assembly frame WG solves as-is -- how far the

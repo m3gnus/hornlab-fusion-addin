@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "fusion-addins" / "WGLink"))
 from wglink_bundle import (  # noqa: E402
     DEFAULT_LIMITS,
+    EXPRESSION_ABS_TOLERANCE,
+    EXPRESSION_REL_TOLERANCE,
     IDENTITY_MATRIX,
     TAG_AREA_TOLERANCE,
     Limits,
@@ -37,6 +39,7 @@ from wglink_bundle import (  # noqa: E402
     attribute_payload,
     enclosure_plan,
     effective_parameters,
+    expressions_equivalent,
     format_expression,
     fusion_matrix_to_mm,
     format_measurement_mm,
@@ -919,6 +922,85 @@ def test_format_expression_preserves_shortest_exact_decimal_without_exponents():
         "0.0000001 mm",
         "1000000000000.0 mm",
     ]
+
+
+# Measured on 2026-09-06 from design "260308Tritonia-M": WG stored a 25.4 mm
+# throat (one inch) and Fusion read the same untouched parameter back one unit
+# in the last place away.
+TRITONIA_THROAT_STORED = "25.400000000000006 mm"
+TRITONIA_THROAT_OBSERVED = "25.400000000000009 mm"
+
+
+def test_untouched_inch_throat_is_not_a_difference():
+    stored = float(TRITONIA_THROAT_STORED.split()[0])
+    observed = float(TRITONIA_THROAT_OBSERVED.split()[0])
+
+    # The two spellings really are different doubles, one ULP apart, so an
+    # exact string or float comparison does call this an edit.
+    assert TRITONIA_THROAT_STORED != TRITONIA_THROAT_OBSERVED
+    assert stored != observed
+    assert abs(observed - stored) == pytest.approx(math.ulp(25.4), rel=1e-12)
+
+    assert expressions_equivalent(TRITONIA_THROAT_STORED, TRITONIA_THROAT_OBSERVED)
+
+
+def test_expressions_equivalent_accepts_every_rounding_of_one_stored_value():
+    assert expressions_equivalent("25.400000000000006 mm", "25.4 mm")
+    assert expressions_equivalent("320.0 mm", "320 mm")
+    assert expressions_equivalent("0.0 mm", "-0.0 mm")
+    assert expressions_equivalent("0.0000001 mm", "1e-7 mm")
+    assert expressions_equivalent("6.0 mm", "6.000000000000001 mm")
+
+
+@pytest.mark.parametrize(
+    "expected, actual",
+    [
+        # A tenth of a micron: five orders below anything machinable, and still
+        # reported, so no real edit can hide under the tolerance.
+        ("25.4 mm", "25.4001 mm"),
+        ("25.4 mm", "25.4000001 mm"),
+        ("0.0 mm", "0.000001 mm"),
+        ("320.0 mm", "319.9999 mm"),
+        # A unit change is a change; this helper cannot convert one.
+        ("25.4 mm", "25.4 cm"),
+        ("25.4 mm", "1.0 in"),
+        ("25.4 mm", "25.4"),
+        # A symbolic expression is never proven equal by inspection.
+        ("50.0 mm", "wg_x_throat_dia * 2"),
+        ("50.0 mm", "25.0 mm * 2"),
+        ("25.4 mm", "(unreadable: RuntimeError)"),
+        ("25.4 mm", None),
+        (None, "25.4 mm"),
+        ("25.4 mm", "nan mm"),
+        ("25.4 mm", ""),
+    ],
+)
+def test_expressions_equivalent_reports_a_real_difference(expected, actual):
+    assert not expressions_equivalent(expected, actual)
+
+
+def test_expression_tolerance_sits_between_binary_noise_and_geometry():
+    """Pin the band the tolerance has to occupy.
+
+    Below it is the float round-trip WGLink must absorb; above it is the
+    finest geometric difference the pipeline can express (Fusion displays
+    1e-3 mm, mesher tolerances are ~1e-4 mm).
+    """
+
+    throat = 25.4
+    noise = math.ulp(throat)
+    smallest_caught = throat * EXPRESSION_REL_TOLERANCE
+
+    assert smallest_caught > 1000.0 * noise
+    assert smallest_caught < 1.0e-4
+    assert EXPRESSION_ABS_TOLERANCE < 1.0e-4
+
+    assert expressions_equivalent(
+        format_expression(throat), format_expression(throat + 0.1 * smallest_caught)
+    )
+    assert not expressions_equivalent(
+        format_expression(throat), format_expression(throat + 10.0 * smallest_caught)
+    )
 
 
 @pytest.mark.parametrize("name", ["1_bad", "wg-bad", "wg bad", ""])

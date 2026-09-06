@@ -30,6 +30,7 @@ if __package__:
         attribute_payload,
         effective_parameters,
         enclosure_plan,
+        expressions_equivalent,
         format_expression,
         fusion_matrix_to_mm,
         health_regressions,
@@ -54,6 +55,7 @@ else:
         attribute_payload,
         effective_parameters,
         enclosure_plan,
+        expressions_equivalent,
         format_expression,
         fusion_matrix_to_mm,
         health_regressions,
@@ -3217,6 +3219,16 @@ def _stored_json(payload: dict[str, Any], name: str, default: object) -> object:
 
 
 def _parameter_drift(design: object, record: dict[str, Any]) -> list[dict[str, object]]:
+    """Name every managed parameter whose live value left the stored one.
+
+    The comparison is numeric, not textual.  Fusion re-emits the expression it
+    parsed, and that round trip is not bit-exact, so an exact string
+    comparison reported an untouched 25.4 mm throat diameter as drifted --
+    ``"25.400000000000006 mm"`` stored against ``"25.400000000000009 mm"``
+    read back.  ``expressions_equivalent`` absorbs that last-place difference
+    and nothing coarser; see its tolerance note.
+    """
+
     expected = _stored_json(record["payload"], "parameter_expressions", {})
     if not isinstance(expected, dict):
         return [{"name": "(metadata)", "expected": "parameter map", "actual": "invalid"}]
@@ -3230,7 +3242,7 @@ def _parameter_drift(design: object, record: dict[str, Any]) -> list[dict[str, o
             actual = str(parameter.expression)
         except Exception as exc:  # noqa: BLE001
             actual = f"(unreadable: {exc})"
-        if actual != str(expression):
+        if not expressions_equivalent(expression, actual):
             drift.append({"name": name, "expected": expression, "actual": actual})
     return drift
 

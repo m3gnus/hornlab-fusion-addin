@@ -675,3 +675,103 @@ def test_update_refuses_when_design_is_not_discoverable_in_the_wg_workspace(
     message = str(refusal.value)
     assert "could not be found in the current WG workspace" in message
     assert "headless wglink_core.relink API" in message
+
+
+# Measured on 2026-09-06 from design "260308Tritonia-M". The user had changed
+# nothing in Fusion, yet WGLink published
+# driftedParameters == ["wg_260308tritonia_m_throat_dia"]: the throat is 25.4 mm
+# (one inch, with no finite binary representation) and Fusion re-emitted the
+# expression it had parsed one unit in the last place away.
+TRITONIA_STORED_EXPRESSIONS = {
+    "wg_260308tritonia_m_depth": "124.5923644327676 mm",
+    "wg_260308tritonia_m_mouth_h": "320.0 mm",
+    "wg_260308tritonia_m_mouth_w": "320.0 mm",
+    "wg_260308tritonia_m_throat_dia": "25.400000000000006 mm",
+    "wg_260308tritonia_m_vertical_offset": "0.0 mm",
+    "wg_260308tritonia_m_wall_t": "6.0 mm",
+}
+TRITONIA_LIVE_EXPRESSIONS = {
+    **TRITONIA_STORED_EXPRESSIONS,
+    "wg_260308tritonia_m_throat_dia": "25.400000000000009 mm",
+}
+
+
+def _drift_record(stored):
+    return {"payload": {"parameter_expressions": json.dumps(stored)}}
+
+
+def _drift_design(live):
+    parameters = {
+        name: types.SimpleNamespace(expression=expression)
+        for name, expression in live.items()
+    }
+    return types.SimpleNamespace(
+        userParameters=types.SimpleNamespace(itemByName=parameters.get)
+    )
+
+
+def test_untouched_tritonia_throat_is_not_reported_as_drifted(core):
+    drift = core._parameter_drift(
+        _drift_design(TRITONIA_LIVE_EXPRESSIONS),
+        _drift_record(TRITONIA_STORED_EXPRESSIONS),
+    )
+
+    assert drift == []
+
+
+def test_parameter_drift_still_names_an_edited_throat(core):
+    live = {
+        **TRITONIA_LIVE_EXPRESSIONS,
+        # A tenth of a micron on the throat: far finer than any waveguide can
+        # be machined, and still reported.
+        "wg_260308tritonia_m_throat_dia": "25.4001 mm",
+    }
+
+    drift = core._parameter_drift(
+        _drift_design(live), _drift_record(TRITONIA_STORED_EXPRESSIONS)
+    )
+
+    assert drift == [
+        {
+            "name": "wg_260308tritonia_m_throat_dia",
+            "expected": "25.400000000000006 mm",
+            "actual": "25.4001 mm",
+        }
+    ]
+
+
+def test_parameter_drift_names_a_deleted_and_a_retyped_parameter(core):
+    live = {
+        **TRITONIA_LIVE_EXPRESSIONS,
+        # Same number, different unit: a hundredfold change of the mouth.
+        "wg_260308tritonia_m_mouth_w": "320.0 cm",
+    }
+    del live["wg_260308tritonia_m_wall_t"]
+
+    drift = core._parameter_drift(
+        _drift_design(live), _drift_record(TRITONIA_STORED_EXPRESSIONS)
+    )
+
+    assert [row["name"] for row in drift] == [
+        "wg_260308tritonia_m_mouth_w",
+        "wg_260308tritonia_m_wall_t",
+    ]
+    assert drift[1]["actual"] is None
+
+
+def test_parameter_drift_names_a_parameter_it_cannot_read(core):
+    class Unreadable:
+        @property
+        def expression(self):
+            raise RuntimeError("Fusion refused")
+
+    design = types.SimpleNamespace(
+        userParameters=types.SimpleNamespace(
+            itemByName={"wg_x_throat_dia": Unreadable()}.get
+        )
+    )
+
+    drift = core._parameter_drift(design, _drift_record({"wg_x_throat_dia": "25.4 mm"}))
+
+    assert [row["name"] for row in drift] == ["wg_x_throat_dia"]
+    assert "unreadable" in str(drift[0]["actual"])

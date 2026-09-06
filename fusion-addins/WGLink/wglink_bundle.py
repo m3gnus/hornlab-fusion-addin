@@ -52,6 +52,30 @@ IDENTITY_MATRIX = (
     (0.0, 0.0, 0.0, 1.0),
 )
 _PARAMETER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# How far two spellings of one managed parameter may sit apart and still count
+# as "the user changed nothing".
+#
+# Fusion parses a millimetre expression into its internal centimetre store and
+# re-emits it, and that round trip is not bit-exact.  A 25.4 mm throat -- one
+# inch, which has no finite binary representation -- was stored as
+# "25.400000000000006 mm" and read back from Fusion as "25.400000000000009 mm":
+# one unit in the last place, 3.6e-15 mm.  An exact string comparison called
+# that a user edit and reported the parameter as drifted.
+#
+# 1e-9 sits in the empty band between the two scales that matter.  It is six
+# orders of magnitude above the double-precision noise it has to absorb, and
+# five or six below the smallest geometric difference this pipeline can even
+# express: Fusion's default length display resolves 1e-3 mm, mesher tolerances
+# are ~1e-4 mm, and machining a waveguide resolves 1e-2 mm at best.  On a
+# 25.4 mm throat it still catches a change of 2.5e-8 mm, far below anything a
+# user can type into the Fusion parameter table.  Managed parameters are
+# millimetre lengths, so the absolute floor -- which only matters for a
+# parameter whose stored value is 0, such as the vertical offset -- is 1e-9 mm.
+EXPRESSION_REL_TOLERANCE = 1.0e-9
+EXPRESSION_ABS_TOLERANCE = 1.0e-9
+_PLAIN_MAGNITUDE = re.compile(
+    r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)\s*"
+)
 _IDENTITY_ERROR = (
     "this bundle was not exported from Waveguide Generator; export it from WG "
     "so the link has an identity"
@@ -970,6 +994,51 @@ def format_expression(value_mm: float) -> str:
     return f"{shortest} mm"
 
 
+def _plain_magnitude(expression: str) -> tuple[float, str] | None:
+    """Split a literal ``"<number> <unit>"`` expression, or refuse to guess."""
+
+    match = _PLAIN_MAGNITUDE.fullmatch(str(expression))
+    if match is None:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:  # pragma: no cover - the pattern already proved the shape
+        return None
+    if not math.isfinite(value):
+        return None
+    return value, match.group(2)
+
+
+def expressions_equivalent(expected: object, actual: object) -> bool:
+    """Report whether a live CAD expression still states the stored value.
+
+    ``format_expression`` writes a literal number and a unit, so a literal in
+    the same unit is the only thing that can be compared numerically.  Anything
+    else -- a symbolic expression such as ``"wg_x_depth * 2"``, a different
+    unit token, a missing or unreadable value -- is a difference and is
+    reported as one.
+    """
+
+    if expected is None or actual is None:
+        return False
+    left = str(expected)
+    right = str(actual)
+    if left == right:
+        return True
+    expected_magnitude = _plain_magnitude(left)
+    actual_magnitude = _plain_magnitude(right)
+    if expected_magnitude is None or actual_magnitude is None:
+        return False
+    if expected_magnitude[1] != actual_magnitude[1]:
+        return False
+    return math.isclose(
+        expected_magnitude[0],
+        actual_magnitude[0],
+        rel_tol=EXPRESSION_REL_TOLERANCE,
+        abs_tol=EXPRESSION_ABS_TOLERANCE,
+    )
+
+
 def validate_parameter_name(name: str) -> None:
     """Refuse names Fusion cannot install as document-global identifiers."""
 
@@ -1736,6 +1805,8 @@ def fusion_matrix_to_mm(values: Sequence[float]) -> list[list[float]]:
 __all__ = [
     "Bundle",
     "DEFAULT_LIMITS",
+    "EXPRESSION_ABS_TOLERANCE",
+    "EXPRESSION_REL_TOLERANCE",
     "EnclosurePlan",
     "Limits",
     "LinkIdentity",
@@ -1748,6 +1819,7 @@ __all__ = [
     "attribute_payload",
     "effective_parameters",
     "enclosure_plan",
+    "expressions_equivalent",
     "format_expression",
     "fusion_matrix_to_mm",
     "format_measurement_mm",

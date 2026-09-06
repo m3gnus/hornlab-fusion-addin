@@ -241,7 +241,11 @@ the document. Do not continue modelling on a partially failed rebuild.
 
 Audit is evidence, not a freshness authority. CAD cannot author WG freshness.
 It can observe a missing or changed body, parameter drift, the geometric source
-tag, and unhealthy timeline features. Fusion has no face-to-feature reverse
+tag, and unhealthy timeline features. Parameter drift is measured numerically,
+not textually: Fusion does not re-emit a parsed expression bit-for-bit, so two
+spellings of one length within `EXPRESSION_REL_TOLERANCE` (1e-9 relative,
+1e-9 mm absolute) are the same value. That band is far below the finest change
+a user can enter, and far above the float round-trip it exists to absorb. Fusion has no face-to-feature reverse
 index, so Audit cannot enumerate every direct B-rep reference and cannot detect
 a reference that silently rebound to the wrong face. A green Audit therefore
 does not prove semantic reference correctness. Direct face/edge references are

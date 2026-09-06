@@ -472,13 +472,26 @@ def _fem_slug(component: object) -> str:
 
 def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
     selection, geometry, selected_entity, export_frame = _selection(design, selection_value)
+    # Every frame-dependent measurement is taken from the handle that lives in
+    # the frame of the file being written, and which handle that is depends on
+    # the selected occurrence's placement, not on the export scope alone.
+    #
+    # A body proxy reports geometry in the ROOT document frame; a native body
+    # reports it in its own component's frame. Under root scope the proxy is
+    # already right. Under occurrence scope:
+    #
+    # * placement identity -- the selected component's frame IS the root frame,
+    #   so the proxies are right for every body, including bodies inside child
+    #   occurrences, whose natives would be in their own child components'
+    #   frames and therefore wrong;
+    # * placement moved or rotated -- ``_selection`` has already refused any
+    #   child occurrence, so every body belongs to the selected component
+    #   itself and its native is exactly the exported frame.
+    placed = selection != "root" and not _is_identity_placement(
+        _occurrence_placement(selected_entity)
+    )
     candidates: list[dict[str, Any]] = []
     bodies: dict[str, object] = {}
-    # Every frame-dependent measurement is taken from the handle that lives in
-    # the frame of the file being written: the body as collected under root
-    # scope (a child occurrence's proxy is already in root coordinates), and the
-    # native body under occurrence scope, which is the same component-local
-    # frame the STEP is exported in.
     measured: dict[str, object] = {}
     fem_components: dict[str, object] = {}
     components: list[object] = []
@@ -536,9 +549,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         ) or _has_source_face(body)
         candidates.append(candidate)
         bodies[object_id] = body
-        measured[object_id] = (
-            native if export_frame == OCCURRENCE_EXPORT_FRAME else body
-        )
+        measured[object_id] = native if placed else body
 
     def walk_component(
         component: object,
@@ -584,6 +595,17 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         children = _collection(occurrence, "childOccurrences") if occurrence is not None else _collection(component, "occurrences")
         if occurrence is not None and not children:
             children = _collection(component, "occurrences")
+        if children and placed:
+            # ``_selection`` refuses this combination, so reaching it means the
+            # document changed under the dialog. Refusing again here is cheap,
+            # and the alternative is measuring a child's native geometry in the
+            # wrong frame.
+            raise wglink_core.WgLinkError(
+                "The selected occurrence is placed away from the assembly origin "
+                "and contains sub-assemblies; its bodies cannot be measured in "
+                "the frame the STEP is written in. Leave Assembly scope empty to "
+                "send the whole root assembly."
+            )
         for child in children:
             child_path = _occurrence_path(child)
             child_suppressed = suppressed or _bool(child, ("isSuppressed",), False)

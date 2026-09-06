@@ -1042,8 +1042,9 @@ class ContractExportManager:
     fake reproduces exactly that, so the contract is a test and not a comment.
     """
 
-    def __init__(self):
+    def __init__(self, bodies=1):
         self.geometries = []
+        self.bodies = bodies
 
     def createSTEPExportOptions(self, path, geometry=None):
         # An omitted argument stays legal here because Autodesk documents it as
@@ -1057,9 +1058,12 @@ class ContractExportManager:
         return path, geometry
 
     def execute(self, options):
+        entities = "".join(
+            f"#{index}=MANIFOLD_SOLID_BREP('',#{index + 100});\n"
+            for index in range(1, self.bodies + 1)
+        )
         Path(options[0]).write_text(
-            "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
-            encoding="utf-8",
+            f"ISO-10303-21;\n{entities}END-ISO-10303-21;\n", encoding="utf-8"
         )
         return True
 
@@ -1538,3 +1542,111 @@ def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
                     **options,
                 },
             )
+
+
+def test_a_child_occurrence_is_measured_where_it_sits_not_in_its_own_component(
+    send_module, tmp_path, monkeypatch
+):
+    """The frame a nested body is measured in follows the placement, not the scope.
+
+    A body proxy reports the root document frame; a native reports its own
+    component's. When the selected occurrence sits at the origin those are the
+    same frame, so the proxies are right for everything -- including a child
+    occurrence that has been moved, whose native is in the *child's* frame and
+    would put the bounding box and the declared-domain measurement somewhere
+    the exported STEP does not have geometry.
+
+    The child here is moved 200 mm along +Y inside its parent. Measured
+    natively it would look like it sits at the origin; measured where it sits
+    it reaches 240 mm.
+    """
+
+    parent_native = body("Horn")
+    parent_native.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    parent_component = component("Horn component", [parent_native])
+    parent_proxy = _proxy_of(parent_native, component_value=parent_component)
+
+    child_native = body("Mouth ring", faces=[face("HF")])
+    child_native.boundingBox = box((-2.0, 0.0, 0.0), (2.0, 4.0, 1.0))
+    child_component = component("Ring component", [child_native])
+    child = _occurrence(
+        child_component,
+        [_proxy_of(child_native, offset_mm=(0.0, 200.0, 0.0), component_value=child_component)],
+        placement=moved_transform(y_cm=20.0),
+        name="Ring:1",
+    )
+
+    occurrence = _occurrence(
+        parent_component, [parent_proxy], children=[child], name="Horn:1"
+    )
+    root = component("Speaker")
+    root.occurrences = Collection([occurrence])
+    root.allOccurrences = Collection([occurrence])
+    design, app, manager = _contract_design(root, ContractExportManager(bodies=2))
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app,
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "selection": occurrence,
+            "domain": ["y0"],
+        },
+    )
+
+    assert manager.geometries == [parent_component]
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    # 240 mm, where the ring actually is inside the exported component -- not
+    # the 40 mm its own component would report.
+    assert manifest["assembly"]["bbox_mm"] == [[-30.0, 0.0, 0.0], [30.0, 240.0, 60.0]]
+    assert manifest["assembly"]["domain"]["evidence"]["y0"]["max_mm"] == 240.0
+    assert manifest["coordinate_system"]["export_frame"] == "selected-occurrence-component"
+
+
+def test_a_moved_parent_holding_sub_assemblies_is_refused_in_the_walk_too(
+    send_module, monkeypatch
+):
+    """The invariant the measurement relies on is enforced where it is used.
+
+    ``_selection`` refuses this pair, so the walk can only reach it if the
+    document changed under an open dialog. It refuses again rather than
+    measuring a child's native geometry in the wrong frame.
+    """
+
+    child_native = body("Bracket")
+    child_component = component("Bracket component", [child_native])
+    child = _occurrence(
+        child_component,
+        [_proxy_of(child_native, component_value=child_component)],
+        name="Bracket:1",
+    )
+    parent_native = body("Horn", faces=[face("HF")])
+    parent_component = component("Horn component", [parent_native])
+    occurrence = _occurrence(
+        parent_component,
+        [_proxy_of(parent_native, offset_mm=(0.0, 120.0, 0.0), component_value=parent_component)],
+        placement=moved_transform(y_cm=12.0),
+        children=[child],
+    )
+    design = types.SimpleNamespace(rootComponent=component("Speaker"))
+
+    # Bypass _selection the way a mid-dialog document change would, and confirm
+    # the walk still refuses rather than mis-measuring.
+    monkeypatch.setattr(
+        send_module,
+        "_selection",
+        lambda _design, _value: (
+            {"kind": "occurrence", "path": "Speaker/Horn:1"},
+            parent_component,
+            occurrence,
+            send_module.OCCURRENCE_EXPORT_FRAME,
+        ),
+    )
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError,
+        match="contains sub-assemblies; its bodies cannot be measured",
+    ):
+        send_module._scope_walk(design, occurrence)

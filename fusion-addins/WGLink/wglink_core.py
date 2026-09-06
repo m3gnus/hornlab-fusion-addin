@@ -409,6 +409,73 @@ def _entity_label(entity: object) -> str:
         return _kind(entity) or "unknown entity"
 
 
+MANAGED_BODY_ROLES = frozenset({"enclosure", "waveguide"})
+
+
+def _attach_managed_objects(
+    design: adsk.fusion.Design, record: dict[str, Any]
+) -> list[object]:
+    """Resolve one raw link record's managed body and wrapper, in place.
+
+    ``_link_records`` groups attributes and resolves no geometry, so a raw
+    record carries entities and payload but no ``body`` at all. Anything that
+    asks about the body has to come through here first; the advisory heartbeat
+    did not, so ``_local_body_state`` called every intact managed body
+    ``missing`` and published no fingerprint beside it.
+
+    Returns the clashing entities when one instance id covers several managed
+    objects, so a caller that must refuse an ambiguous document (Audit,
+    Update) still can, while a caller that must survive one bad link can
+    degrade that link alone.
+    """
+
+    bodies = [
+        entity
+        for entity in record["entities"]
+        if _body_role(entity) in MANAGED_BODY_ROLES
+    ]
+    wrappers = [entity for entity in record.get("wrappers", []) if _kind(entity) == "Component"]
+    token_table = _token_table(record["payload"])
+    if not bodies:
+        bodies = [
+            entity
+            for entity in _find_by_token(design, token_table.get("body:final", ""))
+            if _kind(entity) == "BRepBody"
+        ]
+    if not wrappers:
+        wrappers = [
+            entity
+            for entity in _find_by_token(
+                design, token_table.get("wrapper:component", "")
+            )
+            if _kind(entity) == "Component"
+        ]
+    clashes: list[object] = []
+    if len(bodies) > 1 or len(wrappers) > 1:
+        clashes = bodies if len(bodies) > 1 else wrappers
+    record["body"] = bodies[0] if len(bodies) == 1 else None
+    record["wrapper_component"] = wrappers[0] if len(wrappers) == 1 else None
+    return clashes
+
+
+def _resolved_link_records(design: adsk.fusion.Design) -> dict[str, dict[str, Any]]:
+    """Every managed link in the document, with its body and wrapper resolved.
+
+    The one inventory a reader should ask for. ``_link_records`` underneath it
+    is the raw attribute grouping, and a reader that stops there sees no body
+    on any link -- which is not the same document Audit sees.
+
+    Unlike ``_resolve_link`` this refuses nothing: a duplicated instance id is
+    reported as ``managed_object_clash`` on that record and leaves the rest of
+    the inventory readable.
+    """
+
+    records = _link_records(design)
+    for record in records.values():
+        record["managed_object_clash"] = bool(_attach_managed_objects(design, record))
+    return records
+
+
 def _resolve_link(
     design: adsk.fusion.Design,
     options: dict[str, Any],
@@ -440,37 +507,14 @@ def _resolve_link(
             "options['instance_id'] to choose one."
         )
 
-    bodies = [
-        entity
-        for entity in record["entities"]
-        if _body_role(entity) in {"enclosure", "waveguide"}
-    ]
-    wrappers = [entity for entity in record.get("wrappers", []) if _kind(entity) == "Component"]
-    token_table = _token_table(record["payload"])
-    if not bodies:
-        bodies = [
-            entity
-            for entity in _find_by_token(design, token_table.get("body:final", ""))
-            if _kind(entity) == "BRepBody"
-        ]
-    if not wrappers:
-        wrappers = [
-            entity
-            for entity in _find_by_token(
-                design, token_table.get("wrapper:component", "")
-            )
-            if _kind(entity) == "Component"
-        ]
-    if len(bodies) > 1 or len(wrappers) > 1:
-        clashes = bodies if len(bodies) > 1 else wrappers
+    clashes = _attach_managed_objects(design, record)
+    if clashes:
         labels = ", ".join(_entity_label(entity) for entity in clashes)
         raise WgLinkError(
             f"Duplicate WGLink instance id {record['instance_id']!r} belongs to "
             f"multiple managed objects: {labels}. Give the instances unique ids "
             "or Detach one; WGLink refuses to guess."
         )
-    record["body"] = bodies[0] if bodies else None
-    record["wrapper_component"] = wrappers[0] if wrappers else None
     if not record["payload"].get("topology"):
         raise WgLinkError(
             f"WGLink instance {record['instance_id']!r} is missing its topology "

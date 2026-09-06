@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import types
@@ -250,6 +251,16 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     core.DialogResults = types.SimpleNamespace(
         DialogOK="ok", DialogYes="yes", DialogNo="no"
     )
+    # Fusion's own cast returns None for a product that is not a Design, which
+    # is what lets `wglink_core._design` refuse a non-design document. Tests
+    # whose active product is a bare namespace keep that refusal; only a
+    # fixture that supplies a real design type reaches the live return state.
+    fusion.Design = types.SimpleNamespace(
+        cast=lambda product: (
+            product if getattr(product, "designType", None) is not None else None
+        )
+    )
+    fusion.DesignTypes = types.SimpleNamespace(ParametricDesignType="parametric")
     adsk.doEvents = lambda: None  # type: ignore[attr-defined]
     adsk.core, adsk.fusion = core, fusion  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "adsk", adsk)
@@ -1206,6 +1217,199 @@ def test_expired_owner_is_replaced_and_cannot_tear_successor_down(monkeypatch) -
     second.stop(None)
 
 
+class _Collection(list):
+    @property
+    def count(self) -> int:
+        return len(self)
+
+    def item(self, index: int) -> object:
+        return self[index]
+
+    def itemByName(self, name: str) -> object | None:
+        return next((item for item in self if getattr(item, "name", None) == name), None)
+
+
+class _Attribute:
+    """Fusion's attribute handle: it writes through to its owner's table."""
+
+    def __init__(self, owner: "_Attributes", key: tuple[str, str]) -> None:
+        self._owner, self._key = owner, key
+
+    @property
+    def value(self) -> object:
+        return self._owner.values.get(self._key)
+
+    @value.setter
+    def value(self, value: object) -> None:
+        self._owner.values[self._key] = value
+
+    def deleteMe(self) -> bool:
+        self._owner.values.pop(self._key, None)
+        return True
+
+
+class _Attributes:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str], object] = {}
+
+    def itemByName(self, group: str, name: str) -> _Attribute | None:
+        key = (group, name)
+        return _Attribute(self, key) if self.values.get(key) is not None else None
+
+    def add(self, group: str, name: str, value: object) -> None:
+        self.values[(group, name)] = value
+
+
+def _point(x: float, y: float, z: float) -> object:
+    return types.SimpleNamespace(x=x, y=y, z=z)
+
+
+def _box_mm(low: tuple[float, float, float], high: tuple[float, float, float]) -> object:
+    """A bounding box written in millimetres, stored in Fusion's centimetres."""
+
+    return types.SimpleNamespace(
+        minPoint=_point(*(value / 10.0 for value in low)),
+        maxPoint=_point(*(value / 10.0 for value in high)),
+    )
+
+
+_THROAT_DIAMETER_MM = 25.4
+_THROAT_AREA_MM2 = math.pi * _THROAT_DIAMETER_MM * _THROAT_DIAMETER_MM / 4.0
+
+
+def _managed_body(name: str = "Waveguide") -> object:
+    """One managed solid carrying the painted throat face a return needs."""
+
+    throat = types.SimpleNamespace(
+        area=_THROAT_AREA_MM2 / 100.0,  # Fusion reports face area in cm2
+        appearance=types.SimpleNamespace(name="HF"),
+        edges=_Collection(),
+        boundingBox=_box_mm((0.0, 0.0, 0.0), (10.0, 10.0, 0.0)),
+        attributes=_Attributes(),
+    )
+    return types.SimpleNamespace(
+        name=name,
+        isSolid=True,
+        isVisible=True,
+        faces=_Collection([throat]),
+        attributes=_Attributes(),
+        boundingBox=_box_mm((-40.0, -40.0, 0.0), (40.0, 40.0, 120.0)),
+        volume=1.0,
+        entityToken=f"token-{name}",
+        objectType="adsk::fusion::BRepBody",
+    )
+
+
+def _parameter(name: str, expression: str, value_mm: float) -> object:
+    return types.SimpleNamespace(
+        name=name, expression=expression, value=value_mm / 10.0, unit="mm"
+    )
+
+
+def _linked_document(
+    module,
+    *,
+    instance_id: str = "wgi-heartbeat",
+    bundle_path: str = "bundles/horn.wglink",
+    export_id: str = "wge_1",
+    stored_expressions: dict[str, str] | None = None,
+    live_expressions: dict[str, str] | None = None,
+):
+    """A document holding one real, fully attributed WGLink insertion.
+
+    Everything the heartbeat reads is present as genuine Fusion attributes, so
+    ``_link_records``, ``_local_body_state``, ``_parameter_drift`` and the live
+    ``return_state`` all run for real against it. Stubbing those out is what
+    let the heartbeat report an intact managed body as ``missing`` for a whole
+    release without a single test noticing.
+    """
+
+    core = module.wglink_core
+    body = _managed_body()
+    root = types.SimpleNamespace(
+        name="Doc",
+        objectType="adsk::fusion::Component",
+        bRepBodies=_Collection([body]),
+        meshBodies=_Collection(),
+        constructionPlanes=_Collection([
+            types.SimpleNamespace(
+                name="WG_THROAT_PLANE",
+                geometry=types.SimpleNamespace(
+                    origin=_point(0.0, 0.0, 0.0), normal=_point(0.0, 0.0, 1.0)
+                ),
+            )
+        ]),
+        constructionAxes=_Collection([
+            types.SimpleNamespace(
+                name="WG_AXIS",
+                geometry=types.SimpleNamespace(
+                    origin=_point(0.0, 0.0, 0.0), direction=_point(0.0, 0.0, 1.0)
+                ),
+            )
+        ]),
+        sketches=_Collection(),
+        occurrences=_Collection(),
+        allOccurrences=_Collection(),
+        attributes=_Attributes(),
+    )
+    body.parentComponent = root
+    core._set_attribute(body, "instance_id", instance_id)
+    core._set_attribute(body, "role", "waveguide")
+    core._set_attribute(body, "face_role", "HF")
+
+    stored = dict(stored_expressions or {})
+    payload = {
+        "instance_id": instance_id,
+        "topology": "wg",
+        "design_id": "wgd-a",
+        "design_name": "Horn",
+        "bundle_path": bundle_path,
+        "export_id": export_id,
+        "export_sequence": "1",
+        "build_mode": "freestanding",
+        "parameter_prefix": "wg_",
+        "source_role": "HF",
+        "expected_throat_area_mm2": f"{_THROAT_AREA_MM2:.6f}",
+        "throat_z_mm": "0",
+        "wrapper": "root",
+        "body_fingerprint": json.dumps(core._body_fingerprint(body)),
+        "parameter_expressions": json.dumps(stored),
+    }
+    attributes = [
+        types.SimpleNamespace(
+            name=core._wrapper_attribute_name(instance_id),
+            value=json.dumps(payload),
+            parent=root,
+        ),
+        *[
+            types.SimpleNamespace(name=key[1], value=str(value), parent=body)
+            for key, value in body.attributes.values.items()
+        ],
+    ]
+
+    live = dict(live_expressions if live_expressions is not None else stored)
+    parameters = _Collection([
+        _parameter("wg_throat_dia", f"{_THROAT_DIAMETER_MM} mm", _THROAT_DIAMETER_MM),
+        *[
+            _parameter(name, expression, float(expression.split()[0]))
+            for name, expression in sorted(live.items())
+        ],
+    ])
+    design = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        designType="parametric",
+        rootComponent=root,
+        findAttributes=lambda _group, _name: _Collection(attributes),
+        userParameters=parameters,
+        unitsManager=types.SimpleNamespace(
+            convert=lambda value, source, _target: (
+                value * 10.0 if source == "internalUnits" else value
+            )
+        ),
+    )
+    return design, body
+
+
 def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     monkeypatch,
 ) -> None:
@@ -1213,28 +1417,13 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
-    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     module = _load_instance(monkeypatch, "WGLink_parameter_drift", ui, app)
-    record = {"payload": {}, "body": None}
-    monkeypatch.setattr(
-        module.wglink_core,
-        "_link_records",
-        lambda _design: {"instance-a": record},
+    design, _body = _linked_document(
+        module,
+        stored_expressions={"wg_mouth_thickness": "4 mm", "wg_length": "25 mm"},
+        live_expressions={"wg_mouth_thickness": "6 mm", "wg_length": "30 mm"},
     )
-    monkeypatch.setattr(
-        module.wglink_core,
-        "_parameter_drift",
-        lambda _design, _record: [
-            {"name": "wg_mouth_thickness"},
-            {"name": "wg_length"},
-        ],
-    )
-    monkeypatch.setattr(
-        module.wglink_core,
-        "_local_body_state",
-        lambda _record: "unchanged",
-    )
-    monkeypatch.setattr(module.wglink_send, "return_state", lambda *_args: {})
+    app.activeProduct = design
 
     links = module._document_links()
 
@@ -1244,47 +1433,76 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     )
 
 
+def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:
+    """The heartbeat and Audit read one inventory, so they cannot disagree.
+
+    Measured on an ordinary inserted model: the heartbeat obtained raw
+    ``_link_records``, which resolve no geometry, so every intact managed body
+    was published to WG as ``missing`` with no fingerprint beside it while
+    Audit -- going through ``_resolve_link`` -- called the same link
+    unmodified.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_body_state", ui, app)
+    design, body = _linked_document(module)
+    app.activeProduct = design
+
+    link = module._document_links()[0]
+
+    audited = module.wglink_core._resolve_link(design, {"instance_id": "wgi-heartbeat"})
+    assert link["local_body_state"] == "unmodified"
+    assert link["local_body_state"] == module.wglink_core._local_body_state(audited)
+    assert link["body_fingerprint_hash"] == module._fingerprint_hash(
+        module.wglink_core._body_fingerprint(body)
+    )
+
+
+def test_document_links_report_a_deleted_body_as_missing(monkeypatch) -> None:
+    """The state stays honest: a link whose body is gone still reads missing."""
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_body_deleted", ui, app)
+    design, body = _linked_document(module)
+    # Fusion drops the deleted body's attributes with it, which is what leaves
+    # the wrapper payload as the only surviving evidence of the link.
+    body.attributes.values.clear()
+    design.rootComponent.bRepBodies = _Collection()
+    app.activeProduct = design
+
+    link = module._document_links()[0]
+
+    assert link["local_body_state"] == "missing"
+    assert link["body_fingerprint_hash"] == ""
+
+
 def test_document_links_attach_exact_live_return_identities(monkeypatch) -> None:
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
-    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     module = _load_instance(monkeypatch, "WGLink_live_identities", ui, app)
-    record = {"payload": {}, "body": None}
-    monkeypatch.setattr(
-        module.wglink_core,
-        "_link_records",
-        lambda _design: {"instance-a": record},
-    )
-    monkeypatch.setattr(module.wglink_core, "_parameter_drift", lambda *_args: [])
-    monkeypatch.setattr(
-        module.wglink_core, "_local_body_state", lambda _record: "unchanged"
-    )
-    monkeypatch.setattr(
-        module.wglink_send,
-        "return_state",
-        lambda *_args: {
-            "hash": "sha256:return-state",
-            "body_count": 1,
-            "source_hash": "sha256:sources",
-            "instance_identities": {
-                "instance-a": {
-                    "body_object_ids": ["body-token"],
-                    "transform_hash": "sha256:transform",
-                    "source_ids": ["source-hf"],
-                    "drive_channel_ids": ["drive-hf"],
-                }
-            },
-        },
-    )
+    design, body = _linked_document(module)
+    app.activeProduct = design
 
     link = module._document_links()[0]
 
-    assert link["body_object_ids"] == ["body-token"]
-    assert link["transform_hash"] == "sha256:transform"
-    assert link["source_ids"] == ["source-hf"]
-    assert link["drive_channel_ids"] == ["drive-hf"]
+    state = module.wglink_send.return_state(
+        app, {"selection": "root", "anchor_instance_id": "wgi-heartbeat"}
+    )
+    identity = state["instance_identities"]["wgi-heartbeat"]
+    assert link["body_object_ids"] == [body.entityToken]
+    assert link["transform_hash"] == identity["transform_hash"]
+    assert link["source_ids"] == identity["source_ids"]
+    assert link["drive_channel_ids"] == identity["drive_channel_ids"]
+    assert link["document_signature_hash"] == state["hash"]
+    assert link["source_state_hash"] == state["source_hash"]
 
 
 def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) -> None:
@@ -1440,7 +1658,6 @@ def test_a_pending_new_export_updates_the_existing_link_without_a_prompt(
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
-    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     app.activeDocument = types.SimpleNamespace(name="Tritonia V")
     module = _load_instance(monkeypatch, "WGLink_pending_update", ui, app)
     bundle_root = tmp_path / "wglink"
@@ -1459,13 +1676,13 @@ def test_a_pending_new_export_updates_the_existing_link_without_a_prompt(
     }))
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
-    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {
-        "instance-a": {"payload": {
-            "bundle_path": str(bundle),
-            "design_id": "wgd-a",
-            "export_id": "wge_2",
-        }},
-    })
+    design, _body = _linked_document(
+        module,
+        instance_id="instance-a",
+        bundle_path=str(bundle),
+        export_id="wge_2",
+    )
+    app.activeProduct = design
     updated: list[tuple[str, dict[str, str]]] = []
     monkeypatch.setattr(
         module.wglink_core,
@@ -1487,7 +1704,6 @@ def test_a_pending_update_targets_design_identity_after_bundle_move(
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
-    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     app.activeDocument = types.SimpleNamespace(name="Tritonia V")
     module = _load_instance(monkeypatch, "WGLink_pending_moved_bundle", ui, app)
     bundle_root = tmp_path / "wglink"
@@ -1506,13 +1722,13 @@ def test_a_pending_update_targets_design_identity_after_bundle_move(
     }))
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
-    monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {
-        "instance-a": {"payload": {
-            "bundle_path": str(tmp_path / "old" / "horn.wglink"),
-            "design_id": "wgd-a",
-            "export_id": "wge_3",
-        }},
-    })
+    design, _body = _linked_document(
+        module,
+        instance_id="instance-a",
+        bundle_path=str(tmp_path / "old" / "horn.wglink"),
+        export_id="wge_3",
+    )
+    app.activeProduct = design
     updated: list[tuple[str, dict[str, str]]] = []
     monkeypatch.setattr(
         module.wglink_core,

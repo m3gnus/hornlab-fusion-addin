@@ -1163,7 +1163,11 @@ def _document_links() -> list[dict[str, object]]:
     if "Design" not in str(design.objectType):
         return []
     try:
-        records = wglink_core._link_records(design)
+        # The resolved inventory, not the raw attribute grouping: a record from
+        # `_link_records` alone carries no managed body, so the heartbeat used
+        # to publish `missing` and no fingerprint for links Audit reports as
+        # intact.
+        records = wglink_core._resolved_link_records(design)
     except Exception:  # noqa: BLE001 - a document we cannot read has no links
         return []
     links: list[dict[str, object]] = []
@@ -1213,11 +1217,18 @@ def _document_links() -> list[dict[str, object]]:
             drifted_parameters = sorted(
                 str(item["name"]) for item in parameter_drift
             )
-            local_body_state = wglink_core._local_body_state(record)
-            body = record.get("body")
-            body_fingerprint = (
-                wglink_core._body_fingerprint(body) if body is not None else None
-            )
+            if record.get("managed_object_clash"):
+                # Audit refuses a duplicated instance id outright. The advisory
+                # heartbeat says it cannot tell rather than picking one of them
+                # and publishing that body's fingerprint as the link's.
+                local_body_state = "unknown"
+                body_fingerprint = None
+            else:
+                local_body_state = wglink_core._local_body_state(record)
+                body = record.get("body")
+                body_fingerprint = (
+                    wglink_core._body_fingerprint(body) if body is not None else None
+                )
         except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
             drifted_parameters = []
             local_body_state = "unknown"

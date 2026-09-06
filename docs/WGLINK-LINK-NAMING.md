@@ -105,8 +105,15 @@ WG recovers it the same way when the registry has no record
 (`server/exports/api.py:86` `_slug_from_manifest`).
 
 At Insert, a second placement of the same design takes `wg_<slug>2_`
-(`instance_parameter_prefix`, `wglink_bundle.py:1033`), so the namespace is
-per-*instance* while the slug is per-lineage.
+(`instance_parameter_prefix`, `wglink_bundle.py`), so the namespace is
+per-*instance* while the slug is per-lineage. Allocation reads both the live
+link records and the document's actual parameter table, because they disagree:
+Detach removes a link's attributes and leaves its parameters and the geometry
+they drive, so a namespace with no record can still be fully occupied — and a
+user may have authored `wg_<slug>_*` names of their own. Insert takes the next
+free namespace instead, and refuses by name if it cannot find one. Update never
+allocates: it writes the namespace its own record was minted with, for the life
+of the document.
 
 ### 2d. One more name-derived artifact, purely cosmetic
 

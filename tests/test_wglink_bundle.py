@@ -1170,6 +1170,23 @@ def test_instance_parameter_prefix_preserves_first_and_numbers_later_instances(t
     assert parameters["enc_depth"].name == "wg_tiny2_enc_depth"
 
 
+def test_instance_parameter_prefix_skips_a_namespace_the_document_still_holds():
+    # Detach removes a link's attributes and leaves its parameters, so the
+    # record inventory and the document's own parameter table disagree. Both
+    # occupy a namespace; only the parameter table can prove it is in use.
+    detached = instance_parameter_prefix("tiny", [], ["wg_tiny_depth"])
+    unrelated = instance_parameter_prefix("tiny", [], ["wg_other_depth"])
+    both = instance_parameter_prefix("tiny", ["wg_tiny_"], ["wg_tiny2_depth"])
+    partial = instance_parameter_prefix("tiny", [], ["wg_tiny_my_own_offset"])
+
+    assert (detached, unrelated, both, partial) == (
+        "wg_tiny2_",
+        "wg_tiny_",
+        "wg_tiny3_",
+        "wg_tiny2_",
+    )
+
+
 def test_freestanding_attribute_payload_requires_and_stores_thicken_sign(tmp_path):
     grid = _grid()
     grid["build_mode"] = "freestanding"

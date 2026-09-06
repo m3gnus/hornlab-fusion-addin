@@ -168,6 +168,124 @@ def component(name, bodies=()):
     return value
 
 
+# --------------------------------------------------- Fusion's export contract
+
+
+def _fake_visible(entity):
+    """Read visibility the way ``wglink_send._bool`` reads it off Fusion."""
+
+    for name in ("isVisible", "isLightBulbOn"):
+        value = getattr(entity, name, None)
+        if isinstance(value, bool):
+            return value
+    return True
+
+
+def exported_step_bodies(component_value, *, visible=True):
+    """The bodies Fusion writes to STEP for one Component, in order.
+
+    ``createSTEPExportOptions`` exposes a filename and a Component and nothing
+    else -- there is no per-body scoping in the API -- so what reaches the file
+    is every VISIBLE, unsuppressed B-rep body in that component and in the
+    occurrences below it. Autodesk documents visibility as the only way to
+    narrow a STEP export, and the 2026-08-10 A/B spike measured exactly that:
+    its three exports carry 2 ``MANIFOLD_SOLID_BREP`` and 0
+    ``SHELL_BASED_SURFACE_MODEL`` because the non-solid bodies were hidden by
+    hand first. Mesh bodies have no B-rep to write and never appear.
+
+    The traversal mirrors ``_scope_walk.walk_component`` on purpose. A fake
+    that writes a body count the Component cannot account for lets the export
+    and the inventory look at different trees, which is the whole reason three
+    successive fixes to the same leftover shell all passed.
+
+    Returns ``"solid"``/``"surface"`` tags rather than a bare count so the
+    caller writes the record type Fusion would write for each body.
+    """
+
+    kinds = []
+    if not visible:
+        return kinds
+    for candidate in getattr(component_value, "bRepBodies", ()) or ():
+        if getattr(candidate, "isSuppressed", False):
+            continue
+        if not _fake_visible(candidate):
+            continue
+        kinds.append("solid" if getattr(candidate, "isSolid", False) else "surface")
+    for occurrence in getattr(component_value, "occurrences", ()) or ():
+        child = getattr(occurrence, "component", None)
+        if child is None:
+            continue
+        kinds.extend(
+            exported_step_bodies(
+                child,
+                visible=_fake_visible(occurrence)
+                and not getattr(occurrence, "isSuppressed", False),
+            )
+        )
+    return kinds
+
+
+STEP_RECORD_FOR_BODY = {
+    "solid": "MANIFOLD_SOLID_BREP",
+    "surface": "SHELL_BASED_SURFACE_MODEL",
+}
+
+
+class ContractExportManager:
+    """An ExportManager that enforces what Fusion documents, and nothing less.
+
+    ``ExportManager.createSTEPExportOptions(filename, geometry)`` says of its
+    second argument: "The geometry to export. Valid geometry for this is
+    currently a Component object." (Autodesk Fusion 360 API Python definitions,
+    ``adsk/fusion.py``.) The exporters that came before it -- every fake in this
+    file -- accept whatever they are handed, which is why an Occurrence reached
+    a real Fusion and came back as
+
+        Fusion STEP export failed for assembly.step: 3 : invlid argument geometry.
+
+    3 is Fusion's invalid-argument code and "invlid" is its own spelling. This
+    fake reproduces exactly that, so the contract is a test and not a comment.
+
+    It writes what :func:`exported_step_bodies` says the handed Component
+    holds. An earlier version took the body count as a constructor argument,
+    which made the file independent of the model -- so no test in this suite
+    could see a body that is in the document, is left out of the inventory, and
+    still lands in the STEP.
+    """
+
+    def __init__(self):
+        self.geometries = []
+
+    def createSTEPExportOptions(self, path, geometry=None):
+        # An omitted argument stays legal here because Autodesk documents it as
+        # legal. This fake refuses exactly one thing -- a geometry that is not a
+        # Component -- so what it proves is the documented contract and not a
+        # stricter rule invented to make a test pass.
+        kind = None if geometry is None else getattr(geometry, "objectType", None)
+        if geometry is not None and kind != "adsk::fusion::Component":
+            raise RuntimeError("3 : invlid argument geometry.")
+        self.geometries.append(geometry)
+        return path, geometry
+
+    def execute(self, options):
+        path, geometry = options
+        # Fusion resolves an omitted geometry to the root component; this fake
+        # has no design to resolve it against, so it says so instead of writing
+        # an empty file that would read as "the model has no bodies".
+        assert geometry is not None, (
+            "this fake derives the file from the Component it is handed; "
+            "pass the component explicitly"
+        )
+        entities = "".join(
+            f"#{index}={STEP_RECORD_FOR_BODY[kind]}('',#{index + 100});\n"
+            for index, kind in enumerate(exported_step_bodies(geometry), start=1)
+        )
+        Path(path).write_text(
+            f"ISO-10303-21;\n{entities}END-ISO-10303-21;\n", encoding="utf-8"
+        )
+        return True
+
+
 def test_declaration_round_trip_and_validation(send_module):
     candidate = body("shell", solid=False)
 
@@ -510,6 +628,52 @@ def test_step_body_counter_handles_solid_shell_mixed_and_ignores_names(send_modu
     assert send_module.count_step_bodies("#1=OPEN_SHELL('',());") == 0
 
 
+# ------------------------------------------------------- real STEP fixtures
+#
+# Until these landed the counter was only ever asked about strings written in
+# this file, so nothing checked it against a file a CAD kernel actually wrote.
+# Provenance, all AP214 from Open CASCADE's own STEP writer:
+#
+# * wg-qualification-solid.step -- Waveguide Generator's own qualification
+#   output, one closed solid.
+# * occ-surface-sheet.step, occ-solid-with-void.step -- written for this suite
+#   from a rectangle and from a box minus a fully enclosed sphere. The second
+#   is the shape a solid takes when it has an internal void, which STEP writes
+#   as BREP_WITH_VOIDS and not as MANIFOLD_SOLID_BREP.
+#
+# Each is well under a megabyte and carries no author, path or model identity
+# beyond Open CASCADE's own header strings.
+
+STEP_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "step"
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("wg-qualification-solid.step", 1),
+        ("occ-surface-sheet.step", 1),
+    ],
+    ids=["one-solid", "one-surface-body"],
+)
+def test_the_counter_agrees_with_real_kernel_output(send_module, name, expected):
+    assert send_module.count_step_bodies(STEP_FIXTURES / name) == expected
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "a solid with an internal void is written as BREP_WITH_VOIDS, which "
+        "_STEP_BODY does not match, so occ-solid-with-void.step counts 0 "
+        "bodies where the file holds 1 -- every hollow body a user sends would "
+        "fail the count gate as a body that is not there"
+    ),
+)
+def test_a_solid_with_an_internal_void_counts_as_one_body(send_module):
+    assert send_module.count_step_bodies(
+        STEP_FIXTURES / "occ-solid-with-void.step"
+    ) == 1
+
+
 def test_adjacent_painted_faces_form_one_component(send_module):
     shared = object()
     faces = [face("LF", edges=[shared]), face("LF", edges=[shared])]
@@ -684,20 +848,9 @@ def test_schema_1_1_stamp_stays_paired_with_fail_closed_fingerprint_guard(
     exterior = body("cabinet", faces=[face("LF")])
     root = component("Pairing", [exterior])
 
-    class ExportManager:
-        def createSTEPExportOptions(self, path, geometry=None):
-            return path, geometry
-
-        def execute(self, options):
-            Path(options[0]).write_text(
-                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
-                encoding="utf-8",
-            )
-            return True
-
     design = types.SimpleNamespace(
         rootComponent=root,
-        exportManager=ExportManager(),
+        exportManager=ContractExportManager(),
         findAttributes=lambda _group, _name: Collection(),
     )
     app = types.SimpleNamespace(
@@ -737,20 +890,9 @@ def test_full_unlinked_send_avoids_collisions_and_uses_full_request_ids(
     exterior = body("cabinet", faces=[painted])
     root = component("Speaker", [exterior])
 
-    class ExportManager:
-        def createSTEPExportOptions(self, path, geometry=None):
-            return path, geometry
-
-        def execute(self, options):
-            Path(options[0]).write_text(
-                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
-                encoding="utf-8",
-            )
-            return True
-
     design = types.SimpleNamespace(
         rootComponent=root,
-        exportManager=ExportManager(),
+        exportManager=ContractExportManager(),
         findAttributes=lambda _group, _name: Collection(),
     )
     app = types.SimpleNamespace(
@@ -863,7 +1005,15 @@ def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch)
     exterior = body("cabinet", faces=[face("LF")])
     root = component("Mismatch", [exterior])
 
-    class ExportManager:
+    class DisagreeingExportManager:
+        """Writes a file the model cannot account for, on purpose.
+
+        Every other export fake here derives the file from the Component it is
+        handed. This one is the count gate's own negative case, so it has to
+        disagree with the model -- which is exactly why it must stay the
+        exception and not the pattern.
+        """
+
         def createSTEPExportOptions(self, path, geometry=None):
             return path
 
@@ -873,7 +1023,7 @@ def test_count_gate_failure_leaves_no_target(send_module, tmp_path, monkeypatch)
 
     design = types.SimpleNamespace(
         rootComponent=root,
-        exportManager=ExportManager(),
+        exportManager=DisagreeingExportManager(),
         findAttributes=lambda _group, _name: Collection(),
     )
     app = types.SimpleNamespace(version="1", activeDocument=types.SimpleNamespace(name="Mismatch"))
@@ -938,22 +1088,16 @@ def test_hidden_excluded_body_remains_allowed_without_visibility_mutation(
     send_module.declare_body(excluded, "exclude")
     root = component("ExcludedHidden", [exterior, excluded])
 
-    class ExportManager:
+    class CountingExportManager(ContractExportManager):
         def __init__(self):
+            super().__init__()
             self.execute_calls = []
-
-        def createSTEPExportOptions(self, path, geometry=None):
-            return path, geometry
 
         def execute(self, options):
             self.execute_calls.append(options)
-            Path(options[0]).write_text(
-                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
-                encoding="utf-8",
-            )
-            return True
+            return super().execute(options)
 
-    manager = ExportManager()
+    manager = CountingExportManager()
     design = types.SimpleNamespace(
         rootComponent=root,
         exportManager=manager,
@@ -976,18 +1120,7 @@ def test_hidden_excluded_body_remains_allowed_without_visibility_mutation(
 def _capture_design(root, *, archive: bool | str = True):
     """A design whose STEP export works and whose archive export is switchable."""
 
-    class ExportManager:
-        def createSTEPExportOptions(self, path, geometry=None):
-            return path, geometry
-
-        def execute(self, options):
-            Path(options[0]).write_text(
-                "ISO-10303-21;\n#1=MANIFOLD_SOLID_BREP('',#2);\nEND-ISO-10303-21;\n",
-                encoding="utf-8",
-            )
-            return True
-
-    class ArchivingExportManager(ExportManager):
+    class ArchivingExportManager(ContractExportManager):
         def createFusionArchiveExportOptions(self, path):
             if archive == "raise":
                 raise RuntimeError("archive export is unavailable")
@@ -1001,7 +1134,9 @@ def _capture_design(root, *, archive: bool | str = True):
             Path(options[1]).write_bytes(b"fusion-archive-bytes")
             return True
 
-    manager = ArchivingExportManager() if archive is not False else ExportManager()
+    manager = (
+        ArchivingExportManager() if archive is not False else ContractExportManager()
+    )
     return types.SimpleNamespace(
         rootComponent=root,
         exportManager=manager,
@@ -1129,51 +1264,6 @@ def test_the_capture_setting_is_wgs_and_is_read_from_wgs_own_settings_file(
     assert workspace.capture_document() is True
 
 
-# --------------------------------------------------- Fusion's export contract
-
-
-class ContractExportManager:
-    """An ExportManager that enforces what Fusion documents, and nothing less.
-
-    ``ExportManager.createSTEPExportOptions(filename, geometry)`` says of its
-    second argument: "The geometry to export. Valid geometry for this is
-    currently a Component object." (Autodesk Fusion 360 API Python definitions,
-    ``adsk/fusion.py``.) The exporters that came before it -- every fake in this
-    file -- accept whatever they are handed, which is why an Occurrence reached
-    a real Fusion and came back as
-
-        Fusion STEP export failed for assembly.step: 3 : invlid argument geometry.
-
-    3 is Fusion's invalid-argument code and "invlid" is its own spelling. This
-    fake reproduces exactly that, so the contract is a test and not a comment.
-    """
-
-    def __init__(self, bodies=1):
-        self.geometries = []
-        self.bodies = bodies
-
-    def createSTEPExportOptions(self, path, geometry=None):
-        # An omitted argument stays legal here because Autodesk documents it as
-        # legal. This fake refuses exactly one thing -- a geometry that is not a
-        # Component -- so what it proves is the documented contract and not a
-        # stricter rule invented to make a test pass.
-        kind = None if geometry is None else getattr(geometry, "objectType", None)
-        if geometry is not None and kind != "adsk::fusion::Component":
-            raise RuntimeError("3 : invlid argument geometry.")
-        self.geometries.append(geometry)
-        return path, geometry
-
-    def execute(self, options):
-        entities = "".join(
-            f"#{index}=MANIFOLD_SOLID_BREP('',#{index + 100});\n"
-            for index in range(1, self.bodies + 1)
-        )
-        Path(options[0]).write_text(
-            f"ISO-10303-21;\n{entities}END-ISO-10303-21;\n", encoding="utf-8"
-        )
-        return True
-
-
 def _contract_design(root, manager=None):
     manager = manager or ContractExportManager()
     design = types.SimpleNamespace(
@@ -1191,6 +1281,11 @@ def _contract_design(root, manager=None):
 def _occurrence(
     component_value, bodies, *, placement=None, name="Horn:1", children=()
 ):
+    # A Component owns its occurrences; an Occurrence exposes proxies of the
+    # same children. The scope walk reads the occurrence side and Fusion's STEP
+    # export reads the component side, so a fixture that populates only one of
+    # them lets the two look at different assemblies.
+    component_value.occurrences = Collection(children)
     return types.SimpleNamespace(
         name=name,
         fullPathName=f"Speaker/{name}",
@@ -1236,6 +1331,35 @@ def _proxy_of(native, *, offset_mm=(0.0, 0.0, 0.0), component_value=None):
     proxy.nativeObject = native
     proxy.parentComponent = component_value
     return proxy
+
+
+def test_the_export_fake_writes_the_component_it_is_handed(send_module, tmp_path):
+    """Guard the guard: this fake must never go back to a constant.
+
+    A fake whose body count is independent of the model cannot fail when the
+    model gains a body the inventory does not know about, which is the shape of
+    every STEP count bug this suite has shipped. So the derivation is itself
+    asserted -- visible solid and visible surface in, hidden and suppressed
+    out, nested occurrence included.
+    """
+
+    hidden = body("hidden helper", solid=False, visible=False)
+    suppressed = body("suppressed rib")
+    suppressed.isSuppressed = True
+    inner = component("Ring component", [body("ring", solid=False)])
+    root = component(
+        "Mixed", [body("shell"), body("skin", solid=False), hidden, suppressed]
+    )
+    root.occurrences = Collection([_occurrence(inner, [], name="Ring:1")])
+    manager = ContractExportManager()
+
+    path = tmp_path / "assembly.step"
+    assert manager.execute(manager.createSTEPExportOptions(str(path), root)) is True
+
+    assert exported_step_bodies(root) == ["solid", "surface", "surface"]
+    assert send_module.count_step_bodies(path) == 3
+    assert path.read_text(encoding="utf-8").count("MANIFOLD_SOLID_BREP") == 1
+    assert path.read_text(encoding="utf-8").count("SHELL_BASED_SURFACE_MODEL") == 2
 
 
 def test_root_scope_export_names_the_root_component(send_module, tmp_path, monkeypatch):
@@ -1834,6 +1958,121 @@ def test_the_preflight_previews_a_domain_refusal_instead_of_raising(
     assert "negative side" in report["domain_error"]
 
 
+# ------------------------------------- the leftover shell a freestanding
+# ------------------------------------- insertion leaves in the document
+
+
+def _freestanding_document(send_module, monkeypatch, *, helper_visible):
+    """The document Insert leaves behind, wired up for a real ``send()``."""
+
+    design, final, stitched = _freestanding_insertion(send_module)
+    final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    stitched.isVisible = helper_visible
+    design.exportManager = ContractExportManager()
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="Freestanding"),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    return design, app, final, stitched
+
+
+def test_the_walk_and_the_file_disagree_about_a_visible_helper(
+    send_module, monkeypatch
+):
+    """The divergence itself, stated once, with no export in the way.
+
+    Two filters run over the same document. ``plan_export_scope`` drops the
+    stitched shell by role -- the one skip rule that never asks whether the
+    body is visible -- and Fusion drops nothing, because ``STEPExportOptions``
+    takes a Component and offers no per-body scoping at all. So the inventory
+    says one body and the file gets two, and every gate downstream is doing
+    arithmetic on two different universes.
+    """
+
+    design, _app, _final, stitched = _freestanding_document(
+        send_module, monkeypatch, helper_visible=True
+    )
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    scope = send_module.plan_export_scope(
+        walk["selection"], walk["candidates"]
+    ).manifest_scope()
+
+    assert stitched.isVisible is True
+    assert [record["name"] for record in scope["included"]] == [
+        "WGLink freestanding waveguide"
+    ]
+    assert exported_step_bodies(design.rootComponent) == ["solid", "surface"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "STEP body count gate refused the export: inventory expects 1, but "
+        "assembly.step contains 2. _close_and_thicken leaves the stitched "
+        "shell visible, plan_export_scope skips a WGLink helper without ever "
+        "testing visibility, and Fusion writes every visible body of the "
+        "Component it is handed -- so the user is handed arithmetic about two "
+        "bodies instead of the name of the one that is in the way"
+    ),
+)
+def test_a_freestanding_insertion_names_its_leftover_shell_instead_of_counting(
+    send_module, tmp_path, monkeypatch
+):
+    """What a user with an already-inserted document must be told.
+
+    ``NewBodyFeatureOperation`` does not consume its input and no add-in code
+    path sets ``isVisible = False`` on a body, so the stitched shell is still
+    in the document and still visible. Whatever the export then does, the one
+    thing it must not do is report a body count: the count names nothing the
+    user can act on, and three successive fixes to this same shell all shipped
+    green because no fake in this file could produce it.
+    """
+
+    _design, app, _final, stitched = _freestanding_document(
+        send_module, monkeypatch, helper_visible=True
+    )
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+
+    message = str(refusal.value)
+    assert "WGLink stitched waveguide body" in message
+    assert "count gate" not in message
+    assert stitched.isVisible is True
+    assert not (tmp_path / "Freestanding.wgreturn").exists()
+
+
+def test_an_insertion_whose_helper_is_hidden_exports_exactly_its_inventory(
+    send_module, tmp_path, monkeypatch
+):
+    """The other half of the same fact, and the state the fix leaves behind.
+
+    Hide the shell and Fusion stops writing it, so the file holds exactly the
+    inventory's one body. That is Autodesk's documented -- and only -- way to
+    narrow a STEP export, and it is what the 2026-08-10 spike did by hand
+    before every one of its three exports.
+    """
+
+    _design, app, _final, _stitched = _freestanding_document(
+        send_module, monkeypatch, helper_visible=False
+    )
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    bundle = Path(report["bundle_path"])
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (bundle / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["assembly"]["n_bodies_expected"] == 1
+    assert send_module.count_step_bodies(bundle / "assembly.step") == 1
+
+
 def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
     send_module, tmp_path, monkeypatch
 ):
@@ -1846,8 +2085,17 @@ def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
     refusal on its own -- stays a refusal rather than becoming a source.
     """
 
-    design, final, _stitched = _freestanding_insertion(send_module)
+    design, final, stitched = _freestanding_insertion(send_module)
     final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    # This test is about what a declaration does to an inventory, so it needs a
+    # document that can actually be sent. A freestanding insertion leaves the
+    # stitched shell VISIBLE, and Fusion then writes it into the STEP while the
+    # inventory skips it -- the export refusal covered by
+    # test_a_freestanding_insertion_survives_its_own_leftover_shell. Hiding the
+    # shell here is the state that refusal's fix leaves behind, not a way past
+    # it: the helper is still skipped as a wglink_helper, which is what the
+    # assertions below read.
+    stitched.isVisible = False
     design.exportManager = ContractExportManager()
     app = types.SimpleNamespace(
         version="2704.1.53",
@@ -1952,7 +2200,7 @@ def test_a_child_occurrence_is_measured_where_it_sits_not_in_its_own_component(
     root = component("Speaker")
     root.occurrences = Collection([occurrence])
     root.allOccurrences = Collection([occurrence])
-    design, app, manager = _contract_design(root, ContractExportManager(bodies=2))
+    design, app, manager = _contract_design(root)
     monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
 
     report = send_module.send(
@@ -1966,6 +2214,11 @@ def test_a_child_occurrence_is_measured_where_it_sits_not_in_its_own_component(
     )
 
     assert manager.geometries == [parent_component]
+    # The nested ring is in the exported component's tree, so it is in the file
+    # as well as in the inventory -- both twos, counted the same way.
+    assert send_module.count_step_bodies(
+        Path(report["bundle_path"]) / "assembly.step"
+    ) == 2
     manifest = sys.modules["wglink_return"].loads_return_manifest(
         (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
     )

@@ -1,0 +1,5 @@
+# STEP fixtures are byte-exact CAD kernel output. Keep them out of line-ending
+# normalisation and whitespace linting: the trailing spaces in an Open CASCADE
+# AP214 file are the writer's own, and a fixture that is rewritten on checkout
+# is no longer the file that was measured.
+tests/fixtures/step/*.step -text -whitespace

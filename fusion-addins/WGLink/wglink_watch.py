@@ -258,6 +258,10 @@ def write_fusion_status(
         "edit_version": "editVersion",
         "design_hash": "designHash",
         "design_name": "designName",
+        # The user's own label for this link, or null when they never set one.
+        # Additive under heartbeat schema 1: an older WG client ignores it and
+        # keeps showing designName, exactly as it does today.
+        "link_name": "linkName",
         "formula": "formula",
         "config_present": "configPresent",
         "parameter_count": "parameterCount",

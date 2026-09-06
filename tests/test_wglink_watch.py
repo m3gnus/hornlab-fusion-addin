@@ -136,6 +136,7 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         "exportSequence": None,
         "formula": "r-osse",
         "instanceId": "instance-a",
+        "linkName": None,
         "lineageId": None,
         "parameterCount": 14,
         "parameterDriftCount": 2,
@@ -416,3 +417,43 @@ def test_a_solve_request_refuses_a_bundle_outside_the_workspace(tmp_path) -> Non
             bundle_path=outside,
             workspace_root=workspace,
         )
+
+
+def test_fusion_status_publishes_the_link_label_beside_wgs_design_name(
+    tmp_path: Path,
+) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="waveguide v1",
+        links=[{
+            "instance_id": "instance-a",
+            "design_name": "260308Tritonia-M",
+            "link_name": "Left waveguide",
+        }],
+    )
+
+    payload = json.loads(marker.read_text())
+    link = payload["document"]["links"][0]
+    # Three names, all published, none derived from another: the Fusion
+    # document, WG's design, and the user's own label for this placement.
+    assert payload["document"]["name"] == "waveguide v1"
+    assert link["designName"] == "260308Tritonia-M"
+    assert link["linkName"] == "Left waveguide"
+
+
+def test_a_link_with_no_label_publishes_a_null_rather_than_a_guess(
+    tmp_path: Path,
+) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="waveguide v1",
+        links=[{"instance_id": "instance-a", "design_name": "asro68"}],
+    )
+
+    link = json.loads(marker.read_text())["document"]["links"][0]
+    # Never fill the label in from the design name here: a client that shows
+    # both would then show one name twice and call it two.
+    assert link["linkName"] is None
+    assert link["designName"] == "asro68"

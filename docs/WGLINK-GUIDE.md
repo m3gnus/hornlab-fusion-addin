@@ -53,15 +53,17 @@ contains only **Declare Body…**, **Insert**, **Update**, and **Detach**.
 | **Solve in WG** | Export the assembly and ask WG to prepare and solve it, so WG is already solving when you switch windows. |
 | **Send to WG** | Export the assembly as a validated `.wgreturn` bundle without asking for a solve. |
 | Declare Body… | Classify a body for the return: `exterior-shell` includes an open surface body, `exclude` leaves a body out, Clear restores automatic scoping. |
-| Insert | Insert a WG `.wglink` bundle as a managed link. Ordinarily unneeded: WG's Send to CAD offers the insert automatically. |
+| Insert | Insert a WG `.wglink` bundle as a managed link. Optionally give the link a **Link name** of your own; leave it empty to use WG's design name. Ordinarily unneeded: WG's Send to CAD offers the insert automatically. |
 | Update | Rebuild a managed link in place from its current bundle. If its stored bundle moved, Update finds the newest export of the same design in WG's current workspace and repairs the path automatically. |
 | Detach | Permanently remove WGLink identity without changing geometry. Fusion asks for confirmation because the only way back is to insert a fresh copy from WG. |
 
-Audit and Relink remain available through the headless `wglink_core.audit` and
-`wglink_core.relink` APIs. Audit's document/link data is also published
+Audit, Relink and renaming a link remain available through the headless
+`wglink_core.audit`, `wglink_core.relink` and `wglink_core.set_link_name`
+APIs. Audit's document/link data is also published
 continuously to WG in `.fusion-status.json`, so it does not need a panel
-command. Newer heartbeats add optional `bodyObjectIds`, `transformHash`,
-`sourceIds`, and `driveChannelIds` members to each managed link. They come from
+command. Newer heartbeats add optional `linkName`, `bodyObjectIds`,
+`transformHash`, `sourceIds`, and `driveChannelIds` members to each managed
+link. They come from
 the same strict observation used by Send to WG; an unavailable or fallback
 identity is omitted, while older WG clients can continue ignoring the added
 members under heartbeat schema 1.
@@ -82,6 +84,41 @@ members under heartbeat schema 1.
 
 Renaming the WG design is safe: the parameter namespace and bundle folder are
 fixed the first time a design is exported and never change afterwards.
+
+### The three names a link has
+
+A linked document carries three separate names, and they are allowed to differ.
+Nothing is wrong when they do.
+
+| Name | Where it comes from | What it controls |
+|---|---|---|
+| **Fusion document name** | You, in Fusion (`waveguide v1`) | The Fusion document and its `.f3d`. WGLink publishes it to WG, which titles the CAD project with it. |
+| **WG design name** | WG, from the design you exported (`260308Tritonia-M`) | Nothing, on its own. It is a label WG stamps into the bundle, and it follows a rename in WG. |
+| **Link name** | You, optionally, in the Insert dialog | The link's label in WGLink's menus, in the timeline group, and in what WG shows for the placement. Nothing else. |
+
+The `wg_<name>_*` user parameters are a **fourth** thing, and no name above
+moves them. That namespace and the `.wglink` folder name are minted from the
+design's name the first time it is exported, and then frozen to the design's
+lineage for good — your Fusion datums, enclosure expressions and your own
+features all reference it by name, and Fusion cannot retarget an expression to
+a different parameter. So a design first exported as `260308Tritonia-M` keeps
+`wg_260308tritonia_m_*` and `260308Tritonia-M.wglink` even after it is renamed
+in WG, and even in a document you called something else. That is deliberate:
+the alternative is that renaming a design breaks every document already linked
+to it.
+
+Rename a link at any time — it changes a label and nothing a rebuild or a
+return reads:
+
+```python
+wglink_core.set_link_name(app, "Left waveguide")            # one link
+wglink_core.set_link_name(app, "Left waveguide", {"instance_id": "..."})
+wglink_core.set_link_name(app, "")                          # back to WG's name
+```
+
+The wrapper component (`WGLink_<name>_1`) is an ordinary Fusion component and
+you can rename it in the browser yourself; WGLink finds its links by stored
+identity, never by a component or timeline name.
 
 ## 4. Starting from a model drawn in Fusion
 
@@ -162,6 +199,11 @@ occurrence where it already is and never moves it back to the origin.)
 
 ## 7. Troubleshooting
 
+- **"Why is this link called something I never typed?"** — it is WG's name for
+  the design, not a name for your Fusion document. See *The three names a link
+  has* in section 3. Give the link your own **Link name** at Insert, or rename
+  it afterwards with `wglink_core.set_link_name`. The `wg_<name>_*` parameters
+  keep the bundle's namespace either way, on purpose.
 - **"Waveguide Generator has no selected CAD Link workspace"** — choose the
   WGLink folder in WG under Settings → CAD Link, then send again.
 - **The panel is missing after a Fusion restart** — tick Run on Startup for

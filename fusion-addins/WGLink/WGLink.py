@@ -441,7 +441,9 @@ def _document_link_choices() -> list[tuple[str, str]]:
         instance_id = str(link.get("instance_id") or "")
         if not instance_id:
             continue
-        name = str(link.get("design_name") or "").strip()
+        # The user's own label wins over WG's name for the design: this list is
+        # how they recognise their own link, and the design name is WG's.
+        name = str(link.get("link_name") or link.get("design_name") or "").strip()
         choices.append((f"{name} · {instance_id}" if name else instance_id, instance_id))
     return choices
 
@@ -450,9 +452,12 @@ def _command_options(command_inputs: object) -> dict[str, object]:
     result: dict[str, object] = {}
     chosen = _selected_name(command_inputs, "instance_choice", "")
     if chosen:
-        # The label carries the design name for recognition; the id is the part
-        # the head-less API takes.
+        # The label carries the link's display name for recognition; the id is
+        # the part the head-less API takes.
         result["instance_id"] = chosen.rsplit(" · ", 1)[-1].strip()
+    link_name = str(_input_value(command_inputs, "link_name") or "").strip()
+    if link_name:
+        result["link_name"] = link_name
     return result
 
 
@@ -718,8 +723,19 @@ def _summary(operation: str, report: dict[str, object]) -> str:
         return str(report.get("summary", ""))
     if operation == "insert":
         deviation = report.get("deviation", {})
+        # State both names once, here: the label the link now carries and WG's
+        # own name for the design, which the parameter namespace follows. The
+        # two are allowed to differ and a user who has not been told they are
+        # different things reads the namespace as a mistake.
+        link_name = str(report.get("link_name") or "")
+        design_name = str(report.get("design_name") or "")
+        naming = f"WG design: {design_name or '?'}\n"
+        if link_name:
+            naming = f"Link name: {link_name}\n" + naming
+        naming += f"Parameters: {report.get('parameter_prefix', '?')}*\n"
         return (
             f"Inserted WGLink instance {report.get('instance_id', '?')}.\n"
+            f"{naming}"
             f"Wrapper: {report.get('wrapper', '?')}\n"
             f"{_tag_summary(report.get('tag'))}\n"
             f"Deviation: mean {format_measurement_mm(deviation.get('mean_mm'))}, "
@@ -1080,6 +1096,20 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     source.listItems.add(bundle.label(), index == 0)
                 source.listItems.add(BROWSE_FOLDER, not discovered)
                 source.listItems.add(BROWSE_ZIP, False)
+                # A label for this placement, in the user's own words. It is
+                # display only: the parameter namespace, the wrapper component
+                # and every identifier still come from the bundle, because an
+                # already-linked document depends on them for its lifetime.
+                inputs.addStringValueInput("link_name", "Link name", "")
+                inputs.addTextBoxCommandInput(
+                    "link_name_help",
+                    "",
+                    "Optional. Leave empty to use the WG design name. This "
+                    "names the link in menus and in the timeline only; the "
+                    "wg_&lt;name&gt;_* parameters keep the bundle's namespace.",
+                    3,
+                    True,
+                )
             if self.operation not in {"insert", "send", "solve", "source", "declare"}:
                 # A document with one link needs no choice, and the old free
                 # text field required a separate diagnostic call just to learn
@@ -1200,6 +1230,7 @@ def _document_links() -> list[dict[str, object]]:
             "edit_version": str(payload.get("edit_version") or ""),
             "design_hash": str(payload.get("design_hash") or ""),
             "design_name": str(payload.get("design_name") or ""),
+            "link_name": str(payload.get("link_name") or ""),
             "formula": str(payload.get("formula") or ""),
             "config_present": "true" if config_present else "false",
             "parameter_count": str(parameter_count),

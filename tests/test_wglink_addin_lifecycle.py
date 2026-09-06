@@ -1871,3 +1871,83 @@ def test_a_start_that_fails_partway_rolls_back_panel_and_lease(
     assert recovery._owned is True
     assert panels.itemById(recovery.PANEL_ID) is not None
     recovery.stop(None)
+
+
+def test_the_link_chooser_shows_the_users_label_before_wgs_design_name(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_link_label_preference",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    monkeypatch.setattr(module, "_document_links", lambda: [
+        {
+            "instance_id": "wgi_one",
+            "design_name": "260308Tritonia-M",
+            "link_name": "Left waveguide",
+        },
+        {"instance_id": "wgi_two", "design_name": "260308Tritonia-M"},
+    ])
+
+    # The label is how the user recognises their own link; WG's design name is
+    # the fallback for every link made before the label existed.
+    assert module._document_link_choices() == [
+        ("Left waveguide · wgi_one", "wgi_one"),
+        ("260308Tritonia-M · wgi_two", "wgi_two"),
+    ]
+
+
+def test_the_insert_dialog_offers_an_optional_link_name(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_insert_link_name_input",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    module.adsk.core.DropDownStyles = types.SimpleNamespace(
+        TextListDropDownStyle="text-list"
+    )
+    monkeypatch.setattr(module, "_discovered_bundles", lambda: [])
+    strings: list[str] = []
+    texts: list[tuple[str, str]] = []
+    inputs = types.SimpleNamespace(
+        addDropDownCommandInput=lambda *_args: types.SimpleNamespace(
+            listItems=types.SimpleNamespace(add=lambda *_a: None),
+        ),
+        addStringValueInput=lambda name, *_args: strings.append(name),
+        addTextBoxCommandInput=lambda name, _label, body, *_args: texts.append(
+            (name, body)
+        ),
+    )
+    module.CommandCreatedHandler("insert").notify(types.SimpleNamespace(
+        command=types.SimpleNamespace(
+            commandInputs=inputs,
+            execute=types.SimpleNamespace(add=lambda _handler: None),
+        ),
+    ))
+
+    assert strings == ["link_name"]
+    help_text = dict(texts)["link_name_help"]
+    # The field must say what it does NOT change, or a user reasonably reads it
+    # as renaming the wg_<name>_* parameters their features already reference.
+    assert "Leave empty" in help_text
+    assert "parameters keep the bundle" in help_text
+
+
+def test_a_typed_link_name_reaches_the_headless_insert_options(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_insert_link_name_options",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    values = {"link_name": "  Left waveguide  "}
+    inputs = types.SimpleNamespace(
+        itemById=lambda name: types.SimpleNamespace(value=values[name])
+        if name in values
+        else None,
+    )
+
+    assert module._command_options(inputs) == {"link_name": "Left waveguide"}
+
+    values["link_name"] = "   "
+    assert module._command_options(inputs) == {}

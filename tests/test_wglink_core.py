@@ -775,3 +775,103 @@ def test_parameter_drift_names_a_parameter_it_cannot_read(core):
 
     assert [row["name"] for row in drift] == ["wg_x_throat_dia"]
     assert "unreadable" in str(drift[0]["actual"])
+
+
+def test_a_link_name_is_cleaned_but_its_spelling_is_the_users_own(core):
+    assert core.normalize_link_name("  Left waveguide  ") == "Left waveguide"
+    assert core.normalize_link_name("") == ""
+    assert core.normalize_link_name(None) == ""
+    # Punctuation, spaces and case all survive: this is a label, not a slug,
+    # and nothing downstream turns it into an identifier.
+    assert core.normalize_link_name("Tritonia-M (left) · v2") == "Tritonia-M (left) · v2"
+
+
+def test_a_link_name_refuses_control_characters_and_absurd_length(core):
+    with pytest.raises(core.WgLinkError) as newline:
+        core.normalize_link_name("left\nright")
+    assert "single line" in str(newline.value)
+
+    with pytest.raises(core.WgLinkError) as long:
+        core.normalize_link_name("x" * (core.LINK_NAME_LIMIT + 1))
+    assert str(core.LINK_NAME_LIMIT) in str(long.value)
+
+
+def test_display_name_prefers_the_users_label_and_falls_back_to_wgs(core):
+    named = {"link_name": "Left waveguide", "design_name": "260308Tritonia-M"}
+    assert core.link_display_name(named) == "Left waveguide"
+
+    # A link inserted before the field existed carries no link_name at all,
+    # and must read exactly as it always did.
+    assert core.link_display_name({"design_name": "260308Tritonia-M"}) == "260308Tritonia-M"
+    assert core.link_display_name({"link_name": "", "design_name": "asro68"}) == "asro68"
+    assert core.link_display_name({}) == ""
+    assert core.link_display_name(None) == ""
+
+
+def test_setting_a_link_name_touches_the_label_and_nothing_else(core, monkeypatch):
+    payload = {
+        "design_name": "260308Tritonia-M",
+        "design_id": "wgd_one",
+        "lineage_id": "wgl_one",
+        "parameter_prefix": "wg_260308tritonia_m_",
+        "slug": "260308tritonia_m",
+        "bundle_path": "/w/260308Tritonia-M.wglink",
+    }
+    record = {"instance_id": "wgi_one", "payload": payload}
+    written: list[dict[str, str]] = []
+    monkeypatch.setattr(core, "_design", lambda _app: object())
+    monkeypatch.setattr(core, "_resolve_link", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(
+        core,
+        "_update_payload_attributes",
+        lambda _design, _instance, updates: written.append(dict(updates)),
+    )
+
+    report = core.set_link_name(object(), "  Left waveguide ")
+
+    # The one attribute a rename may write. The namespace, the ids and the
+    # bundle path are what an already-linked document depends on.
+    assert written == [{"link_name": "Left waveguide"}]
+    assert report["link_name"] == "Left waveguide"
+    assert report["display_name"] == "Left waveguide"
+    assert report["design_name"] == "260308Tritonia-M"
+    assert report["parameter_prefix"] == "wg_260308tritonia_m_"
+    assert payload["parameter_prefix"] == "wg_260308tritonia_m_"
+    assert payload["design_id"] == "wgd_one"
+
+
+def test_clearing_a_link_name_returns_the_wg_design_name(core, monkeypatch):
+    record = {
+        "instance_id": "wgi_one",
+        "payload": {"design_name": "asro68", "link_name": "Old label"},
+    }
+    written: list[dict[str, str]] = []
+    monkeypatch.setattr(core, "_design", lambda _app: object())
+    monkeypatch.setattr(core, "_resolve_link", lambda *_args, **_kwargs: record)
+    monkeypatch.setattr(
+        core,
+        "_update_payload_attributes",
+        lambda _design, _instance, updates: written.append(dict(updates)),
+    )
+
+    report = core.set_link_name(object(), "")
+
+    assert written == [{"link_name": ""}]
+    assert report["display_name"] == "asro68"
+
+
+def test_a_link_name_survives_update_because_the_refresh_never_names_it(core):
+    # Update merges its refresh into the stored payload, so a key it does not
+    # write is preserved. Guard the property rather than the spelling.
+    stored = {"link_name": "Left waveguide", "design_name": "old", "slug": "horn"}
+    refresh = {"design_name": "renamed", "slug": "horn"}
+    assert "link_name" not in refresh
+    stored.update(refresh)
+    assert stored["link_name"] == "Left waveguide"
+    assert core.link_display_name(stored) == "Left waveguide"
+
+
+def test_the_link_name_is_a_recognised_payload_attribute(core):
+    # _link_records only copies whitelisted direct attributes off an entity;
+    # a label missing from that set would vanish on every read.
+    assert "link_name" in core._PAYLOAD_KEYS

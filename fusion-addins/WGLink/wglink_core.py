@@ -8,6 +8,7 @@ harness.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import math
 import os
@@ -111,6 +112,7 @@ _PAYLOAD_KEYS = {
     "geometry_hash",
     "instance_id",
     "lineage_id",
+    "link_name",
     "local_body_state",
     "parameter_prefix",
     "schema",
@@ -137,6 +139,51 @@ def _options(options: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(options, dict):
         raise WgLinkError(f"options must be an object, got {type(options).__name__}")
     return dict(options)
+
+
+LINK_NAME_LIMIT = 120
+
+
+def normalize_link_name(value: object) -> str:
+    """Clean one user-typed link label, or return '' for 'use the design name'.
+
+    This is a label and nothing else. It never reaches the parameter namespace,
+    the wrapper component name, the bundle path, or any identifier: those are
+    minted once per WG lineage and an already-linked document depends on them
+    for the life of the document. Keeping the label separate is what makes
+    renaming a link free.
+    """
+
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if any(character in text for character in "\r\n\t") or any(
+        ord(character) < 0x20 or ord(character) == 0x7F for character in text
+    ):
+        raise WgLinkError(
+            "A WGLink link name must be a single line without control characters."
+        )
+    if len(text) > LINK_NAME_LIMIT:
+        raise WgLinkError(
+            f"A WGLink link name must be at most {LINK_NAME_LIMIT} characters; "
+            f"got {len(text)}."
+        )
+    return text
+
+
+def link_display_name(payload: Mapping[str, Any]) -> str:
+    """What a human should be shown for one link: their label, else WG's name.
+
+    An empty or absent ``link_name`` is the pre-existing behaviour, so every
+    link inserted before this field existed keeps reading exactly as it did.
+    """
+
+    if not isinstance(payload, Mapping):
+        return ""
+    chosen = str(payload.get("link_name") or "").strip()
+    return chosen or str(payload.get("design_name") or "").strip()
 
 
 def _read_owned_bundle(path: str | os.PathLike[str]) -> object:
@@ -2514,6 +2561,9 @@ def insert(
     if overshoot_mm <= 0.0 and mode == "enclosure":
         raise WgLinkError("enclosure overshoot_mm must be positive to avoid a zero-thickness cut")
     instance_id = str(opts.get("instance_id") or uuid.uuid4())
+    # Validate the label before anything is built: a refusal here costs the
+    # user a retyped field, while one raised mid-insert costs an Undo.
+    link_name = normalize_link_name(opts.get("link_name"))
     existing_records = _link_records(design)
     if instance_id in existing_records:
         raise WgLinkError(
@@ -2660,6 +2710,11 @@ def insert(
         payload["occurrence_token"] = _entity_token(occurrence) if occurrence else ""
         payload["wrapper"] = wrapper_mode
         payload["source_role"] = role
+        if link_name:
+            # Only written when the user typed one. An absent key and an empty
+            # one both mean "show the WG design name", so a link made before
+            # this field existed reads exactly as it always did.
+            payload["link_name"] = link_name
         payload["throat_z_mm"] = repr(throat_z)
         managed_sketch_indices = [
             index
@@ -2706,8 +2761,12 @@ def insert(
             if _kind(entity) not in {"Sketch", "ConstructionPlane", "ConstructionAxis"}:
                 _stamp_payload(entity, payload)
 
-        design_name = str(bundle.manifest.get("design", {}).get("name") or f"WGLink {slug}")
-        _group_timeline(design, timeline_start, design_name, warnings)
+        # The timeline group is a label the user reads in their own document,
+        # so their own name for the link wins over WG's name for the design.
+        group_name = link_name or str(
+            bundle.manifest.get("design", {}).get("name") or f"WGLink {slug}"
+        )
+        _group_timeline(design, timeline_start, group_name, warnings)
         checks = _insert_check_points(bundle, plan, int(opts.get("max_checks", 400)))
         report.update(
             {
@@ -2720,6 +2779,10 @@ def insert(
                 ),
                 "enclosure": enclosure_report,
                 "instance_id": instance_id,
+                "design_name": str(
+                    bundle.manifest.get("design", {}).get("name", "")
+                ),
+                "link_name": link_name,
                 # Which document-global namespace this insertion took. A second
                 # copy of one design gets wg_<slug>2_, and the user needs to
                 # know which set of parameters drives which waveguide.
@@ -3429,6 +3492,9 @@ def audit(
         "bundle_design_name": (
             str(bundle.manifest.get("design", {}).get("name", "")) if bundle else ""
         ),
+        "design_name": str(record["payload"].get("design_name") or ""),
+        "link_name": str(record["payload"].get("link_name") or ""),
+        "display_name": link_display_name(record["payload"]),
         "warnings": warnings,
     }
 
@@ -3454,6 +3520,38 @@ def relink(
         bundle,
         force=bool(opts.get("force")),
     )
+
+
+def set_link_name(
+    app: adsk.core.Application,
+    link_name: object,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rename one link's label, changing nothing a rebuild or a return reads.
+
+    The label is the only WGLink name a user may change. The parameter
+    namespace, the wrapper component, the bundle path and every identifier are
+    deliberately untouched, so this is safe on a document that is already
+    linked, already jointed, and already driving user-authored features.
+
+    Pass an empty name to clear the label and fall back to the WG design name.
+    """
+
+    opts = _options(options)
+    design = _design(app)
+    record = _resolve_link(design, opts, allow_missing_body=True)
+    chosen = normalize_link_name(link_name)
+    _update_payload_attributes(design, record["instance_id"], {"link_name": chosen})
+    payload = dict(record["payload"])
+    payload["link_name"] = chosen
+    return {
+        "instance_id": record["instance_id"],
+        "link_name": chosen,
+        "design_name": str(payload.get("design_name") or ""),
+        "display_name": link_display_name(payload),
+        "parameter_prefix": str(payload.get("parameter_prefix") or ""),
+        "warnings": [],
+    }
 
 
 def _delete_attribute(attribute: object) -> bool:

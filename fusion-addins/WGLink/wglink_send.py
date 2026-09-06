@@ -780,15 +780,20 @@ def _merge_bounds(
 
 
 def _source_faces(
-    records: list[dict[str, Any]], included_bodies: list[object]
+    records: list[dict[str, Any]],
+    included_bodies: list[object],
+    retained_fractions: dict[str, float] | None = None,
 ) -> list[object]:
     """Every face the export would treat as a source, linked or painted."""
 
+    fractions = retained_fractions or {}
     faces: list[object] = []
     seen: set[tuple[str, object]] = set()
     for record in records:
         try:
-            claimed = _throat_faces(record)
+            claimed = _throat_faces(
+                record, fractions.get(str(record["instance_id"]), 1.0)
+            )
         except wglink_core.WgLinkError:
             continue
         for face in claimed:
@@ -882,7 +887,16 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         if instance_body is not None:
             record["source_body"] = instance_body
     try:
-        sources = _sources(records, included_bodies)
+        sources = _sources(
+            records,
+            included_bodies,
+            _retained_fractions(
+                design,
+                records,
+                resolve_domain_planes(opts.get("domain")),
+                selected_occurrence=walk["selected_occurrence"],
+            ),
+        )
     except wglink_core.WgLinkError as exc:
         report["source_error"] = str(exc)
         sources = []
@@ -906,7 +920,16 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         bounds = _merge_bounds(bounds, body)
     report["bounds_mm"] = bounds
     source_bounds = None
-    for face in _source_faces(records, included_bodies):
+    for face in _source_faces(
+        records,
+        included_bodies,
+        _retained_fractions(
+            design,
+            records,
+            resolve_domain_planes(opts.get("domain")),
+            selected_occurrence=walk["selected_occurrence"],
+        ),
+    ):
         source_bounds = _merge_bounds(source_bounds, face)
     report["source_bounds_mm"] = source_bounds
     return report
@@ -959,7 +982,16 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         if source_body is not None:
             record["source_body"] = source_body
     try:
-        sources = _sources(records, [body for _item, body in included_pairs])
+        sources = _sources(
+            records,
+            [body for _item, body in included_pairs],
+            _retained_fractions(
+                design,
+                records,
+                resolve_domain_planes(opts.get("domain")),
+                selected_occurrence=walk["selected_occurrence"],
+            ),
+        )
     except wglink_core.WgLinkError as exc:
         return {"hash": None, "reason": str(exc)}
     bodies = []
@@ -1371,7 +1403,7 @@ def _face_area(face: object) -> float:
     return area
 
 
-def _throat_faces(record: dict[str, Any]) -> list[object]:
+def _throat_faces(record: dict[str, Any], retained_fraction: float = 1.0) -> list[object]:
     # Prefer the body wrapper the scope walk observed (an occurrence proxy in
     # an assembly). Fusion mints distinct Python wrappers -- with distinct
     # entity tokens -- for native and proxy views of ONE face, so the claim
@@ -1390,6 +1422,18 @@ def _throat_faces(record: dict[str, Any]) -> list[object]:
         raise wglink_core.WgLinkError(
             f"WGLink instance {record['instance_id']!r} lacks a complete required throat selector."
         )
+    # What the declared domain leaves of the contract's disc, decided before any
+    # face is looked at. Both candidate branches are measured against it: the
+    # geometric one and the painted one match the same physical face, so a
+    # required source cut in half used to fail *both* gates and refuse the
+    # export -- the linked reduced model WG's own ingest already accepts.
+    retained = float(retained_fraction)
+    if not math.isfinite(retained) or not 0.0 < retained <= 1.0:
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {record['instance_id']!r} has a retained source "
+            f"fraction of {retained!r}, which is not a share of a disc."
+        )
+    expected = expected * retained
     faces = wglink_core._items(getattr(body, "faces", None))
     geometric = []
     painted = []
@@ -1412,8 +1456,14 @@ def _throat_faces(record: dict[str, Any]) -> list[object]:
     # to the observed body wrapper, so their keys claim correctly downstream.
     matches = geometric if len(geometric) == 1 else painted
     if len(matches) != 1:
+        share = (
+            ""
+            if retained >= 1.0
+            else f" at the {retained:g} of its disc a declared cut leaves ({expected:.4g} mm2)"
+        )
         raise wglink_core.WgLinkError(
-            f"WGLink instance {record['instance_id']!r} required throat source resolved to {len(matches)} faces; expected exactly one."
+            f"WGLink instance {record['instance_id']!r} required throat source{share} "
+            f"resolved to {len(matches)} faces; expected exactly one."
         )
     return matches
 
@@ -1467,7 +1517,181 @@ def _observed(faces: list[object], face_bodies: dict[tuple[str, object], str]) -
     }
 
 
-def _sources(records: list[dict[str, Any]], included_bodies: list[object]) -> list[dict[str, Any]]:
+#: How far from perpendicular a throat axis may sit to its own throat plane
+#: before the disc a declared cut would halve stops being defined. Matches the
+#: reader's own limit, because the two decide the same thing about the same
+#: contract and a disagreement would be a return one side accepts and the other
+#: refuses.
+THROAT_NORMAL_ANGLE_DEG = 0.1
+
+
+def _placed_point(matrix: list[list[float]], point: list[float]) -> list[float]:
+    """A link-local millimetre point in the frame the STEP is written in."""
+
+    return [
+        sum(matrix[row][column] * point[column] for column in range(3)) + matrix[row][3]
+        for row in range(3)
+    ]
+
+
+def _placed_direction(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    """A link-local direction in the exported frame: rotation only."""
+
+    return [
+        sum(matrix[row][column] * vector[column] for column in range(3))
+        for row in range(3)
+    ]
+
+
+def _unit(vector: list[float]) -> tuple[list[float], float]:
+    length = math.sqrt(sum(value * value for value in vector))
+    if not math.isfinite(length) or length <= 0.0:
+        return vector, 0.0
+    return [value / length for value in vector], length
+
+
+def _declared_disc_reduction(
+    instance_id: str,
+    contract: dict[str, Any] | None,
+    matrix: list[list[float]] | None,
+    planes: tuple[str, ...],
+) -> float:
+    """What a declared cut leaves of this throat's disc, or a refusal.
+
+    A declared plane does one of exactly two supported things to a throat disc.
+    It can miss it -- the ordinary shape of a source whose mirror twin the cut
+    removed, which stays whole -- or it can pass through the disc's centre, and
+    then exactly half survives because a disc is symmetric about its centre.
+    Anything else is refused with the measurement rather than guessed: an
+    off-centre clip leaves a circular segment of no fixed fraction, and a plane
+    past the far edge leaves no source at all.
+
+    The decision is made once per contract, from the contract's own geometry
+    placed in the exported frame, before any face is looked at -- so a face
+    cannot argue itself into a different expectation than the one it must meet.
+    ``server/mesh/imported.declared_disc_reduction`` decides the same thing on
+    the reading side from the same contract, which is why this does not write
+    the answer into the manifest: two recorded fractions could disagree, and
+    the one that drifted would be the one nobody re-derived.
+    """
+
+    if not planes:
+        return 1.0
+    if contract is None or matrix is None:
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} declares a reduced domain but has no "
+            "readable throat contract, so what the cut leaves of its source cannot "
+            "be derived. Send the full model, or repair the link's throat datums."
+        )
+    plane_link = contract.get("throat_plane_link") or {}
+    axis_link = contract.get("axis_link") or {}
+    normal, normal_length = _unit(
+        _placed_direction(matrix, [float(value) for value in plane_link["normal"]])
+    )
+    direction, direction_length = _unit(
+        _placed_direction(matrix, [float(value) for value in axis_link["direction"]])
+    )
+    diameter = float(contract["throat_diameter_mm"])
+    if normal_length <= 0.0 or direction_length <= 0.0 or diameter <= 0.0:
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} has a degenerate throat plane, axis or "
+            "diameter, so a declared reduced domain cannot be applied to its source."
+        )
+    plane_origin = _placed_point(
+        matrix, [float(value) for value in plane_link["origin_mm"]]
+    )
+    axis_origin = _placed_point(
+        matrix, [float(value) for value in axis_link["origin_mm"]]
+    )
+    along = sum(direction[axis] * normal[axis] for axis in range(3))
+    if abs(along) < math.cos(math.radians(THROAT_NORMAL_ANGLE_DEG)):
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} has a throat axis that is not "
+            "perpendicular to its own throat plane, so the disc a declared reduced "
+            "domain would cut is undefined."
+        )
+    # Where the axis pierces the throat plane: the centre of the contract's disc.
+    reach_along = (
+        sum((plane_origin[axis] - axis_origin[axis]) * normal[axis] for axis in range(3))
+        / along
+    )
+    centre = [axis_origin[axis] + direction[axis] * reach_along for axis in range(3)]
+    radius = 0.5 * diameter
+
+    fraction = 1.0
+    cuts: list[list[float]] = []
+    for plane in planes:
+        axis_index = DOMAIN_AXIS_FOR_PLANE.get(plane)
+        if axis_index is None:
+            raise wglink_core.WgLinkError(
+                f"Declared cut plane {plane!r} is not one a throat source understands."
+            )
+        world = [0.0, 0.0, 0.0]
+        world[axis_index] = 1.0
+        projection = sum(world[axis] * normal[axis] for axis in range(3))
+        in_plane = [world[axis] - projection * normal[axis] for axis in range(3)]
+        span = math.sqrt(sum(value * value for value in in_plane))
+        # How far the disc reaches along this world axis, and where its centre
+        # sits relative to the plane at coordinate zero.
+        reach = radius * span
+        offset = centre[axis_index]
+        if offset - reach >= -DOMAIN_TOLERANCE_FLOOR_MM:
+            continue
+        if abs(offset) <= DOMAIN_TOLERANCE_FLOOR_MM and reach > DOMAIN_TOLERANCE_FLOOR_MM:
+            fraction *= 0.5
+            cuts.append([value / span for value in in_plane])
+            continue
+        raise wglink_core.WgLinkError(
+            f"The export was declared a reduced domain about {DOMAIN_PLANE_LABEL[plane]}, "
+            f"but that plane crosses the throat of WGLink instance {instance_id!r} "
+            f"{offset:+.4g} mm off its centre (disc reach {reach:.4g} mm). A declared "
+            "cut is supported only where it misses a source or passes through its "
+            "centre; this one would leave a partial disc of no known area."
+        )
+    if len(cuts) == 2:
+        skew = abs(sum(cuts[0][axis] * cuts[1][axis] for axis in range(3)))
+        if skew > 1.0e-3:
+            raise wglink_core.WgLinkError(
+                f"The two declared cut planes are not perpendicular within the throat "
+                f"plane of WGLink instance {instance_id!r}, so the retained wedge is "
+                "not a quarter of its disc."
+            )
+    return fraction
+
+
+def _retained_fractions(
+    design: object,
+    records: list[dict[str, Any]],
+    planes: tuple[str, ...],
+    *,
+    selected_occurrence: object | None = None,
+) -> dict[str, float]:
+    """The share of each link's throat disc a declared cut leaves.
+
+    One derivation, used by the export, by the preview that predicts it and by
+    the return-state fingerprint, so a declaration cannot mean one thing in the
+    dialog and another in the bundle.
+    """
+
+    if not planes:
+        return {}
+    fractions: dict[str, float] = {}
+    for record in records:
+        instance_id = str(record["instance_id"])
+        matrix, _path = _strict_assembly_from_link(
+            design, record, selected_occurrence=selected_occurrence
+        )
+        fractions[instance_id] = _declared_disc_reduction(
+            instance_id, _source_contract(design, record), matrix, planes
+        )
+    return fractions
+
+
+def _sources(
+    records: list[dict[str, Any]],
+    included_bodies: list[object],
+    retained_fractions: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     claimed: set[tuple[str, object]] = set()
     used: set[str] = set()
@@ -1477,9 +1701,10 @@ def _sources(records: list[dict[str, Any]], included_bodies: list[object]) -> li
         for face in wglink_core._items(getattr(body, "faces", None)):
             face_bodies[_face_key(face)] = name
 
+    fractions = retained_fractions or {}
     for record in records:
         role = str(record.get("payload", {}).get("source_role") or "").upper()
-        faces = _throat_faces(record)
+        faces = _throat_faces(record, fractions.get(str(record["instance_id"]), 1.0))
         for face in faces:
             key = _face_key(face)
             claimed.add(key)
@@ -1920,7 +2145,16 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         )
         for record in records
     ]
-    sources = _sources(records, included_bodies)
+    sources = _sources(
+        records,
+        included_bodies,
+        _retained_fractions(
+            design,
+            records,
+            domain_planes,
+            selected_occurrence=walk["selected_occurrence"],
+        ),
+    )
     return_state_snapshot = return_state(app, options)
     return_state_hash = return_state_snapshot.get("hash")
     if not return_state_hash:

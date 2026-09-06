@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import json
+import math
 import sys
 import types
 
@@ -1413,6 +1414,266 @@ def test_a_half_kept_on_the_wrong_side_is_refused_rather_than_mirrored(
     with pytest.raises(
         send_module.wglink_core.WgLinkError,
         match="no extent on the positive side",
+    ):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "domain": ["y0"],
+            },
+        )
+
+
+# --- a linked model that was really cut before it was sent ------------------
+#
+# The add-in refused these before the fix: `_throat_faces` measured every
+# candidate against the FULL throat disc, on both the geometric and the painted
+# branch, so a linked source that a declared cut had genuinely halved matched
+# nothing and the export stopped at "resolved to 0 faces". WG's own ingest
+# accepted the same reduced return, so the two sides disagreed about a model the
+# user is being told to build.
+
+DISC_DIAMETER_MM = 25.4
+FULL_DISC_MM2 = math.pi * DISC_DIAMETER_MM * DISC_DIAMETER_MM / 4.0
+
+
+def _linked_attribute(owner, name, value):
+    holder = types.SimpleNamespace(name=name, value=value, parent=owner)
+    return holder
+
+
+def _linked_cut_design(
+    send_module,
+    *,
+    retained_fraction,
+    low,
+    high,
+    instance_id="wgi-cut",
+    throat_normal=(0.0, 0.0, 1.0),
+    throat_origin_cm=(0.0, 0.0, 0.0),
+):
+    """A linked wrapper whose managed body carries a really-reduced throat face.
+
+    The face's area is the share of the disc the declared cut leaves, which is
+    what a user who cut the model in CAD actually has. Everything else -- the
+    stored contract, the diameter parameter, the datums -- still describes the
+    whole disc, because the contract records the design's throat and not what
+    survived of it.
+    """
+
+    throat = face("HF", area=FULL_DISC_MM2 * retained_fraction / 100.0)
+    shell = half_body("PartyMEH", low=low, high=high, faces=[throat])
+    root = component("PartyMEH", [shell])
+    core = send_module.wglink_core
+    core._set_attribute(shell, "instance_id", instance_id)
+    core._set_attribute(shell, "role", "waveguide")
+    core._set_attribute(shell, "face_role", "HF")
+    root.constructionPlanes = Collection([
+        types.SimpleNamespace(
+            name="WG_THROAT_PLANE",
+            geometry=types.SimpleNamespace(
+                origin=point(*throat_origin_cm), normal=point(*throat_normal)
+            ),
+        )
+    ])
+    root.constructionAxes = Collection([
+        types.SimpleNamespace(
+            name="WG_AXIS",
+            geometry=types.SimpleNamespace(
+                origin=point(*throat_origin_cm), direction=point(0.0, 0.0, 1.0)
+            ),
+        )
+    ])
+    payload = {
+        "instance_id": instance_id,
+        "design_id": "design-1",
+        "export_id": "export-1",
+        "export_sequence": "1",
+        "build_mode": "freestanding",
+        "parameter_prefix": "wg_",
+        "source_role": "HF",
+        "expected_throat_area_mm2": f"{FULL_DISC_MM2:.6f}",
+        "throat_z_mm": "0",
+        "wrapper": "root",
+    }
+    attributes = [
+        _linked_attribute(root, "link_payload", json.dumps(payload)),
+        *[
+            _linked_attribute(shell, name, str(value))
+            for name, value in shell.attributes.values.items()
+        ],
+    ]
+    for attribute in attributes:
+        if isinstance(attribute.name, tuple):
+            attribute.name = attribute.name[1]
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=ContractExportManager(),
+        findAttributes=lambda _group, _name: Collection(attributes),
+        userParameters=Collection([
+            types.SimpleNamespace(name="wg_throat_dia", value=DISC_DIAMETER_MM / 10.0)
+        ]),
+    )
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="PartyMEH"),
+    )
+    return design, app
+
+
+def _send_linked_cut(send_module, tmp_path, monkeypatch, *, fraction, low, high, domain):
+    design, app = _linked_cut_design(
+        send_module, retained_fraction=fraction, low=low, high=high
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    return send_module.send(
+        app,
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "overwrite": True,
+            "domain": domain,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "fraction, domain, low",
+    [
+        (0.5, ["y0"], (-40.0, 0.0, 0.0)),
+        (0.25, ["x0", "y0"], (0.0, 0.0, 0.0)),
+    ],
+    ids=["declared-half", "declared-quarter"],
+)
+def test_a_linked_source_cut_by_the_declared_domain_still_exports(
+    send_module, tmp_path, monkeypatch, fraction, domain, low
+):
+    """The release blocker, at the real entry point.
+
+    Before the fix this raised "required throat source resolved to 0 faces" out
+    of `send()` -- the whole export, not a parser -- because the half face was
+    measured against the whole disc.
+    """
+
+    report = _send_linked_cut(
+        send_module,
+        tmp_path,
+        monkeypatch,
+        fraction=fraction,
+        low=low,
+        high=(40.0, 90.0, 120.0),
+        domain=domain,
+    )
+
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["assembly"]["domain"]["cut_planes"] == sorted(domain)
+    source = next(item for item in manifest["sources"] if item["role"] == "HF")
+    # The retained area is recorded as observed, because that is what is there.
+    assert source["observed"]["total_area_mm2"] == pytest.approx(
+        FULL_DISC_MM2 * fraction, rel=1e-6
+    )
+    assert source["instance_id"] == "wgi-cut"
+    # The contract still describes the WHOLE disc: it records the design's
+    # throat, and the reader derives the same reduction from it independently.
+    contract = manifest["instances"][0]["source_contract"]
+    assert contract["expected_disc_area_mm2"] == pytest.approx(FULL_DISC_MM2, rel=1e-6)
+    assert contract["throat_diameter_mm"] == pytest.approx(DISC_DIAMETER_MM, rel=1e-6)
+
+
+def test_the_full_disc_is_still_required_when_nothing_was_declared(
+    send_module, tmp_path, monkeypatch
+):
+    """The reduction is not a loosened tolerance: undeclared still means whole."""
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match="resolved to 0 faces"
+    ):
+        _send_linked_cut(
+            send_module,
+            tmp_path,
+            monkeypatch,
+            fraction=0.5,
+            low=(-40.0, 0.0, 0.0),
+            high=(40.0, 90.0, 120.0),
+            domain=None,
+        )
+
+
+def test_a_declared_half_does_not_accept_a_source_the_cut_never_reached(
+    send_module, tmp_path, monkeypatch
+):
+    """An untouched offset source keeps its whole disc, as WG's reader does.
+
+    A pair of drivers mirrored about y = 0, cut to keep one, leaves a source
+    whose disc is entirely still there. Halving every source on sight would
+    refuse that legitimate model; here the declared plane misses the disc, so
+    the full area is still what is demanded -- and a half-area face fails.
+    """
+
+    design, app = _linked_cut_design(
+        send_module,
+        retained_fraction=0.5,
+        low=(-40.0, 0.0, 0.0),
+        high=(40.0, 90.0, 120.0),
+        throat_origin_cm=(0.0, 6.0, 0.0),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match="resolved to 0 faces"
+    ):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "domain": ["y0"],
+            },
+        )
+
+
+def test_an_off_centre_declared_cut_is_refused_with_its_measurement(
+    send_module, tmp_path, monkeypatch
+):
+    """A plane that clips a disc off-centre leaves a segment of no known area."""
+
+    design, app = _linked_cut_design(
+        send_module,
+        retained_fraction=0.5,
+        low=(-40.0, 0.0, 0.0),
+        high=(40.0, 90.0, 120.0),
+        throat_origin_cm=(0.0, -0.5, 0.0),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="off its centre"):
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "domain": ["y0"],
+            },
+        )
+
+
+def test_a_throat_axis_askew_to_its_own_plane_refuses_a_declared_cut(
+    send_module, tmp_path, monkeypatch
+):
+    design, app = _linked_cut_design(
+        send_module,
+        retained_fraction=0.5,
+        low=(-40.0, 0.0, 0.0),
+        high=(40.0, 90.0, 120.0),
+        throat_normal=(0.0, 1.0, 1.0),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match=r"not\s+perpendicular"
     ):
         send_module.send(
             app,

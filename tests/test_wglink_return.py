@@ -437,7 +437,37 @@ def test_s7_fem_air_volume_refuses_more_than_one_solid_and_names_fix():
         plan.manifest_scope()
 
 
-def test_s8_wglink_helper_skips_informational_with_reason():
+def test_s8_hidden_wglink_helper_skips_informational_with_reason():
+    plan = plan_export_scope(
+        "root",
+        [
+            Candidate(
+                "helper",
+                "cut tool",
+                "solid",
+                False,
+                wglink_managed=True,
+                wglink_role="cut-tool",
+            )
+        ],
+    )
+
+    assert plan.status == "clean"
+    assert plan.skipped[0]["kind"] == "wglink_helper"
+    assert "final body carries the solve exterior" in plan.skipped[0]["reason"]
+
+
+def test_s8_visible_wglink_helper_refuses_and_names_the_body():
+    """A skip Fusion does not honour is a refusal, not a skip.
+
+    This is the only skip rule that drops a B-rep body, and Fusion's STEP
+    export has exactly one per-body control -- visibility -- which this rule
+    never consulted. So a visible helper was written into the file while the
+    inventory left it out, and the user got a body count instead of a name.
+    The remedy has to say BODY: Autodesk exports a body that is invisible only
+    because its group is hidden as if it were visible.
+    """
+
     plan = plan_export_scope(
         "root",
         [
@@ -452,9 +482,13 @@ def test_s8_wglink_helper_skips_informational_with_reason():
         ],
     )
 
-    assert plan.status == "clean"
-    assert plan.skipped[0]["kind"] == "wglink_helper"
-    assert "final body carries the solve exterior" in plan.skipped[0]["reason"]
+    assert plan.skipped == ()
+    with pytest.raises(WgReturnError) as refusal:
+        plan.manifest_scope()
+    message = str(refusal.value)
+    assert "'cut tool'" in message
+    assert "hide the body itself" in message
+    assert "Hiding a folder that contains it will not work" in message
 
 
 def test_s9_hidden_brep_body_skips_degraded_with_ratified_reason():

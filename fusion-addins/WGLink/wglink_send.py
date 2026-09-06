@@ -481,6 +481,106 @@ def _exports_its_faces(candidate: dict[str, Any]) -> bool:
     )
 
 
+def _display_body_name(record: dict[str, Any]) -> str:
+    """Name a body the way ``wglink_return._display_name`` names it.
+
+    Deliberately the same order of keys: a body that both refusals can talk
+    about has to be called the same thing by both, or the user reads two
+    messages about what looks like two bodies.
+    """
+
+    for key in ("path", "name", "object_id"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "unnamed body"
+
+
+def _fusion_would_export(candidate: dict[str, Any]) -> bool:
+    """Would Fusion write this body into ``assembly.step``?
+
+    This is Fusion's own predicate and nothing else: visible, unsuppressed,
+    B-rep. ``ExportManager.createSTEPExportOptions`` takes a filename and a
+    Component, so there is no per-body scoping to consult -- no role, no
+    declaration, no inventory. It deliberately does NOT reuse
+    :func:`_exports_its_faces`, which asks WGLink's policy questions as well;
+    the whole point of this one is to be the other side of the comparison.
+
+    LIMITATION, and it is not closable from inside this module. Autodesk
+    documents that hiding a body GROUP does not exclude its members: "such
+    objects while invisible will be exported as if they were visible."
+    ``_scope_walk`` reads ``isVisible`` first (``isLightBulbOn`` as fallback),
+    and ``isVisible`` reads False for exactly such a body. So this predicate is
+    right for an individually-hidden body and wrong for a group-hidden one --
+    it under-predicts the file rather than over-predicting it. Treat it as a
+    named check that catches what it can, not as an exhaustive one; the count
+    gate after the export is still what catches the rest, and the refusal text
+    says so rather than promising a completeness this cannot deliver.
+    """
+
+    return (
+        candidate.get("kind") == "body"
+        and candidate.get("body_kind") in {"solid", "surface"}
+        and not candidate.get("suppressed")
+        and candidate.get("visible") is not False
+    )
+
+
+def _refuse_inventory_disagreement(
+    candidates: list[dict[str, Any]], included: list[dict[str, Any]]
+) -> None:
+    """Compare the two filters by name before the export, not by count after.
+
+    Two independent filters run over the same document -- ``plan_export_scope``
+    decides the inventory and Fusion decides the file -- and until they were
+    compared the only symptom of a disagreement was the count gate's
+    arithmetic, which names nothing a user can act on. Bodies on each side are
+    named here instead.
+    """
+
+    predicted = {
+        str(candidate.get("object_id")): _display_body_name(candidate)
+        for candidate in candidates
+        if _fusion_would_export(candidate)
+    }
+    inventoried = {
+        str(record.get("object_id")): _display_body_name(record)
+        for record in included
+    }
+    if predicted.keys() == inventoried.keys():
+        return
+    parts = []
+    unlisted = sorted(
+        predicted[key] for key in predicted.keys() - inventoried.keys()
+    )
+    unexported = sorted(
+        inventoried[key] for key in inventoried.keys() - predicted.keys()
+    )
+    if unlisted:
+        parts.append(
+            "Fusion will export "
+            + ", ".join(repr(name) for name in unlisted)
+            + ", which the return inventory does not list"
+        )
+    if unexported:
+        parts.append(
+            "the return inventory lists "
+            + ", ".join(repr(name) for name in unexported)
+            + ", which Fusion will not export"
+        )
+    raise wglink_core.WgLinkError(
+        "The return inventory and Fusion's STEP export disagree about this "
+        "document: "
+        + "; ".join(parts)
+        + ". Fusion writes every visible, unsuppressed B-rep body of the "
+        "exported component and offers no other way to narrow a STEP export, "
+        "so hide the body itself in the browser -- hiding a folder that "
+        "contains it will not work, because Autodesk exports a group-hidden "
+        "body as if it were visible, and that case is one this check cannot "
+        "see."
+    )
+
+
 def _mark_uncovered_helper_sources(candidates: list[dict[str, Any]]) -> None:
     """Let a helper claim only the source roles its own insertion loses.
 
@@ -2177,6 +2277,11 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         scope = scope_plan.manifest_scope()
     except WgReturnError as exc:
         raise wglink_core.WgLinkError(str(exc)) from exc
+
+    # Before anything is written: the inventory and the file must be about the
+    # same set of bodies. Run it here, ahead of the temp bundle and the export,
+    # so a disagreement costs nothing and is reported by name.
+    _refuse_inventory_disagreement(walk["candidates"], scope["included"])
 
     included_pairs = [
         (record, walk["bodies"][record["object_id"]])

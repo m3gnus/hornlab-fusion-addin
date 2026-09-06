@@ -889,3 +889,18 @@ def test_an_unsupported_symmetry_plane_cannot_be_declared():
                 evidence={"z0": {"min_mm": 0.0, "max_mm": 1.0, "tolerance_mm": 0.05}},
             )
         )
+
+
+def test_the_export_frame_is_named_and_checked():
+    """The file states which component's frame it is in, or it means the root."""
+
+    manifest = _worked_example()
+    validate_return_manifest(manifest)  # absent is the root component
+
+    for frame in ("root-component", "selected-occurrence-component"):
+        manifest["coordinate_system"]["export_frame"] = frame
+        validate_return_manifest(manifest)
+
+    manifest["coordinate_system"]["export_frame"] = "assembly"
+    with pytest.raises(WgReturnError, match="export_frame must be one of"):
+        validate_return_manifest(manifest)

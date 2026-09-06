@@ -251,25 +251,46 @@ def _is_identity_placement(
     return True
 
 
-def _selection(design: object, value: object) -> tuple[object, object, object]:
-    """Resolve the selection into (scope record, export Component, occurrence).
+ROOT_EXPORT_FRAME = "root-component"
+OCCURRENCE_EXPORT_FRAME = "selected-occurrence-component"
 
-    The middle value is what Fusion's STEP export is given, so it is always a
+
+def _child_occurrences(occurrence: object, component: object) -> list[object]:
+    """The children the scope walk would descend into, resolved its way."""
+
+    children = _collection(occurrence, "childOccurrences")
+    if not children:
+        children = _collection(component, "occurrences")
+    return children
+
+
+def _selection(design: object, value: object) -> tuple[object, object, object, str]:
+    """Resolve the selection into (scope record, export Component, occurrence, frame).
+
+    The second value is what Fusion's STEP export is given, so it is always a
     Component -- see :func:`_export_step`. A Component exports in its OWN
-    frame, while ``assembly.bbox_mm`` and every ``assembly_from_link`` in the
-    manifest are in the root assembly's frame. Those two frames coincide
-    exactly when the selected occurrence sits at the assembly origin unrotated,
-    and a placed occurrence is refused rather than composed: composing the
-    chain here is the unverified arithmetic on the trust path that
-    ``_strict_assembly_from_link`` already refuses for the same reason, and a
-    STEP silently written in a frame the manifest does not describe is a wrong
-    solve rather than an error.
+    frame, and the fourth value names that frame so nothing downstream has to
+    infer it: ``assembly.bbox_mm``, every ``assembly_from_link``, and the
+    declared-domain measurement are all in the frame of the file that was
+    written.
+
+    Occurrence scope is therefore *component-local*, not assembly-local. That
+    is exact and needs no arithmetic in one shape: when the selected
+    occurrence's subtree contains no child occurrences, every exported body is
+    a native body of that one component, so each frame-dependent value can be
+    read from the native object Fusion already keeps "outside the context of an
+    assembly". A placed occurrence that *does* contain children is refused --
+    its children's bodies are native to their own components and reaching the
+    exported frame from there means composing the placement chain, which is the
+    unverified arithmetic ``_strict_assembly_from_link`` refuses for the same
+    reason. An identity placement is accepted either way, because then the two
+    frames are the same frame.
     """
 
     root = design.rootComponent
     selected = _selection_items(value)
     if not selected or selected == [root]:
-        return "root", root, root
+        return "root", root, root, ROOT_EXPORT_FRAME
     if len(selected) != 1:
         raise wglink_core.WgLinkError(
             "Select the root or exactly one occurrence subtree; several selections are not supported."
@@ -290,15 +311,24 @@ def _selection(design: object, value: object) -> tuple[object, object, object]:
         # An unresolved external link has no component to export. The scope walk
         # turns this into the actionable "unresolved" refusal, so hand the
         # occurrence back unchanged and let it get there.
-        return {"kind": "occurrence", "path": path}, entity, entity
-    if not _is_identity_placement(_occurrence_placement(entity)):
-        raise wglink_core.WgLinkError(
-            f"Occurrence {path!r} is moved or rotated relative to the assembly "
-            "origin, and Fusion can only export its component in the component's "
-            "own frame. Send the root component instead, or ground the occurrence "
-            "at the origin."
+        return (
+            {"kind": "occurrence", "path": path},
+            entity,
+            entity,
+            OCCURRENCE_EXPORT_FRAME,
         )
-    return {"kind": "occurrence", "path": path}, component, entity
+    if not _is_identity_placement(
+        _occurrence_placement(entity)
+    ) and _child_occurrences(entity, component):
+        raise wglink_core.WgLinkError(
+            f"Occurrence {path!r} is placed away from the assembly origin and "
+            "contains sub-assemblies, and Fusion can only export a component in "
+            "its own frame. Leave Assembly scope empty to send the whole root "
+            "assembly, select one of the sub-assemblies on its own, or move the "
+            "occurrence back onto the assembly origin (edit or delete the joint "
+            "or Move feature that placed it) and send again."
+        )
+    return {"kind": "occurrence", "path": path}, component, entity, OCCURRENCE_EXPORT_FRAME
 
 
 def _component_name(component: object) -> str:
@@ -441,9 +471,15 @@ def _fem_slug(component: object) -> str:
 
 
 def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
-    selection, geometry, selected_entity = _selection(design, selection_value)
+    selection, geometry, selected_entity, export_frame = _selection(design, selection_value)
     candidates: list[dict[str, Any]] = []
     bodies: dict[str, object] = {}
+    # Every frame-dependent measurement is taken from the handle that lives in
+    # the frame of the file being written: the body as collected under root
+    # scope (a child occurrence's proxy is already in root coordinates), and the
+    # native body under occurrence scope, which is the same component-local
+    # frame the STEP is exported in.
+    measured: dict[str, object] = {}
     fem_components: dict[str, object] = {}
     components: list[object] = []
     construction_count = 0
@@ -500,6 +536,9 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         ) or _has_source_face(body)
         candidates.append(candidate)
         bodies[object_id] = body
+        measured[object_id] = (
+            native if export_frame == OCCURRENCE_EXPORT_FRAME else body
+        )
 
     def walk_component(
         component: object,
@@ -617,8 +656,11 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
     return {
         "selection": selection,
         "geometry": geometry,
+        "selected_occurrence": None if selection == "root" else selected_entity,
+        "export_frame": export_frame,
         "candidates": candidates,
         "bodies": bodies,
+        "measured": measured,
         "fem_components": fem_components,
         "components": components,
     }
@@ -796,6 +838,9 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         if item["object_id"] in walk["bodies"]
     ]
     included_bodies = [body for _item, body in included_pairs]
+    measured_bodies = [
+        walk["measured"][item["object_id"]] for item, _body in included_pairs
+    ]
     report["included"] = [
         {
             "name": str(item.get("path") or item.get("name") or "unnamed body"),
@@ -829,13 +874,13 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         })
     try:
         report["domain"] = plan_domain(
-            resolve_domain_planes(opts.get("domain")), included_bodies
+            resolve_domain_planes(opts.get("domain")), measured_bodies
         )
     except wglink_core.WgLinkError as exc:
         # The preview's whole job is to say this before OK rather than after.
         report["domain_error"] = str(exc)
     bounds = None
-    for body in included_bodies:
+    for body in measured_bodies:
         bounds = _merge_bounds(bounds, body)
     report["bounds_mm"] = bounds
     source_bounds = None
@@ -1047,8 +1092,37 @@ def _matching_occurrences(design: object, record: dict[str, Any]) -> list[object
     return result
 
 
-def _strict_assembly_from_link(design: object, record: dict[str, Any]) -> tuple[list[list[float]], str | None]:
+def _strict_assembly_from_link(
+    design: object,
+    record: dict[str, Any],
+    *,
+    selected_occurrence: object | None = None,
+) -> tuple[list[list[float]], str | None]:
+    """The transform from this link's own frame into the exported file's frame.
+
+    Under occurrence scope the exported file *is* the selected occurrence's
+    component, so for the instance whose wrapper is that very occurrence the
+    answer is the identity -- definitionally, not by composing anything. Any
+    other in-scope wrapper would need the placement chain and is refused, which
+    keeps this function's rule intact: never a plausible default.
+    """
+
     instance_id = str(record["instance_id"])
+    if selected_occurrence is not None:
+        occurrences = _matching_occurrences(design, record)
+        if len(occurrences) == 1 and occurrences[0] is selected_occurrence:
+            return [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ], _occurrence_path(selected_occurrence)
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} is not the selected occurrence, so "
+            "its placement inside the exported component cannot be recorded "
+            "faithfully. Leave Assembly scope empty to send the whole root "
+            "assembly, or select that instance's own occurrence."
+        )
     if record.get("payload", {}).get("wrapper") == "root":
         return [
             [1.0, 0.0, 0.0, 0.0],
@@ -1212,9 +1286,17 @@ def _source_contract(design: object, record: dict[str, Any]) -> dict[str, Any] |
     }
 
 
-def _instance_record(design: object, record: dict[str, Any], observed_at: str) -> dict[str, Any]:
+def _instance_record(
+    design: object,
+    record: dict[str, Any],
+    observed_at: str,
+    *,
+    selected_occurrence: object | None = None,
+) -> dict[str, Any]:
     payload = record.get("payload", {})
-    matrix, occurrence_path = _strict_assembly_from_link(design, record)
+    matrix, occurrence_path = _strict_assembly_from_link(
+        design, record, selected_occurrence=selected_occurrence
+    )
     body = record.get("body")
     baseline = _stored_fingerprint(payload.get("body_fingerprint"))
     observed = wglink_core._body_fingerprint(body) if body is not None else None
@@ -1788,6 +1870,10 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         if record["object_id"] in walk["bodies"]
     ]
     included_bodies = [body for _record, body in included_pairs]
+    # The same bodies, as handles in the frame the STEP is written in.
+    measured_bodies = [
+        walk["measured"][record["object_id"]] for record, _body in included_pairs
+    ]
     if len(included_pairs) != len(scope["included"]):
         raise wglink_core.WgLinkError("Could not resolve every included body back to live Fusion geometry.")
     for record in records:
@@ -1801,9 +1887,17 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         )
         if instance_body is not None:
             record["source_body"] = instance_body
-    domain = plan_domain(domain_planes, included_bodies)
+    domain = plan_domain(domain_planes, measured_bodies)
     observed_at = _utc_timestamp()
-    instance_records = [_instance_record(design, record, observed_at) for record in records]
+    instance_records = [
+        _instance_record(
+            design,
+            record,
+            observed_at,
+            selected_occurrence=walk["selected_occurrence"],
+        )
+        for record in records
+    ]
     sources = _sources(records, included_bodies)
     return_state_snapshot = return_state(app, options)
     return_state_hash = return_state_snapshot.get("hash")
@@ -1879,6 +1973,13 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             "length_unit": "mm",
             "handedness": "right",
             "matrix_convention": "row-major-local-to-parent",
+            # Which component's own frame assembly.step is written in. Fusion
+            # exports a Component in its own coordinates and offers no way to
+            # export one in its assembly placement, so the file's frame is a
+            # fact about the export scope. Stating it keeps every other
+            # coordinate in this manifest -- the bounding box, each
+            # assembly_from_link -- readable without inferring anything.
+            "export_frame": walk["export_frame"],
         }
         if anchor is not None:
             coordinate["solver_anchor_instance_id"] = anchor
@@ -1899,7 +2000,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             assembly={
                 "file": "assembly.step",
                 "n_bodies_expected": expected_count,
-                "bbox_mm": _bbox(included_bodies),
+                "bbox_mm": _bbox(measured_bodies),
                 "signature_hash": return_state_hash,
                 **({"domain": domain} if domain is not None else {}),
             },

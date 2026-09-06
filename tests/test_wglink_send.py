@@ -1078,7 +1078,9 @@ def _contract_design(root, manager=None):
     return design, app, manager
 
 
-def _occurrence(component_value, bodies, *, placement=None, name="Horn:1"):
+def _occurrence(
+    component_value, bodies, *, placement=None, name="Horn:1", children=()
+):
     return types.SimpleNamespace(
         name=name,
         fullPathName=f"Speaker/{name}",
@@ -1086,12 +1088,44 @@ def _occurrence(component_value, bodies, *, placement=None, name="Horn:1"):
         component=component_value,
         bRepBodies=Collection(bodies),
         meshBodies=Collection(),
-        childOccurrences=Collection(),
-        occurrences=Collection(),
+        childOccurrences=Collection(children),
+        occurrences=Collection(children),
         transform2=placement or transform(),
         isVisible=True,
         isSuppressed=False,
     )
+
+
+def _proxy_of(native, *, offset_mm=(0.0, 0.0, 0.0), component_value=None):
+    """A body proxy: the same shape, seen in the assembly's coordinates.
+
+    Fusion's own words for the other half of this pair: "The NativeObject is
+    the object outside the context of an assembly." The proxy therefore reports
+    the body where it *sits* in the assembly, and the native reports it in its
+    own component -- which is the frame a Component's STEP export writes. The
+    attribute split is the measured one this file already documents: the proxy
+    carries none.
+    """
+
+    low = native.boundingBox.minPoint
+    high = native.boundingBox.maxPoint
+    proxy = body(native.name, solid=native.isSolid, faces=list(native.faces))
+    proxy.boundingBox = box(
+        (
+            low.x + offset_mm[0] / 10.0,
+            low.y + offset_mm[1] / 10.0,
+            low.z + offset_mm[2] / 10.0,
+        ),
+        (
+            high.x + offset_mm[0] / 10.0,
+            high.y + offset_mm[1] / 10.0,
+            high.z + offset_mm[2] / 10.0,
+        ),
+    )
+    proxy.attributes = Attributes()  # measured Fusion behavior: zero attributes
+    proxy.nativeObject = native
+    proxy.parentComponent = component_value
+    return proxy
 
 
 def test_root_scope_export_names_the_root_component(send_module, tmp_path, monkeypatch):
@@ -1170,32 +1204,107 @@ def test_export_step_refuses_a_non_component_before_calling_fusion(send_module):
     assert calls == []
 
 
-def test_a_placed_occurrence_is_refused_rather_than_exported_into_a_lost_frame(
-    send_module, tmp_path, monkeypatch
-):
-    """A Component exports in its own frame; the manifest describes the assembly's.
+def _placed_horn(monkeypatch, send_module, *, children=()):
+    """One wrapper occurrence, moved 120 mm along +Y in the assembly.
 
-    Fusion offers no way to export an occurrence in its assembly placement, so
-    the two frames have to coincide. They do when the occurrence sits at the
-    origin unrotated, and this is the other case.
+    This is WGLink's own documented workflow -- Insert puts a wrapper
+    occurrence in the document, the user moves and joints *that*, and then
+    returns it -- so it is the placement an ordinary return actually has.
     """
 
     native = body("Horn", faces=[face("HF")])
+    native.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
     inner = component("Horn component", [native])
-    proxy = body("Horn", faces=[face("HF")])
-    proxy.nativeObject = native
-    proxy.parentComponent = inner
-    # 12 cm along +Y in Fusion's internal units: 120 mm in the contract.
-    occurrence = _occurrence(inner, [proxy], placement=moved_transform(y_cm=12.0))
+    proxy = _proxy_of(native, offset_mm=(0.0, 120.0, 0.0), component_value=inner)
+    occurrence = _occurrence(
+        inner, [proxy], placement=moved_transform(y_cm=12.0), children=children
+    )
     root = component("Speaker")
     root.occurrences = Collection([occurrence])
+    root.allOccurrences = Collection([occurrence])
     design, app, manager = _contract_design(root)
     monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    return occurrence, native, inner, design, app, manager
+
+
+def test_a_placed_occurrence_exports_its_component_frame_and_says_which_frame(
+    send_module, tmp_path, monkeypatch
+):
+    """The ordinary moved wrapper is supported, and the file says what it is.
+
+    Fusion exports a Component in the component's OWN coordinates and offers no
+    way to export one in its assembly placement. Nothing here composes a
+    transform to paper over that: every coordinate written is read from the
+    native object, which Fusion defines as the body "outside the context of an
+    assembly" -- the same frame the STEP is in.
+    """
+
+    occurrence, native, inner, _design, app, manager = _placed_horn(
+        monkeypatch, send_module
+    )
+
+    report = send_module.send(
+        app,
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "selection": occurrence,
+        },
+    )
+
+    assert manager.geometries == [inner]
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["coordinate_system"]["export_frame"] == "selected-occurrence-component"
+    # The native box, not the proxy's 120 mm higher one: the file is the
+    # component, so its bounding box is the component's.
+    assert manifest["assembly"]["bbox_mm"] == [[-30.0, 0.0, 0.0], [30.0, 40.0, 60.0]]
+
+
+def test_the_root_scope_still_names_the_root_frame(send_module, tmp_path, monkeypatch):
+    root = component("Party", [body("shell", faces=[face("HF")])])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["coordinate_system"]["export_frame"] == "root-component"
+
+
+def test_a_placed_occurrence_with_sub_assemblies_is_refused_with_a_real_remedy(
+    send_module, tmp_path, monkeypatch
+):
+    """The one shape that cannot be read natively is the one that is refused.
+
+    A child occurrence's bodies are native to *its* component, so reaching the
+    exported frame from there means composing the placement chain -- the
+    arithmetic ``_strict_assembly_from_link`` refuses for the same reason. The
+    remedy has to be something that actually moves the occurrence: Fusion's
+    Ground freezes an occurrence where it already is and never returns it to
+    the origin, so it must not be offered here.
+    """
+
+    child_native = body("Bracket")
+    child_component = component("Bracket component", [child_native])
+    child = _occurrence(
+        child_component,
+        [_proxy_of(child_native, component_value=child_component)],
+        name="Bracket:1",
+    )
+    occurrence, _native, _inner, _design, app, manager = _placed_horn(
+        monkeypatch, send_module, children=[child]
+    )
 
     with pytest.raises(
         send_module.wglink_core.WgLinkError,
-        match="moved or rotated relative to the assembly origin",
-    ):
+        match="placed away from the assembly origin and contains sub-assemblies",
+    ) as refusal:
         send_module.send(
             app,
             {
@@ -1205,6 +1314,10 @@ def test_a_placed_occurrence_is_refused_rather_than_exported_into_a_lost_frame(
             },
         )
 
+    message = str(refusal.value)
+    assert "Leave Assembly scope empty" in message
+    assert "move the occurrence back onto the assembly origin" in message
+    assert "ground" not in message.casefold()
     assert manager.geometries == []
     assert not list(tmp_path.iterdir())
 

@@ -137,11 +137,28 @@ scales the mirrored domain the same way either way.
 ## 6. Assembly scope
 
 **Leave Assembly scope empty** to return the root component, or select exactly
-one occurrence. An occurrence is exported as its component, in the component's
-own frame — Fusion offers no way to export one in its assembly placement — so an
-occurrence that is moved or rotated away from the assembly origin is refused
-rather than exported into a frame the manifest does not describe. Return the
-root instead, or ground the occurrence at the origin.
+one occurrence.
+
+A selected occurrence is exported as its **component**, in that component's own
+frame. Fusion's STEP export takes a Component and writes it in its own
+coordinates; it offers no way to export an occurrence in its assembly
+placement. So the bundle states which frame it is in
+(`coordinate_system.export_frame`), and every coordinate in it — the bounding
+box, each instance placement, the declared-domain measurement — is read from
+the native bodies, which Fusion defines as the bodies "outside the context of
+an assembly". A moved or jointed wrapper occurrence therefore returns
+correctly, which is the ordinary WGLink round trip: Insert places the wrapper,
+you move and joint it, and Solve in WG returns it.
+
+The one shape this cannot do is a **placed occurrence that itself contains
+sub-assemblies**. Its children's bodies are native to their own components, and
+getting from there to the exported frame means composing the placement chain —
+arithmetic WGLink will not do unverified. That case is refused, and there are
+three real ways forward: leave Assembly scope empty and send the whole root
+assembly, select one of the sub-assemblies on its own, or move the occurrence
+back onto the assembly origin by editing or deleting the joint or Move feature
+that placed it. (Fusion's **Ground** is not one of them: it freezes an
+occurrence where it already is and never moves it back to the origin.)
 
 ## 7. Troubleshooting
 

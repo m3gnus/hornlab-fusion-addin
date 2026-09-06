@@ -41,6 +41,10 @@ BASE_RETURN_FEATURES = (
 # reader that does not know this vocabulary must refuse the bundle rather than
 # solve a half as an open full-domain shell, which is what ``reduced-domain-v1``
 # in ``required_features`` is for.
+# Which component's own frame ``assembly.step`` is written in. Fusion exports a
+# Component in its own coordinates, so the export scope decides the file's
+# frame; every coordinate in this manifest is in that frame.
+EXPORT_FRAMES = ("root-component", "selected-occurrence-component")
 DOMAIN_PLANES = ("x0", "y0")
 DOMAIN_KIND_FOR_PLANES = {
     (): "full",
@@ -1065,6 +1069,13 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
         if coordinate[key] != expected:
             raise WgReturnError(
                 f"coordinate_system.{key} must be {expected!r}, got {coordinate[key]!r}"
+            )
+    if "export_frame" in coordinate:
+        frame = _string(coordinate["export_frame"], label="coordinate_system.export_frame")
+        if frame not in EXPORT_FRAMES:
+            raise WgReturnError(
+                "coordinate_system.export_frame must be one of "
+                + ", ".join(EXPORT_FRAMES)
             )
 
     assembly = _mapping(root["assembly"], label="assembly")

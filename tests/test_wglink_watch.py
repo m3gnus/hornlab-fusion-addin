@@ -309,13 +309,54 @@ def test_a_later_export_after_an_announcement_is_announced_again(tmp_path: Path)
 
 
 def test_forget_lets_a_failed_update_be_offered_again(tmp_path: Path) -> None:
+    """A failed update retries on nothing but ``forget``.
+
+    Nothing touches the bundle here, deliberately. The bundle is exactly as it
+    was when the update failed, which is the only situation `forget` exists
+    for; a `_touch` in this test manufactured the disk change production never
+    has, and hid a watcher that could not retry at all.
+    """
+
     bundle = _bundle(tmp_path, "horn", "wge_2")
     watcher = wglink_watch.ExportWatcher()
     assert len(watcher.survey([_link(bundle, "wge_1")])) == 1
 
     watcher.forget("instance-a")
-    _touch(bundle, 7_000)
     assert len(watcher.survey([_link(bundle, "wge_1")])) == 1
+
+
+def test_a_second_instance_of_one_bundle_is_surveyed_on_its_own_terms(
+    tmp_path: Path,
+) -> None:
+    """Two insertions of one design share a bundle path and not a verdict.
+
+    The first instance is already on the current export and the second is a
+    version behind. Reading identity per link rather than per bundle read is
+    what lets the stale one be seen at all.
+    """
+
+    bundle = _bundle(tmp_path, "horn", "wge_2", sequence=2)
+    watcher = wglink_watch.ExportWatcher()
+
+    found = watcher.survey([
+        _link(bundle, "wge_2", "instance-current"),
+        _link(bundle, "wge_1", "instance-stale"),
+    ])
+
+    assert [item.instance_id for item in found] == ["instance-stale"]
+    assert found[0].available_export_id == "wge_2"
+
+
+def test_every_stale_instance_of_one_bundle_is_announced(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, "horn", "wge_2", sequence=2)
+    watcher = wglink_watch.ExportWatcher()
+
+    found = watcher.survey([
+        _link(bundle, "wge_1", "instance-a"),
+        _link(bundle, "wge_1", "instance-b"),
+    ])
+
+    assert [item.instance_id for item in found] == ["instance-a", "instance-b"]
 
 
 @pytest.mark.parametrize(

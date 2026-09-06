@@ -1505,6 +1505,46 @@ def test_document_links_attach_exact_live_return_identities(monkeypatch) -> None
     assert link["source_state_hash"] == state["source_hash"]
 
 
+def test_a_failed_announced_update_is_offered_again_on_the_next_tick(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The retry the failure branch promises, on the disk it actually has.
+
+    Nothing touches the bundle between the two surveys, because in production
+    nothing does: a refused Update leaves the export exactly where it was.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_failed_update_retry", ui, app)
+    bundle = tmp_path / "horn.wglink"
+    bundle.mkdir()
+    (bundle / "wglink.json").write_text(
+        json.dumps({"export": {"id": "wge_2", "sequence": 2}}), encoding="utf-8"
+    )
+    links = [{
+        "instance_id": "instance-a",
+        "bundle_path": str(bundle),
+        "export_id": "wge_1",
+    }]
+
+    def _refuse(_app, _path, _options):
+        raise module.wglink_core.WgLinkError("the managed body is in an edit")
+
+    monkeypatch.setattr(module.wglink_core, "update", _refuse)
+    announced = module._watcher.survey(links)
+    assert [item.instance_id for item in announced] == ["instance-a"]
+
+    module._apply_announced_updates(announced)
+
+    assert any("Not updated" in text for _title, text in ui.messages)
+    assert [item.instance_id for item in module._watcher.survey(links)] == [
+        "instance-a"
+    ]
+
+
 def test_heartbeat_loops_use_the_main_thread_application_reference(monkeypatch) -> None:
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)

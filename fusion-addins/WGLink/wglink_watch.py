@@ -397,6 +397,7 @@ class ExportWatcher:
     def __init__(self) -> None:
         self._announced: dict[str, str] = {}
         self._stamps: dict[str, tuple[float, int]] = {}
+        self._identities: dict[str, tuple[str, str] | None] = {}
 
     def forget(self, instance_id: str) -> None:
         """Drop the announcement record once a link has been updated."""
@@ -406,29 +407,45 @@ class ExportWatcher:
     def reset(self) -> None:
         self._announced.clear()
         self._stamps.clear()
+        self._identities.clear()
 
-    def _changed_on_disk(self, bundle_path: str) -> bool:
-        """Cheap gate so an idle workspace costs one stat per link per tick."""
+    def _current_identity(self, bundle_path: str) -> tuple[str, str] | None:
+        """The bundle's export identity, re-parsed only when the file moved.
+
+        The stat stamp is a read cache and nothing else: it decides whether the
+        manifest is worth parsing again, never whether a link is announced. It
+        used to do both, so the first link to consult a bundle consumed the
+        change on behalf of every other link sharing that bundle -- a second
+        insertion of the same design was never announced, and a failed update
+        could not be retried without the file being touched again.
+        """
 
         try:
             status = _manifest_path(bundle_path).stat()
         except OSError:
             self._stamps.pop(bundle_path, None)
-            return False
+            self._identities.pop(bundle_path, None)
+            return None
         stamp = (status.st_mtime, status.st_size)
-        if self._stamps.get(bundle_path) == stamp:
-            return False
-        self._stamps[bundle_path] = stamp
-        return True
+        if self._stamps.get(bundle_path) != stamp:
+            self._stamps[bundle_path] = stamp
+            self._identities[bundle_path] = read_export_identity(bundle_path)
+        return self._identities.get(bundle_path)
 
     def survey(self, links: Iterable[Mapping[str, Any]]) -> list[Announcement]:
         """Announcements for links whose bundle names an unseen newer export.
 
         ``links`` carries plain strings copied off the document on the main
         thread -- never live Fusion objects, which must not cross a thread.
+
+        Identity is read once per bundle path per tick and every link is then
+        compared against it, so several instances of one design each get their
+        own answer. Whether the user has already been told is tracked per
+        instance in ``_announced``, and nowhere else.
         """
 
         found: list[Announcement] = []
+        identities: dict[str, tuple[str, str] | None] = {}
         for link in links:
             instance_id = str(link.get("instance_id") or "")
             bundle_path = str(link.get("bundle_path") or "")
@@ -439,9 +456,9 @@ class ExportWatcher:
             # a manifest; announcing it would be guessing, so leave it alone.
             if not stored_export_id:
                 continue
-            if not self._changed_on_disk(bundle_path):
-                continue
-            identity = read_export_identity(bundle_path)
+            if bundle_path not in identities:
+                identities[bundle_path] = self._current_identity(bundle_path)
+            identity = identities[bundle_path]
             if identity is None:
                 continue
             available_export_id, sequence = identity

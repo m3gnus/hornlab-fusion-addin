@@ -1336,7 +1336,9 @@ def _apply_announced_updates(announcements: list) -> None:
             })
         except Exception as exc:  # noqa: BLE001 - one bad link must not stop the rest
             failed.append(f"{announcement.instance_id}: {exc}")
-            # Let the next tick offer it again rather than swallowing it.
+            # Let the next tick offer it again rather than swallowing it. This
+            # is the whole retry: announcement state is per instance and is not
+            # gated on the bundle changing again, which it will not.
             _watcher.forget(announcement.instance_id)
         else:
             applied.append(announcement.describe())

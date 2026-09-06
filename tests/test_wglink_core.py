@@ -87,6 +87,188 @@ def test_mouth_overshoot_parameter_is_created_then_updated_in_place(core):
     assert len(parameters.added) == 1
 
 
+class _UserParameters:
+    """Fusion's document-global parameter table, as Insert and Update see it."""
+
+    def __init__(self, existing: dict[str, str] | None = None):
+        self.values = {
+            name: types.SimpleNamespace(name=name, expression=expression, unit="mm")
+            for name, expression in (existing or {}).items()
+        }
+        self.added: list[str] = []
+
+    @property
+    def count(self) -> int:
+        return len(self.values)
+
+    def item(self, index):
+        return list(self.values.values())[index]
+
+    def itemByName(self, name):
+        return self.values.get(name)
+
+    def add(self, name, value, unit, description):
+        parameter = types.SimpleNamespace(name=name, expression=value, unit=unit)
+        self.values[name] = parameter
+        self.added.append(name)
+        return parameter
+
+
+def _horn_bundle(depth_mm: float) -> object:
+    """A bundle whose real interface table owns the wg_horn_ namespace."""
+
+    return types.SimpleNamespace(
+        manifest={
+            "design": {"name": "Horn", "build_mode": "freestanding"},
+            "parameters": [
+                {
+                    "name": "wg_horn_throat_dia",
+                    "unit": "mm",
+                    "value": 25.4,
+                    "role": "interface",
+                },
+                {
+                    "name": "wg_horn_depth",
+                    "unit": "mm",
+                    "value": depth_mm,
+                    "role": "interface",
+                },
+            ],
+        }
+    )
+
+
+def _insert_prefix(core, design, records) -> str:
+    """Exactly the namespace decision insert() makes, with real functions."""
+
+    return core.instance_parameter_prefix(
+        "horn",
+        core._stored_parameter_prefixes(records),
+        core._document_parameter_names(design),
+    )
+
+
+def _document(core, existing: dict[str, str]):
+    core.adsk.core.ValueInput = types.SimpleNamespace(createByString=lambda value: value)
+    parameters = _UserParameters(existing)
+    return types.SimpleNamespace(userParameters=parameters), parameters
+
+
+# Measured against the real allocator and the real parameter push: with no link
+# records left, allocation returned "wg_horn_" and the push reassigned the
+# surviving wg_horn_depth from "25 mm" to "50.0 mm".
+def test_reinsert_after_detach_leaves_the_surviving_parameters_alone(core):
+    # Detach deletes link ATTRIBUTES only, so the document keeps wg_horn_* and
+    # every feature they drive while no link record mentions them.
+    design, parameters = _document(
+        core, {"wg_horn_throat_dia": "25.4 mm", "wg_horn_depth": "25 mm"}
+    )
+    survivor = parameters.values["wg_horn_depth"]
+
+    prefix = _insert_prefix(core, design, {})
+    report = core._push_parameters(design, _horn_bundle(50.0), prefix, create_only=True)
+
+    assert prefix == "wg_horn2_"
+    assert survivor.expression == "25 mm"
+    assert report["updated"] == []
+    assert sorted(report["created"]) == ["wg_horn2_depth", "wg_horn2_throat_dia"]
+
+
+def test_insert_does_not_rewrite_a_user_authored_parameter_in_its_namespace(core):
+    # wg_horn_depth here was typed by the user, not minted by any link.
+    design, parameters = _document(core, {"wg_horn_depth": "25 mm"})
+    authored = parameters.values["wg_horn_depth"]
+
+    prefix = _insert_prefix(core, design, {})
+    report = core._push_parameters(design, _horn_bundle(50.0), prefix, create_only=True)
+
+    assert prefix == "wg_horn2_"
+    assert authored.expression == "25 mm"
+    assert report["updated"] == []
+
+
+def test_insert_refuses_by_name_when_a_collision_cannot_be_allocated_away(core):
+    # A parameter table that cannot be walked hides the collision from
+    # allocation, so the create-only push is what keeps the promise. Refusing
+    # is the correct outcome; rewriting the user's expression is the defect.
+    design, parameters = _document(core, {"wg_horn_depth": "25 mm"})
+    design.userParameters = types.SimpleNamespace(
+        itemByName=parameters.itemByName, add=parameters.add
+    )
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        core._push_parameters(design, _horn_bundle(50.0), "wg_horn_", create_only=True)
+
+    message = str(refusal.value)
+    assert "wg_horn_depth" in message
+    assert "never takes over ones it did not create" in message
+    assert parameters.values["wg_horn_depth"].expression == "25 mm"
+    assert parameters.added == []
+
+
+def test_insert_refuses_a_mouth_overshoot_parameter_it_did_not_create(core):
+    design, parameters = _document(core, {"wg_horn_mouth_overshoot": "3 mm"})
+    design.userParameters = types.SimpleNamespace(
+        itemByName=parameters.itemByName, add=parameters.add
+    )
+
+    with pytest.raises(core.WgLinkError, match="wg_horn_mouth_overshoot"):
+        core._push_mouth_overshoot_parameter(
+            design, "wg_horn_", 5.0, create_only=True
+        )
+
+    assert parameters.values["wg_horn_mouth_overshoot"].expression == "3 mm"
+
+
+def test_an_existing_link_keeps_its_namespace_when_a_second_copy_is_inserted(core):
+    # One live link owns wg_horn_. Inserting a second copy of the same design
+    # takes the next namespace, and the first link's own Update still writes
+    # the namespace its record names -- Update never reallocates, because
+    # Fusion cannot retarget the datums and user features naming it.
+    design, parameters = _document(
+        core, {"wg_horn_throat_dia": "25.4 mm", "wg_horn_depth": "25 mm"}
+    )
+    records = {
+        "wgi_one": {"payload": {"slug": "horn", "parameter_prefix": "wg_horn_"}}
+    }
+    owned = parameters.values["wg_horn_depth"]
+
+    second = _insert_prefix(core, design, records)
+    core._push_parameters(design, _horn_bundle(50.0), second, create_only=True)
+    first = core._record_parameter_prefix(records["wgi_one"]["payload"])
+    replaced = core._push_parameters(design, _horn_bundle(30.0), first)
+
+    assert (first, second) == ("wg_horn_", "wg_horn2_")
+    assert owned.expression == "30.0 mm"
+    assert parameters.values["wg_horn2_depth"].expression == "50.0 mm"
+    assert replaced["created"] == []
+    assert sorted(replaced["updated"]) == ["wg_horn_depth", "wg_horn_throat_dia"]
+
+
+def test_a_link_minted_before_the_stamp_keeps_its_slug_namespace(core):
+    assert core._record_parameter_prefix({"slug": "horn"}) == "wg_horn_"
+    assert (
+        core._record_parameter_prefix(
+            {"slug": "horn", "parameter_prefix": "wg_horn2_"}
+        )
+        == "wg_horn2_"
+    )
+
+
+def test_document_parameter_names_prefer_the_table_that_holds_model_parameters(core):
+    # A model parameter occupies a name too: userParameters.add refuses a name
+    # a feature already carries, so allocation must see it.
+    user = _UserParameters({"wg_horn_depth": "25 mm"})
+    every = _UserParameters({"wg_horn_depth": "25 mm", "d17": "4 mm"})
+    design = types.SimpleNamespace(allParameters=every, userParameters=user)
+
+    assert sorted(core._document_parameter_names(design)) == ["d17", "wg_horn_depth"]
+    assert core._document_parameter_names(
+        types.SimpleNamespace(userParameters=user)
+    ) == ["wg_horn_depth"]
+    assert core._document_parameter_names(types.SimpleNamespace()) == []
+
+
 def test_observed_parameters_normalize_lengths_to_mm_and_reject_other_units(core):
     parameter_by_name = {
         "wg_angle": types.SimpleNamespace(expression="30 deg", value=0.5, unit="deg"),

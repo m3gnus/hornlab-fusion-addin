@@ -1099,18 +1099,44 @@ def parameters_by_suffix(bundle: Bundle) -> dict[str, Parameter]:
     return indexed
 
 
-def instance_parameter_prefix(slug: str, existing: Sequence[str]) -> str:
-    """Choose the first unused document-global namespace for one insertion."""
+def instance_parameter_prefix(
+    slug: str,
+    existing: Sequence[str],
+    parameter_names: Sequence[str] = (),
+) -> str:
+    """Choose the first unused document-global namespace for one insertion.
+
+    ``existing`` are the namespaces the document's live link records claim.
+    ``parameter_names`` are the parameter names the document ACTUALLY holds,
+    and they are not the same inventory: Detach removes a link's attributes
+    but leaves its parameters and every feature they drive, so a namespace
+    whose record is gone can still be fully occupied.  A user-authored
+    ``wg_<slug>_*`` parameter occupies one the same way.  Allocating from the
+    records alone hands the next insertion a namespace whose parameters it
+    would then reassign, so both sources are consulted here.
+
+    A namespace counts as taken when ANY existing parameter name carries it,
+    not only the ones this link would create -- one namespace belongs to one
+    link, and a partial overlap is exactly the shared ownership the frozen
+    ``wg_<slug>_`` contract exists to prevent.
+    """
 
     if not isinstance(slug, str) or not slug:
         raise WgLinkError(f"link parameter slug is invalid: {slug!r}")
     base = f"wg_{slug}"
     occupied = {str(value) for value in existing}
+    names = [str(value) for value in parameter_names]
+
+    def taken(candidate: str) -> bool:
+        if candidate in occupied:
+            return True
+        return any(name.startswith(candidate) for name in names)
+
     first = f"{base}_"
-    if first not in occupied:
+    if not taken(first):
         return first
     index = 2
-    while f"{base}{index}_" in occupied:
+    while taken(f"{base}{index}_"):
         index += 1
     return f"{base}{index}_"
 

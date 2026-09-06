@@ -213,6 +213,16 @@ occurrence where it already is and never moves it back to the origin.)
   names the recovery: Detach and delete the component, then Insert; the
   rebuild restores the managed bodies, datums and parameters, and only
   user-authored features on the old parameters need repointing.
+- **"WGLink Insert creates parameters; it never takes over ones it did not
+  create"** — the namespace this Insert would have used is already occupied by
+  parameters WGLink does not own, and it could not allocate a free one either.
+  Insert normally steps to the next free namespace on its own: Detach leaves a
+  link's `wg_<name>_*` parameters and the geometry they drive behind, so a
+  fresh Insert of that design takes `wg_<name>2_` rather than reassigning the
+  detached model's expressions. The refusal names the colliding parameters;
+  rename or delete them, or keep them and let the new link have its own
+  namespace. Only Update rewrites parameters, and only for the namespace a
+  link this document still records was minted with.
 - **"The linked bundle could not be found in the current WG workspace"** —
   Update already searched the selected WG workspace by design identity. Put the
   bundle back under that workspace and run Update again. If it was deliberately

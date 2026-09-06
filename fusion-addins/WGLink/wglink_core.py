@@ -8,7 +8,7 @@ harness.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import json
 import math
 import os
@@ -561,15 +561,107 @@ def _parameter_by_suffix(parameters: dict[str, object], suffix: str) -> object:
     return parameter
 
 
+def _document_parameter_names(design: object) -> list[str]:
+    """Every parameter name this document actually holds.
+
+    ``allParameters`` is preferred over ``userParameters`` because a model
+    parameter occupies a name just as firmly -- ``userParameters.add`` refuses
+    a name a feature already carries -- and because allocation must see names
+    no link record mentions.  A Fusion collection that cannot be enumerated
+    yields nothing rather than raising: the create-only push in
+    :func:`_push_parameters` is the guarantee, and this list only steers the
+    allocator away from a namespace it can see is in use.
+    """
+
+    for source in ("allParameters", "userParameters"):
+        names = []
+        for parameter in _items(getattr(design, source, None)):
+            try:
+                name = str(parameter.name)
+            except Exception:  # noqa: BLE001 - a nameless parameter is not a namespace
+                continue
+            if name:
+                names.append(name)
+        if names:
+            return names
+    return []
+
+
+def _existing_parameter(design: object, name: str) -> object | None:
+    try:
+        return design.userParameters.itemByName(name)
+    except Exception:  # noqa: BLE001 - absence and an unreadable table read alike
+        return None
+
+
+def _unowned_parameters(design: object, names: Sequence[str]) -> list[str]:
+    """Which of ``names`` the document already holds, so Insert must not write.
+
+    Both the enumerated table and the by-name lookup are consulted because
+    either one can be the answer Fusion gives: a model parameter appears only
+    in ``allParameters``, while a design whose collection cannot be walked
+    still answers ``itemByName``.
+    """
+
+    document = set(_document_parameter_names(design))
+    return [
+        name
+        for name in names
+        if name in document or _existing_parameter(design, name) is not None
+    ]
+
+
+def _record_parameter_prefix(payload: Mapping[str, Any]) -> str:
+    """The namespace this link already owns, read only from its own record.
+
+    Never allocated, never re-derived from the document: a link minted before
+    ``parameter_prefix`` was stamped falls back to ``wg_<slug>_``, which is
+    exactly what it was given, and a link that stamped one keeps it for the
+    life of the document.  Fusion cannot retarget an expression, so every
+    datum, enclosure dimension and user feature naming these parameters
+    depends on this answer never moving.
+    """
+
+    return str(payload.get("parameter_prefix") or f"wg_{payload.get('slug', '')}_")
+
+
+def _refuse_parameter_takeover(prefix: str, names: Sequence[str]) -> None:
+    listed = ", ".join(sorted(names))
+    raise WgLinkError(
+        "WGLink Insert creates parameters; it never takes over ones it did not "
+        f"create. This document already holds {listed}, so inserting into the "
+        f"{prefix!r} namespace would reassign those expressions and every "
+        "feature driven by them. Rename or delete those parameters, or keep "
+        "them and give this insertion its own namespace by renaming the design "
+        "in WG before exporting. Only Update rewrites parameters, and only for "
+        "a link this document still records."
+    )
+
+
 def _push_parameters(
     design: adsk.fusion.Design,
     bundle: object,
     prefix: str,
+    *,
+    create_only: bool = False,
 ) -> dict[str, list[str]]:
+    """Write this link's interface parameters into the document.
+
+    ``create_only`` is Insert's mode: a name that already exists is somebody
+    else's, and the whole insertion is refused before a single parameter is
+    written.  Update leaves it off, because replacing the expressions of the
+    namespace its own link record names is exactly Update's job.
+    """
+
     created: list[str] = []
     updated: list[str] = []
     design_name = str(bundle.manifest.get("design", {}).get("name", "waveguide"))
-    for parameter in effective_parameters(bundle, prefix).values():
+    wanted = list(effective_parameters(bundle, prefix).values())
+    if create_only:
+        conflicts = _unowned_parameters(design, [parameter.name for parameter in wanted])
+        if conflicts:
+            _refuse_parameter_takeover(prefix, conflicts)
+    for parameter in wanted:
         existing = design.userParameters.itemByName(parameter.name)
         if existing is None:
             design.userParameters.add(
@@ -589,9 +681,13 @@ def _push_mouth_overshoot_parameter(
     design: adsk.fusion.Design,
     prefix: str,
     overshoot_mm: float,
+    *,
+    create_only: bool = False,
 ) -> tuple[str, dict[str, list[str]]]:
     name = f"{prefix}{MOUTH_OVERSHOOT_SUFFIX}"
     expression = format_expression(overshoot_mm)
+    if create_only and _unowned_parameters(design, [name]):
+        _refuse_parameter_takeover(prefix, [name])
     existing = design.userParameters.itemByName(name)
     if existing is None:
         design.userParameters.add(
@@ -1862,9 +1958,7 @@ def _link_frame_report(design: object, record: dict[str, Any]) -> dict[str, obje
     """
 
     payload = record.get("payload", {})
-    prefix = str(
-        payload.get("parameter_prefix") or f"wg_{payload.get('slug', '')}_"
-    )
+    prefix = _record_parameter_prefix(payload)
     parameter_name = f"{prefix}vertical_offset"
     expected_z = float(payload.get("throat_z_mm", 0.0) or 0.0)
     try:
@@ -2569,10 +2663,31 @@ def insert(
         raise WgLinkError(
             f"WGLink instance id {instance_id!r} already exists. Choose a unique id."
         )
+    # Allocate against the parameters the document HOLDS, not only against the
+    # namespaces its link records claim.  Detach leaves a namespace and its
+    # driven geometry behind with no record, and a user may have authored
+    # wg_<slug>_* names of their own; either way the next free namespace is
+    # cheap and taking over the occupied one is not.
     parameter_prefix = instance_parameter_prefix(
-        slug, _stored_parameter_prefixes(existing_records)
+        slug,
+        _stored_parameter_prefixes(existing_records),
+        _document_parameter_names(design),
     )
     parameters = _parameter_map(bundle, parameter_prefix)
+    # Refuse before anything is built.  A refusal raised mid-insert costs the
+    # user an Undo, and a silent overwrite costs them their model.
+    conflicts = _unowned_parameters(
+        design,
+        sorted(
+            _managed_parameter_expressions(
+                bundle,
+                parameter_prefix,
+                mouth_overshoot_mm=(overshoot_mm if mode == "enclosure" else None),
+            )
+        ),
+    )
+    if conflicts:
+        _refuse_parameter_takeover(parameter_prefix, conflicts)
     wall_parameter = None
     if mode == "freestanding":
         wall_parameter = _parameter_by_suffix(parameters, "wall_t")
@@ -2605,12 +2720,14 @@ def insert(
         component, occurrence, wrapper_mode = _create_wrapper(design, slug, opts, warnings)
         mutated = True
         report["wrapper"] = wrapper_mode
-        parameter_report = _push_parameters(design, bundle, parameter_prefix)
+        parameter_report = _push_parameters(
+            design, bundle, parameter_prefix, create_only=True
+        )
         mouth_overshoot_parameter = None
         if mode == "enclosure":
             mouth_overshoot_parameter, overshoot_parameter_report = (
                 _push_mouth_overshoot_parameter(
-                    design, parameter_prefix, overshoot_mm
+                    design, parameter_prefix, overshoot_mm, create_only=True
                 )
             )
             _merge_parameter_reports(parameter_report, overshoot_parameter_report)
@@ -3006,9 +3123,10 @@ def update(
             "parameters from the bundle, and every WG setting travels in the bundle. "
             "Only your own features built on the old parameters need repointing."
         )
-    parameter_prefix = str(
-        record["payload"].get("parameter_prefix") or f"wg_{stored_slug}_"
-    )
+    # An existing link keeps the namespace it was minted with, always. Update
+    # never allocates: re-prefixing a live link would orphan every datum,
+    # enclosure dimension and user feature that names its parameters.
+    parameter_prefix = _record_parameter_prefix(record["payload"])
     _validate_enclosure_placement(bundle)
     _validate_mouth_outline(bundle)
     if state.verdict == "corrupt_export":

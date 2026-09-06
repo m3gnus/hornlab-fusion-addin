@@ -303,6 +303,36 @@ def test_the_anchor_and_the_source_land_on_the_final_body_only(send_module):
     assert flags["WGLink stitched waveguide body"] == (False, False, False)
 
 
+def test_a_helper_repeating_the_final_bodys_own_source_does_not_refuse(send_module):
+    """Reproduction of the 2026-09-06 acceptance failure.
+
+    ``_close_and_thicken`` stitches the loft and the *throat patch* into one
+    surface body before thickening it, so on a throat-opened model the leftover
+    shell carries the very HF face the final solid also carries.  Measured from
+    ``260308Tritonia-M`` (one required source, ``HF``, ``throat_opened: true``):
+    the helper's duplicate HF flagged ``contains_required_source``, the skip by
+    role then became a terminal refusal, and every such return failed with
+    "cannot skip 'waveguide v1/WGLink stitched waveguide body'".
+
+    A role the final body already carries is not evidence WG can lose.
+    """
+
+    design, _final, _stitched = _freestanding_insertion(
+        send_module, helper_faces=[face("HF")]
+    )
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    assert [reason["reason"] for reason in plan.refusals] == []
+    scope = plan.manifest_scope()
+    assert [record["name"] for record in scope["included"]] == [
+        "WGLink freestanding waveguide"
+    ]
+    assert [record["kind"] for record in scope["skipped"]] == ["wglink_helper"]
+
+
 def test_a_helper_that_carries_a_painted_source_still_refuses_the_skip(send_module):
     """Role is not licence to drop a real source.
 
@@ -323,6 +353,81 @@ def test_a_helper_that_carries_a_painted_source_still_refuses_the_skip(send_modu
         send_module.WgReturnError, match="stitched waveguide body.*required source"
     ):
         plan.manifest_scope()
+
+
+def _refuses_the_stitched_skip(plan):
+    return any(
+        "stitched waveguide body" in refusal["reason"]
+        and "required source" in refusal["reason"]
+        for refusal in plan.refusals
+    )
+
+
+def test_a_role_only_another_helper_carries_is_still_a_loss(send_module):
+    """Cover has to come from a body the STEP actually carries.
+
+    Two helpers agreeing about an LF face is no reason to drop it: both are
+    skipped by role, so WG would receive a file with no LF face anywhere.
+    """
+
+    core = send_module.wglink_core
+    design, _final, _stitched = _freestanding_insertion(
+        send_module, helper_faces=[face("LF")]
+    )
+    twin = body("WGLink throat patch", solid=False, faces=[face("LF")])
+    core._set_attribute(twin, "instance_id", "wgi-free")
+    core._set_attribute(twin, "role", "cut_tool")
+    twin.parentComponent = design.rootComponent
+    design.rootComponent.bRepBodies.append(twin)
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    assert _refuses_the_stitched_skip(plan)
+
+
+def test_another_insertions_hf_does_not_cover_this_helpers(send_module):
+    """Cover is per insertion, not per role name.
+
+    A second waveguide's HF face sits somewhere else entirely; exporting it
+    does not hand WG the face this helper is about to take with it.
+    """
+
+    core = send_module.wglink_core
+    design, final, _stitched = _freestanding_insertion(
+        send_module, helper_faces=[face("HF")]
+    )
+    core._set_attribute(final, "instance_id", "wgi-other")
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    assert _refuses_the_stitched_skip(plan)
+
+
+@pytest.mark.parametrize("withheld", ["hidden", "suppressed"])
+def test_a_body_that_never_reaches_wg_covers_nothing(send_module, withheld):
+    """The final body's HF only redeems the helper's while it is exported.
+
+    Hide or suppress it and the export loses HF twice over, so the helper's
+    duplicate becomes the loss it looks like and the refusal comes back.
+    """
+
+    design, final, _stitched = _freestanding_insertion(
+        send_module, helper_faces=[face("HF")]
+    )
+    if withheld == "hidden":
+        final.isVisible = False
+    else:
+        final.isSuppressed = True
+
+    walk = send_module._scope_walk(design, "root")
+    send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+
+    assert _refuses_the_stitched_skip(plan)
 
 
 def _design_of(root, monkeypatch, send_module):
@@ -1780,11 +1885,15 @@ def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
         record["kind"] for record in full["scope"]["skipped"]
     }
 
-    # The same document with paint on the helper refuses either way: a face
-    # WGLink would skip cannot also be a source, and a domain declaration is
-    # not a way around that.
+    # The same document with a LOST source on the helper refuses either way: a
+    # face WGLink would skip cannot also be the only carrier of a source, and a
+    # domain declaration is not a way around that. The paint is LF, a role the
+    # final body does not carry -- an HF helper duplicates the final body's own
+    # throat patch on every throat-opened model, which is not a loss and no
+    # longer refuses (see
+    # test_a_helper_repeating_the_final_bodys_own_source_does_not_refuse).
     painted, painted_final, _helper = _freestanding_insertion(
-        send_module, instance_id="wgi-painted", helper_faces=[face("HF", area=9.0)]
+        send_module, instance_id="wgi-painted", helper_faces=[face("LF", area=9.0)]
     )
     painted_final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
     painted.exportManager = ContractExportManager()

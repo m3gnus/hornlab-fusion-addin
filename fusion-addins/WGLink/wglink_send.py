@@ -417,8 +417,15 @@ def _face_role(face: object) -> str | None:
     return canonical if canonical in RECOGNISED_SOURCE_ROLES else None
 
 
-def _has_source_face(body: object) -> bool:
-    return any(_face_role(face) is not None for face in wglink_core._items(getattr(body, "faces", None)))
+def _source_face_roles(body: object) -> tuple[str, ...]:
+    """The distinct painted source roles a body carries, in the order found."""
+
+    roles: list[str] = []
+    for face in wglink_core._items(getattr(body, "faces", None)):
+        role = _face_role(face)
+        if role is not None and role not in roles:
+            roles.append(role)
+    return tuple(roles)
 
 
 def _is_managed_helper(candidate: dict[str, Any]) -> bool:
@@ -427,8 +434,8 @@ def _is_managed_helper(candidate: dict[str, Any]) -> bool:
     Every entity ``_stamp_managed`` touches carries the instance id, including
     the cut tool, the throat patch and the stitched shell that ``_close_and_thicken``
     leaves behind.  ``plan_export_scope`` skips those by role, so they must not
-    also claim to hold the anchor or a required source -- a dependency flag on a
-    skipped body is a terminal refusal.
+    also claim to hold the anchor, or a required source that an exported body
+    already carries -- a dependency flag on a skipped body is a terminal refusal.
     """
 
     return bool(candidate.get("wglink_managed")) and candidate.get(
@@ -445,6 +452,53 @@ def _mark_solver_anchor(candidates: list[dict[str, Any]], anchor: str | None) ->
             and candidate.get("wglink_instance_id") == anchor
             and not _is_managed_helper(candidate)
         )
+
+
+def _exports_its_faces(candidate: dict[str, Any]) -> bool:
+    """Do this candidate's painted faces reach the STEP file?
+
+    Only the rules that can keep a body out of the export are asked -- helper
+    role, suppression, visibility and an ``exclude`` declaration -- because a
+    body WG never receives cannot stand in for one that is dropped.
+    """
+
+    return (
+        candidate.get("kind") == "body"
+        and candidate.get("body_kind") in {"solid", "surface"}
+        and not _is_managed_helper(candidate)
+        and not candidate.get("suppressed")
+        and candidate.get("visible") is not False
+        and candidate.get("declaration") != "exclude"
+    )
+
+
+def _mark_uncovered_helper_sources(candidates: list[dict[str, Any]]) -> None:
+    """Let a helper claim only the source roles its own insertion loses.
+
+    ``_close_and_thicken`` stitches the loft and the throat patch into one
+    surface body before thickening it, so on a throat-opened model the leftover
+    shell carries the very painted face the final solid carries. That duplicate
+    is no evidence of a loss: skipping it costs WG nothing WG is not already
+    being handed. Cover only counts from an exported body of the *same*
+    instance -- another insertion's HF sits somewhere else entirely -- and a
+    role nothing exported carries still flags, so the refusal that stops WG
+    losing a source silently stays. Coverage spans the whole walk, so this
+    cannot be decided while one candidate is being built.
+    """
+
+    covered: dict[str, set[str]] = {}
+    for candidate in candidates:
+        instance_id = candidate.get("wglink_instance_id")
+        if instance_id and _exports_its_faces(candidate):
+            covered.setdefault(instance_id, set()).update(
+                candidate.get("source_face_roles", ())
+            )
+    for candidate in candidates:
+        if _is_managed_helper(candidate):
+            kept = covered.get(candidate.get("wglink_instance_id"), ())
+            candidate["contains_required_source"] = any(
+                role not in kept for role in candidate.get("source_face_roles", ())
+            )
 
 
 def _collection(entity: object, name: str) -> list[object]:
@@ -539,14 +593,17 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
             "wglink_managed": bool(instance_id or managed_role),
             "wglink_role": managed_role,
             "wglink_instance_id": instance_id,
+            "source_face_roles": _source_face_roles(body),
             "contains_required_source": False,
             "contains_solver_anchor": False,
             "only_enclosing_exterior": False,
             "requested_fem_air_volume": False,
         }
+        # A helper's claim is settled by _mark_uncovered_helper_sources once the
+        # walk knows what else is exported.
         candidate["contains_required_source"] = (
             bool(instance_id) and not _is_managed_helper(candidate)
-        ) or _has_source_face(body)
+        ) or bool(candidate["source_face_roles"])
         candidates.append(candidate)
         bodies[object_id] = body
         measured[object_id] = native if placed else body
@@ -675,6 +732,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
     ]
     if len(exterior) == 1:
         exterior[0]["only_enclosing_exterior"] = True
+    _mark_uncovered_helper_sources(candidates)
     return {
         "selection": selection,
         "geometry": geometry,

@@ -449,6 +449,37 @@ def plan_export_scope(
         managed = candidate.get("wglink_managed") is True
         managed_role = candidate.get("wglink_role")
         if managed and managed_role not in {"waveguide", "enclosure"}:
+            # This skip is the one rule that drops a B-rep body without asking
+            # whether it is visible, and Fusion's STEP export asks nothing
+            # else: ``STEPExportOptions`` takes a Component, so every visible
+            # body under it reaches the file whatever this inventory says. A
+            # document inserted by an older WGLink still has its leftover
+            # shell visible, and nothing here can retroactively hide it -- so
+            # the best available outcome for that document is a refusal that
+            # NAMES the body in the way, mirroring the 'exclude' rule above.
+            # A new insertion hides its own helpers and never reaches this.
+            if (
+                body_kind in {"solid", "surface"}
+                and candidate.get("visible") is not False
+            ):
+                refusals.append(
+                    _refusal_record(
+                        candidate,
+                        index,
+                        reason=(
+                            f"WGLink helper body {name!r} is left out of the return "
+                            "inventory but is still visible, and Fusion's STEP export "
+                            "writes every visible body of the exported component, so "
+                            "it would reach the solver as a second radiating surface; "
+                            "hide the body itself in the Fusion browser and send "
+                            "again, or run Insert again to have WGLink hide it. "
+                            "Hiding a folder that contains it will not work: Autodesk "
+                            "documents that objects invisible only because their group "
+                            "is hidden are exported as if they were visible"
+                        ),
+                    )
+                )
+                continue
             record = _skipped_record(
                 candidate,
                 index,

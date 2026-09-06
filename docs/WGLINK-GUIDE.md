@@ -166,6 +166,15 @@ occurrence where it already is and never moves it back to the origin.)
   WGLink folder in WG under Settings → CAD Link, then send again.
 - **The panel is missing after a Fusion restart** — tick Run on Startup for
   WGLink (see Install); Fusion's toggle overrides the manifest.
+- **"WGLink helper body … is still visible"** on Send — a freestanding
+  insertion leaves a stitched surface shell behind, and Fusion's STEP export
+  writes every visible body of the exported component, so that shell would
+  reach the solver as a second radiating surface. Insert now hides it, but a
+  document inserted by an earlier WGLink still has it visible. Hide **the body
+  itself** in the browser — the refusal names it — and send again, or run
+  Insert again. Hiding a folder that contains the body will not work: Autodesk
+  exports a body that is invisible only because its group is hidden as if it
+  were visible.
 - **"WGLink parameter namespace mismatch"** on Update — the document's link
   predates the stable-namespace fix and its bundle was renamed. The refusal
   names the recovery: Detach and delete the component, then Insert; the

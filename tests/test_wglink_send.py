@@ -354,12 +354,22 @@ def test_occurrence_proxy_uses_native_attributes_but_remains_geometry_handle(
     assert proxy.attributes.values == {}
 
 
-def _freestanding_insertion(send_module, instance_id="wgi-free", helper_faces=()):
+def _freestanding_insertion(
+    send_module, instance_id="wgi-free", helper_faces=(), helper_visible=False
+):
     """The two bodies a freestanding insertion leaves in the document.
 
     ``_close_and_thicken`` stitches the loft and the throat patch into one
     surface body, thickens that into the solid, and stamps both with the same
     instance id -- the shell keeps role ``cut_tool``.
+
+    It also hides the shell, because visibility is the only per-body control
+    Fusion's STEP export has and a visible helper is therefore a body the file
+    would carry and the inventory would not. So ``helper_visible=False`` is
+    what a current insertion leaves behind, and the tests below that are about
+    roles and sources read that state. Pass ``helper_visible=True`` for the
+    document an OLDER WGLink left, which no insert-time fix can reach
+    retroactively and which Send refuses by name.
     """
 
     core = send_module.wglink_core
@@ -368,7 +378,10 @@ def _freestanding_insertion(send_module, instance_id="wgi-free", helper_faces=()
     core._set_attribute(final, "role", "waveguide")
     core._set_attribute(final, "face_role", "HF")
     stitched = body(
-        "WGLink stitched waveguide body", solid=False, faces=list(helper_faces)
+        "WGLink stitched waveguide body",
+        solid=False,
+        visible=helper_visible,
+        faces=list(helper_faces),
     )
     core._set_attribute(stitched, "instance_id", instance_id)
     core._set_attribute(stitched, "role", "cut_tool")
@@ -492,7 +505,9 @@ def test_a_role_only_another_helper_carries_is_still_a_loss(send_module):
     design, _final, _stitched = _freestanding_insertion(
         send_module, helper_faces=[face("LF")]
     )
-    twin = body("WGLink throat patch", solid=False, faces=[face("LF")])
+    twin = body(
+        "WGLink throat patch", solid=False, visible=False, faces=[face("LF")]
+    )
     core._set_attribute(twin, "instance_id", "wgi-free")
     core._set_attribute(twin, "role", "cut_tool")
     twin.parentComponent = design.rootComponent
@@ -1973,12 +1988,19 @@ def test_the_walk_and_the_file_disagree_about_a_visible_helper(
 ):
     """The divergence itself, stated once, with no export in the way.
 
-    Two filters run over the same document. ``plan_export_scope`` drops the
-    stitched shell by role -- the one skip rule that never asks whether the
-    body is visible -- and Fusion drops nothing, because ``STEPExportOptions``
-    takes a Component and offers no per-body scoping at all. So the inventory
-    says one body and the file gets two, and every gate downstream is doing
-    arithmetic on two different universes.
+    Two filters run over the same document. ``plan_export_scope`` used to drop
+    the stitched shell by role -- the one skip rule that never asked whether
+    the body is visible -- while Fusion dropped nothing, because
+    ``STEPExportOptions`` takes a Component and offers no per-body scoping at
+    all. So the inventory said one body, the file got two, and every gate
+    downstream did arithmetic on two different universes.
+
+    Fusion's side of that is unchanged and unchangeable, as the last assertion
+    keeps saying: the file still gets two bodies. What changed is that the plan
+    now refuses in the same place it used to skip, and names the body. It is
+    the *only* moment at which a user can be told something they can act on --
+    the shell is already in their document, and no fix to Insert can reach
+    backwards into it.
     """
 
     design, _app, _final, stitched = _freestanding_document(
@@ -1986,28 +2008,22 @@ def test_the_walk_and_the_file_disagree_about_a_visible_helper(
     )
     walk = send_module._scope_walk(design, "root")
     send_module._mark_solver_anchor(walk["candidates"], "wgi-free")
-    scope = send_module.plan_export_scope(
-        walk["selection"], walk["candidates"]
-    ).manifest_scope()
+    plan = send_module.plan_export_scope(walk["selection"], walk["candidates"])
 
     assert stitched.isVisible is True
-    assert [record["name"] for record in scope["included"]] == [
+    assert exported_step_bodies(design.rootComponent) == ["solid", "surface"]
+    assert [record["name"] for record in plan.included] == [
         "WGLink freestanding waveguide"
     ]
-    assert exported_step_bodies(design.rootComponent) == ["solid", "surface"]
+    assert [refusal["name"] for refusal in plan.refusals] == [
+        "WGLink stitched waveguide body"
+    ]
+    with pytest.raises(send_module.WgReturnError) as refusal:
+        plan.manifest_scope()
+    assert "hide the body itself" in str(refusal.value)
+    assert "hiding a folder that contains it will not work" in str(refusal.value).lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "STEP body count gate refused the export: inventory expects 1, but "
-        "assembly.step contains 2. _close_and_thicken leaves the stitched "
-        "shell visible, plan_export_scope skips a WGLink helper without ever "
-        "testing visibility, and Fusion writes every visible body of the "
-        "Component it is handed -- so the user is handed arithmetic about two "
-        "bodies instead of the name of the one that is in the way"
-    ),
-)
 def test_a_freestanding_insertion_names_its_leftover_shell_instead_of_counting(
     send_module, tmp_path, monkeypatch
 ):
@@ -2064,6 +2080,60 @@ def test_an_insertion_whose_helper_is_hidden_exports_exactly_its_inventory(
     assert send_module.count_step_bodies(bundle / "assembly.step") == 1
 
 
+def test_the_two_filters_are_compared_by_name_before_anything_is_written(
+    send_module, tmp_path, monkeypatch
+):
+    """The generic check, on a disagreement no role rule can see.
+
+    ``plan_export_scope`` includes a resolved external link before it ever
+    reaches its visibility rule, so a hidden body inside one is inventoried and
+    is not in the file. That is a second, unrelated way for the two filters to
+    part company -- which is the argument for comparing the sets themselves
+    rather than adding a rule per case. Nothing is written: the refusal lands
+    before the temp bundle exists, so the output folder is untouched.
+    """
+
+    hidden = body("linked jig", visible=False)
+    linked = component("Jig", [hidden])
+    occurrence = types.SimpleNamespace(
+        name="Jig:1",
+        fullPathName="Speaker/Jig:1",
+        component=linked,
+        bRepBodies=Collection(),
+        meshBodies=Collection(),
+        childOccurrences=Collection(),
+        transform2=transform(),
+        isVisible=True,
+        isSuppressed=False,
+        isReferencedComponent=True,
+        objectType="adsk::fusion::Occurrence",
+    )
+    root = component("Speaker", [body("cabinet", faces=[face("LF")])])
+    root.occurrences = Collection([occurrence])
+    root.allOccurrences = Collection([occurrence])
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=ContractExportManager(),
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="Linked"),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+
+    message = str(refusal.value)
+    assert "linked jig" in message
+    assert "will not export" in message
+    assert "hiding a folder that contains it will not work" in message.lower()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
     send_module, tmp_path, monkeypatch
 ):
@@ -2079,13 +2149,15 @@ def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
     design, final, stitched = _freestanding_insertion(send_module)
     final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
     # This test is about what a declaration does to an inventory, so it needs a
-    # document that can actually be sent. A freestanding insertion leaves the
-    # stitched shell VISIBLE, and Fusion then writes it into the STEP while the
-    # inventory skips it -- the export refusal covered by
-    # test_a_freestanding_insertion_survives_its_own_leftover_shell. Hiding the
-    # shell here is the state that refusal's fix leaves behind, not a way past
-    # it: the helper is still skipped as a wglink_helper, which is what the
-    # assertions below read.
+    # document that can actually be sent, and a document an OLDER WGLink
+    # inserted cannot be: its stitched shell is VISIBLE, so Fusion writes it
+    # into the STEP while the inventory leaves it out, which is the refusal
+    # covered by
+    # test_a_freestanding_insertion_names_its_leftover_shell_instead_of_counting.
+    # The hidden shell is what the current insertion leaves behind and is now
+    # _freestanding_insertion's default; it is restated here because this test
+    # depends on it. The helper is still skipped as a wglink_helper, which is
+    # what the assertions below read.
     stitched.isVisible = False
     design.exportManager = ContractExportManager()
     app = types.SimpleNamespace(

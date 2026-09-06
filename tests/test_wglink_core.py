@@ -675,3 +675,58 @@ def test_update_refuses_when_design_is_not_discoverable_in_the_wg_workspace(
     message = str(refusal.value)
     assert "could not be found in the current WG workspace" in message
     assert "headless wglink_core.relink API" in message
+
+
+def test_a_leftover_helper_is_hidden_by_every_name_fusion_exposes(core):
+    """The insert-time half of the STEP export fix.
+
+    Visibility is the only per-body control Fusion's STEP export has, so a
+    helper body that survives ``_close_and_thicken`` has to be hidden there or
+    it lands in ``assembly.step``. ``BRepBody`` spells the light bulb
+    ``isVisible`` on some builds and ``isLightBulbOn`` on others, and the send
+    walk reads them in that order, so both are written -- and the read-back, in
+    that same order, not the write, decides what is reported.
+    """
+
+    both = types.SimpleNamespace(isVisible=True, isLightBulbOn=True)
+    assert core._hide_helper_body(both) is True
+    assert (both.isVisible, both.isLightBulbOn) == (False, False)
+
+    bulb_only = types.SimpleNamespace(isLightBulbOn=True)
+    assert core._hide_helper_body(bulb_only) is True
+    assert bulb_only.isLightBulbOn is False
+
+
+def test_a_helper_fusion_will_not_hide_reports_failure_rather_than_success(core):
+    """A refused write must not read as a hidden body.
+
+    If the read-back still says visible, Send is going to refuse this document
+    by name, and the insertion report is the only place that can warn while the
+    fix is still cheap. Reporting a write that did not take as a success is how
+    that warning would go missing.
+    """
+
+    class ReadOnlyVisibility:
+        name = "WGLink stitched waveguide body"
+
+        @property
+        def isVisible(self):
+            return True
+
+        @isVisible.setter
+        def isVisible(self, _value):
+            raise RuntimeError("3 : property is read-only")
+
+    assert core._hide_helper_body(ReadOnlyVisibility()) is False
+
+
+def test_a_consumed_helper_body_needs_no_hiding(core):
+    """A body the stitch consumed is gone, not visible.
+
+    Fusion invalidates the handle rather than deleting the attribute, so the
+    question "is it in the file" answers itself, and probing it further is what
+    would raise.
+    """
+
+    consumed = types.SimpleNamespace(isValid=False)
+    assert core._hide_helper_body(consumed) is True

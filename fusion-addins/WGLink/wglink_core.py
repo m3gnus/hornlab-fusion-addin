@@ -249,6 +249,53 @@ def _name_body(body: object, role: str) -> object:
     return body
 
 
+def _hide_helper_body(body: object) -> bool:
+    """Take one leftover helper body out of the STEP export, or report failure.
+
+    Visibility is the only way Autodesk documents for narrowing a STEP export:
+    ``ExportManager.createSTEPExportOptions`` takes a filename and a Component
+    and offers no per-body scoping at all, and "export a single BRepBody" is an
+    unimplemented IdeaStation request whose only workaround is to build a
+    component from the body -- which edits the design a second time. So a
+    helper body still visible when Send runs is written into ``assembly.step``
+    whatever the return inventory says about it, and the user is handed a body
+    count instead of a name.
+
+    Insert edits the design by definition, so hiding here spends nothing Insert
+    has not already spent. It is also exactly what the 2026-08-10 A/B spike did
+    by hand before each of its three exports.
+
+    ``BRepBody`` exposes its light bulb as ``isVisible`` and, on newer builds,
+    also as ``isLightBulbOn``. Both are written, because either may be the
+    read-only one; the verdict then comes from reading back in ``isVisible``,
+    ``isLightBulbOn`` order -- exactly the order ``wglink_send`` reads
+    visibility off a body -- so this function and Send can never disagree about
+    the same body. A write that did not take therefore reports failure instead
+    of a silent success, and the insertion warns while the fix is still cheap.
+
+    A body the stitch consumed is gone rather than hidden: Fusion invalidates
+    the handle, so it is not in the file and needs nothing done to it.
+    """
+
+    if not bool(getattr(body, "isValid", True)):
+        return True
+    for name in ("isVisible", "isLightBulbOn"):
+        if not hasattr(body, name):
+            continue
+        try:
+            setattr(body, name, False)
+        except Exception:  # noqa: BLE001 - a read-only property is not fatal
+            pass
+    for name in ("isVisible", "isLightBulbOn"):
+        try:
+            value = getattr(body, name)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(value, bool):
+            return value is False
+    return False
+
+
 def _stamp_payload(entity: object, payload: dict[str, str]) -> None:
     for name, value in payload.items():
         _set_attribute(entity, name, value)
@@ -819,7 +866,17 @@ def _close_and_thicken(
     wall_t_mm: float,
     thickness_parameter: str,
     instance_id: str,
-) -> tuple[object, int, list[object]]:
+) -> tuple[object, int, list[object], dict[str, list[str]]]:
+    """Close the loft, thicken it, and leave no visible helper behind.
+
+    The fourth return value records what happened to the helper bodies this
+    operation leaves in the document -- ``{"hidden": [...],
+    "still_visible": [...]}``, both lists of browser names. It is the
+    insertion's own account of the one thing Send cannot fix later: Send
+    "publishes without ever editing the open design", so a helper that is
+    visible when Send runs is a refusal, not something Send may quietly hide.
+    """
+
     features = component.features
     made: list[object] = []
     throat_z_mm = throat_axis_mm[2]
@@ -879,7 +936,24 @@ def _close_and_thicken(
             thicken.name = "WGLink outward wall"
             _stamp_managed(thicken, instance_id, "feature", "thicken")
             made.append(thicken)
-            return solid, sign, made
+            # Every helper body this operation can leave behind, hidden before
+            # the insertion is reported. The stitch's NewBodyFeatureOperation
+            # does not consume its inputs, so the loft surface and the throat
+            # patch can survive it as well as the stitched shell; whichever of
+            # them the kernel actually kept is hidden, and whichever it
+            # consumed reports itself invalid and needs nothing. All three
+            # carry role ``cut_tool``, so none of them is ever the exported
+            # exterior.
+            helpers: dict[str, list[str]] = {"hidden": [], "still_visible": []}
+            for helper in (stitched, patch_body, surface_body):
+                try:
+                    name = str(helper.name)
+                except Exception:  # noqa: BLE001 - a consumed body has no name
+                    name = "unnamed helper body"
+                key = "hidden" if _hide_helper_body(helper) else "still_visible"
+                if name not in helpers[key]:
+                    helpers[key].append(name)
+            return solid, sign, made, helpers
         if not exact_opposite:
             disagreements = []
             if not cavity_ok:
@@ -2598,9 +2672,10 @@ def insert(
         )
         thicken_sign = None
         enclosure_report = None
+        helper_report: dict[str, list[str]] | None = None
         if mode == "freestanding":
             assert wall_parameter is not None
-            final_body, thicken_sign, close_features = _close_and_thicken(
+            final_body, thicken_sign, close_features, helper_report = _close_and_thicken(
                 component,
                 cut_or_surface,
                 throat_axis_mm=throat_axis,
@@ -2611,6 +2686,17 @@ def insert(
             made.extend(close_features)
             _stamp_managed(final_body, instance_id, "role", "waveguide")
             _name_body(final_body, "waveguide")
+            if helper_report["still_visible"]:
+                # Send refuses this by name rather than reporting a body
+                # count, but the insertion is where it can still be fixed
+                # cheaply, so say it here too.
+                warnings.append(
+                    "LOUD: Fusion would not hide "
+                    + ", ".join(repr(name) for name in helper_report["still_visible"])
+                    + ". Fusion's STEP export writes every visible body of the "
+                    "exported component, so hide the body itself in the browser "
+                    "before Send; hiding a folder that contains it will not work."
+                )
         else:
             final_body, enclosure_report, enclosure_features = _build_enclosure(
                 component,
@@ -2717,6 +2803,12 @@ def insert(
                     app, final_body, checks, int(opts.get("max_checks", 400))
                 ),
                 "enclosure": enclosure_report,
+                # Which leftover helper bodies this insertion took out of the
+                # STEP export, and which it could not. ``None`` for an
+                # enclosure, which has no close-and-thicken step. Visibility is
+                # the only per-body control Fusion's STEP export has, so this
+                # is the record of whether the document can be sent at all.
+                "helpers": helper_report,
                 "instance_id": instance_id,
                 # Which document-global namespace this insertion took. A second
                 # copy of one design gets wg_<slug>2_, and the user needs to

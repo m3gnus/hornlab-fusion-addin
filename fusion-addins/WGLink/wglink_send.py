@@ -71,7 +71,16 @@ SOURCE_RESOLUTION_MM = {
     "PORT_EXIT": 25.0,  # legacy spelling; same physical role
 }
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-_STEP_BODY = re.compile(r"\b(?:MANIFOLD_SOLID_BREP|SHELL_BASED_SURFACE_MODEL)\s*\(", re.I)
+# One top-level Part 21 body entity, in all three spellings a CAD kernel writes.
+# BREP_WITH_VOIDS is the ISO 10303-42 subtype of MANIFOLD_SOLID_BREP used for a
+# solid with an enclosed internal void, and Open CASCADE's writer emits it as a
+# plain entity rather than as a complex instance -- so a hollow body was counted
+# as zero bodies here, and every export of one failed the count gate as a body
+# that is not there.
+_STEP_BODY = re.compile(
+    r"\b(?:MANIFOLD_SOLID_BREP|BREP_WITH_VOIDS|SHELL_BASED_SURFACE_MODEL)\s*\(",
+    re.I,
+)
 
 
 def _adapter_version() -> str:

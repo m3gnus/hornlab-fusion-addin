@@ -659,15 +659,6 @@ def test_the_counter_agrees_with_real_kernel_output(send_module, name, expected)
     assert send_module.count_step_bodies(STEP_FIXTURES / name) == expected
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "a solid with an internal void is written as BREP_WITH_VOIDS, which "
-        "_STEP_BODY does not match, so occ-solid-with-void.step counts 0 "
-        "bodies where the file holds 1 -- every hollow body a user sends would "
-        "fail the count gate as a body that is not there"
-    ),
-)
 def test_a_solid_with_an_internal_void_counts_as_one_body(send_module):
     assert send_module.count_step_bodies(
         STEP_FIXTURES / "occ-solid-with-void.step"

@@ -1462,3 +1462,79 @@ def test_the_preflight_previews_a_domain_refusal_instead_of_raising(
 
     assert report["domain"] is None
     assert "negative side" in report["domain_error"]
+
+
+def test_a_declared_domain_changes_no_body_inventory_and_no_helper_verdict(
+    send_module, tmp_path, monkeypatch
+):
+    """Declaring a half says what the model IS; it never changes what is sent.
+
+    If a declaration could move a body between included and skipped, or change
+    which faces drive, it would be a way to alter an export by relabelling it.
+    Both halves of that are checked: the inventory is identical with and
+    without the declaration, and a painted helper -- which is a terminal
+    refusal on its own -- stays a refusal rather than becoming a source.
+    """
+
+    design, final, _stitched = _freestanding_insertion(send_module)
+    final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    design.exportManager = ContractExportManager()
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="Helper"),
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    def manifest_for(**extra):
+        report = send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "overwrite": True,
+                **extra,
+            },
+        )
+        return sys.modules["wglink_return"].loads_return_manifest(
+            (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+        )
+
+    full = manifest_for()
+    declared = manifest_for(domain=["y0"])
+
+    assert declared["assembly"]["domain"]["cut_planes"] == ["y0"]
+    assert "domain" not in full["assembly"]
+    assert declared["scope"] == full["scope"]
+    assert (
+        declared["assembly"]["n_bodies_expected"]
+        == full["assembly"]["n_bodies_expected"]
+    )
+    assert declared["sources"] == full["sources"]
+    assert [source["role"] for source in full["sources"]] == ["HF"]
+    assert "wglink_helper" in {
+        record["kind"] for record in full["scope"]["skipped"]
+    }
+
+    # The same document with paint on the helper refuses either way: a face
+    # WGLink would skip cannot also be a source, and a domain declaration is
+    # not a way around that.
+    painted, painted_final, _helper = _freestanding_insertion(
+        send_module, instance_id="wgi-painted", helper_faces=[face("HF", area=9.0)]
+    )
+    painted_final.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    painted.exportManager = ContractExportManager()
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: painted)
+    for options in ({}, {"domain": ["y0"]}):
+        with pytest.raises(
+            send_module.wglink_core.WgLinkError,
+            match="cannot skip .* selector candidates for a required source",
+        ):
+            send_module.send(
+                app,
+                {
+                    "output_folder": str(tmp_path),
+                    "capture_document": False,
+                    "overwrite": True,
+                    **options,
+                },
+            )

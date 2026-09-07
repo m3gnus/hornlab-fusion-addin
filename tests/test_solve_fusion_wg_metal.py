@@ -1695,7 +1695,11 @@ def test_main_writes_running_manifest_before_native_solve(tmp_path, monkeypatch)
     )
     assert final_manifest["status"] == "complete"
     assert final_manifest["layout_version"] == 2
-    assert final_manifest["layout"]["sources_dir"].endswith("out/sources")
+    # A host path, so the separator is os.sep -- see the same fix in
+    # tests/test_fusion_pipeline_launch.py.
+    assert final_manifest["layout"]["sources_dir"].endswith(
+        str(Path("out/sources"))
+    )
 
 
 def test_solver_parser_accepts_output_skip_flags(tmp_path):

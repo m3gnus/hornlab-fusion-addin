@@ -715,6 +715,19 @@ def test_zip_context_cleans_owned_extraction_on_success_and_exception(tmp_path):
     assert not failed_root.exists()
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "The simulation does not port, though the property does. This test "
+        "swaps the file between hash check and parse with os.replace, and "
+        "Windows refuses to replace a file while a descriptor on it is open "
+        "-- WinError 5. That refusal happens because read_bundle holds the "
+        "descriptor open, which is exactly the property being asserted, so "
+        "Windows is more protective here, not less. Reaching it there needs a "
+        "different hostile technique, and none has been verified on a Windows "
+        "host."
+    ),
+)
 def test_directory_hash_and_grid_parse_use_the_same_open_descriptor(
     tmp_path, monkeypatch
 ):

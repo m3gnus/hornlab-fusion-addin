@@ -324,13 +324,17 @@ def test_build_pipeline_command_defaults_to_automatic_pipeline():
 
     cmd = _helper_command(helper)
 
+    # The helper stringifies Path objects, so the expected argv has to be
+    # built the same way: str(Path("/venv/bin/python")) is "\\venv\\bin\\python"
+    # on Windows. Comparing against a POSIX literal asserted the separator,
+    # not the path, and only ever passed because nothing ran this on Windows.
     assert cmd[:6] == [
-        "/venv/bin/python",
-        "/repo/scripts/fusion_step_to_wg_pipeline.py",
+        str(Path("/venv/bin/python")),
+        str(Path("/repo/scripts/fusion_step_to_wg_pipeline.py")),
         "--step",
-        "/out/design.step",
+        str(Path("/out/design.step")),
         "--out",
-        "/out/run",
+        str(Path("/out/run")),
     ]
     assert cmd[cmd.index("--sources") + 1] == "LF:20,MF:10,HF:5"
     assert "--mesh-sizing-mode" not in cmd
@@ -404,7 +408,7 @@ def test_build_pipeline_command_forwards_fem_chamber_contract():
         fem_resolution_mm="6",
         fem_loss_factor="0.004",
     )
-    assert cmd[cmd.index("--fem-chamber-step") + 1] == "/out/fem.step"
+    assert cmd[cmd.index("--fem-chamber-step") + 1] == str(Path("/out/fem.step"))
     assert [cmd[index + 1] for index, item in enumerate(cmd) if item == "--fem-entry"] == [
         "MF_ENTRY_1",
         "MF_ENTRY_2",
@@ -3429,14 +3433,17 @@ def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     assert metadata["status"] == "running"
     assert metadata["step"] == str(tmp_path / "design.step")
     assert metadata["fusion_archive"] == str(tmp_path / "design.f3d")
+    # expected_paths are host filesystem paths, not URLs, so the separator is
+    # os.sep. Build the tail with Path so the assertion means "under logs/"
+    # on every platform rather than "spelled with a forward slash".
     assert metadata["expected_paths"]["prepare_stdout"].endswith(
-        "logs/prepare_step_for_wg_metal.stdout.log"
+        str(Path("logs/prepare_step_for_wg_metal.stdout.log"))
     )
     assert metadata["expected_paths"]["diagnose_stderr"].endswith(
-        "logs/diagnose_wg_metal_orientation.stderr.log"
+        str(Path("logs/diagnose_wg_metal_orientation.stderr.log"))
     )
     assert metadata["expected_paths"]["solve_stdout"].endswith(
-        "logs/solve_fusion_wg_metal.stdout.log"
+        str(Path("logs/solve_fusion_wg_metal.stdout.log"))
     )
     assert metadata["expected_paths"]["launch_metadata"].endswith(
         "manifests/fusion_addin_launch.json"

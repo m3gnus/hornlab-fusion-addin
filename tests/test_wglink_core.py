@@ -1112,3 +1112,367 @@ def test_a_consumed_helper_body_needs_no_hiding(core):
 
     consumed = types.SimpleNamespace(isValid=False)
     assert core._hide_helper_body(consumed) is True
+
+
+# --------------------------------------------------------------------------
+# Driving _close_and_thicken and insert() for real.
+#
+# A unit test of _hide_helper_body proves the helper works in isolation and
+# proves nothing about whether anything calls it. Mutating
+#
+#     key = "hidden" if _hide_helper_body(helper) else "still_visible"
+#
+# to a bare ``key = "hidden"`` deletes the only call there is, and the whole
+# add-in suite stayed green -- so every helper body would have been left
+# visible, written into assembly.step, and reported as hidden. The fix's own
+# premise, that a current insertion leaves no visible shell, was the untested
+# part. These fakes exist to make that call observable: they are Fusion's
+# feature surface, not stand-ins for the code under test.
+# --------------------------------------------------------------------------
+
+
+class _Attributes:
+    """The two calls _set_attribute makes on a Fusion attribute collection."""
+
+    def __init__(self):
+        self.values = {}
+
+    def add(self, group, name, text):
+        self.values[(group, name)] = types.SimpleNamespace(value=text)
+
+    def itemByName(self, group, name):
+        return self.values.get((group, name))
+
+
+class _Collection(list):
+    """Fusion exposes item()/count where Python would expose a sequence."""
+
+    def item(self, index):
+        return self[index]
+
+    @property
+    def count(self):
+        return len(self)
+
+
+class _Entity:
+    def __init__(self, kind, name):
+        self.attributes = _Attributes()
+        self.entityToken = f"token:{name}"
+        self.objectType = f"adsk::fusion::{kind}"
+        self.name = name
+        self.timelineObject = types.SimpleNamespace(index=0)
+
+
+class _FakeBody(_Entity):
+    """A BRepBody whose light bulb is real state, not a recorded call.
+
+    ``hideable=False`` is Fusion refusing the write the way it refuses any
+    read-only property, so the body stays visible and the read-back says so.
+    """
+
+    def __init__(self, name, *, hideable=True, containment=None, edge_z_mm=()):
+        super().__init__("BRepBody", name)
+        self._hideable = hideable
+        self._visible = True
+        self.isValid = True
+        self._containment = containment
+        self.edges = _Collection(
+            types.SimpleNamespace(
+                boundingBox=types.SimpleNamespace(
+                    minPoint=types.SimpleNamespace(z=z_mm / 10.0),
+                    maxPoint=types.SimpleNamespace(z=z_mm / 10.0),
+                )
+            )
+            for z_mm in edge_z_mm
+        )
+
+    @property
+    def isVisible(self):
+        return self._visible
+
+    @isVisible.setter
+    def isVisible(self, value):
+        if not self._hideable:
+            raise RuntimeError("3 : property is read-only")
+        self._visible = bool(value)
+
+    def pointContainment(self, point):
+        return self._containment(point)
+
+
+class _FakeFeature(_Entity):
+    def __init__(self, body):
+        super().__init__("Feature", "feature")
+        self.bodies = _Collection([body])
+        self.deleted = False
+
+    def deleteMe(self):
+        self.deleted = True
+
+
+class _FakeFeatures:
+    """patch -> stitch -> thicken, the three features _close_and_thicken uses.
+
+    The thicken's solid answers pointContainment so the outward sign wins on
+    the first pass; the sign search is not what these tests are about.
+    """
+
+    def __init__(self, *, patch_hideable, surface_body):
+        outer = self
+        self.patch_body = _FakeBody("patch", hideable=patch_hideable)
+        self.stitched_body = _FakeBody("stitched")
+        self.surface_body = surface_body
+
+        def outward_wall(point):
+            # Material below the throat plane, cavity above it: the state
+            # _wall_side_probe accepts for sign +1.
+            return "outside" if point.z * 10.0 > 0.0 else "inside"
+
+        class _Patch:
+            def createInput(self, _edge, _operation):
+                return object()
+
+            def add(self, _input):
+                return _FakeFeature(outer.patch_body)
+
+        class _Stitch:
+            def createInput(self, surfaces, _tolerance, _operation):
+                outer.stitched_from = list(surfaces)
+                return object()
+
+            def add(self, _input):
+                return _FakeFeature(outer.stitched_body)
+
+        class _Thicken:
+            def createInput(self, _shells, _value, _a, _operation, _b):
+                return object()
+
+            def add(self, _input):
+                return _FakeFeature(
+                    _FakeBody("solid", containment=outward_wall)
+                )
+
+        self.patchFeatures = _Patch()
+        self.stitchFeatures = _Stitch()
+        self.thickenFeatures = _Thicken()
+
+
+def _install_fusion_geometry(core, *, patch_hideable=True):
+    """Give ``core.adsk`` the surface _close_and_thicken actually calls."""
+
+    class ObjectCollection(list):
+        @classmethod
+        def create(cls):
+            return cls()
+
+        def add(self, item):
+            self.append(item)
+
+        def item(self, index):
+            return self[index]
+
+    core.adsk.core.ObjectCollection = ObjectCollection
+    core.adsk.core.ValueInput = types.SimpleNamespace(
+        createByReal=lambda value: value,
+        createByString=lambda value: value,
+    )
+    core.adsk.core.Point3D = types.SimpleNamespace(
+        create=lambda x, y, z: types.SimpleNamespace(x=x, y=y, z=z)
+    )
+    core.adsk.fusion.FeatureOperations = types.SimpleNamespace(
+        NewBodyFeatureOperation="NewBodyFeatureOperation"
+    )
+    core.adsk.fusion.PointContainment = types.SimpleNamespace(
+        PointInsidePointContainment="inside",
+        PointOutsidePointContainment="outside",
+        PointOnPointContainment="on",
+        UnknownPointContainment="unknown",
+    )
+
+    # The loft surface carries the throat edge _throat_edge selects, at the
+    # throat plane z=0, plus a mouth edge it must not select. insert() has
+    # already applied its browser name by the time _close_and_thicken sees it,
+    # so the fake carries that name too.
+    surface_body = _FakeBody(
+        core.BODY_NAMES["waveguide_surface"], hideable=True, edge_z_mm=(0.0, 320.0)
+    )
+    features = _FakeFeatures(
+        patch_hideable=patch_hideable, surface_body=surface_body
+    )
+    component = _Entity("Component", "WGLink probe")
+    component.features = features
+    return component, surface_body, features
+
+
+def test_close_and_thicken_hides_every_helper_body_it_leaves_behind(core):
+    """The insert-time fix, exercised through the function that performs it.
+
+    Fusion's STEP export writes every visible body of the component it is
+    handed, so the assertion that matters is the state of the body objects
+    themselves -- not what the report says about them. The report is checked
+    second, against those same objects.
+    """
+
+    component, surface_body, features = _install_fusion_geometry(core)
+
+    solid, sign, made, helpers = core._close_and_thicken(
+        component,
+        surface_body,
+        throat_axis_mm=(0.0, 0.0, 0.0),
+        wall_t_mm=6.0,
+        thickness_parameter="wg_probe_wall_t",
+        instance_id="probe",
+    )
+
+    assert sign == 1
+    assert solid.isVisible is True, "the exported waveguide must stay visible"
+
+    survivors = (features.stitched_body, features.patch_body, surface_body)
+    assert [body.isVisible for body in survivors] == [False, False, False]
+
+    assert helpers["still_visible"] == []
+    assert helpers["hidden"] == [
+        core.BODY_NAMES["stitched_waveguide"],
+        core.BODY_NAMES["throat_patch"],
+        core.BODY_NAMES["waveguide_surface"],
+    ]
+    assert [body.name for body in survivors] == helpers["hidden"]
+    assert len(made) == 3
+
+
+def _drive_insert(core, monkeypatch, *, patch_hideable):
+    """Run the real insert() with only the surrounding builders stubbed.
+
+    Everything between _close_and_thicken and the returned report is the
+    production code: the hide loop, the still_visible warning, and the
+    report["helpers"] entry. The stubs are the geometry, parameter and
+    measurement machinery around that path, none of which this test asserts on.
+    """
+
+    component, surface_body, features = _install_fusion_geometry(
+        core, patch_hideable=patch_hideable
+    )
+    core.adsk.fusion.Design = types.SimpleNamespace(cast=lambda product: product)
+    core.adsk.fusion.DesignTypes = types.SimpleNamespace(
+        ParametricDesignType="parametric"
+    )
+    core.adsk.core.Matrix3D = types.SimpleNamespace(create=lambda: "identity")
+
+    design = types.SimpleNamespace(
+        designType="parametric",
+        timeline=types.SimpleNamespace(
+            count=0,
+            timelineGroups=types.SimpleNamespace(
+                add=lambda _start, _end: types.SimpleNamespace(name="")
+            ),
+        ),
+        rootComponent=types.SimpleNamespace(),
+        findAttributes=lambda _group, _name: [],
+    )
+    app = types.SimpleNamespace(activeProduct=design)
+    bundle = types.SimpleNamespace(
+        manifest={"design": {"build_mode": "freestanding", "name": "probe"}},
+        grid={
+            "n_phi": 4,
+            "n_length": 4,
+            "all_rings_planar": False,
+            "inner_points": [[[0.0, 0.0, 0.0]] * 4] * 4,
+            "ring_z_mm": [0.0, 10.0, 20.0, 320.0],
+        },
+    )
+    section_plan = types.SimpleNamespace(
+        phi_stride=1, ring_stride=1, points_per_ring=4, ring_indices=(0, 1, 2, 3)
+    )
+    wall = types.SimpleNamespace(name="wg_probe_wall_t", value=6.0)
+
+    for name, replacement in {
+        "_read_owned_bundle": lambda _path: bundle,
+        "_validate_enclosure_placement": lambda _bundle: None,
+        "_validate_mouth_outline": lambda _bundle: None,
+        "plan_sections": lambda *a, **k: section_plan,
+        "parameter_slug": lambda _bundle: "probe",
+        "_link_records": lambda _design: {},
+        "instance_parameter_prefix": lambda *a, **k: "wg_probe_",
+        "_document_parameter_names": lambda _design: [],
+        "_parameter_map": lambda _bundle, _prefix: {"wall_t": wall},
+        "_unowned_parameters": lambda _design, _names: [],
+        "_managed_parameter_expressions": lambda *a, **k: {},
+        "throat_area_mm2": lambda _bundle: 100.0,
+        "_push_parameters": lambda *a, **k: {"created": [], "updated": []},
+        "_create_wrapper": lambda *a, **k: (component, None, "occurrence"),
+        "_build_interface_sketches": lambda *a, **k: {
+            "throat": _Entity("Sketch", "throat")
+        },
+        "_selected_sections": lambda _grid, _plan: [],
+        "_build_loft": lambda *a, **k: (
+            surface_body,
+            _Entity("Feature", "loft"),
+            [_Entity("Sketch", "ring")],
+        ),
+        "_build_datums": lambda *a, **k: ({}, {}),
+        "_tag_report": lambda *a, **k: {},
+        "attribute_payload": lambda *a, **k: {},
+        "_body_fingerprint": lambda _body: {},
+        "_body_measurement": lambda _body, _manifest: {},
+        "_deviation": lambda *a, **k: {},
+        "_insert_check_points": lambda *a, **k: [],
+        "_warn_unmeasured": lambda _deviation, _warnings: None,
+        "_stamp_wrapper": lambda _component, _payload: None,
+        "_stamp_payload": lambda _entity, _payload: None,
+    }.items():
+        monkeypatch.setattr(core, name, replacement)
+
+    report = core.insert(app, "bundle.wglink", {"instance_id": "probe"})
+    return report, surface_body, features
+
+
+def test_an_insertion_reports_the_helper_bodies_it_hid(core, monkeypatch):
+    """report["helpers"] is the document's own account of whether Send can run.
+
+    Send publishes without editing the open design, so a helper still visible
+    when Send runs is a refusal it cannot repair. The insertion is the only
+    place that knows, and this is the key it says it in.
+    """
+
+    report, surface_body, features = _drive_insert(
+        core, monkeypatch, patch_hideable=True
+    )
+
+    survivors = (features.stitched_body, features.patch_body, surface_body)
+    assert [body.isVisible for body in survivors] == [False, False, False]
+    assert report["helpers"] == {
+        "hidden": [body.name for body in survivors],
+        "still_visible": [],
+    }
+    assert not [line for line in report["warnings"] if "would not hide" in line]
+
+
+def test_a_helper_fusion_refuses_to_hide_is_named_loudly_by_the_insertion(
+    core, monkeypatch
+):
+    """A refused write must reach the user while the fix is still cheap.
+
+    Hiding at Insert cannot be retried later -- Send only refuses -- so the
+    body Fusion would not hide has to be named here, with the remedy, and with
+    the group-hidden caveat that turns a bug report into a ten-second fix.
+    """
+
+    report, surface_body, features = _drive_insert(
+        core, monkeypatch, patch_hideable=False
+    )
+
+    patch_name = core.BODY_NAMES["throat_patch"]
+    assert features.patch_body.isVisible is True
+    assert report["helpers"]["still_visible"] == [patch_name]
+    assert report["helpers"]["hidden"] == [
+        core.BODY_NAMES["stitched_waveguide"],
+        core.BODY_NAMES["waveguide_surface"],
+    ]
+    assert features.stitched_body.isVisible is False
+    assert surface_body.isVisible is False
+
+    loud = [line for line in report["warnings"] if line.startswith("LOUD: ")]
+    assert len(loud) == 1
+    assert repr(patch_name) in loud[0]
+    assert "hiding a folder that contains it will not work" in loud[0]

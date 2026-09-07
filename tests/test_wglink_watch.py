@@ -498,3 +498,37 @@ def test_a_link_with_no_label_publishes_a_null_rather_than_a_guess(
     # both would then show one name twice and call it two.
     assert link["linkName"] is None
     assert link["designName"] == "asro68"
+
+
+def test_fusion_status_publishes_tick_diagnostics_when_they_are_supplied(
+    tmp_path: Path,
+) -> None:
+    """The heartbeat is the only place a closed Fusion can be measured from.
+
+    Nothing else reports what one watch tick cost on the user's own document,
+    and that tick runs on Fusion's main thread every four seconds -- so its
+    wall clock is what a "Fusion feels slow" report is actually about.
+    """
+
+    marker = wglink_watch.write_fusion_status(
+        tmp_path,
+        session_id="session-a",
+        document_name="waveguide v1",
+        links=[],
+        diagnostics={
+            "watchIntervalSeconds": 4.0,
+            "lastTickMs": {"return_state_ms": 812.4, "snapshot_ms": 900.1},
+            "source": {"sourceCommit": "abc1234+dirty"},
+        },
+    )
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["diagnostics"]["lastTickMs"]["return_state_ms"] == 812.4
+    assert payload["diagnostics"]["source"]["sourceCommit"] == "abc1234+dirty"
+    assert payload["schemaVersion"] == 1
+
+
+def test_fusion_status_omits_diagnostics_when_there_are_none(tmp_path: Path) -> None:
+    marker = wglink_watch.write_fusion_status(
+        tmp_path, session_id="session-a", document_name="waveguide v1", links=[]
+    )
+    assert "diagnostics" not in json.loads(marker.read_text(encoding="utf-8"))

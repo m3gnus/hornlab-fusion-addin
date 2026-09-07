@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import time
 import types
 
 import pytest
@@ -933,12 +934,12 @@ def test_the_link_chooser_appears_only_with_several_links(monkeypatch) -> None:
         ))
         return added
 
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {"instance_id": "wgi_one", "design_name": "Tritonia"},
     ])
     assert build() == []
 
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {"instance_id": "wgi_one", "design_name": "Tritonia"},
         {"instance_id": "wgi_two", "design_name": "asro68"},
     ])
@@ -1433,6 +1434,130 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     )
 
 
+def _tick_module(monkeypatch, name: str):
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, name, ui, app)
+    design, body = _linked_document(module)
+    app.activeProduct = design
+    body.revisionId = "revision-1"
+    return module, design, body
+
+
+def _count_measurements(monkeypatch, module) -> list[int]:
+    calls: list[int] = []
+    real = module.wglink_send.return_state
+
+    def counted(app, options=None):
+        calls.append(1)
+        return real(app, options)
+
+    monkeypatch.setattr(module.wglink_send, "return_state", counted)
+    return calls
+
+
+def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> None:
+    """Which phase costs the four-second tick, measured where it runs.
+
+    The measured half walks the whole export scope and fingerprints every
+    included face; it happens on Fusion's main thread, and until it is timed
+    there, "Fusion is slow" and "the heartbeat is slow" are the same
+    unfalsifiable sentence.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_tick_timings")
+
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert timings["geometry_state"] == "measured"
+    assert {"resolve_links_ms", "geometry_state_ms", "per_link_ms"} <= set(timings)
+    assert all(
+        value >= 0.0 for value in timings.values() if isinstance(value, float)
+    )
+
+    snapshot = module._fusion_snapshot()
+    diagnostics = snapshot["diagnostics"]
+    assert diagnostics["watchIntervalSeconds"] == module.WATCH_INTERVAL_SECONDS
+    assert "snapshot_ms" in diagnostics["lastTickMs"]
+
+
+def test_the_heartbeat_does_not_re_measure_a_document_that_has_not_moved(
+    monkeypatch,
+) -> None:
+    """An idle document must cost the tick nothing it can feel.
+
+    ``return_state`` evaluates ``face.area`` and ``body.volume``, which are
+    computed on a dense NURBS body rather than looked up. On a four-second
+    timer with no change detection that is a permanent load on Fusion's main
+    thread for a document nobody is editing.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_tick_cached")
+    calls = _count_measurements(monkeypatch, module)
+
+    first = module._document_links()
+    second_timings: dict[str, float] = {}
+    second = module._document_links(second_timings)
+
+    assert len(calls) == 1
+    assert second_timings["geometry_state"] == "cached"
+    assert second[0]["document_signature_hash"] == first[0]["document_signature_hash"]
+    assert second[0]["local_body_state"] == first[0]["local_body_state"]
+
+
+def test_the_heartbeat_re_measures_when_the_managed_body_moves(monkeypatch) -> None:
+    """The cache may not outlive the geometry it describes.
+
+    ``revisionId`` is a property read, so asking it every tick is free; the
+    measurement it guards is not.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_tick_revision")
+    calls = _count_measurements(monkeypatch, module)
+    # The duty cycle is a separate guard with its own test. Two calls a
+    # microsecond apart would otherwise be deferred by it, and this test would
+    # pass whether or not the key noticed the body at all.
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+
+    module._document_links()
+    body.revisionId = "revision-2"
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert len(calls) == 2
+    assert timings["geometry_state"] == "measured"
+
+
+def test_a_costly_measurement_defers_the_next_one(monkeypatch) -> None:
+    """The duty cycle is the guard the change key cannot be.
+
+    A key that moves on every tick -- a document genuinely being edited -- would
+    otherwise reinstate exactly the load this fixes. Waiting a multiple of what
+    the last measurement cost bounds the share of the main thread this can take
+    on any document, at the price of an advisory token a few seconds behind.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_tick_duty")
+    real = module.wglink_send.return_state
+
+    def slow(app, options=None):
+        time.sleep(0.02)
+        return real(app, options)
+
+    monkeypatch.setattr(module.wglink_send, "return_state", slow)
+
+    module._document_links()
+    body.revisionId = "revision-2"
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert timings["geometry_state"] == "deferred"
+    assert timings["geometry_state_ms"] < 20.0
+
+
 def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:
     """The heartbeat and Audit read one inventory, so they cannot disagree.
 
@@ -1587,7 +1712,7 @@ def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> Non
     monkeypatch.setattr(
         module,
         "_document_links",
-        lambda: snapshots.append(links) or links,
+        lambda *_a, **_k: snapshots.append(links) or links,
     )
     monkeypatch.setattr(
         module._watcher, "survey", lambda links: surveyed.append(links) or []
@@ -2031,7 +2156,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "design_id": "wgd-a", "instance_id": "instance-a",
         "document_signature_hash": "sha256:state-a",
     }])
@@ -2162,7 +2287,7 @@ def test_a_refused_handoff_does_not_starve_a_pending_return_request(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(tmp_path / "elsewhere" / "other.wglink"),
@@ -2215,7 +2340,7 @@ def test_a_refused_handoff_does_not_starve_a_newer_export_offer(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: None)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(linked_bundle),
@@ -2258,7 +2383,7 @@ def test_a_refused_return_request_does_not_starve_a_newer_export_offer(
     monkeypatch.setattr(module, "_pending_handoff", lambda: None)
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:other")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(linked_bundle),
@@ -2329,7 +2454,7 @@ def test_the_link_chooser_shows_the_users_label_before_wgs_design_name(
         "WGLink_link_label_preference",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {
             "instance_id": "wgi_one",
             "design_name": "260308Tritonia-M",

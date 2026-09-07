@@ -244,8 +244,16 @@ def write_fusion_status(
     workspace_root: Path | None = None,
     links: Iterable[Mapping[str, Any]],
     updated_at: datetime | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Atomically publish the active Fusion document as inert JSON."""
+    """Atomically publish the active Fusion document as inert JSON.
+
+    ``diagnostics`` is advisory and additive under heartbeat schema 1: it
+    carries what the last tick cost and which source the add-in is running, so
+    a change can be shown to be live -- and a slow heartbeat measured -- from
+    outside Fusion, without a debugger and without shipping a build. An older
+    WG client ignores the key, exactly as it ignores ``linkName``.
+    """
 
     root = bundle_root.expanduser().resolve()
     if not root.is_dir():
@@ -337,6 +345,8 @@ def write_fusion_status(
             else None
         ),
     }
+    if diagnostics:
+        payload["diagnostics"] = json.loads(json.dumps(diagnostics, default=str))
     marker = root / FUSION_STATUS_FILENAME
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f"{FUSION_STATUS_FILENAME}.", dir=root

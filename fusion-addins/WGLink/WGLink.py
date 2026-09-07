@@ -125,6 +125,8 @@ _panel = None
 _owned = False
 
 WATCH_INTERVAL_SECONDS = 4.0
+_installed_source_cache: dict[str, object] | None = None
+_geometry_state_cache: dict[str, object] | None = None
 OWNER_LEASE_SECONDS = WATCH_INTERVAL_SECONDS * 3
 WATCH_EVENT_ID = f"hornlab_wglink_export_available_{_watch_session_id}"
 _candidate_event_id = f"hornlab_wglink_owner_candidate_{_watch_session_id}"
@@ -1174,29 +1176,46 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
-def _document_links() -> list[dict[str, object]]:
-    """Copy each managed link's identity out of the document as plain strings.
+GEOMETRY_STATE_MAX_AGE_SECONDS = 60.0
+GEOMETRY_STATE_DUTY_CYCLE = 12.0
+GEOMETRY_STATE_MAX_WAIT_SECONDS = 120.0
 
-    Called on Fusion's main thread only. What it returns is deliberately inert
-    data: the watcher runs on another thread and must never hold a live Fusion
-    object.
+
+def _geometry_change_key(design: object, records: dict) -> tuple:
+    """A key that moves when the geometry the heartbeat measures moves.
+
+    Every entry here is a property read. Nothing evaluates a surface, and that
+    is the whole point: ``body.volume`` and ``face.area`` are *computed* on a
+    dense NURBS body, not looked up, so recomputing them on a four-second timer
+    is what makes Fusion unusable on a linked document. The timeline count
+    catches every modelling operation in a parametric design; the per-body
+    revision and visibility catch an edit or a hide that leaves the count
+    alone; the stored export id and edit version catch an Update.
     """
 
-    app = _app()
-    design = app.activeProduct if app else None
-    if design is None or not isinstance(getattr(design, "objectType", ""), str):
-        return []
-    if "Design" not in str(design.objectType):
-        return []
+    parts: list[object] = []
     try:
-        # The resolved inventory, not the raw attribute grouping: a record from
-        # `_link_records` alone carries no managed body, so the heartbeat used
-        # to publish `missing` and no fingerprint for links Audit reports as
-        # intact.
-        records = wglink_core._resolved_link_records(design)
-    except Exception:  # noqa: BLE001 - a document we cannot read has no links
-        return []
-    links: list[dict[str, object]] = []
+        parts.append(int(design.timeline.count))
+    except Exception:  # noqa: BLE001 - a product without a timeline still keys
+        parts.append(-1)
+    for instance_id in sorted(records):
+        record = records[instance_id]
+        payload = record.get("payload") or {}
+        body = record.get("body")
+        parts.append((
+            str(instance_id),
+            str(payload.get("export_id") or ""),
+            str(payload.get("edit_version") or ""),
+            bool(record.get("managed_object_clash")),
+            str(getattr(body, "revisionId", "") or "") if body is not None else "",
+            bool(getattr(body, "isVisible", False)) if body is not None else False,
+        ))
+    return tuple(parts)
+
+
+def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
+    """The part of the heartbeat that costs real geometry evaluation."""
+
     first_instance = next(iter(sorted(records)), None)
     try:
         return_state = wglink_send.return_state(
@@ -1220,6 +1239,144 @@ def _document_links() -> list[dict[str, object]]:
         document_body_count = ""
         source_state_hash = ""
         instance_identities = {}
+    bodies: dict[str, dict[str, object]] = {}
+    for instance_id, record in records.items():
+        try:
+            if record.get("managed_object_clash"):
+                # Audit refuses a duplicated instance id outright. The advisory
+                # heartbeat says it cannot tell rather than picking one of them
+                # and publishing that body's fingerprint as the link's.
+                local_body_state = "unknown"
+                body_fingerprint = None
+            else:
+                local_body_state = wglink_core._local_body_state(record)
+                body = record.get("body")
+                body_fingerprint = (
+                    wglink_core._body_fingerprint(body) if body is not None else None
+                )
+        except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
+            local_body_state = "unknown"
+            body_fingerprint = None
+        bodies[str(instance_id)] = {
+            "local_body_state": str(local_body_state),
+            "body_fingerprint_hash": (
+                _fingerprint_hash(body_fingerprint) if body_fingerprint else ""
+            ),
+        }
+    return {
+        "document_signature_hash": document_signature_hash,
+        "document_body_count": document_body_count,
+        "source_state_hash": source_state_hash,
+        "instance_identities": instance_identities,
+        "bodies": bodies,
+    }
+
+
+def _geometry_state(
+    app: object,
+    design: object,
+    records: dict,
+    document_id: str | None,
+    timings: dict[str, float] | None = None,
+) -> tuple[dict[str, object], str]:
+    """The measured state, recomputed only when it can have moved.
+
+    Two guards, because they fail in different directions. The **key** skips
+    the measurement when nothing changed, which is the ordinary case and the
+    one that was costing the user a modelling session. The **duty cycle** caps
+    what the measurement may cost even when the key does move: a recompute
+    waits until the time since the last one is ``GEOMETRY_STATE_DUTY_CYCLE``
+    times what that one took, so this can never own more than a small slice of
+    Fusion's main thread whatever the document costs. An advisory token that is
+    a few seconds behind is a far smaller problem than a CAD application that
+    stops responding.
+
+    The age ceiling is the third: anything the key fails to notice -- a
+    visibility change on a body this add-in does not manage, say -- self-heals
+    within a minute rather than persisting for the session.
+    """
+
+    global _geometry_state_cache
+    started = time.perf_counter()
+    key = (document_id, _geometry_change_key(design, records))
+    now = time.monotonic()
+    cached = _geometry_state_cache
+    verdict = "measured"
+    if cached is not None:
+        age = now - float(cached["at"])
+        unchanged = cached["key"] == key and age < GEOMETRY_STATE_MAX_AGE_SECONDS
+        wait = min(
+            float(cached["cost_ms"]) / 1000.0 * GEOMETRY_STATE_DUTY_CYCLE,
+            GEOMETRY_STATE_MAX_WAIT_SECONDS,
+        )
+        if unchanged or age < wait:
+            if timings is not None:
+                timings["geometry_state_ms"] = round(
+                    (time.perf_counter() - started) * 1000.0, 1
+                )
+                timings["geometry_state_age_s"] = round(age, 1)
+            return dict(cached["state"]), "cached" if unchanged else "deferred"
+    state = _measure_geometry_state(app, records)
+    cost_ms = (time.perf_counter() - started) * 1000.0
+    _geometry_state_cache = {
+        "key": key,
+        "at": time.monotonic(),
+        "cost_ms": cost_ms,
+        "state": state,
+    }
+    if timings is not None:
+        timings["geometry_state_ms"] = round(cost_ms, 1)
+        timings["geometry_state_age_s"] = 0.0
+    return state, verdict
+
+
+def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, object]]:
+    """Copy each managed link's identity out of the document as plain strings.
+
+    Called on Fusion's main thread only. What it returns is deliberately inert
+    data: the watcher runs on another thread and must never hold a live Fusion
+    object.
+
+    Identity comes from stored attributes and costs nothing, so it is read on
+    every tick. The measured half -- the export fingerprint and the body
+    fingerprints -- goes through :func:`_geometry_state`, which is what keeps
+    this off Fusion's main thread when the document has not moved.
+
+    ``timings`` collects the wall clock of each phase in milliseconds, which is
+    the only way to say what this costs on a real document without attaching a
+    debugger to Fusion.
+    """
+
+    def _record(name: str, started: float) -> None:
+        if timings is not None:
+            timings[name] = round((time.perf_counter() - started) * 1000.0, 1)
+
+    app = _app()
+    design = app.activeProduct if app else None
+    if design is None or not isinstance(getattr(design, "objectType", ""), str):
+        return []
+    if "Design" not in str(design.objectType):
+        return []
+    resolve_started = time.perf_counter()
+    try:
+        # The resolved inventory, not the raw attribute grouping: a record from
+        # `_link_records` alone carries no managed body, so the heartbeat used
+        # to publish `missing` and no fingerprint for links Audit reports as
+        # intact.
+        records = wglink_core._resolved_link_records(design)
+    except Exception:  # noqa: BLE001 - a document we cannot read has no links
+        _record("resolve_links_ms", resolve_started)
+        return []
+    _record("resolve_links_ms", resolve_started)
+    state, verdict = _geometry_state(
+        app, design, records, _active_document_id(), timings
+    )
+    if timings is not None:
+        timings["geometry_state"] = verdict
+    instance_identities = state["instance_identities"]
+    body_states = state["bodies"]
+    links: list[dict[str, object]] = []
+    per_link_started = time.perf_counter()
     for instance_id, record in records.items():
         payload = record.get("payload") or {}
         try:
@@ -1239,26 +1396,16 @@ def _document_links() -> list[dict[str, object]]:
         except (TypeError, ValueError):
             parameter_count = 0
         try:
+            # Drift is a comparison of stored and live parameter expressions:
+            # a handful of string reads, so it stays on every tick and never
+            # goes stale behind the cache.
             parameter_drift = wglink_core._parameter_drift(design, record)
             drifted_parameters = sorted(
                 str(item["name"]) for item in parameter_drift
             )
-            if record.get("managed_object_clash"):
-                # Audit refuses a duplicated instance id outright. The advisory
-                # heartbeat says it cannot tell rather than picking one of them
-                # and publishing that body's fingerprint as the link's.
-                local_body_state = "unknown"
-                body_fingerprint = None
-            else:
-                local_body_state = wglink_core._local_body_state(record)
-                body = record.get("body")
-                body_fingerprint = (
-                    wglink_core._body_fingerprint(body) if body is not None else None
-                )
         except Exception:  # noqa: BLE001 - advisory status may degrade to unknown
             drifted_parameters = []
-            local_body_state = "unknown"
-            body_fingerprint = None
+        measured = body_states.get(str(instance_id), {})
         link = {
             "instance_id": str(instance_id),
             "bundle_path": str(payload.get("bundle_path") or ""),
@@ -1273,13 +1420,11 @@ def _document_links() -> list[dict[str, object]]:
             "parameter_count": str(parameter_count),
             "parameter_drift_count": str(len(drifted_parameters)),
             "drifted_parameters": drifted_parameters,
-            "local_body_state": str(local_body_state),
-            "body_fingerprint_hash": (
-                _fingerprint_hash(body_fingerprint) if body_fingerprint else ""
-            ),
-            "document_signature_hash": document_signature_hash,
-            "document_body_count": document_body_count,
-            "source_state_hash": source_state_hash,
+            "local_body_state": str(measured.get("local_body_state") or "unknown"),
+            "body_fingerprint_hash": str(measured.get("body_fingerprint_hash") or ""),
+            "document_signature_hash": state["document_signature_hash"],
+            "document_body_count": state["document_body_count"],
+            "source_state_hash": state["source_state_hash"],
             "export_id": str(payload.get("export_id") or ""),
             "export_sequence": str(payload.get("export_sequence") or ""),
         }
@@ -1293,6 +1438,7 @@ def _document_links() -> list[dict[str, object]]:
             if isinstance(transform_hash, str) and transform_hash:
                 link["transform_hash"] = transform_hash
         links.append(link)
+    _record("per_link_ms", per_link_started)
     return links
 
 
@@ -1310,9 +1456,40 @@ def _active_document_id() -> str | None:
     return f"local:{_watch_session_id}:{id(document)}"
 
 
+def _installed_source() -> dict[str, object]:
+    """Which source this add-in is running, when a dev sync left a marker.
+
+    Validating a WGLink change otherwise means push, pin, package and install,
+    and nothing on the way back says which build Fusion actually loaded.
+    ``scripts/dev_sync_wglink.py`` writes this marker beside the add-in, so the
+    heartbeat can state it and one ``cat`` of the status file proves a restart
+    picked the edit up. Absent -- an ordinary managed install -- it is silent.
+    """
+
+    global _installed_source_cache
+    if _installed_source_cache is not None:
+        return _installed_source_cache
+    marker = Path(__file__).resolve().parent / "wglink_dev.json"
+    payload: dict[str, object] = {}
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            payload = {
+                key: value[key]
+                for key in ("sourceRoot", "sourceCommit", "syncedAt", "treeHash")
+                if key in value
+            }
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    _installed_source_cache = payload
+    return payload
+
+
 def _fusion_snapshot() -> dict[str, object]:
     """Read the active document and managed-link state once on the main thread."""
 
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
     app = _app()
     product = app.activeProduct if app else None
     active_document = getattr(app, "activeDocument", None) if app else None
@@ -1321,11 +1498,20 @@ def _fusion_snapshot() -> dict[str, object]:
         links: list[dict[str, object]] = []
     else:
         document_name = str(getattr(active_document, "name", "") or "Untitled")
-        links = _document_links()
+        links = _document_links(timings)
+    timings["snapshot_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    diagnostics: dict[str, object] = {
+        "watchIntervalSeconds": WATCH_INTERVAL_SECONDS,
+        "lastTickMs": timings,
+    }
+    source = _installed_source()
+    if source:
+        diagnostics["source"] = source
     return {
         "document_name": document_name,
         "document_id": _active_document_id(),
         "links": links,
+        "diagnostics": diagnostics,
     }
 
 
@@ -1348,6 +1534,7 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
             adapter_version=wglink_send.ADAPTER_VERSION,
             workspace_root=wglink_workspace.workspace_root(),
             links=current["links"],
+            diagnostics=current.get("diagnostics"),
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
         pass

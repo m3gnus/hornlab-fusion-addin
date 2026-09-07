@@ -22,6 +22,8 @@ meshing and solves run:
 - [WGLink user guide](docs/WGLINK-GUIDE.md) — the WG-linked add-in
 - [Naming a WGLink link](docs/WGLINK-LINK-NAMING.md) — which names are labels,
   which are frozen identifiers, and why
+- [Validating a WGLink change without a release](docs/WGLINK-DEV-LOOP.md) — the
+  in-place dev sync, and reading the heartbeat's tick timings
 - [WG Metal Pipeline user guide](docs/WGMETAL-PIPELINE-GUIDE.md) — the standalone solver add-in
 - [Headless reruns, sweeps, and A/B compare](docs/HEADLESS.md)
 - [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)

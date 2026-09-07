@@ -24,7 +24,7 @@ on load (see ``_pressure_complex_from_npz``).
 from __future__ import annotations
 
 import argparse
-import fcntl
+import errno
 from datetime import datetime
 from functools import lru_cache
 import json
@@ -500,6 +500,67 @@ def _update_manifest(path: Path, manifest: dict[str, Any], **updates: Any) -> No
     _write_json(path, manifest)
 
 
+def _lock_exclusive(handle, *, blocking: bool) -> bool:
+    """Take an exclusive advisory lock on an open file.
+
+    ``fcntl.flock`` on POSIX and ``msvcrt.locking`` on Windows. Both are held
+    by the *open file* and released by the operating system when the holding
+    process dies, which is the property this lock depends on: a solve that is
+    killed must not leave the next one waiting forever.
+
+    Returns True when the lock is held, False when ``blocking`` is False and
+    someone else holds it. This module previously imported ``fcntl`` at the top
+    level, which made the whole file unimportable on Windows -- 86 of the 92
+    Windows failures in the first CI run were that one line.
+    """
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI hosts
+        import msvcrt
+
+        # msvcrt has no blocking-forever mode: LK_LOCK retries ten times at one
+        # second apart and then raises. Loop it so "blocking" means blocking.
+        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+        while True:
+            try:
+                msvcrt.locking(handle.fileno(), mode, 1)
+                return True
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if not blocking:
+                    return False
+    import fcntl
+
+    flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+    try:
+        fcntl.flock(handle, flags)
+    except OSError as exc:
+        if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise
+    return True
+
+
+def _unlock(handle) -> None:
+    """Release the advisory lock. Closing the file would do it too."""
+
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI hosts
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
 def _acquire_direct_solve_lock(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -509,9 +570,7 @@ def _acquire_direct_solve_lock(
     # Open append-mode so a waiting process does not truncate/overwrite the
     # actual holder's pid record; the pid is written only after acquisition.
     lock_file = lock_path.open("a", encoding="utf-8")
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+    if not _lock_exclusive(lock_file, blocking=False):
         _update_manifest(
             manifest_path,
             manifest,
@@ -523,7 +582,7 @@ def _acquire_direct_solve_lock(
             f"Waiting for existing HornLab direct solve lock: {lock_path}",
             flush=True,
         )
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _lock_exclusive(lock_file, blocking=True)
     lock_file.truncate(0)
     lock_file.write(f"pid={os.getpid()}\n")
     lock_file.flush()
@@ -7495,7 +7554,7 @@ def main(argv: list[str] | None = None) -> int:
         returncode = 1
     finally:
         if lock_file is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _unlock(lock_file)
             lock_file.close()
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _write_json(manifest_path, manifest)

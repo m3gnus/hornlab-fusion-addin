@@ -1964,6 +1964,298 @@ def test_the_preflight_previews_a_domain_refusal_instead_of_raising(
     assert "negative side" in report["domain_error"]
 
 
+# --- a MANAGED link sent by selecting its own occurrence --------------------
+#
+# The occurrence fixtures further up carry no attributes at all, so no link
+# transform is ever resolved for them and the whole selected-occurrence branch
+# of `_strict_assembly_from_link` stays unexecuted. These build the shape the
+# guide's recovery advice actually names -- "select that instance's own
+# occurrence" -- with a stored occurrence token, a source contract and a real
+# wrapper placement, which is where the manifest and its own fingerprint used
+# to describe two different frames.
+
+IDENTITY_ROWS = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+]
+
+
+def _datum_collections(component_value, *, origin_cm=(0.0, 0.0, 0.0)):
+    component_value.constructionPlanes = Collection([
+        types.SimpleNamespace(
+            name="WG_THROAT_PLANE",
+            geometry=types.SimpleNamespace(
+                origin=point(*origin_cm), normal=point(0.0, 0.0, 1.0)
+            ),
+        )
+    ])
+    component_value.constructionAxes = Collection([
+        types.SimpleNamespace(
+            name="WG_AXIS",
+            geometry=types.SimpleNamespace(
+                origin=point(*origin_cm), direction=point(0.0, 0.0, 1.0)
+            ),
+        )
+    ])
+
+
+def _linked_wrapper_document(
+    send_module,
+    *,
+    instance_id="wgi-occ",
+    token_lookup="same-object",
+    nested=False,
+):
+    """A managed link whose wrapper occurrence is moved 120 mm along +Y.
+
+    ``token_lookup`` chooses what ``findEntityByToken`` hands back for the
+    stored occurrence token. ``"same-object"`` is the wrapper the UI selection
+    produced; ``"equivalent-wrapper"`` is a second Python handle on the same
+    Fusion occurrence -- same ``entityToken``, same component, same placement,
+    built the same way -- which is what the review's probe was given and what
+    the API is free to return. Neither is a loosened double: they differ only
+    in the way two Python wrappers for one entity differ.
+
+    ``nested`` puts that wrapper inside a parent occurrence, so it carries an
+    ``assemblyContext`` -- the case the guide tells the user to recover from by
+    selecting the instance's own occurrence.
+    """
+
+    core = send_module.wglink_core
+    throat = face("HF", area=FULL_DISC_MM2 / 100.0)
+    native = body("Horn", faces=[throat])
+    native.boundingBox = box((-3.0, 0.0, 0.0), (3.0, 4.0, 6.0))
+    core._set_attribute(native, "instance_id", instance_id)
+    core._set_attribute(native, "role", "waveguide")
+    core._set_attribute(native, "face_role", "HF")
+    inner = component("Horn component", [native])
+    _datum_collections(inner)
+    proxy = _proxy_of(native, offset_mm=(0.0, 120.0, 0.0), component_value=inner)
+    placement = moved_transform(y_cm=12.0)
+    occurrence = _occurrence(inner, [proxy], placement=placement)
+    occurrence.entityToken = "token-horn-occurrence"
+    occurrence.assemblyContext = None
+
+    root = component("Speaker")
+    all_occurrences = [occurrence]
+    if nested:
+        parent_component = component("Cabinet component")
+        parent = _occurrence(
+            parent_component, [], name="Cabinet:1", children=[occurrence]
+        )
+        parent.entityToken = "token-cabinet-occurrence"
+        parent.assemblyContext = None
+        occurrence.assemblyContext = parent
+        occurrence.fullPathName = "Speaker/Cabinet:1/Horn:1"
+        root.occurrences = Collection([parent])
+        all_occurrences = [parent, occurrence]
+    else:
+        root.occurrences = Collection([occurrence])
+    root.allOccurrences = Collection(all_occurrences)
+
+    if token_lookup == "equivalent-wrapper":
+        # A second handle on the same occurrence. Fusion reuses the Python
+        # wrapper on some builds and mints a fresh one on others, and the
+        # add-in cannot see which it was given.
+        lookup = _occurrence(inner, [proxy], placement=placement)
+        lookup.entityToken = occurrence.entityToken
+        lookup.assemblyContext = occurrence.assemblyContext
+        lookup.fullPathName = occurrence.fullPathName
+        # ``_occurrence`` re-seeds the component's own children; the wrapper
+        # under test keeps the childless component it was built with.
+        inner.occurrences = Collection()
+    else:
+        lookup = occurrence
+
+    payload = {
+        "instance_id": instance_id,
+        "design_id": "design-1",
+        "export_id": "export-1",
+        "export_sequence": "1",
+        "build_mode": "freestanding",
+        "parameter_prefix": "wg_",
+        "source_role": "HF",
+        "expected_throat_area_mm2": f"{FULL_DISC_MM2:.6f}",
+        "throat_z_mm": "0",
+        "wrapper": "occurrence",
+        "occurrence_token": occurrence.entityToken,
+    }
+    attributes = [
+        _linked_attribute(
+            inner, f"link_{instance_id.replace('-', '_')}", json.dumps(payload)
+        ),
+        *[
+            _linked_attribute(native, name[1], str(value))
+            for name, value in native.attributes.values.items()
+        ],
+    ]
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=ContractExportManager(),
+        findAttributes=lambda _group, _name: Collection(attributes),
+        findEntityByToken=lambda token: Collection(
+            [lookup] if token == occurrence.entityToken else []
+        ),
+        userParameters=Collection([
+            types.SimpleNamespace(name="wg_throat_dia", value=DISC_DIAMETER_MM / 10.0)
+        ]),
+    )
+    app = types.SimpleNamespace(
+        version="2704.1.53",
+        activeDocument=types.SimpleNamespace(name="Speaker"),
+    )
+    return design, app, occurrence
+
+
+def _send_selecting(send_module, tmp_path, monkeypatch, design, app, occurrence):
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    options = {
+        "output_folder": str(tmp_path),
+        "capture_document": False,
+        "selection": occurrence,
+    }
+    report = send_module.send(app, options)
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    return manifest, options
+
+
+def test_equivalent_fusion_wrappers_are_compared_by_entity_token(send_module):
+    """Two handles on one entity are one entity; two entities never are.
+
+    Fusion's own identity for a live entity is its ``entityToken``, so that is
+    what decides. An entity with no readable token falls back to the object,
+    because an empty token must not make two unknowns look equal.
+    """
+
+    left, twin = body("shell"), body("shell")
+    assert left is not twin and left.entityToken == twin.entityToken
+
+    assert send_module._same_entity(left, twin) is True
+    assert send_module._same_entity(left, body("other")) is False
+    assert send_module._same_entity(None, left) is False
+    assert send_module._same_entity(left, None) is False
+
+    tokenless = types.SimpleNamespace()
+    assert send_module._same_entity(tokenless, tokenless) is True
+    assert send_module._same_entity(tokenless, types.SimpleNamespace()) is False
+
+
+def test_a_fresh_wrapper_for_the_selected_occurrence_is_still_that_occurrence(
+    send_module, tmp_path, monkeypatch
+):
+    """The latent host-dependent refusal, made deterministic.
+
+    With ``is`` this send failed with "is not the selected occurrence" on any
+    Fusion build whose token lookup mints a new wrapper -- the exact object the
+    review's probe was handed -- while succeeding on one that reuses it.
+    """
+
+    design, app, occurrence = _linked_wrapper_document(
+        send_module, token_lookup="equivalent-wrapper"
+    )
+    manifest, _options = _send_selecting(
+        send_module, tmp_path, monkeypatch, design, app, occurrence
+    )
+
+    assert manifest["instances"][0]["instance_id"] == "wgi-occ"
+    assert manifest["instances"][0]["assembly_from_link"] == IDENTITY_ROWS
+    assert manifest["instances"][0]["occurrence_path"] == "Speaker/Horn:1"
+
+
+def test_the_manifest_and_its_own_fingerprint_place_the_link_in_one_frame(
+    send_module, tmp_path, monkeypatch
+):
+    """The frame disagreement, at the entry point that publishes both halves.
+
+    ``send`` records the placement in the exported component's frame and then
+    stamps ``assembly.signature_hash`` from ``return_state``. The fingerprint
+    used to resolve the same instance WITHOUT the selection, so a moved
+    root-level wrapper was identity in the manifest and 120 mm up in the hash
+    published beside it -- two frames offered as one return state.
+    """
+
+    design, app, occurrence = _linked_wrapper_document(send_module)
+    manifest, options = _send_selecting(
+        send_module, tmp_path, monkeypatch, design, app, occurrence
+    )
+
+    state = send_module.return_state(app, options)
+
+    assert manifest["instances"][0]["assembly_from_link"] == IDENTITY_ROWS
+    assert (
+        state["state"]["instances"][0]["assembly_from_link"]
+        == manifest["instances"][0]["assembly_from_link"]
+    )
+    assert manifest["assembly"]["signature_hash"] == state["hash"]
+
+
+def test_selecting_a_nested_wrappers_own_occurrence_really_is_the_recovery(
+    send_module, tmp_path, monkeypatch
+):
+    """The advertised remedy, end to end.
+
+    The guide tells a user whose wrapper is nested to select that instance's
+    own occurrence. The manifest accepted it; the mandatory fingerprint call
+    resolved it again without the selection, found the ``assemblyContext`` and
+    refused the whole send as nested -- so the remedy did not work on the one
+    document it exists for.
+    """
+
+    design, app, occurrence = _linked_wrapper_document(send_module, nested=True)
+    assert occurrence.assemblyContext is not None
+
+    manifest, options = _send_selecting(
+        send_module, tmp_path, monkeypatch, design, app, occurrence
+    )
+    state = send_module.return_state(app, options)
+
+    assert manifest["instances"][0]["assembly_from_link"] == IDENTITY_ROWS
+    assert (
+        state["state"]["instances"][0]["assembly_from_link"] == IDENTITY_ROWS
+    )
+    assert manifest["assembly"]["signature_hash"] == state["hash"]
+
+
+def test_a_link_that_is_not_the_selected_occurrence_is_refused_by_both_halves(
+    send_module, tmp_path, monkeypatch
+):
+    """Agreeing on one frame is not the same as accepting everything.
+
+    The strict resolver still refuses a wrapper that is not the selection, and
+    now the fingerprint refuses it for the same reason instead of quietly
+    reporting a root-relative placement for it.
+    """
+
+    design, app, occurrence = _linked_wrapper_document(send_module)
+    stranger = _occurrence(component("Other component"), [], name="Other:1")
+    stranger.entityToken = "token-other-occurrence"
+    stranger.assemblyContext = None
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    options = {
+        "output_folder": str(tmp_path),
+        "capture_document": False,
+        "selection": occurrence,
+    }
+    # The document changed under the dialog: the stored token now resolves to a
+    # different occurrence than the one that was selected.
+    design.findEntityByToken = lambda _token: Collection([stranger])
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match="is not the selected occurrence"
+    ):
+        send_module.send(app, options)
+
+    state = send_module.return_state(app, options)
+    assert state["hash"] is None
+    assert "is not the selected occurrence" in state["reason"]
+    assert not list(tmp_path.iterdir())
+
+
 # ------------------------------------- the leftover shell a freestanding
 # ------------------------------------- insertion leaves in the document
 

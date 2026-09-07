@@ -1054,19 +1054,23 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         if instance_body is not None:
             record["source_body"] = instance_body
     try:
-        sources = _sources(
+        # The preview predicts the export, so it resolves the export-frame
+        # placements the same way and only once -- the second derivation below
+        # reuses these fractions instead of asking again outside this guard.
+        fractions = _retained_fractions(
+            design,
             records,
-            included_bodies,
-            _retained_fractions(
-                design,
-                records,
-                resolve_domain_planes(opts.get("domain")),
-                selected_occurrence=walk["selected_occurrence"],
+            resolve_domain_planes(opts.get("domain")),
+            selected_occurrence=walk["selected_occurrence"],
+            transforms=_assembly_transforms(
+                design, records, selected_occurrence=walk["selected_occurrence"]
             ),
         )
+        sources = _sources(records, included_bodies, fractions)
     except wglink_core.WgLinkError as exc:
         report["source_error"] = str(exc)
         sources = []
+        fractions = {}
     for source in sources:
         observed = source.get("observed", {})
         report["sources"].append({
@@ -1087,16 +1091,7 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         bounds = _merge_bounds(bounds, body)
     report["bounds_mm"] = bounds
     source_bounds = None
-    for face in _source_faces(
-        records,
-        included_bodies,
-        _retained_fractions(
-            design,
-            records,
-            resolve_domain_planes(opts.get("domain")),
-            selected_occurrence=walk["selected_occurrence"],
-        ),
-    ):
+    for face in _source_faces(records, included_bodies, fractions):
         source_bounds = _merge_bounds(source_bounds, face)
     report["source_bounds_mm"] = source_bounds
     return report
@@ -1148,6 +1143,15 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         )
         if source_body is not None:
             record["source_body"] = source_body
+    # The fingerprint has to be about the frame the export writes, so the
+    # placements are resolved here, once, with the same selected occurrence the
+    # manifest uses -- not a second time in the root-relative frame.
+    try:
+        transforms = _assembly_transforms(
+            design, records, selected_occurrence=walk["selected_occurrence"]
+        )
+    except wglink_core.WgLinkError as exc:
+        return {"hash": None, "reason": str(exc)}
     try:
         sources = _sources(
             records,
@@ -1157,6 +1161,7 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
                 records,
                 resolve_domain_planes(opts.get("domain")),
                 selected_occurrence=walk["selected_occurrence"],
+                transforms=transforms,
             ),
         )
     except wglink_core.WgLinkError as exc:
@@ -1175,7 +1180,7 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         instances.append({
             "instance_id": str(record["instance_id"]),
             "design_id": str(record.get("payload", {}).get("design_id") or ""),
-            "assembly_from_link": _strict_assembly_from_link(design, record)[0],
+            "assembly_from_link": transforms[str(record["instance_id"])][0],
             "observed_parameters": wglink_core._observed_parameters(design, record),
         })
     source_state = [{
@@ -1292,6 +1297,32 @@ def _strict_matrix_rows(matrix: object, instance_id: str) -> list[list[float]]:
         ) from exc
 
 
+def _same_entity(left: object, right: object) -> bool:
+    """True when two handles denote the same Fusion entity.
+
+    Fusion hands out equivalent but *distinct* Python wrappers for one entity:
+    the occurrence a token lookup returns need not be the object the UI
+    selection produced, even though both name the same placement. Comparing
+    them with ``is`` therefore makes a refusal depend on whether a given Fusion
+    build happened to reuse the wrapper, which is not something this add-in can
+    observe. ``entityToken`` is Fusion's own published identity for exactly
+    this comparison, so it is what is compared.
+
+    An entity with no readable token falls back to object identity rather than
+    to an empty-string match -- two different unreadable entities must never
+    look equal, because equality here is what grants the identity transform.
+    """
+
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    left_token = wglink_core._entity_token(left)
+    if not left_token:
+        return False
+    return left_token == wglink_core._entity_token(right)
+
+
 def _matching_occurrences(design: object, record: dict[str, Any]) -> list[object]:
     payload = record.get("payload", {})
     token = str(payload.get("occurrence_token") or "")
@@ -1331,7 +1362,7 @@ def _strict_assembly_from_link(
     instance_id = str(record["instance_id"])
     if selected_occurrence is not None:
         occurrences = _matching_occurrences(design, record)
-        if len(occurrences) == 1 and occurrences[0] is selected_occurrence:
+        if len(occurrences) == 1 and _same_entity(occurrences[0], selected_occurrence):
             return [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -1385,6 +1416,57 @@ def _strict_assembly_from_link(
                 f"WGLink instance {instance_id!r} has an unreadable occurrence transform: {exc}."
             ) from exc
     return _strict_matrix_rows(matrix, instance_id), _occurrence_path(occurrence)
+
+
+def _assembly_transforms(
+    design: object,
+    records: list[dict[str, Any]],
+    *,
+    selected_occurrence: object | None = None,
+) -> dict[str, tuple[list[list[float]], str | None]]:
+    """Resolve every in-scope link's export-frame placement ONCE.
+
+    The manifest's ``assembly_from_link``, the declared-domain disc reduction
+    and the return-state fingerprint published beside them all have to describe
+    the frame the STEP was actually written in. They used to call the strict
+    resolver separately, and ``return_state`` called it *without* the selected
+    occurrence: an occurrence-scope send then recorded the identity in the
+    manifest while its own signature hash carried the root-relative placement,
+    and a nested wrapper the manifest accepted was refused as nested by the
+    fingerprint -- so "select that instance's own occurrence" was not the
+    complete recovery the guide advertises.
+
+    Resolving here and handing the answer down removes the opportunity to
+    disagree: one selection argument, one resolution, one frame.
+    """
+
+    resolved: dict[str, tuple[list[list[float]], str | None]] = {}
+    for record in records:
+        instance_id = str(record["instance_id"])
+        if instance_id in resolved:
+            continue
+        resolved[instance_id] = _strict_assembly_from_link(
+            design, record, selected_occurrence=selected_occurrence
+        )
+    return resolved
+
+
+def _resolved_transform(
+    design: object,
+    record: dict[str, Any],
+    *,
+    selected_occurrence: object | None,
+    transforms: dict[str, tuple[list[list[float]], str | None]] | None,
+) -> tuple[list[list[float]], str | None]:
+    """One record's placement, taken from the shared resolution when there is one."""
+
+    if transforms is not None:
+        resolved = transforms.get(str(record["instance_id"]))
+        if resolved is not None:
+            return resolved
+    return _strict_assembly_from_link(
+        design, record, selected_occurrence=selected_occurrence
+    )
 
 
 def _nullable(value: object) -> object | None:
@@ -1513,10 +1595,14 @@ def _instance_record(
     observed_at: str,
     *,
     selected_occurrence: object | None = None,
+    transforms: dict[str, tuple[list[list[float]], str | None]] | None = None,
 ) -> dict[str, Any]:
     payload = record.get("payload", {})
-    matrix, occurrence_path = _strict_assembly_from_link(
-        design, record, selected_occurrence=selected_occurrence
+    matrix, occurrence_path = _resolved_transform(
+        design,
+        record,
+        selected_occurrence=selected_occurrence,
+        transforms=transforms,
     )
     body = record.get("body")
     baseline = _stored_fingerprint(payload.get("body_fingerprint"))
@@ -1832,6 +1918,7 @@ def _retained_fractions(
     planes: tuple[str, ...],
     *,
     selected_occurrence: object | None = None,
+    transforms: dict[str, tuple[list[list[float]], str | None]] | None = None,
 ) -> dict[str, float]:
     """The share of each link's throat disc a declared cut leaves.
 
@@ -1845,8 +1932,11 @@ def _retained_fractions(
     fractions: dict[str, float] = {}
     for record in records:
         instance_id = str(record["instance_id"])
-        matrix, _path = _strict_assembly_from_link(
-            design, record, selected_occurrence=selected_occurrence
+        matrix, _path = _resolved_transform(
+            design,
+            record,
+            selected_occurrence=selected_occurrence,
+            transforms=transforms,
         )
         fractions[instance_id] = _declared_disc_reduction(
             instance_id, _source_contract(design, record), matrix, planes
@@ -2308,12 +2398,18 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             record["source_body"] = instance_body
     domain = plan_domain(domain_planes, measured_bodies)
     observed_at = _utc_timestamp()
+    # One resolution of the export-frame placements, shared by the manifest's
+    # instance records and by the declared-domain reduction beside them.
+    transforms = _assembly_transforms(
+        design, records, selected_occurrence=walk["selected_occurrence"]
+    )
     instance_records = [
         _instance_record(
             design,
             record,
             observed_at,
             selected_occurrence=walk["selected_occurrence"],
+            transforms=transforms,
         )
         for record in records
     ]
@@ -2325,6 +2421,7 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             records,
             domain_planes,
             selected_occurrence=walk["selected_occurrence"],
+            transforms=transforms,
         ),
     )
     return_state_snapshot = return_state(app, options)

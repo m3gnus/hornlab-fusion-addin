@@ -248,6 +248,20 @@ def _skipped_record(
     return record
 
 
+# Appended to whatever reason the ordinary classification rules produced, so a
+# linked body says where its geometry came from without that provenance
+# changing the verdict.
+_EXTERNAL_NOTES = {
+    "resolved-stale": (
+        "; the body comes from a resolved external link that is stale, so this "
+        "is the current local snapshot of it"
+    ),
+    "resolved-current": (
+        "; the body comes from a resolved, current external link"
+    ),
+}
+
+
 def _refusal_record(
     candidate: Mapping[str, Any], index: int, *, reason: str
 ) -> dict[str, Any]:
@@ -343,24 +357,20 @@ def plan_export_scope(
             )
             continue
 
-        if external in {"resolved-stale", "resolved-current"}:
-            stale = external == "resolved-stale"
-            included.append(
-                _included_record(
-                    candidate,
-                    index,
-                    external_reference=external,
-                    reason=(
-                        "resolved external link is stale; included the current "
-                        "local snapshot"
-                        if stale
-                        else "resolved external link is current and included"
-                    ),
-                    severity="degraded" if stale else "info",
-                )
-            )
-            degraded = degraded or stale
-            continue
+        # A RESOLVED external reference is evidence about a body, not a verdict
+        # on it. It used to short-circuit straight into ``included`` here, which
+        # gave linked geometry its own eligibility policy: a hidden external
+        # solid was inventoried where a local one is skipped, an external mesh
+        # was inventoried where a local one is not, and an undeclared external
+        # surface was inventoried where a local one is refused. The inventory
+        # feeds the STEP body-count gate, and Fusion exports visible bodies
+        # only, so an included hidden body inflates the expected count against
+        # a file that cannot contain it. Every rule below therefore judges
+        # local and linked geometry alike; currency is attached to whatever
+        # record the ordinary rules produce (see ``external_note`` on the
+        # include paths, and the skipped-record pass after the loop).
+        external_note = _EXTERNAL_NOTES.get(external, "")
+        stale_external = external == "resolved-stale"
 
         if body_kind == "mesh" or kind == "mesh_body":
             record = _skipped_record(
@@ -439,10 +449,19 @@ def plan_export_scope(
                 {
                     "file": file_name,
                     "n_bodies_expected": 1,
-                    "reason": "declared FEM air volume is exported as a separate one-solid member",
+                    "reason": (
+                        "declared FEM air volume is exported as a separate "
+                        "one-solid member" + external_note
+                    ),
                     "severity": "info",
                 }
             )
+            # Evidence only. ``validate_return_manifest`` derives
+            # ``scope.status`` from the skipped and included records alone, so
+            # degrading the plan on a FEM record nothing counts would make the
+            # manifest fail its own status check.
+            if external != "none":
+                record["external_reference"] = external
             fem_air_volumes.append(record)
             continue
 
@@ -507,10 +526,15 @@ def plan_export_scope(
                 _included_record(
                     candidate,
                     index,
-                    external_reference="none",
-                    reason="visible B-rep solids are included in the exterior assembly",
+                    external_reference=external,
+                    reason=(
+                        "visible B-rep solids are included in the exterior assembly"
+                        + external_note
+                    ),
+                    severity="degraded" if stale_external else "info",
                 )
             )
+            degraded = degraded or stale_external
             continue
 
         declared_shell = candidate.get("declaration") == "exterior-shell"
@@ -524,15 +548,20 @@ def plan_export_scope(
                 _included_record(
                     candidate,
                     index,
-                    external_reference="none",
+                    external_reference=external,
                     reason=(
-                        "visible surface body is declared as an exterior shell "
-                        "and is included"
-                        if declared_shell
-                        else "visible WGLink-managed surface body is included"
+                        (
+                            "visible surface body is declared as an exterior shell "
+                            "and is included"
+                            if declared_shell
+                            else "visible WGLink-managed surface body is included"
+                        )
+                        + external_note
                     ),
+                    severity="degraded" if stale_external else "info",
                 )
             )
+            degraded = degraded or stale_external
             continue
 
         if body_kind == "surface" and candidate.get("visible") is True:
@@ -542,7 +571,7 @@ def plan_export_scope(
                     index,
                     reason=(
                         f"visible surface body {name!r} is unclassified; mark it "
-                        "'exterior-shell' or exclude it"
+                        "'exterior-shell' or exclude it" + external_note
                     ),
                 )
             )
@@ -562,6 +591,20 @@ def plan_export_scope(
 
     if construction is not None:
         skipped.append((construction, {}))
+
+    # Currency as evidence on a skip the ordinary rules already decided. A
+    # stale link is still a degraded reason -- the signal the old
+    # short-circuit carried -- but it no longer decides whether the body is
+    # in the inventory.
+    for record, candidate in skipped:
+        external = candidate.get("external_reference", "none")
+        if external not in {"resolved-stale", "resolved-current"}:
+            continue
+        record["external_reference"] = external
+        record["reason"] += _EXTERNAL_NOTES[external]
+        if external == "resolved-stale" and record["severity"] != "degraded":
+            record["severity"] = "degraded"
+            degraded = True
 
     for record, candidate in skipped:
         dependency = _dependency_reason(candidate)

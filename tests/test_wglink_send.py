@@ -2085,12 +2085,14 @@ def test_the_two_filters_are_compared_by_name_before_anything_is_written(
 ):
     """The generic check, on a disagreement no role rule can see.
 
-    ``plan_export_scope`` includes a resolved external link before it ever
-    reaches its visibility rule, so a hidden body inside one is inventoried and
-    is not in the file. That is a second, unrelated way for the two filters to
-    part company -- which is the argument for comparing the sets themselves
-    rather than adding a rule per case. Nothing is written: the refusal lands
-    before the temp bundle exists, so the output folder is untouched.
+    A hidden body behind a resolved external link used to be inventoried and
+    not exported, because ``plan_export_scope`` included a resolved link ahead
+    of its own visibility rule. It no longer does -- linked and local geometry
+    face the same rules, and the first half of this test pins that -- so the
+    disagreement is injected here instead. The check is not a rule per case: it
+    is for the ways the two filters can part company that no role rule sees,
+    Autodesk's group-hidden export among them. Nothing is written: the refusal
+    lands before the temp bundle exists, so the output folder is untouched.
     """
 
     hidden = body("linked jig", visible=False)
@@ -2121,6 +2123,39 @@ def test_the_two_filters_are_compared_by_name_before_anything_is_written(
         activeDocument=types.SimpleNamespace(name="Linked"),
     )
     monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    walk = send_module._scope_walk(design, "root")
+    honest = send_module.plan_export_scope(walk["selection"], walk["candidates"])
+    assert [record["name"] for record in honest.included] == ["cabinet"]
+    assert [record["kind"] for record in honest.skipped] == ["hidden_body"]
+
+    real_planner = send_module.plan_export_scope
+
+    class _InventoryThatListsAnUnexportedBody:
+        def __init__(self, plan):
+            self._plan = plan
+
+        def manifest_scope(self):
+            scope = self._plan.manifest_scope()
+            scope["included"].append(
+                {
+                    "object_id": "body-phantom",
+                    "name": "linked jig",
+                    "component": "Jig",
+                    "body_kind": "solid",
+                    "visible": True,
+                    "external_reference": "resolved-current",
+                }
+            )
+            return scope
+
+    monkeypatch.setattr(
+        send_module,
+        "plan_export_scope",
+        lambda selection, candidates: _InventoryThatListsAnUnexportedBody(
+            real_planner(selection, candidates)
+        ),
+    )
 
     with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
         send_module.send(

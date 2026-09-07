@@ -354,6 +354,7 @@ def test_s3_stale_external_link_includes_degraded_with_reason():
 
     assert plan.status == "degraded"
     assert plan.included[0]["external_reference"] == "resolved-stale"
+    assert plan.included[0]["severity"] == "degraded"
     assert "stale" in plan.included[0]["reason"]
 
 
@@ -373,7 +374,133 @@ def test_s4_current_external_link_includes_clean_with_reason():
 
     assert plan.status == "clean"
     assert plan.included[0]["external_reference"] == "resolved-current"
-    assert "current and included" in plan.included[0]["reason"]
+    assert plan.included[0]["severity"] == "info"
+    assert "resolved, current external link" in plan.included[0]["reason"]
+    assert "B-rep solids are included" in plan.included[0]["reason"]
+
+
+def _external_and_local(external_reference: str, **fields):
+    """The same body twice: once behind a resolved link, once local."""
+
+    linked = plan_export_scope(
+        "root",
+        [Candidate("linked", "Supplier part", external_reference=external_reference, **fields)],
+    )
+    local = plan_export_scope("root", [Candidate("local", "Own part", **fields)])
+    return linked, local
+
+
+def _verdicts(plan):
+    return (
+        tuple(record["object_id"] for record in plan.included),
+        tuple(record["kind"] for record in plan.skipped),
+        tuple(record["decision"] for record in plan.refusals),
+    )
+
+
+@pytest.mark.parametrize("external", ["resolved-current", "resolved-stale"])
+def test_a_hidden_linked_solid_is_skipped_exactly_as_a_hidden_local_one(external):
+    """Reference currency is evidence about a body, not a verdict on it.
+
+    The resolved-link branch used to include the body and stop, ahead of every
+    rule below it, so linked geometry had its own eligibility policy. The
+    inventory is what the STEP body-count gate compares against the file, and
+    Fusion writes visible bodies only, so a hidden body listed here is a count
+    the file can never match.
+    """
+
+    linked, local = _external_and_local(external, body_kind="solid", visible=False)
+
+    assert _verdicts(linked)[1:] == _verdicts(local)[1:] == (("hidden_body",), ())
+    assert linked.included == ()
+    assert linked.status == "degraded"
+    record = linked.skipped[0]
+    assert record["external_reference"] == external
+    assert record["severity"] == "degraded"
+    assert "hidden bodies are excluded by policy" in record["reason"]
+
+
+@pytest.mark.parametrize("external", ["resolved-current", "resolved-stale"])
+def test_a_linked_mesh_body_is_skipped_exactly_as_a_local_mesh(external):
+    linked, local = _external_and_local(external, body_kind="mesh", visible=True)
+
+    assert _verdicts(linked)[1:] == _verdicts(local)[1:] == (("mesh_body",), ())
+    assert linked.included == ()
+    assert linked.status == "degraded"
+    assert linked.skipped[0]["external_reference"] == external
+    assert "not authoritative B-rep" in linked.skipped[0]["reason"]
+
+
+@pytest.mark.parametrize("external", ["resolved-current", "resolved-stale"])
+def test_an_undeclared_visible_linked_surface_is_refused_exactly_as_a_local_one(
+    external,
+):
+    linked, local = _external_and_local(external, body_kind="surface", visible=True)
+
+    assert _verdicts(linked)[1:] == _verdicts(local)[1:] == ((), ("refuse",))
+    assert linked.included == ()
+    with pytest.raises(WgReturnError, match="Supplier part.*unclassified"):
+        linked.manifest_scope()
+
+
+def test_a_stale_link_still_degrades_a_skip_that_is_otherwise_informational():
+    """The stale signal survives the reordering, on whatever record is made."""
+
+    plan = plan_export_scope(
+        "root",
+        [
+            Candidate(
+                "helper",
+                "WGLink jig",
+                "solid",
+                False,
+                external_reference="resolved-stale",
+                wglink_managed=True,
+                wglink_role="jig",
+            )
+        ],
+    )
+
+    record = plan.skipped[0]
+    assert record["kind"] == "wglink_helper"
+    assert record["severity"] == "degraded"
+    assert record["external_reference"] == "resolved-stale"
+    assert plan.status == "degraded"
+
+
+def test_a_hidden_linked_body_does_not_inflate_the_expected_step_inventory():
+    """End of the chain: what the count gate compares is what Fusion writes."""
+
+    plan = plan_export_scope(
+        "root",
+        [
+            {
+                "kind": "body",
+                "object_id": "body-0001",
+                "name": "speaker",
+                "component": "wg_tritonia",
+                "body_kind": "solid",
+                "visible": True,
+                "wglink_instance_id": INSTANCE_ID,
+            },
+            {
+                "kind": "body",
+                "object_id": "body-0002",
+                "name": "linked jig",
+                "component": "Jig",
+                "body_kind": "solid",
+                "visible": False,
+                "external_reference": "resolved-current",
+            },
+        ],
+    )
+    manifest = _worked_example()
+    manifest["scope"] = plan.manifest_scope()
+
+    validate_return_manifest(manifest)
+
+    assert len(plan.included) == manifest["assembly"]["n_bodies_expected"] == 1
+    assert [record["object_id"] for record in plan.skipped] == ["body-0002"]
 
 
 def test_s5_mesh_body_skips_degraded_with_reason():

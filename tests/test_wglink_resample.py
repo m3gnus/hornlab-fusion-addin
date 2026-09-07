@@ -170,6 +170,37 @@ def test_payload_shape_counts_and_stored_arc_positions_are_honoured(tmp_path):
     assert payload["outer_points"] is None
 
 
+def test_payload_names_the_export_this_process_actually_read(tmp_path):
+    """The add-in validates one read of the bundle and this command makes another.
+
+    Reporting the identity of the bytes read here is what lets
+    ``wglink_core._verify_resample_identity`` refuse a bundle Waveguide
+    Generator replaced between the two reads, instead of stamping the first
+    export's identity onto the second export's shape.
+    """
+
+    module = _load_script()
+    bundle, _grid = _write_bundle(tmp_path / "new.wglink")
+    topology = _write_topology(tmp_path / "topology.json")
+    manifest = json.loads((bundle / "wglink.json").read_text(encoding="utf-8"))
+
+    payload = module.build_payload(bundle, topology)
+
+    identity = payload["bundle_identity"]
+    assert identity["design_id"] == "wgd_resample"
+    assert identity["lineage_id"] == "wgl_resample"
+    assert identity["export_id"] == "wge_resample"
+    assert identity["export_sequence"] == 4
+    assert identity["file_hashes"] == {
+        name: record["sha256"] for name, record in manifest["files"].items()
+    }
+    # The digests are the ones read_bundle already verified against the bytes
+    # on disk, so this identifies content and not only a declared label.
+    assert identity["file_hashes"]["point-grid.json"] == _digest(
+        (bundle / "point-grid.json").read_bytes()
+    )
+
+
 def test_topology_section_count_must_match_stored_arc_positions(tmp_path):
     module = _load_script()
     bundle, _grid = _write_bundle(tmp_path / "new.wglink")

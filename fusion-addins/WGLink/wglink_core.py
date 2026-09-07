@@ -2333,10 +2333,108 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
+_RESAMPLE_IDENTITY_LABELS = {
+    "design_id": "design id",
+    "export_id": "export id",
+    "export_sequence": "export sequence",
+    "geometry_hash": "geometry hash",
+    "lineage_id": "lineage id",
+}
+
+
+def _resample_identity(bundle: object) -> dict[str, Any]:
+    """The identity of the bundle bytes one reader validated.
+
+    Counterpart of ``scripts/wglink_resample.py``'s ``bundle_identity``; the
+    two must produce the same mapping for the same bytes, so change them
+    together. ``file_hashes`` comes from the manifest files table, whose
+    digests ``read_bundle`` has already verified against the bytes on disk.
+    """
+
+    manifest = getattr(bundle, "manifest", None) or {}
+    export = manifest.get("export", {})
+    files = manifest.get("files", {})
+    identity = bundle.identity
+    return {
+        "design_id": identity.design_id,
+        "export_id": identity.export_id,
+        "export_sequence": int(identity.export_sequence),
+        "file_hashes": {
+            str(name): str(record.get("sha256", ""))
+            for name, record in sorted(files.items())
+            if isinstance(record, Mapping)
+        }
+        if isinstance(files, Mapping)
+        else {},
+        "geometry_hash": (
+            str(export.get("geometry_hash", "")) if isinstance(export, Mapping) else ""
+        ),
+        "lineage_id": identity.lineage_id,
+    }
+
+
+def _verify_resample_identity(bundle: object, payload: Mapping[str, Any]) -> None:
+    """Refuse geometry that came from different bytes than the validated ones.
+
+    INFERRED race, traced end to end: Update reads and validates bundle A,
+    runs its freshness, build-mode and namespace checks against A, and then
+    hands the resampler the same filesystem PATH. The subprocess reads that
+    path again. Waveguide Generator replaces an export atomically, so if it
+    lands B between the two reads and B happens to be topologically
+    compatible, the document receives B's shape carrying A's parameters,
+    ``edit_version``, export id and geometry hash -- and every bundle
+    integrity check on both sides still passes, because each read saw one
+    self-consistent file. ``_command_busy`` guards Fusion-side activity only;
+    it cannot stop WG writing a file.
+
+    So the resampler reports the identity it actually read, and this compares
+    it against the validated one. The call sits inside ``_resample_payload``,
+    which every caller reaches before it touches the document, because a
+    half-applied update is worse than a refused one.
+    """
+
+    expected = _resample_identity(bundle)
+    observed = payload.get("bundle_identity")
+    if not isinstance(observed, Mapping):
+        raise WgLinkError(
+            "WGLink refuses this operation because the resampler did not report "
+            "which export it read, so the resampled geometry cannot be bound to "
+            "the bundle WGLink validated. Re-run Waveguide Generator's platform "
+            "installer so the add-in and scripts/wglink_resample.py come from the "
+            "same release. Nothing in the document was changed."
+        )
+    changed = [
+        f"{label} ({expected[key]!r} became {observed.get(key)!r})"
+        for key, label in sorted(_RESAMPLE_IDENTITY_LABELS.items())
+        if observed.get(key) != expected[key]
+    ]
+    observed_files = observed.get("file_hashes")
+    if not isinstance(observed_files, Mapping):
+        observed_files = {}
+    expected_files = expected["file_hashes"]
+    changed.extend(
+        f"bundle member {name!r}"
+        for name in sorted(set(expected_files) | set(observed_files))
+        if expected_files.get(name) != observed_files.get(name)
+    )
+    if not changed:
+        return
+    raise WgLinkError(
+        "WGLink refuses this operation because the bundle on disk changed while "
+        "it was being used, so the resampled geometry belongs to a different "
+        "export than the one WGLink checked: "
+        + "; ".join(changed)
+        + ". Nothing in the document was changed. Wait for Waveguide Generator to "
+        "finish writing the export, then run Update again."
+    )
+
+
 def _resample_payload(
     bundle_path: str | os.PathLike[str],
     topology: dict[str, Any],
     options: dict[str, Any],
+    *,
+    bundle: object,
 ) -> dict[str, Any]:
     repo_root = _repo_root(options)
     python = _python_for_resampler(repo_root, options)
@@ -2389,6 +2487,7 @@ def _resample_payload(
             raise WgLinkError(f"Could not read WGLink resampling output: {exc}") from exc
     if not isinstance(payload, dict):
         raise WgLinkError("WGLink resampling output was not a JSON object.")
+    _verify_resample_identity(bundle, payload)
     return payload
 
 
@@ -3376,7 +3475,10 @@ def update(
         topology = json.loads(record["payload"]["topology"])
     except (TypeError, ValueError, KeyError) as exc:
         raise WgLinkError("Stored WGLink topology is invalid. Recreate the link.") from exc
-    payload = _resample_payload(source_path, topology, opts)
+    # The identity check inside _resample_payload binds the geometry this
+    # returns to the bundle validated above, and it refuses before the
+    # timeline marker moves or a single parameter is pushed.
+    payload = _resample_payload(source_path, topology, opts, bundle=bundle)
     rings = _ring_sketches(design, record["instance_id"], record["payload"])
     interfaces = _interface_sketches(
         design, record["instance_id"], record["payload"]

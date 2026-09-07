@@ -746,7 +746,10 @@ def _stub_no_op_update(core, monkeypatch, record, observed_paths):
     monkeypatch.setattr(
         core,
         "_resample_payload",
-        lambda path, _topology, _options: (observed_paths.append(path), {})[1],
+        lambda path, _topology, _options, **_kwargs: (
+            observed_paths.append(path),
+            {},
+        )[1],
     )
     monkeypatch.setattr(core, "_ring_sketches", lambda *_args: [])
     monkeypatch.setattr(core, "_interface_sketches", lambda *_args: {})
@@ -1588,7 +1591,7 @@ def _drive_update(core, monkeypatch, tmp_path, record, *, no_op):
         "parameter_slug": lambda _bundle: "probe",
         "_validate_enclosure_placement": lambda _bundle: None,
         "_validate_mouth_outline": lambda _bundle: None,
-        "_resample_payload": lambda *_a: {
+        "_resample_payload": lambda *_a, **_k: {
             "points": [],
             "outer_points": [],
             "check_points": [],
@@ -1752,3 +1755,336 @@ def test_audit_is_silent_when_every_helper_is_already_hidden(core, monkeypatch):
         for warning in report["warnings"]
         if "still visible" in warning
     ]
+
+
+# --------------------------------------------------------------------------
+# F2: resampled geometry and stamped identity must come from the same bytes.
+#
+# Update validates bundle A in memory, then hands the resampler A's PATH, and
+# the subprocess reads that path again. Waveguide Generator replaces an export
+# atomically, so a same-topology A->B swap between the two reads used to give
+# Fusion B's shape carrying A's parameters, edit_version, export id and
+# geometry hash -- with every bundle integrity check passing on both sides,
+# because each read saw one self-consistent file.
+#
+# These tests model exactly that swap. The first read is the real
+# _read_owned_bundle, the second read is the real build_payload from
+# scripts/wglink_resample.py, and the file on disk is genuinely replaced with
+# a valid, topologically compatible export in between. Only the subprocess
+# spawn is stood in for, and the stand-in runs the resampler's own code.
+# --------------------------------------------------------------------------
+
+
+RESAMPLE_SCRIPT = ROOT / "scripts" / "wglink_resample.py"
+
+
+def _load_resampler():
+    spec = importlib.util.spec_from_file_location(
+        "wglink_resample_for_core_tests", RESAMPLE_SCRIPT
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _swap_points(n_phi: int, n_length: int, radius_scale: float) -> list:
+    import math as _math
+
+    grid = []
+    for ray in range(n_phi):
+        angle = 2.0 * _math.pi * ray / n_phi
+        row = []
+        for section in range(n_length):
+            station = (section / (n_length - 1)) ** 1.7
+            radius = radius_scale * (10.0 + 30.0 * station**1.2)
+            row.append(
+                [
+                    radius * _math.cos(angle),
+                    5.0 + 0.8 * radius * _math.sin(angle),
+                    100.0 * station,
+                ]
+            )
+        grid.append(row)
+    return grid
+
+
+def _write_swappable_bundle(
+    path: Path,
+    *,
+    export_id: str = "wge_a",
+    sequence: int = 4,
+    radius_scale: float = 1.0,
+    n_phi: int = 8,
+    n_length: int = 6,
+) -> Path:
+    """Write one valid bundle directory, replacing whatever is already there.
+
+    Calling it twice on the same path is the atomic-replacement WG performs:
+    every file is self-consistent both before and after, so read_bundle
+    accepts either state without complaint.
+    """
+
+    import hashlib
+    import shutil
+
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    points = _swap_points(n_phi, n_length, radius_scale)
+    ring_z = [
+        sum(points[ray][section][2] for ray in range(n_phi)) / n_phi
+        for section in range(n_length)
+    ]
+    grid = {
+        "all_rings_planar": True,
+        "build_mode": "enclosure",
+        "closed": True,
+        "frame": "link-local",
+        "has_outer_points": False,
+        "inner_points": points,
+        "n_length": n_length,
+        "n_phi": n_phi,
+        "outer_points": None,
+        "ring_planar": [True] * n_length,
+        "ring_z_mm": ring_z,
+        "units": "mm",
+    }
+    grid_bytes = json.dumps(grid, allow_nan=False, sort_keys=True).encode() + b"\n"
+    step_bytes = b"ISO-10303-21;\nEND-ISO-10303-21;\n"
+    (path / "point-grid.json").write_bytes(grid_bytes)
+    (path / "waveguide.step").write_bytes(step_bytes)
+
+    def digest(data: bytes) -> str:
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    manifest = {
+        "coordinate_system": {
+            "handedness": "right",
+            "length_unit": "mm",
+            "matrix_convention": "row-major-local-to-parent",
+            "step_from_design": [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+        },
+        "design": {
+            "build_mode": "enclosure",
+            "id": "wgd_swap",
+            "lineage_id": "wgl_swap",
+        },
+        "export": {
+            "geometry_hash": f"sha256:{export_id}",
+            "id": export_id,
+            "sequence": sequence,
+        },
+        "files": {
+            "point-grid.json": {
+                "sha256": digest(grid_bytes),
+                "size_bytes": len(grid_bytes),
+            },
+            "waveguide.step": {
+                "sha256": digest(step_bytes),
+                "size_bytes": len(step_bytes),
+            },
+        },
+        "required_features": ["checksummed-files-v1", "link-local-frame-v1"],
+        "wglink_version": "1.0",
+    }
+    (path / "wglink.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+_SWAP_TOPOLOGY = {
+    "has_outer": False,
+    "overshoot_mm": 0.0,
+    "point_count": 5,
+    "section_arc_positions": [0.0, 0.35, 1.0],
+    "sections": 3,
+    "walls": 1,
+}
+
+
+def _run_resampler_in_process(core, monkeypatch, transform=None):
+    """Stand in for the subprocess, running the resampler's real code.
+
+    The command line is parsed exactly as the child would parse it, and
+    ``build_payload`` reads whatever is on disk at that moment -- which is the
+    second, unsynchronised read this finding is about.
+    """
+
+    resampler = _load_resampler()
+    calls: list[dict] = []
+
+    def fake_run(command, **_kwargs):
+        options = dict(zip(command[2::2], command[3::2]))
+        payload = resampler.build_payload(
+            Path(options["--bundle"]), Path(options["--topology"])
+        )
+        if transform is not None:
+            payload = transform(payload)
+        Path(options["--out"]).write_text(
+            json.dumps(payload, allow_nan=False), encoding="utf-8"
+        )
+        calls.append(options)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(core, "_repo_root", lambda _options: ROOT)
+    monkeypatch.setattr(core, "_python_for_resampler", lambda _root, _options: Path(sys.executable))
+    return calls
+
+
+def test_resample_refuses_a_compatible_bundle_swapped_in_between_the_two_reads(
+    core, monkeypatch, tmp_path: Path
+):
+    """The adversarial case: A and B are both valid and topologically equal."""
+
+    path = tmp_path / "swap.wglink"
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4)
+    validated = core._read_owned_bundle(path)
+    # Waveguide Generator lands a newer export while Update is between reads.
+    _write_swappable_bundle(path, export_id="wge_b", sequence=5, radius_scale=1.05)
+    _run_resampler_in_process(core, monkeypatch)
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        core._resample_payload(path, _SWAP_TOPOLOGY, {}, bundle=validated)
+
+    message = str(refusal.value)
+    assert "changed while it was being used" in message
+    assert "'wge_a'" in message and "'wge_b'" in message
+    assert "export sequence" in message
+    assert "'point-grid.json'" in message
+    assert "Nothing in the document was changed" in message
+
+
+def test_resample_accepts_the_bundle_it_validated(core, monkeypatch, tmp_path: Path):
+    """The honest path must still resample; a check that refuses all is no check."""
+
+    path = tmp_path / "stable.wglink"
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4)
+    validated = core._read_owned_bundle(path)
+    _run_resampler_in_process(core, monkeypatch)
+
+    payload = core._resample_payload(path, _SWAP_TOPOLOGY, {}, bundle=validated)
+
+    assert payload["sections"] == 3
+    assert payload["points_per_ring"] == 5
+    assert payload["bundle_identity"]["export_id"] == "wge_a"
+
+
+def test_resample_refuses_changed_geometry_reissued_under_one_export_id(
+    core, monkeypatch, tmp_path: Path
+):
+    """Identity labels alone are not enough; the file digests are compared."""
+
+    path = tmp_path / "reissued.wglink"
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4)
+    validated = core._read_owned_bundle(path)
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4, radius_scale=1.05)
+    _run_resampler_in_process(core, monkeypatch)
+
+    with pytest.raises(core.WgLinkError, match="'point-grid.json'"):
+        core._resample_payload(path, _SWAP_TOPOLOGY, {}, bundle=validated)
+
+
+def test_resample_refuses_a_payload_that_names_no_export(
+    core, monkeypatch, tmp_path: Path
+):
+    """An older or foreign resampler cannot prove the binding, so it is refused."""
+
+    path = tmp_path / "silent.wglink"
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4)
+    validated = core._read_owned_bundle(path)
+    _run_resampler_in_process(
+        core,
+        monkeypatch,
+        transform=lambda payload: {
+            key: value for key, value in payload.items() if key != "bundle_identity"
+        },
+    )
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        core._resample_payload(path, _SWAP_TOPOLOGY, {}, bundle=validated)
+
+    message = str(refusal.value)
+    assert "did not report which export it read" in message
+    assert "platform installer" in message
+
+
+def test_update_refuses_the_swap_before_it_touches_the_document(
+    core, monkeypatch, tmp_path: Path
+):
+    """The refusal must land before any mutation: a half-applied update is worse.
+
+    Everything from _resolve_link through _resample_payload is production
+    code. The timeline records every marker write and _push_parameters records
+    every call, so the assertions land on the document, not on a report.
+    """
+
+    path = tmp_path / "update-swap.wglink"
+    _write_swappable_bundle(path, export_id="wge_a", sequence=4)
+    validated = core._read_owned_bundle(path)
+    _write_swappable_bundle(path, export_id="wge_b", sequence=5, radius_scale=1.05)
+    _run_resampler_in_process(core, monkeypatch)
+
+    marker_writes: list[int] = []
+    pushed: list[object] = []
+
+    class _Timeline:
+        count = 9
+
+        def __init__(self) -> None:
+            self._marker = 9
+
+        @property
+        def markerPosition(self) -> int:
+            return self._marker
+
+        @markerPosition.setter
+        def markerPosition(self, value: int) -> None:
+            marker_writes.append(value)
+            self._marker = value
+
+        def moveToEnd(self) -> None:
+            marker_writes.append(-1)
+
+    design = types.SimpleNamespace(timeline=_Timeline())
+    record = {
+        "instance_id": "probe",
+        "payload": {
+            "build_mode": "enclosure",
+            "last_managed_sketch_index": "4",
+            "parameter_prefix": "wg_swap_",
+            "slug": "swap",
+            "source_role": "HF",
+            "throat_z_mm": "0.0",
+            "topology": json.dumps(_SWAP_TOPOLOGY),
+        },
+    }
+    for name, replacement in {
+        "_design": lambda _app: design,
+        "_resolve_link": lambda *_a, **_k: record,
+        "_link_frame_report": lambda *_a: {"verdict": "in_frame"},
+        "_refuse_bad_link_frame": lambda *_a, **_k: None,
+        "_bundle_for_update": lambda *_a: (path, validated),
+        "link_state": lambda *_a: types.SimpleNamespace(verdict="newer_export"),
+        "parameter_slug": lambda _bundle: "swap",
+        "_validate_enclosure_placement": lambda _bundle: None,
+        "_validate_mouth_outline": lambda _bundle: None,
+        "_push_parameters": lambda *_a: pushed.append(_a),
+        "_expand_groups": lambda _timeline: pushed.append("expand"),
+    }.items():
+        monkeypatch.setattr(core, name, replacement)
+
+    with pytest.raises(core.WgLinkError, match="changed while it was being used"):
+        core.update(object(), None, {"instance_id": "probe"})
+
+    assert marker_writes == []
+    assert pushed == []

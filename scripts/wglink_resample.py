@@ -10,7 +10,7 @@ update only assigns fit-point coordinates.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import json
 import math
 from pathlib import Path
@@ -179,6 +179,48 @@ def _check_points(
     return _even_sample(candidates, maximum)
 
 
+def bundle_identity(bundle: Any) -> dict[str, Any]:
+    """Describe the exact export bytes THIS process read and validated.
+
+    The add-in reads and validates one bundle, then launches this command
+    against the same filesystem path, which is a second and completely
+    independent read. Waveguide Generator replaces a bundle atomically, so the
+    two reads can legitimately observe two different exports, and both of them
+    pass every bundle integrity check because each file is self-consistent.
+    Without this field the add-in would stamp the first export's identity,
+    freshness and parameters onto the second export's shape.
+
+    ``wglink_core._resample_identity`` builds the same mapping from its own
+    bundle object and ``wglink_core._verify_resample_identity`` compares the
+    two before any Fusion document is touched. The two sites are a contract:
+    change one and change the other.
+
+    ``file_hashes`` comes from the manifest's files table, whose digests
+    ``read_bundle`` has already verified against the bytes on disk, so it
+    identifies content and not only a declared label.
+    """
+
+    manifest = bundle.manifest
+    export = manifest.get("export", {})
+    files = manifest.get("files", {})
+    return {
+        "design_id": bundle.identity.design_id,
+        "export_id": bundle.identity.export_id,
+        "export_sequence": int(bundle.identity.export_sequence),
+        "file_hashes": {
+            str(name): str(record.get("sha256", ""))
+            for name, record in sorted(files.items())
+            if isinstance(record, Mapping)
+        }
+        if isinstance(files, Mapping)
+        else {},
+        "geometry_hash": (
+            str(export.get("geometry_hash", "")) if isinstance(export, Mapping) else ""
+        ),
+        "lineage_id": bundle.identity.lineage_id,
+    }
+
+
 def build_payload(bundle_path: Path, topology_path: Path) -> dict[str, Any]:
     """Build the deterministic update payload without writing it."""
 
@@ -188,6 +230,7 @@ def build_payload(bundle_path: Path, topology_path: Path) -> dict[str, Any]:
         bundle = read_bundle(bundle_path)
     except WgLinkError as exc:
         raise ResampleError(str(exc)) from exc
+    identity = bundle_identity(bundle)
     bundle.close()
     topology = _load_json(topology_path, "topology")
     point_count, positions, overshoot, walls, _has_outer = _topology(topology)
@@ -234,6 +277,7 @@ def build_payload(bundle_path: Path, topology_path: Path) -> dict[str, Any]:
     checks = _check_points(inner, positions)
     ring_z = [float(np.mean(points[:, section, 2])) for section in range(points.shape[1])]
     return {
+        "bundle_identity": identity,
         "check_points": checks,
         "outer_points": outer_points.tolist() if outer_points is not None else None,
         "overshoot_mm": overshoot,

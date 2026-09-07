@@ -44,18 +44,31 @@ carries what that tick cost:
   "watchIntervalSeconds": 4.0,
   "lastTickMs": {
     "resolve_links_ms": 12.4,
-    "return_state_ms": 812.4,
-    "per_link_ms": 41.9,
-    "snapshot_ms": 870.2
+    "geometry_state_ms": 0.3,
+    "geometry_state": "cached",
+    "geometry_state_age_s": 37.2,
+    "per_link_ms": 3.1,
+    "snapshot_ms": 16.4
   },
   "source": {"sourceCommit": "abc1234+dirty", "syncedAt": "..."}
 }
 ```
 
-`return_state_ms` is the export-scope walk and fingerprint — the same work Send
-does short of writing STEP. It is recomputed from scratch on every tick, so it
-is the first number to read when Fusion feels heavy while a managed link is
-open. `source` appears only after a dev sync; a managed install stays silent.
+`geometry_state_ms` is the export-scope walk and body fingerprint — the work
+Send does short of writing STEP, and the only part of a tick that evaluates
+geometry rather than reading a property. `geometry_state` says which of three
+things the tick did:
+
+| | |
+|---|---|
+| `measured` | the document moved, so it was measured; this is the real cost |
+| `cached` | nothing moved — the tick was free |
+| `deferred` | it moved, but the last measurement was expensive enough that another one is not due yet |
+
+A healthy idle document reads `cached` with `geometry_state_ms` near zero. A
+run of `measured` ticks at hundreds of milliseconds on a document nobody is
+editing is the bug this instrumentation exists to catch. `source` appears only
+after a dev sync; a managed install stays silent.
 
 ## Going back to the managed install
 

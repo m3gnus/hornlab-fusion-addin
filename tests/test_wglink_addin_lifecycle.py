@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import sys
+import time
 import types
 
 import pytest
@@ -1433,36 +1434,128 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     )
 
 
-def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> None:
-    """Which phase costs the four-second tick, measured where it runs.
-
-    ``return_state`` walks the whole export scope and fingerprints every
-    included face; it happens on Fusion's main thread on every tick, and until
-    it is timed there, "Fusion is slow" and "the heartbeat is slow" are the
-    same unfalsifiable sentence. The phases are reported separately because the
-    remedies differ: caching a resolved inventory is not the same fix as not
-    recomputing an export fingerprint that nothing asked for.
-    """
-
+def _tick_module(monkeypatch, name: str):
     panels = _Panels()
     definitions = _Definitions(reserve_ids=False)
     ui = _UI(panels, definitions)
     app = _Application(ui)
-    module = _load_instance(monkeypatch, "WGLink_tick_timings", ui, app)
-    design, _body = _linked_document(module)
+    module = _load_instance(monkeypatch, name, ui, app)
+    design, body = _linked_document(module)
     app.activeProduct = design
+    body.revisionId = "revision-1"
+    return module, design, body
+
+
+def _count_measurements(monkeypatch, module) -> list[int]:
+    calls: list[int] = []
+    real = module.wglink_send.return_state
+
+    def counted(app, options=None):
+        calls.append(1)
+        return real(app, options)
+
+    monkeypatch.setattr(module.wglink_send, "return_state", counted)
+    return calls
+
+
+def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> None:
+    """Which phase costs the four-second tick, measured where it runs.
+
+    The measured half walks the whole export scope and fingerprints every
+    included face; it happens on Fusion's main thread, and until it is timed
+    there, "Fusion is slow" and "the heartbeat is slow" are the same
+    unfalsifiable sentence.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_tick_timings")
 
     timings: dict[str, float] = {}
     module._document_links(timings)
 
-    assert set(timings) == {"resolve_links_ms", "return_state_ms", "per_link_ms"}
-    assert all(value >= 0.0 for value in timings.values())
+    assert timings["geometry_state"] == "measured"
+    assert {"resolve_links_ms", "geometry_state_ms", "per_link_ms"} <= set(timings)
+    assert all(
+        value >= 0.0 for value in timings.values() if isinstance(value, float)
+    )
 
     snapshot = module._fusion_snapshot()
     diagnostics = snapshot["diagnostics"]
     assert diagnostics["watchIntervalSeconds"] == module.WATCH_INTERVAL_SECONDS
     assert "snapshot_ms" in diagnostics["lastTickMs"]
-    assert "return_state_ms" in diagnostics["lastTickMs"]
+
+
+def test_the_heartbeat_does_not_re_measure_a_document_that_has_not_moved(
+    monkeypatch,
+) -> None:
+    """An idle document must cost the tick nothing it can feel.
+
+    ``return_state`` evaluates ``face.area`` and ``body.volume``, which are
+    computed on a dense NURBS body rather than looked up. On a four-second
+    timer with no change detection that is a permanent load on Fusion's main
+    thread for a document nobody is editing.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_tick_cached")
+    calls = _count_measurements(monkeypatch, module)
+
+    first = module._document_links()
+    second_timings: dict[str, float] = {}
+    second = module._document_links(second_timings)
+
+    assert len(calls) == 1
+    assert second_timings["geometry_state"] == "cached"
+    assert second[0]["document_signature_hash"] == first[0]["document_signature_hash"]
+    assert second[0]["local_body_state"] == first[0]["local_body_state"]
+
+
+def test_the_heartbeat_re_measures_when_the_managed_body_moves(monkeypatch) -> None:
+    """The cache may not outlive the geometry it describes.
+
+    ``revisionId`` is a property read, so asking it every tick is free; the
+    measurement it guards is not.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_tick_revision")
+    calls = _count_measurements(monkeypatch, module)
+    # The duty cycle is a separate guard with its own test. Two calls a
+    # microsecond apart would otherwise be deferred by it, and this test would
+    # pass whether or not the key noticed the body at all.
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+
+    module._document_links()
+    body.revisionId = "revision-2"
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert len(calls) == 2
+    assert timings["geometry_state"] == "measured"
+
+
+def test_a_costly_measurement_defers_the_next_one(monkeypatch) -> None:
+    """The duty cycle is the guard the change key cannot be.
+
+    A key that moves on every tick -- a document genuinely being edited -- would
+    otherwise reinstate exactly the load this fixes. Waiting a multiple of what
+    the last measurement cost bounds the share of the main thread this can take
+    on any document, at the price of an advisory token a few seconds behind.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_tick_duty")
+    real = module.wglink_send.return_state
+
+    def slow(app, options=None):
+        time.sleep(0.02)
+        return real(app, options)
+
+    monkeypatch.setattr(module.wglink_send, "return_state", slow)
+
+    module._document_links()
+    body.revisionId = "revision-2"
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert timings["geometry_state"] == "deferred"
+    assert timings["geometry_state_ms"] < 20.0
 
 
 def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:

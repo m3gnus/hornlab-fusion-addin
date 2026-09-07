@@ -217,6 +217,22 @@ occurrence where it already is and never moves it back to the origin.)
   Insert again. Hiding a folder that contains the body will not work: Autodesk
   exports a body that is invisible only because its group is hidden as if it
   were visible.
+- **A surface sits on top of the waveguide in the browser, and I selected and
+  simulated it by mistake** — a freestanding insertion leaves a stitched
+  surface shell behind. It is zero-thickness and coincident with the final
+  solid, so in the browser and in the canvas it is easy to pick instead of the
+  body you meant, and a solve started from it is a solve of the wrong
+  geometry. Insert hides it, and so does **Update** — run Update on the
+  document and WGLink hides every leftover helper body it still shows,
+  reporting them under `helpers`. Audit names them without touching anything,
+  so you can see which document is affected before you change it. A document
+  built before this change keeps the shell visible until one of those runs.
+  Failing that, hide **the body itself** in the browser. Hiding a folder or
+  group that contains it does **not** work: Autodesk exports a body that is
+  invisible only because its group is hidden as if it were visible, so it
+  would still reach the STEP file and the solver. Do not delete the shell —
+  WGLink reads its managed bodies by role for tag repair and anchoring, and a
+  deleted one cannot be restored without recreating the link.
 - **"WGLink parameter namespace mismatch"** on Update — the document's link
   predates the stable-namespace fix and its bundle was renamed. The refusal
   names the recovery: Detach and delete the component, then Insert; the

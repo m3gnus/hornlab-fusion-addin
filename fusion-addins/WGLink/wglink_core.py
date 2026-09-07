@@ -345,6 +345,98 @@ def _hide_helper_body(body: object) -> bool:
     return False
 
 
+def _helper_body_name(body: object) -> str:
+    """The browser name of a helper body, or a placeholder for a consumed one."""
+
+    try:
+        return str(body.name)
+    except Exception:  # noqa: BLE001 - a consumed body has no name
+        return "unnamed helper body"
+
+
+def _body_is_visible(body: object) -> bool:
+    """Whether Fusion would draw this body, read the way ``Send`` reads it.
+
+    ``isVisible`` first, ``isLightBulbOn`` second -- the same order
+    ``_hide_helper_body`` reads its verdict back in, and the same order
+    ``wglink_send`` reads visibility off a body, so no two of the three can
+    ever disagree about one body. A body the kernel consumed is not in the
+    document at all and is reported invisible rather than probed.
+    """
+
+    if not bool(getattr(body, "isValid", True)):
+        return False
+    for name in ("isVisible", "isLightBulbOn"):
+        try:
+            value = getattr(body, name)
+        except Exception:  # noqa: BLE001 - visibility diagnostics are non-fatal
+            continue
+        if isinstance(value, bool):
+            return value
+    return True
+
+
+def _visible_helper_bodies(record: Mapping[str, Any]) -> list[object]:
+    """Every managed helper body of one link that is still drawn in the browser.
+
+    The universe is the one ``wglink_return.plan_export_scope`` refuses on: a
+    B-rep body WGLink manages whose role is not one of ``MANAGED_BODY_ROLES``,
+    which is to say a ``cut_tool`` -- the stitched shell, the throat patch and
+    the loft surface. One rule, so a body Send names is a body Update can hide
+    and Audit can report.
+    """
+
+    return [
+        entity
+        for entity in record.get("entities", [])
+        if _kind(entity) == "BRepBody"
+        and _body_role(entity) not in MANAGED_BODY_ROLES
+        and _body_is_visible(entity)
+    ]
+
+
+def _still_visible_helper_warning(names: Sequence[str]) -> str:
+    """The one text Insert and Update both use for a refused visibility write."""
+
+    return (
+        "LOUD: Fusion would not hide "
+        + ", ".join(repr(name) for name in names)
+        + ". Fusion's STEP export writes every visible body of the "
+        "exported component, so hide the body itself in the browser "
+        "before Send; hiding a folder that contains it will not work."
+    )
+
+
+def _hide_link_helpers(record: Mapping[str, Any], report: dict[str, Any]) -> None:
+    """Take a document's leftover helper bodies out of the browser, and say so.
+
+    ``_close_and_thicken`` hides the shell it creates, which only ever helps a
+    NEW insertion: a document inserted by an older WGLink still shows a
+    zero-thickness surface sitting coincident with, and on top of, the final
+    solid, and it stays selectable there forever. A user picked exactly that
+    body and solved it instead of the waveguide. Send refuses such a document
+    by name, but Send publishes without editing the open design, so it can
+    never repair one -- Update is the entry point that already mutates the
+    design, so it is the one that fixes it.
+
+    Records the outcome as ``report["helpers"]``, the same
+    ``{"hidden": [...], "still_visible": [...]}`` shape ``insert()`` reports,
+    and raises the same LOUD warning for a body Fusion refuses to hide.
+    """
+
+    helpers: dict[str, list[str]] = {"hidden": [], "still_visible": []}
+    for body in _visible_helper_bodies(record):
+        name = _helper_body_name(body)
+        key = "hidden" if _hide_helper_body(body) else "still_visible"
+        if name not in helpers[key]:
+            helpers[key].append(name)
+    report["helpers"] = helpers
+    if helpers["still_visible"]:
+        report.setdefault("warnings", []).append(
+            _still_visible_helper_warning(helpers["still_visible"])
+        )
+
+
 def _stamp_payload(entity: object, payload: dict[str, str]) -> None:
     for name, value in payload.items():
         _set_attribute(entity, name, value)
@@ -1135,10 +1227,7 @@ def _close_and_thicken(
             # exterior.
             helpers: dict[str, list[str]] = {"hidden": [], "still_visible": []}
             for helper in (stitched, patch_body, surface_body):
-                try:
-                    name = str(helper.name)
-                except Exception:  # noqa: BLE001 - a consumed body has no name
-                    name = "unnamed helper body"
+                name = _helper_body_name(helper)
                 key = "hidden" if _hide_helper_body(helper) else "still_visible"
                 if name not in helpers[key]:
                     helpers[key].append(name)
@@ -2904,11 +2993,7 @@ def insert(
                 # count, but the insertion is where it can still be fixed
                 # cheaply, so say it here too.
                 warnings.append(
-                    "LOUD: Fusion would not hide "
-                    + ", ".join(repr(name) for name in helper_report["still_visible"])
-                    + ". Fusion's STEP export writes every visible body of the "
-                    "exported component, so hide the body itself in the browser "
-                    "before Send; hiding a folder that contains it will not work."
+                    _still_visible_helper_warning(helper_report["still_visible"])
                 )
         else:
             final_body, enclosure_report, enclosure_features = _build_enclosure(
@@ -3225,7 +3310,13 @@ def update(
     bundle_path: str | os.PathLike[str] | None,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Rebuild a managed link in place by moving existing fit points only."""
+    """Rebuild a managed link in place by moving existing fit points only.
+
+    Also hides any leftover WGLink helper body the document still shows --
+    ``report["helpers"]``, in the shape ``insert()`` reports. Insert-time
+    hiding reaches new insertions only, and Update is the entry point that
+    reaches the documents a user already has.
+    """
 
     opts = _options(options)
     design = _design(app)
@@ -3292,9 +3383,16 @@ def update(
     )
     sections, _points = _validate_rebuild_topology(rings, interfaces, payload, topology)
     if no_op:
-        return _no_op_update_report(
+        no_op_report = _no_op_update_report(
             app, design, record, bundle, opts, link_frame
         )
+        # A no-op Update still repairs the tag, and it is also the Update a
+        # user runs on an existing document when nothing in WG has changed --
+        # which is exactly the document carrying a visible leftover shell. If
+        # the hide only happened on the rebuild path, the remedy the guide
+        # gives would silently do nothing for them.
+        _hide_link_helpers(record, no_op_report)
+        return no_op_report
 
     _expand_groups(design.timeline)
     entries = _timeline_entries(design.timeline)
@@ -3435,6 +3533,11 @@ def update(
         ) from failure
 
     body_record = _resolve_link(design, {"instance_id": record["instance_id"]})
+    # Re-resolved after the rebuild, so the helper bodies hidden here are the
+    # ones the document actually has now. Visibility is not a timeline
+    # property, so the rollback this rebuild performed neither undid an
+    # earlier hide nor requires this one to be repeated.
+    _hide_link_helpers(body_record, report)
     body = body_record["body"]
     role = record["payload"].get("source_role", "HF")
     throat_z = float(payload.get("throat_z_mm", record["payload"].get("throat_z_mm", 0.0)))
@@ -3705,6 +3808,24 @@ def audit(
         )
     if local_state == "missing":
         warnings.append("The managed body is missing. Recreate the link; Audit cannot restore it.")
+    # Audit must report, never refuse -- and never mutate. A leftover helper
+    # body sits coincident with, and on top of, the final solid, and it stays
+    # pickable in the browser: a user selected one and simulated it instead of
+    # the waveguide. Naming it here is the only way a document built before
+    # insert-time hiding tells anyone it is there; Update is what hides it.
+    still_visible = [
+        _helper_body_name(helper) for helper in _visible_helper_bodies(record)
+    ]
+    if still_visible:
+        warnings.append(
+            "WGLink helper bodies are still visible: "
+            + ", ".join(repr(name) for name in still_visible)
+            + ". They sit on top of the exported body and can be picked and "
+            "solved in its place, and Fusion's STEP export writes every "
+            "visible body of the exported component. Run Update to have "
+            "WGLink hide them, or hide each body itself in the browser; "
+            "hiding a folder that contains them will not work."
+        )
     role = payload.get("source_role", "HF")
     expected = float(payload.get("expected_throat_area_mm2", 0.0) or 0.0)
     throat_z = float(payload.get("throat_z_mm", 0.0) or 0.0)

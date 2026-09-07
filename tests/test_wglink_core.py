@@ -816,7 +816,10 @@ def test_update_self_heals_a_missing_bundle_path_by_design_identity(
 
     report = core.update(object(), None)
 
-    assert report == {"updated_export_sequence": 7}
+    assert report["updated_export_sequence"] == 7
+    # Every Update now accounts for the leftover helper bodies it hid; this
+    # link record carries no entities at all, so there are none to hide.
+    assert report["helpers"] == {"hidden": [], "still_visible": []}
     assert observed_paths == [newest_match]
     assert rewritten == [
         (design, "wgi_one", {"bundle_path": str(newest_match.resolve())})
@@ -1476,3 +1479,276 @@ def test_a_helper_fusion_refuses_to_hide_is_named_loudly_by_the_insertion(
     assert len(loud) == 1
     assert repr(patch_name) in loud[0]
     assert "hiding a folder that contains it will not work" in loud[0]
+
+
+# --------------------------------------------------------------------------
+# The documents a user ALREADY has.
+#
+# Hiding the shell at Insert only ever helps a new insertion. Every document
+# built before that change still shows a zero-thickness surface sitting
+# coincident with, and on top of, the final solid, and it stays pickable in
+# the browser forever: the user selected one and simulated it instead of the
+# waveguide, so he solved the wrong geometry. Send refuses such a document by
+# name but publishes without editing it, so Update -- which already mutates
+# the design -- is the entry point that repairs it, and Audit is the read-only
+# one that names it.
+#
+# These tests drive the real update() and the real audit(). The helper bodies
+# hold their light bulbs as real state behind a property, so every assertion
+# lands on the body object and not on a report that could lie about it.
+# --------------------------------------------------------------------------
+
+
+def _managed_link_record(core, *, hideable=True, visible=True, instance_id="probe"):
+    """One resolved link record: a managed body, two helpers, and a sketch.
+
+    The helper roles are the ones ``wglink_return.plan_export_scope`` refuses
+    on -- managed, B-rep, and not a member of ``MANAGED_BODY_ROLES``.
+    """
+
+    final = _FakeBody(core.BODY_NAMES["waveguide"])
+    core._set_attribute(final, "role", "waveguide")
+    shell = _FakeBody(core.BODY_NAMES["stitched_waveguide"], hideable=hideable)
+    core._set_attribute(shell, "role", "cut_tool")
+    patch = _FakeBody(core.BODY_NAMES["throat_patch"])
+    core._set_attribute(patch, "role", "cut_tool")
+    if not visible:
+        shell.isVisible = False
+        patch.isVisible = False
+    sketch = _Entity("Sketch", "WGLink ring 0")
+    core._set_attribute(sketch, "role", "ring")
+
+    record = {
+        "instance_id": instance_id,
+        "entities": [final, shell, patch, sketch],
+        "payload": {
+            "bundle_path": "",
+            "build_mode": "freestanding",
+            "expected_throat_area_mm2": "0.0",
+            "last_managed_sketch_index": "4",
+            "parameter_prefix": "wg_probe_",
+            "slug": "probe",
+            "source_role": "HF",
+            "throat_z_mm": "0.0",
+            "topology": "{}",
+            "wrapper": "root",
+        },
+        "body": final,
+        "wrapper_component": None,
+    }
+    return record, final, shell, patch
+
+
+def _update_stub_bundle():
+    return types.SimpleNamespace(
+        identity=types.SimpleNamespace(
+            design_id="wgd_probe",
+            export_id="wge_probe",
+            export_sequence=7,
+            lineage_id="wgl_probe",
+        ),
+        manifest={
+            "bundle": {"id": "b1"},
+            "design": {
+                "build_mode": "freestanding",
+                "config": {},
+                "design_hash": "h",
+                "edit_version": "1",
+                "formula": "f",
+                "name": "probe",
+            },
+            "export": {"geometry_hash": "g"},
+        },
+        grid={"ring_z_mm": [0.0], "all_rings_planar": True},
+    )
+
+
+def _drive_update(core, monkeypatch, tmp_path, record, *, no_op):
+    """Run the real update() with the surrounding rebuild machinery stubbed.
+
+    Everything from ``_resolve_link`` to the returned report is production
+    code, including both places update() hides helper bodies: the no-op
+    branch a user hits when nothing in WG changed, and the branch that
+    actually rebuilds. Nothing here stands in for the code under test.
+    """
+
+    bundle = _update_stub_bundle()
+    timeline = types.SimpleNamespace(count=9, markerPosition=9)
+    timeline.moveToEnd = lambda: None
+    design = types.SimpleNamespace(timeline=timeline)
+    verdict = "same_export" if no_op else "newer_export"
+
+    for name, replacement in {
+        "_design": lambda _app: design,
+        "_resolve_link": lambda *_a, **_k: record,
+        "_link_frame_report": lambda *_a: {"verdict": "in_frame"},
+        "_refuse_bad_link_frame": lambda *_a, **_k: None,
+        "_bundle_for_update": lambda *_a: (tmp_path / "probe.wglink", bundle),
+        "link_state": lambda *_a: types.SimpleNamespace(verdict=verdict),
+        "parameter_slug": lambda _bundle: "probe",
+        "_validate_enclosure_placement": lambda _bundle: None,
+        "_validate_mouth_outline": lambda _bundle: None,
+        "_resample_payload": lambda *_a: {
+            "points": [],
+            "outer_points": [],
+            "check_points": [],
+            "throat_z_mm": 0.0,
+            "overshoot_mm": 0.0,
+        },
+        "_ring_sketches": lambda *_a: [],
+        "_interface_sketches": lambda *_a: {},
+        "_validate_rebuild_topology": lambda *_a: (0, 0),
+        "_expand_groups": lambda _timeline: None,
+        "_timeline_entries": lambda _timeline: [{"index": 5, "kind": "Sketch"}],
+        "_last_managed_sketch_index": lambda *_a: 4,
+        "rollback_target": lambda _entries, **_k: 5,
+        "_feature_health": lambda _design: ([], []),
+        "_progress_path": lambda *_a: tmp_path / "progress.json",
+        "_write_progress": lambda *_a: None,
+        "_assembly_from_link": lambda *_a: core.IDENTITY_MATRIX,
+        "_local_body_state": lambda _record: "unchanged",
+        "_push_parameters": lambda *_a: {"created": [], "updated": []},
+        "_rebuild_interface_points": lambda _payload: {},
+        "_fixed_enclosure_sketch": lambda *_a: None,
+        "_tag_report": lambda *_a, **_k: {"area_mm2": 0.0},
+        "_deviation": lambda *_a, **_k: {},
+        "_body_measurement": lambda *_a: {},
+        "_body_fingerprint": lambda _body: {},
+        "health_regressions": lambda *_a: [],
+        "refreshed_body_evidence": lambda *_a: ("unchanged", None),
+        "_managed_parameter_expressions": lambda *_a, **_k: {},
+        "throat_area_mm2": lambda _bundle: 100.0,
+        "_update_payload_attributes": lambda *_a: None,
+        "_warn_unmeasured": lambda _deviation, _warnings: None,
+    }.items():
+        monkeypatch.setattr(core, name, replacement)
+
+    return core.update(object(), None, {"instance_id": record["instance_id"]})
+
+
+@pytest.mark.parametrize("no_op", [False, True])
+def test_update_hides_a_visible_helper_left_by_an_older_insertion(
+    core, monkeypatch, tmp_path: Path, no_op
+):
+    """The repair for a document that already exists, on both Update paths.
+
+    The no-op path is not a detail: a user whose WG design has not changed
+    re-selects the same bundle and takes exactly that branch, and it is the
+    branch the guide's "run Update" remedy lands on most often.
+    """
+
+    record, final, shell, patch = _managed_link_record(core)
+
+    report = _drive_update(core, monkeypatch, tmp_path, record, no_op=no_op)
+
+    assert shell.isVisible is False
+    assert patch.isVisible is False
+    assert final.isVisible is True, "the exported waveguide must stay visible"
+    assert report["helpers"] == {
+        "hidden": [
+            core.BODY_NAMES["stitched_waveguide"],
+            core.BODY_NAMES["throat_patch"],
+        ],
+        "still_visible": [],
+    }
+    assert [body.name for body in (shell, patch)] == report["helpers"]["hidden"]
+    assert not [line for line in report.get("warnings", []) if "LOUD: " in line]
+
+
+def test_update_names_a_helper_fusion_refuses_to_hide(
+    core, monkeypatch, tmp_path: Path
+):
+    """A refused visibility write must not be reported as a success.
+
+    Fusion refuses a read-only property by raising, and a report that claimed
+    the body was hidden would leave the user picking it in the browser and
+    exporting it to the solver while WGLink said the document was clean.
+    """
+
+    record, _final, shell, patch = _managed_link_record(core, hideable=False)
+
+    report = _drive_update(core, monkeypatch, tmp_path, record, no_op=False)
+
+    shell_name = core.BODY_NAMES["stitched_waveguide"]
+    assert shell.isVisible is True
+    assert patch.isVisible is False
+    assert report["helpers"] == {
+        "hidden": [core.BODY_NAMES["throat_patch"]],
+        "still_visible": [shell_name],
+    }
+
+    loud = [line for line in report["warnings"] if line.startswith("LOUD: ")]
+    assert len(loud) == 1
+    assert repr(shell_name) in loud[0]
+    assert "hiding a folder that contains it will not work" in loud[0]
+
+
+def test_update_says_nothing_about_helpers_that_are_already_hidden(
+    core, monkeypatch, tmp_path: Path
+):
+    """A current insertion's document must not be nagged about a fixed state."""
+
+    record, _final, shell, patch = _managed_link_record(core, visible=False)
+
+    report = _drive_update(core, monkeypatch, tmp_path, record, no_op=False)
+
+    assert (shell.isVisible, patch.isVisible) == (False, False)
+    assert report["helpers"] == {"hidden": [], "still_visible": []}
+    assert not [line for line in report["warnings"] if "LOUD: " in line]
+
+
+def _drive_audit(core, monkeypatch, record):
+    """Run the real audit() over one resolved link record."""
+
+    design = types.SimpleNamespace(findEntityByToken=lambda _token: [])
+    for name, replacement in {
+        "_design": lambda _app: design,
+        "_resolve_link": lambda *_a, **_k: record,
+        "_feature_health": lambda _design: ([], []),
+        "_link_frame_report": lambda *_a: {"verdict": "in_frame"},
+        "_local_body_state": lambda _record: "unchanged",
+        "_parameter_drift": lambda *_a: [],
+        "_ground_to_parent": lambda *_a: False,
+    }.items():
+        monkeypatch.setattr(core, name, replacement)
+    return core.audit(object())
+
+
+def test_audit_names_a_visible_helper_body_and_changes_nothing(core, monkeypatch):
+    """Audit must report, never refuse -- and here, never mutate either.
+
+    Audit is how a user finds out which of their existing documents carries
+    the shell, so it has to name it; it is also the read-only entry point, so
+    the light bulbs must read exactly as they did before it ran.
+    """
+
+    record, final, shell, patch = _managed_link_record(core)
+
+    report = _drive_audit(core, monkeypatch, record)
+
+    assert (shell.isVisible, patch.isVisible, final.isVisible) == (True, True, True)
+    assert "helpers" not in report
+
+    named = [
+        warning
+        for warning in report["warnings"]
+        if "helper bodies are still visible" in warning
+    ]
+    assert len(named) == 1
+    assert repr(core.BODY_NAMES["stitched_waveguide"]) in named[0]
+    assert repr(core.BODY_NAMES["throat_patch"]) in named[0]
+    assert "Run Update" in named[0]
+    assert "hiding a folder that contains them will not work" in named[0]
+
+
+def test_audit_is_silent_when_every_helper_is_already_hidden(core, monkeypatch):
+    record, _final, shell, patch = _managed_link_record(core, visible=False)
+
+    report = _drive_audit(core, monkeypatch, record)
+
+    assert (shell.isVisible, patch.isVisible) == (False, False)
+    assert not [
+        warning
+        for warning in report["warnings"]
+        if "still visible" in warning
+    ]

@@ -1,3 +1,19 @@
+# This repository is consumed byte-wise. Waveguide Generator packages a checkout
+# of a pinned commit into a deterministic archive, ships that archive inside its
+# application layer, and its release workflow asserts that the Windows-built and
+# macOS-built layers carry the same treeSha256. Without a rule here, that
+# checkout inherits the build host's core.autocrlf -- true by default on Git for
+# Windows -- and the two hosts build different archives from one commit.
+#
+# Measured 2026-09-07 on the then-pinned commit: 13 of 43 archive members
+# differed, each longer by roughly a byte a line, and the archives hashed
+# differently. The consumer pins its own checkout as well, because a pin can
+# name a commit older than this line; this rule is what makes that belt and
+# braces rather than a single point of failure.
+#
+# No blob in this repository contains CRLF today, so this changes no content.
+* text=auto eol=lf
+
 # STEP fixtures are byte-exact CAD kernel output. Keep them out of line-ending
 # normalisation and whitespace linting: the trailing spaces in an Open CASCADE
 # AP214 file are the writer's own, and a fixture that is rewritten on checkout

@@ -9,7 +9,7 @@ Fusion history. It supports the two solid WG export modes:
   parameter-driven wall thickness that form the freestanding waveguide solid.
 
 The add-in is licensed under the repository's AGPL-3.0 license. Its manifest
-author is `m3gnus <megamaggi@gmail.com>`.
+author is `m3gnus`.
 
 ## What WGLink manages
 

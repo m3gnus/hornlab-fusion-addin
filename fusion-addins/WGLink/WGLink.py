@@ -125,6 +125,7 @@ _panel = None
 _owned = False
 
 WATCH_INTERVAL_SECONDS = 4.0
+_installed_source_cache: dict[str, object] | None = None
 OWNER_LEASE_SECONDS = WATCH_INTERVAL_SECONDS * 3
 WATCH_EVENT_ID = f"hornlab_wglink_export_available_{_watch_session_id}"
 _candidate_event_id = f"hornlab_wglink_owner_candidate_{_watch_session_id}"
@@ -1174,13 +1175,23 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
-def _document_links() -> list[dict[str, object]]:
+def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, object]]:
     """Copy each managed link's identity out of the document as plain strings.
 
     Called on Fusion's main thread only. What it returns is deliberately inert
     data: the watcher runs on another thread and must never hold a live Fusion
     object.
+
+    ``timings`` collects the wall clock of each phase in milliseconds. This
+    function runs on Fusion's main thread every ``WATCH_INTERVAL_SECONDS``, so
+    what it costs is what the user feels while modelling; measuring it here is
+    the only way to say which phase that is without attaching a debugger to
+    Fusion. Four ``perf_counter`` reads per tick is not a cost worth gating.
     """
+
+    def _record(name: str, started: float) -> None:
+        if timings is not None:
+            timings[name] = round((time.perf_counter() - started) * 1000.0, 1)
 
     app = _app()
     design = app.activeProduct if app else None
@@ -1188,6 +1199,7 @@ def _document_links() -> list[dict[str, object]]:
         return []
     if "Design" not in str(design.objectType):
         return []
+    resolve_started = time.perf_counter()
     try:
         # The resolved inventory, not the raw attribute grouping: a record from
         # `_link_records` alone carries no managed body, so the heartbeat used
@@ -1195,9 +1207,12 @@ def _document_links() -> list[dict[str, object]]:
         # intact.
         records = wglink_core._resolved_link_records(design)
     except Exception:  # noqa: BLE001 - a document we cannot read has no links
+        _record("resolve_links_ms", resolve_started)
         return []
+    _record("resolve_links_ms", resolve_started)
     links: list[dict[str, object]] = []
     first_instance = next(iter(sorted(records)), None)
+    return_state_started = time.perf_counter()
     try:
         return_state = wglink_send.return_state(
             app,
@@ -1220,6 +1235,8 @@ def _document_links() -> list[dict[str, object]]:
         document_body_count = ""
         source_state_hash = ""
         instance_identities = {}
+    _record("return_state_ms", return_state_started)
+    per_link_started = time.perf_counter()
     for instance_id, record in records.items():
         payload = record.get("payload") or {}
         try:
@@ -1293,6 +1310,7 @@ def _document_links() -> list[dict[str, object]]:
             if isinstance(transform_hash, str) and transform_hash:
                 link["transform_hash"] = transform_hash
         links.append(link)
+    _record("per_link_ms", per_link_started)
     return links
 
 
@@ -1310,9 +1328,40 @@ def _active_document_id() -> str | None:
     return f"local:{_watch_session_id}:{id(document)}"
 
 
+def _installed_source() -> dict[str, object]:
+    """Which source this add-in is running, when a dev sync left a marker.
+
+    Validating a WGLink change otherwise means push, pin, package and install,
+    and nothing on the way back says which build Fusion actually loaded.
+    ``scripts/dev_sync_wglink.py`` writes this marker beside the add-in, so the
+    heartbeat can state it and one ``cat`` of the status file proves a restart
+    picked the edit up. Absent -- an ordinary managed install -- it is silent.
+    """
+
+    global _installed_source_cache
+    if _installed_source_cache is not None:
+        return _installed_source_cache
+    marker = Path(__file__).resolve().parent / "wglink_dev.json"
+    payload: dict[str, object] = {}
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            payload = {
+                key: value[key]
+                for key in ("sourceRoot", "sourceCommit", "syncedAt", "treeHash")
+                if key in value
+            }
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    _installed_source_cache = payload
+    return payload
+
+
 def _fusion_snapshot() -> dict[str, object]:
     """Read the active document and managed-link state once on the main thread."""
 
+    started = time.perf_counter()
+    timings: dict[str, float] = {}
     app = _app()
     product = app.activeProduct if app else None
     active_document = getattr(app, "activeDocument", None) if app else None
@@ -1321,11 +1370,20 @@ def _fusion_snapshot() -> dict[str, object]:
         links: list[dict[str, object]] = []
     else:
         document_name = str(getattr(active_document, "name", "") or "Untitled")
-        links = _document_links()
+        links = _document_links(timings)
+    timings["snapshot_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    diagnostics: dict[str, object] = {
+        "watchIntervalSeconds": WATCH_INTERVAL_SECONDS,
+        "lastTickMs": timings,
+    }
+    source = _installed_source()
+    if source:
+        diagnostics["source"] = source
     return {
         "document_name": document_name,
         "document_id": _active_document_id(),
         "links": links,
+        "diagnostics": diagnostics,
     }
 
 
@@ -1348,6 +1406,7 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
             adapter_version=wglink_send.ADAPTER_VERSION,
             workspace_root=wglink_workspace.workspace_root(),
             links=current["links"],
+            diagnostics=current.get("diagnostics"),
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
         pass

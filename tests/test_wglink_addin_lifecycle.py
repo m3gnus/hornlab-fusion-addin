@@ -933,12 +933,12 @@ def test_the_link_chooser_appears_only_with_several_links(monkeypatch) -> None:
         ))
         return added
 
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {"instance_id": "wgi_one", "design_name": "Tritonia"},
     ])
     assert build() == []
 
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {"instance_id": "wgi_one", "design_name": "Tritonia"},
         {"instance_id": "wgi_two", "design_name": "asro68"},
     ])
@@ -1433,6 +1433,38 @@ def test_document_links_derive_sorted_drifted_parameter_names_from_drift(
     )
 
 
+def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> None:
+    """Which phase costs the four-second tick, measured where it runs.
+
+    ``return_state`` walks the whole export scope and fingerprints every
+    included face; it happens on Fusion's main thread on every tick, and until
+    it is timed there, "Fusion is slow" and "the heartbeat is slow" are the
+    same unfalsifiable sentence. The phases are reported separately because the
+    remedies differ: caching a resolved inventory is not the same fix as not
+    recomputing an export fingerprint that nothing asked for.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_tick_timings", ui, app)
+    design, _body = _linked_document(module)
+    app.activeProduct = design
+
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+
+    assert set(timings) == {"resolve_links_ms", "return_state_ms", "per_link_ms"}
+    assert all(value >= 0.0 for value in timings.values())
+
+    snapshot = module._fusion_snapshot()
+    diagnostics = snapshot["diagnostics"]
+    assert diagnostics["watchIntervalSeconds"] == module.WATCH_INTERVAL_SECONDS
+    assert "snapshot_ms" in diagnostics["lastTickMs"]
+    assert "return_state_ms" in diagnostics["lastTickMs"]
+
+
 def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:
     """The heartbeat and Audit read one inventory, so they cannot disagree.
 
@@ -1587,7 +1619,7 @@ def test_the_watcher_prompt_is_held_off_while_a_command_runs(monkeypatch) -> Non
     monkeypatch.setattr(
         module,
         "_document_links",
-        lambda: snapshots.append(links) or links,
+        lambda *_a, **_k: snapshots.append(links) or links,
     )
     monkeypatch.setattr(
         module._watcher, "survey", lambda links: surveyed.append(links) or []
@@ -2031,7 +2063,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "design_id": "wgd-a", "instance_id": "instance-a",
         "document_signature_hash": "sha256:state-a",
     }])
@@ -2162,7 +2194,7 @@ def test_a_refused_handoff_does_not_starve_a_pending_return_request(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(tmp_path / "elsewhere" / "other.wglink"),
@@ -2215,7 +2247,7 @@ def test_a_refused_handoff_does_not_starve_a_newer_export_offer(
     )
     monkeypatch.setattr(module, "_pending_return_request", lambda: None)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(linked_bundle),
@@ -2258,7 +2290,7 @@ def test_a_refused_return_request_does_not_starve_a_newer_export_offer(
     monkeypatch.setattr(module, "_pending_handoff", lambda: None)
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:other")
-    monkeypatch.setattr(module, "_document_links", lambda: [{
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
         "instance_id": "instance-a",
         "design_id": "wgd-a",
         "bundle_path": str(linked_bundle),
@@ -2329,7 +2361,7 @@ def test_the_link_chooser_shows_the_users_label_before_wgs_design_name(
         "WGLink_link_label_preference",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
-    monkeypatch.setattr(module, "_document_links", lambda: [
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
         {
             "instance_id": "wgi_one",
             "design_name": "260308Tritonia-M",

@@ -3457,21 +3457,21 @@ def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
     assert metadata["expected_paths"]["direct_solve_manifest"].endswith(
         str(Path("manifests/direct_solve_manifest.json"))
     )
-    assert metadata["expected_paths"]["prepare_manifest"].endswith("mesh/manifest.json")
+    assert metadata["expected_paths"]["prepare_manifest"].endswith(str(Path("mesh/manifest.json")))
     assert metadata["expected_paths"]["tagged_sources_msh"].endswith(
-        "mesh/tagged_sources.msh"
+        str(Path("mesh/tagged_sources.msh"))
     )
     assert metadata["expected_paths"]["orientation_report"].endswith(
-        "mesh/orientation_report.json"
+        str(Path("mesh/orientation_report.json"))
     )
     assert metadata["expected_paths"]["combined_time_aligned_frequency_response_png"].endswith(
-        "combined/combined_frequency_response_time_aligned.png"
+        str(Path("combined/combined_frequency_response_time_aligned.png"))
     )
     assert metadata["expected_paths"]["driver_time_alignment_txt"].endswith(
-        "combined/driver_time_alignment.txt"
+        str(Path("combined/driver_time_alignment.txt"))
     )
     assert metadata["expected_paths"]["port_exit_radiation_impedance_npz"].endswith(
-        "sources/port_exit_radiation_impedance_matrix.npz"
+        str(Path("sources/port_exit_radiation_impedance_matrix.npz"))
     )
     assert metadata["expected_paths"]["run_report_html"].endswith("report.html")
     json.dumps(metadata)

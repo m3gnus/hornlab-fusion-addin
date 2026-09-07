@@ -620,7 +620,19 @@ def _resolve_link(
     options: dict[str, Any],
     *,
     allow_missing_body: bool = False,
+    allow_duplicates: bool = False,
 ) -> dict[str, Any]:
+    """One managed link, resolved, or a refusal explaining why it cannot be.
+
+    ``allow_duplicates`` is for the caller that is the *remedy* for a
+    duplicated instance id rather than a victim of it. Detach names itself in
+    the duplicate refusal below, and it needs no single resolved body -- it
+    works from the instance id -- so refusing it there made the advertised
+    recovery unreachable. Either way the resolved record carries
+    ``managed_object_clash`` and ``clashing_objects``, so a tolerant caller
+    still knows what it is looking at.
+    """
+
     records = _link_records(design)
     if not records:
         raise WgLinkError(
@@ -647,12 +659,19 @@ def _resolve_link(
         )
 
     clashes = _attach_managed_objects(design, record)
-    if clashes:
+    record["managed_object_clash"] = bool(clashes)
+    record["clashing_objects"] = list(clashes)
+    if clashes and not allow_duplicates:
         labels = ", ".join(_entity_label(entity) for entity in clashes)
         raise WgLinkError(
             f"Duplicate WGLink instance id {record['instance_id']!r} belongs to "
-            f"multiple managed objects: {labels}. Give the instances unique ids "
-            "or Detach one; WGLink refuses to guess."
+            f"multiple managed objects: {labels}. Update and Send need one "
+            "managed object per instance and will not guess. Detach does run "
+            "on this document and never changes geometry: with no target it "
+            "removes every copy's WGLink metadata, and with "
+            "options['entity_token'] or options['entity'] naming one copy it "
+            "removes only that copy's, leaving the other a working link. Add "
+            "options['preview'] to list what it would remove first."
         )
     if not record["payload"].get("topology"):
         raise WgLinkError(
@@ -4039,17 +4058,133 @@ def _delete_attribute(attribute: object) -> bool:
         return False
 
 
+def _same_entity(left: object, right: object) -> bool:
+    """Whether two Fusion handles name the same object.
+
+    Fusion hands out a fresh Python wrapper per lookup, so ``is`` answers
+    "same wrapper", not "same entity". The entity token is the identity that
+    survives that; object identity is only the fallback for an entity that
+    carries no token.
+    """
+
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    token = _entity_token(left)
+    return bool(token) and token == _entity_token(right)
+
+
+def _parent_component(entity: object) -> object | None:
+    try:
+        return entity.parentComponent
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _target_component(target: object) -> object | None:
+    """The component a detach target stands for, or None for a plain body."""
+
+    kind = _kind(target)
+    if kind == "Component":
+        return target
+    if kind == "Occurrence":
+        try:
+            return target.component
+        except Exception:  # noqa: BLE001
+            return None
+    return None
+
+
+def _detach_target(
+    design: adsk.fusion.Design, options: dict[str, Any]
+) -> object | None:
+    """The one entity a targeted Detach was pointed at, or None for all of them."""
+
+    entity = options.get("entity")
+    token = str(options.get("entity_token") or "")
+    if entity is not None and token:
+        raise WgLinkError(
+            "Detach takes options['entity'] or options['entity_token'], not "
+            "both: two targets cannot name one copy."
+        )
+    if entity is not None:
+        return entity
+    if not token:
+        return None
+    found = _find_by_token(design, token)
+    if not found:
+        raise WgLinkError(
+            f"Detach target entity token {token!r} is not in this document. "
+            "Entity tokens are published beside each managed object in the "
+            "audit report; pass options['entity'] to target a live handle."
+        )
+    if len(found) > 1:
+        raise WgLinkError(
+            f"Detach target entity token {token!r} matches {len(found)} "
+            "entities, so it cannot name one copy. Pass options['entity'] "
+            "with the handle you mean."
+        )
+    return found[0]
+
+
+def _target_covers(target: object, entity: object) -> bool:
+    """Whether a detach target owns this managed entity.
+
+    A body target covers itself and nothing else. A component or occurrence
+    target covers itself and everything parented to that component -- the
+    subtree a user means when they select the copied wrapper rather than the
+    copied body inside it.
+    """
+
+    if _same_entity(target, entity):
+        return True
+    component = _target_component(target)
+    if component is None:
+        return False
+    if _same_entity(component, entity):
+        return True
+    return _same_entity(component, _parent_component(entity))
+
+
 def detach(
     app: adsk.core.Application,
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Remove only WGLink metadata, leaving all Fusion geometry untouched."""
+    """Remove only WGLink metadata, leaving all Fusion geometry untouched.
+
+    Detach is what every duplicate refusal points at -- copying a managed body
+    or component gives both copies one instance id -- so it resolves that
+    state instead of refusing it. It never needed a single resolved managed
+    object: it works from the instance id.
+
+    With no target, every copy of the instance is unmanaged, which is the
+    route the Fusion command takes. With ``options['entity']`` or
+    ``options['entity_token']`` naming one copy, only that entity and, for a
+    component or occurrence, its subtree are unmanaged, so the other copy
+    stays a working link. ``options['preview']`` reports exactly the rows the
+    same call would remove and removes nothing.
+    """
 
     opts = _options(options)
     design = _design(app)
-    record = _resolve_link(design, opts, allow_missing_body=True)
+    record = _resolve_link(
+        design, opts, allow_missing_body=True, allow_duplicates=True
+    )
     instance_id = record["instance_id"]
+    preview = bool(opts.get("preview"))
+    target = _detach_target(design, opts)
     entities = _managed_entities(design, instance_id)
+    if target is not None:
+        scoped = [entity for entity in entities if _target_covers(target, entity)]
+        if not scoped:
+            raise WgLinkError(
+                f"The selected {_entity_label(target)} carries no WGLink "
+                f"attributes for instance {instance_id!r}, so a targeted "
+                "Detach would remove nothing. Select the copy that carries "
+                "the link, or Detach with no target to unmanage every copy."
+            )
+        entities = scoped
     removed: list[dict[str, str]] = []
     wrapper_name = _wrapper_attribute_name(instance_id)
     for entity in entities:
@@ -4060,18 +4195,43 @@ def detach(
             if name not in attrs:
                 continue
             attribute = _attribute(entity, name)
-            if attribute is not None and _delete_attribute(attribute):
+            if attribute is None:
+                continue
+            if preview or _delete_attribute(attribute):
                 removed.append({"entity": _entity_label(entity), "name": name})
         if not direct_owner and wrapper_name in attrs:
             # A root component may host more than one fallback link.  Keep its
             # shared entity-token cross-check while any wrapper record remains.
-            remaining = _direct_attributes(entity)
+            # A preview deletes nothing, so it has to reason about the state
+            # the real call would have left rather than re-read the live one.
+            remaining = (
+                {name: value for name, value in attrs.items() if name != wrapper_name}
+                if preview
+                else _direct_attributes(entity)
+            )
             if not any(name.startswith("link_") for name in remaining):
                 token_attribute = _attribute(entity, "entity_token")
-                if token_attribute is not None and _delete_attribute(token_attribute):
+                if token_attribute is not None and (
+                    preview or _delete_attribute(token_attribute)
+                ):
                     removed.append(
                         {"entity": _entity_label(entity), "name": "entity_token"}
                     )
+    warnings: list[str] = []
+    clashing = record.get("clashing_objects") or []
+    if clashing and target is None:
+        outcome = "would be unmanaged" if preview else "was unmanaged"
+        warnings.append(
+            f"WGLink instance {instance_id!r} covered {len(clashing)} managed "
+            f"objects and every copy {outcome}. To keep one of them linked, "
+            "Detach with options['entity_token'] or options['entity'] naming "
+            "only the copy you are giving up."
+        )
+    if preview:
+        warnings.append(
+            "Preview only: no WGLink attributes were removed. Repeat this call "
+            "without options['preview'] to apply it."
+        )
     return {
         "instance_id": instance_id,
         "attributes_removed": len(removed),
@@ -4079,7 +4239,9 @@ def detach(
         "removed": removed,
         "bodies_changed": 0,
         "features_changed": 0,
-        "warnings": [],
+        "preview": preview,
+        "target": _entity_label(target) if target is not None else "",
+        "warnings": warnings,
     }
 
 

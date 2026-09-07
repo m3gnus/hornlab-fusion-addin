@@ -2088,3 +2088,248 @@ def test_update_refuses_the_swap_before_it_touches_the_document(
 
     assert marker_writes == []
     assert pushed == []
+
+
+# --- Recovering from a copied managed object -------------------------------
+#
+# Copying a managed body or component in Fusion copies its WGLink attributes,
+# so one instance id names two managed objects. Every resolving entry point
+# refuses that document and points the user at Detach -- and Detach used to
+# resolve the link the same way, so it hit the very refusal it was advertised
+# to clear. These tests drive the real ``detach`` entry point, and the real
+# Send scope walk, against one such document.
+
+
+class _LiveAttribute:
+    """A Fusion attribute handle: it writes through, and it deletes itself."""
+
+    def __init__(self, owner, group, name, value):
+        self._owner = owner
+        self.groupName = group
+        self.name = name
+        self.value = value
+        self.parent = owner.entity
+
+    def deleteMe(self):
+        self._owner.discard(self)
+        return True
+
+
+class _LiveAttributes:
+    """A walkable attribute collection: add, itemByName, and item()/count."""
+
+    def __init__(self, entity):
+        self.entity = entity
+        self.items = []
+
+    @property
+    def count(self):
+        return len(self.items)
+
+    def item(self, index):
+        return self.items[index]
+
+    def itemByName(self, group, name):
+        for attribute in self.items:
+            if attribute.groupName == group and attribute.name == name:
+                return attribute
+        return None
+
+    def add(self, group, name, text):
+        attribute = _LiveAttribute(self, group, name, text)
+        self.items.append(attribute)
+        return attribute
+
+    def discard(self, attribute):
+        self.items = [item for item in self.items if item is not attribute]
+
+
+class _LiveEntity:
+    def __init__(self, kind, name, token, parent_component=None):
+        self.objectType = f"adsk::fusion::{kind}"
+        self.name = name
+        self.entityToken = token
+        self.parentComponent = parent_component
+        self.attributes = _LiveAttributes(self)
+
+
+def _copied_component_document(core):
+    """A document holding an original managed link and a copy of its component.
+
+    ``copy`` carries the original's instance id on both its own wrapper
+    attribute and the body inside it, which is what Fusion's copy/paste of a
+    managed component produces.
+    """
+
+    root = _LiveEntity("Component", "Doc", "tok-root")
+    original = _LiveEntity("BRepBody", "Waveguide", "tok-body-a", root)
+    copy_component = _LiveEntity("Component", "Waveguide (1)", "tok-comp-b", None)
+    copy_body = _LiveEntity("BRepBody", "Waveguide", "tok-body-b", copy_component)
+    # An ordinary unmanaged body, so a detach target can exist and still carry
+    # none of the link.
+    bracket = _LiveEntity("BRepBody", "Bracket", "tok-bracket", root)
+
+    for body in (original, copy_body):
+        core._set_attribute(body, "instance_id", "wg-1")
+        core._set_attribute(body, "role", "waveguide")
+        core._set_attribute(body, "topology", "wg")
+        core._set_attribute(body, "entity_token", body.entityToken)
+
+    payload = {
+        "instance_id": "wg-1",
+        "topology": "wg",
+        "design_name": "Horn",
+        "wrapper": "root",
+        "entity_tokens": json.dumps({"body:final": "tok-body-a"}),
+    }
+    for component in (root, copy_component):
+        core._set_attribute(
+            component, core._wrapper_attribute_name("wg-1"), json.dumps(payload)
+        )
+        core._set_attribute(component, "entity_token", component.entityToken)
+
+    entities = [root, original, copy_component, copy_body, bracket]
+    design = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        designType="parametric",
+        rootComponent=root,
+        findAttributes=lambda _group, _name: [
+            attribute
+            for entity in entities
+            for attribute in list(entity.attributes.items)
+        ],
+        findEntityByToken=lambda token: [
+            entity for entity in entities if entity.entityToken == token
+        ],
+    )
+    core.adsk.fusion.Design = types.SimpleNamespace(cast=lambda product: product)
+    core.adsk.fusion.DesignTypes = types.SimpleNamespace(
+        ParametricDesignType="parametric"
+    )
+    app = types.SimpleNamespace(activeProduct=design)
+    return app, design, original, copy_component, copy_body
+
+
+def test_a_duplicated_instance_id_still_refuses_the_resolving_entry_points(core):
+    _app, design, _original, _copy_component, _copy_body = (
+        _copied_component_document(core)
+    )
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        core._resolve_link(design, {"instance_id": "wg-1"})
+
+    assert "Duplicate WGLink instance id" in str(refusal.value)
+
+
+def test_targeted_detach_unmanages_one_copy_and_leaves_the_other_resolvable(core):
+    """The recovery the duplicate refusal advertises, driven end to end.
+
+    Detach used to resolve its own link through the refusing resolver, so this
+    call returned the duplicate refusal instead of removing anything. The
+    assertion that matters is the last one: after Detach the user is out of
+    the state, with both bodies still in the document.
+    """
+
+    app, design, original, copy_component, copy_body = _copied_component_document(
+        core
+    )
+
+    preview = core.detach(
+        app, {"instance_id": "wg-1", "entity_token": "tok-comp-b", "preview": True}
+    )
+
+    assert preview["preview"] is True
+    assert preview["target"].startswith("Waveguide (1)")
+    assert {(row["entity"], row["name"]) for row in preview["removed"]} == {
+        ("Waveguide (1) (Component)", "link_wg_1"),
+        ("Waveguide (1) (Component)", "entity_token"),
+        ("Waveguide (BRepBody)", "instance_id"),
+        ("Waveguide (BRepBody)", "role"),
+        ("Waveguide (BRepBody)", "topology"),
+        ("Waveguide (BRepBody)", "entity_token"),
+    }
+    assert core._direct_attributes(copy_body) != {}, "a preview removes nothing"
+    assert core._direct_attributes(copy_component) != {}
+
+    report = core.detach(app, {"instance_id": "wg-1", "entity_token": "tok-comp-b"})
+
+    assert report["preview"] is False
+    assert report["attributes_removed"] == preview["attributes_removed"] == 6
+    assert report["entities_touched"] == 2
+    assert report["bodies_changed"] == 0
+    assert core._direct_attributes(copy_body) == {}
+    assert core._direct_attributes(copy_component) == {}
+    # The original link is untouched, and the document resolves again.
+    resolved = core._resolve_link(design, {"instance_id": "wg-1"})
+    assert resolved["body"] is original
+    assert resolved["wrapper_component"] is design.rootComponent
+
+
+def test_untargeted_detach_clears_every_copy_and_says_that_it_did(core):
+    """The route the Fusion Detach command takes: it passes an id and nothing else.
+
+    The UI dialog collects no entity, so this is the only Detach a user can
+    reach from the panel. It has to succeed, or the duplicate refusal names a
+    button that refuses.
+    """
+
+    app, design, original, copy_component, copy_body = _copied_component_document(
+        core
+    )
+
+    report = core.detach(app, {"instance_id": "wg-1"})
+
+    # Four managed entities, six attributes on the two copies and two wrapper
+    # attributes on the two components. ``entities_touched`` counts rendered
+    # labels, and a copied component keeps its body's name, so it reads 3.
+    assert report["attributes_removed"] == 12
+    assert report["bodies_changed"] == 0
+    assert core._link_records(design) == {}
+    for entity in (original, copy_body, copy_component, design.rootComponent):
+        assert core._direct_attributes(entity) == {}
+    assert any("every copy was unmanaged" in text for text in report["warnings"])
+
+
+def test_detach_refuses_a_target_that_carries_none_of_the_link(core):
+    app, _design, _original, _copy_component, _copy_body = (
+        _copied_component_document(core)
+    )
+
+    with pytest.raises(core.WgLinkError, match="carries no WGLink attributes"):
+        core.detach(app, {"instance_id": "wg-1", "entity_token": "tok-bracket"})
+
+    with pytest.raises(core.WgLinkError, match="is not in this document"):
+        core.detach(app, {"instance_id": "wg-1", "entity_token": "tok-nothing"})
+
+
+def test_send_duplicate_body_refusal_names_a_detach_that_runs(core, monkeypatch):
+    """Send's own duplicate message, and the recovery it recommends.
+
+    Send refuses independently of ``_resolve_link``, so its message is a
+    second place a copied body sends a user to Detach. Both live here because
+    both are checked against one real document and one real Detach.
+    """
+
+    monkeypatch.setitem(sys.modules, "wglink_core", core)
+    spec = importlib.util.spec_from_file_location(
+        "wglink_send_duplicate_test", ADDIN / "wglink_send.py"
+    )
+    assert spec is not None and spec.loader is not None
+    send = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, send)
+    spec.loader.exec_module(send)
+
+    app, design, original, _copy_component, _copy_body = _copied_component_document(
+        core
+    )
+    walk = {"selection": "root"}
+
+    with pytest.raises(core.WgLinkError) as refusal:
+        send._records_in_scope(design, walk)
+    assert "belongs to several managed bodies" in str(refusal.value)
+
+    core.detach(app, {"instance_id": "wg-1", "entity_token": "tok-comp-b"})
+
+    records = send._records_in_scope(design, walk)
+    assert [record["instance_id"] for record in records] == ["wg-1"]
+    assert records[0]["body"] is original

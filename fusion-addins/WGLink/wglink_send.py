@@ -862,8 +862,15 @@ def _record_body(record: dict[str, Any]) -> object | None:
         if _role(entity) in EXTERIOR_ROLES
     ]
     if len(bodies) > 1:
+        labels = ", ".join(wglink_core._entity_label(entity) for entity in bodies)
         raise wglink_core.WgLinkError(
-            f"WGLink instance {record['instance_id']!r} belongs to several managed bodies; Detach the duplicate."
+            f"WGLink instance {record['instance_id']!r} belongs to several "
+            f"managed bodies: {labels}. Send cannot choose between them. "
+            "Detach removes WGLink metadata and no geometry, and it does run "
+            "on this state: pass options['entity_token'] or options['entity'] "
+            "naming the copy you are giving up to unmanage only that one, "
+            "options['preview'] to see what that removes first, or no target "
+            "to unmanage every copy."
         )
     return bodies[0] if bodies else None
 

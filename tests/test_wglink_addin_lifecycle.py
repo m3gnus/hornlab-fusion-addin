@@ -1833,7 +1833,7 @@ def test_a_pending_update_targets_the_exact_selected_duplicate_instance(
         ],
     }
 
-    assert module._apply_pending_handoff(snapshot) is True
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
 
     assert updated == [(str(bundle), {"instance_id": "instance-b"})]
     assert not marker.exists()
@@ -1923,12 +1923,15 @@ def test_a_duplicate_pending_update_refuses_missing_stale_or_ambiguous_identity(
         ],
     }
 
-    assert module._apply_pending_handoff(snapshot) is True
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
 
     assert mutations == []
     assert marker.exists()
     assert len(ui.messages) == 1
     assert message_fragment in ui.messages[0][1]
+    # The marker stays; nothing in Fusion retries it. Saying only "refresh and
+    # try again" sends the user to a control that cannot unblock this.
+    assert module._HANDOFF_RETRY_HINT in ui.messages[0][1]
 
 
 def test_a_targeted_return_refuses_if_the_active_document_changed(
@@ -1953,12 +1956,14 @@ def test_a_targeted_return_refuses_if_the_active_document_changed(
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
 
-    assert module._apply_pending_return_request() is True
+    assert module._apply_pending_return_request() == module.HANDLED
 
     assert sent == []
     assert ui.messages == [(
         "WGLink return to WG refused",
-        "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again.",
+        "The active Fusion document changed after WG requested the model. "
+        "Reopen CAD Link and try again."
+        f"\n\n{module._RETURN_RETRY_HINT}",
     )]
 
 
@@ -1992,10 +1997,13 @@ def test_a_refused_return_request_is_attempted_once_until_its_id_changes(
 
     monkeypatch.setattr(module, "_active_document_id", wrong_document)
 
-    assert module._apply_pending_return_request() is True
-    assert module._apply_pending_return_request() is True
+    assert module._apply_pending_return_request() == module.HANDLED
+    # The second call must not re-run the request, and must not re-prompt --
+    # but it did no work, so it reports SUPPRESSED and leaves the tick to the
+    # survey channel behind it rather than claiming it.
+    assert module._apply_pending_return_request() == module.SUPPRESSED
     pending["request"] = request_b
-    assert module._apply_pending_return_request() is True
+    assert module._apply_pending_return_request() == module.HANDLED
 
     assert attempts == ["request-a", "request-b"]
     assert [title for title, _text in ui.messages] == [
@@ -2033,7 +2041,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
     acknowledged: list[object] = []
     monkeypatch.setattr(module.wglink_watch, "acknowledge_return_request", acknowledged.append)
 
-    assert module._apply_pending_return_request() is True
+    assert module._apply_pending_return_request() == module.HANDLED
 
     assert sent == [{
         "selection": "root",
@@ -2085,7 +2093,191 @@ def test_a_refused_automatic_insert_is_not_retried_every_tick(
 
     assert attempts == [str(bundle)]
     assert marker.exists()
-    assert ui.messages == [("WGLink automatic insert refused", "bad bundle")]
+    assert ui.messages == [(
+        "WGLink automatic insert refused",
+        f"bad bundle\n\n{module._HANDOFF_RETRY_HINT}",
+    )]
+
+
+def _refusing_handoff(monkeypatch, module, tmp_path: Path) -> Path:
+    """A handoff marker whose insert always refuses, left on disk afterwards.
+
+    This is the state that used to wedge the dispatcher: the marker survives
+    the refusal, so its export id stays in ``_handoff_attempted_id`` for the
+    rest of the Fusion session and every later tick meets it again.
+    """
+
+    bundle_root = tmp_path / "wglink"
+    bundle = bundle_root / "horn.wglink"
+    bundle.mkdir(parents=True)
+    (bundle / "wglink.json").write_text("{}")
+    marker = bundle_root / module.wglink_watch.HANDOFF_FILENAME
+    marker.write_text(json.dumps({
+        "schemaVersion": 1,
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_2",
+        "exportId": "wge_2",
+        "sequence": 2,
+    }))
+    monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
+    monkeypatch.setattr(
+        module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root
+    )
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise module.wglink_core.WgLinkError("bad bundle")
+
+    monkeypatch.setattr(module.wglink_core, "insert", refuse)
+    monkeypatch.setattr(module.wglink_core, "update", refuse)
+    return marker
+
+
+def test_a_refused_handoff_does_not_starve_a_pending_return_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The handoff channel runs first; a refusal must not own every later tick.
+
+    ``_apply_pending_handoff`` reported the same "yes, handled" for a real
+    attempt and for the suppression that follows one, and ``_on_watch_tick``
+    returned on both. WG's next Ask for model then reached a dispatcher that
+    had already left, silently, for the rest of the session -- and the refusal
+    the user saw named none of that.
+    """
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_refusal_starves_return", ui, app)
+    marker = _refusing_handoff(monkeypatch, module, tmp_path)
+
+    request = types.SimpleNamespace(
+        design_id="wgd-a",
+        document_id="fusion:doc-a",
+        instance_id="instance-a",
+        expected_return_state_hash="sha256:state-a",
+        request_id="request-a",
+    )
+    monkeypatch.setattr(module, "_pending_return_request", lambda: request)
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda: [{
+        "instance_id": "instance-a",
+        "design_id": "wgd-a",
+        "bundle_path": str(tmp_path / "elsewhere" / "other.wglink"),
+        "export_id": "wge_1",
+        "document_signature_hash": "sha256:state-a",
+    }])
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.wglink_send, "send", lambda _app, options: sent.append(options)
+    )
+    acknowledged: list[object] = []
+    monkeypatch.setattr(
+        module.wglink_watch, "acknowledge_return_request", acknowledged.append
+    )
+
+    module._on_watch_tick()
+    # The refusal took the first tick, so the request is still waiting.
+    assert sent == []
+
+    module._on_watch_tick()
+
+    assert [options["request_id"] for options in sent] == ["request-a"]
+    assert acknowledged == [request]
+    # The refused handoff is still refused and still on disk, and the user was
+    # told about it exactly once -- that suppression is the correct half.
+    assert marker.exists()
+    assert [title for title, _text in ui.messages] == [
+        "WGLink automatic insert refused",
+    ]
+
+
+def test_a_refused_handoff_does_not_starve_a_newer_export_offer(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The survey sits behind both IPC channels, so it starved the same way."""
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False), dialog_result="no")
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_refusal_starves_survey", ui, app)
+    _refusing_handoff(monkeypatch, module, tmp_path)
+
+    linked_bundle = tmp_path / "elsewhere" / "other.wglink"
+    linked_bundle.mkdir(parents=True)
+    (linked_bundle / "wglink.json").write_text(
+        json.dumps({"export": {"id": "wge_9", "sequence": 9}})
+    )
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda: [{
+        "instance_id": "instance-a",
+        "design_id": "wgd-a",
+        "bundle_path": str(linked_bundle),
+        "export_id": "wge_8",
+    }])
+
+    module._on_watch_tick()
+    module._on_watch_tick()
+
+    assert [title for title, _text in ui.messages] == [
+        "WGLink automatic insert refused",
+        f"{module.PANEL_NAME} — newer export available",
+    ]
+
+
+def test_a_refused_return_request_does_not_starve_a_newer_export_offer(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The return channel carries the same attempted-id early return."""
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False), dialog_result="no")
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    app.activeDocument = types.SimpleNamespace(name="Tritonia V")
+    module = _load_instance(monkeypatch, "WGLink_return_refusal_starves", ui, app)
+
+    linked_bundle = tmp_path / "elsewhere" / "other.wglink"
+    linked_bundle.mkdir(parents=True)
+    (linked_bundle / "wglink.json").write_text(
+        json.dumps({"export": {"id": "wge_9", "sequence": 9}})
+    )
+    request = types.SimpleNamespace(
+        design_id="wgd-a",
+        document_id="fusion:expected",
+        instance_id="instance-a",
+        expected_return_state_hash="sha256:state-a",
+        request_id="request-a",
+    )
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: request)
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:other")
+    monkeypatch.setattr(module, "_document_links", lambda: [{
+        "instance_id": "instance-a",
+        "design_id": "wgd-a",
+        "bundle_path": str(linked_bundle),
+        "export_id": "wge_8",
+    }])
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.wglink_send, "send", lambda _app, options: sent.append(options)
+    )
+
+    module._on_watch_tick()
+    module._on_watch_tick()
+
+    assert sent == []
+    assert [title for title, _text in ui.messages] == [
+        "WGLink return to WG refused",
+        f"{module.PANEL_NAME} — newer export available",
+    ]
+    assert module._RETURN_RETRY_HINT in ui.messages[0][1]
 
 
 def test_a_start_that_fails_partway_rolls_back_panel_and_lease(

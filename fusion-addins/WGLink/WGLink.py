@@ -166,6 +166,32 @@ _handoff_attempted_id: str | None = None
 # that exact request while allowing a later request id through normally.
 _return_request_attempted_id: str | None = None
 
+# What one IPC channel did for a single watch tick. The distinction exists
+# because suppressing a repeat error is not the same as doing work: a refused
+# handoff keeps its marker and its export id for the whole Fusion session, so a
+# channel that reported "handled" on every later tick monopolised the
+# dispatcher and starved the return-request and survey channels behind it.
+IDLE = "idle"  # nothing was pending on this channel
+HANDLED = "handled"  # the channel used this tick -- later channels wait
+SUPPRESSED = "suppressed"  # already reported, no work done -- carry on
+
+# A refusal keeps its marker on disk and its id in this session's memory, so
+# "try again" alone is wrong: nothing in Fusion retries it. Say what does.
+_HANDOFF_RETRY_HINT = (
+    "WGLink will not retry this handoff by itself. Send the model from WG "
+    f"again, or delete {wglink_watch.HANDOFF_FILENAME} from the WG CAD Link "
+    "folder."
+)
+_RETURN_RETRY_HINT = (
+    "WGLink will not retry this request by itself. Ask WG for the model "
+    f"again, or delete {wglink_watch.RETURN_REQUEST_FILENAME} from the WG CAD "
+    "Link folder."
+)
+
+
+def _refusal_text(reason: str, hint: str) -> str:
+    return f"{reason}\n\n{hint}"
+
 
 def _lease_now() -> float:
     return time.monotonic()
@@ -1374,15 +1400,21 @@ def _pending_return_request() -> wglink_watch.PendingReturnRequest | None:
 
 def _apply_pending_return_request(
     snapshot: dict[str, object] | None = None,
-) -> bool:
-    """Export the current Fusion body/tags after an explicit WG request."""
+) -> str:
+    """Export the current Fusion body/tags after an explicit WG request.
+
+    Returns one of ``IDLE``, ``HANDLED`` or ``SUPPRESSED``. A request already
+    attempted this session is ``SUPPRESSED``: the user has seen its refusal and
+    must not see it again, but nothing ran, so the tick still belongs to the
+    survey channel behind this one.
+    """
 
     global _command_busy, _return_request_attempted_id
     request = _pending_return_request()
     if request is None:
-        return False
+        return IDLE
     if _return_request_attempted_id == request.request_id:
-        return True
+        return SUPPRESSED
     _return_request_attempted_id = request.request_id
     _command_busy = True
     try:
@@ -1431,12 +1463,15 @@ def _apply_pending_return_request(
         wglink_send.send(_app(), options)
         wglink_watch.acknowledge_return_request(request)
     except wglink_core.WgLinkError as exc:
-        _message(str(exc), "WGLink return to WG refused")
+        _message(
+            _refusal_text(str(exc), _RETURN_RETRY_HINT),
+            "WGLink return to WG refused",
+        )
     except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
         _report_error("Returning this model to WG", "WGLink return to WG error", exc)
     finally:
         _command_busy = False
-    return True
+    return HANDLED
 
 
 def _design_ready() -> bool:
@@ -1462,24 +1497,34 @@ def _ensure_design_ready() -> bool:
     return _design_ready()
 
 
-def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
-    """Insert or update the bundle named by WG's explicit CAD action."""
+def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
+    """Insert or update the bundle named by WG's explicit CAD action.
+
+    Returns one of ``IDLE``, ``HANDLED`` or ``SUPPRESSED``. A refused handoff
+    keeps its marker on disk and its export id in ``_handoff_attempted_id`` for
+    the rest of the session, so every later tick takes the ``SUPPRESSED``
+    branch. That must not read as "this tick is spoken for" -- a return request
+    or a newer export behind it would then never be looked at again.
+    """
 
     global _command_busy, _handoff_attempted_id
     handoff = _pending_handoff()
     if handoff is None:
-        return False
+        return IDLE
 
     if _handoff_attempted_id == handoff.export_id:
-        return True
+        return SUPPRESSED
     try:
         ready = _ensure_design_ready()
     except wglink_core.WgLinkError as exc:
         _handoff_attempted_id = handoff.export_id
-        _message(str(exc), "WGLink automatic open refused")
-        return True
+        _message(
+            _refusal_text(str(exc), _HANDOFF_RETRY_HINT),
+            "WGLink automatic open refused",
+        )
+        return HANDLED
     if not ready:
-        return False
+        return IDLE
 
     links = snapshot["links"] if snapshot is not None else _document_links()
     try:
@@ -1575,7 +1620,10 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
         # refusals and unexpected failures below still demand attention.
     except wglink_core.WgLinkError as exc:
         operation = "update" if linked else "insert"
-        _message(str(exc), f"WGLink automatic {operation} refused")
+        _message(
+            _refusal_text(str(exc), _HANDOFF_RETRY_HINT),
+            f"WGLink automatic {operation} refused",
+        )
     except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
         operation = "update" if linked else "insert"
         _report_error(
@@ -1583,7 +1631,7 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> bool:
         )
     finally:
         _command_busy = False
-    return True
+    return HANDLED
 
 
 def _on_watch_tick() -> None:
@@ -1594,9 +1642,13 @@ def _on_watch_tick() -> None:
         return
     snapshot = _fusion_snapshot()
     try:
-        if _apply_pending_handoff(snapshot):
+        # Only a channel that actually did something claims the tick. A
+        # suppressed refusal did nothing, so the channels behind it are still
+        # owed this tick -- otherwise one refused handoff silently swallows
+        # every return request and every newer export for the session.
+        if _apply_pending_handoff(snapshot) == HANDLED:
             return
-        if _apply_pending_return_request(snapshot):
+        if _apply_pending_return_request(snapshot) == HANDLED:
             return
         announcements = _watcher.survey(snapshot["links"])
         if not announcements:

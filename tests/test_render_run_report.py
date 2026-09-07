@@ -202,3 +202,47 @@ def test_render_index_links_folder_when_manifest_cannot_render_report(tmp_path):
 
     assert 'href="260704-bad/"' in html
     assert 'href="260704-bad/report.html"' not in html
+
+
+def test_relative_links_are_url_paths_even_when_the_host_separator_is_not(
+    tmp_path, monkeypatch
+):
+    """A Windows host must not put its own separator into an href or a src.
+
+    os.path.relpath answers in the host's separator and the result goes
+    straight into <img src> and <a href>, so on windows-latest every link in
+    the report read "driver-lem\\MF_excursion.png". That is what failed
+    test_render_run_report_includes_expected_sections_and_relative_paths
+    there.
+
+    The host separator is faked rather than the platform, so this guards the
+    behaviour on every runner instead of only on the one that showed it.
+    """
+
+    renderer = _load_renderer()
+    monkeypatch.setattr(renderer.os, "sep", "\\")
+    monkeypatch.setattr(
+        renderer.os.path, "relpath", lambda *_a, **_k: r"driver-lem\MF_excursion.png"
+    )
+
+    assert renderer._rel(tmp_path, tmp_path / "anything.png") == (
+        "driver-lem/MF_excursion.png"
+    )
+    assert "\\" not in renderer._image(tmp_path, tmp_path / "anything.png", "MF")
+    assert "\\" not in renderer._link(tmp_path, tmp_path / "anything.png")
+
+
+def test_a_posix_filename_containing_a_backslash_is_left_alone(tmp_path, monkeypatch):
+    """The conversion is the host's, not a blanket rewrite.
+
+    On POSIX a backslash is an ordinary character in a filename, so rewriting
+    it would corrupt a real name rather than fix a separator.
+    """
+
+    renderer = _load_renderer()
+    monkeypatch.setattr(renderer.os, "sep", "/")
+    monkeypatch.setattr(
+        renderer.os.path, "relpath", lambda *_a, **_k: r"odd\name.png"
+    )
+
+    assert renderer._rel(tmp_path, tmp_path / "anything.png") == r"odd\name.png"

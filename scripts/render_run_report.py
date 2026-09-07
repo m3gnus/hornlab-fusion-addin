@@ -59,9 +59,28 @@ def _rel(run_dir: Path, value: Any) -> str | None:
     if not path.is_absolute():
         path = run_dir / path
     try:
-        return os.path.relpath(path, run_dir)
+        rel = os.path.relpath(path, run_dir)
     except ValueError:
-        return str(path)
+        rel = str(path)
+    return _as_url_path(rel)
+
+
+def _as_url_path(value: str) -> str:
+    """Answer in URL separators, whatever the host writes paths with.
+
+    Every caller interpolates this into an href or a src, and os.path.relpath
+    answers in the host's separator: on Windows that put
+    "driver-lem\MF_excursion.png" into every <img> the report writes. The
+    conversion is conditional on the host, exactly as zipfile does it for
+    archive member names, because on POSIX a backslash is an ordinary
+    character in a filename and has to survive as one.
+    """
+
+    if os.sep != "/":
+        value = value.replace(os.sep, "/")
+    if os.altsep and os.altsep != "/":
+        value = value.replace(os.altsep, "/")
+    return value
 
 
 def _link(run_dir: Path, value: Any, label: str | None = None) -> str:

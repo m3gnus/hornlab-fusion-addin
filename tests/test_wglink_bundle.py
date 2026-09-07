@@ -770,7 +770,19 @@ def test_directory_and_zip_reject_corruption_identically(tmp_path):
 def test_zip_rejects_unsafe_member_names_before_writing(tmp_path, name, message):
     archive = tmp_path / "bad.wglink"
     with zipfile.ZipFile(archive, "w") as output:
-        output.writestr(name, b"bad")
+        # The member name is set on the ZipInfo rather than passed to writestr,
+        # because ZipInfo.__init__ rewrites os.sep to "/" -- so on Windows
+        # writestr(r"folder\evil") stores "folder/evil", an ordinary nested
+        # path, and this test stopped reaching the backslash guard at all
+        # there. It failed on windows-latest for that reason: the bundle was
+        # still rejected, but as a missing manifest rather than a bad name. A
+        # hostile archive is not built by CPython and can carry a literal
+        # backslash, so the guard has to be exercised on every platform.
+        info = zipfile.ZipInfo("placeholder")
+        info.filename = name
+        output.writestr(info, b"bad")
+
+    assert zipfile.ZipFile(archive).namelist() == [name]
 
     with pytest.raises(WgLinkError, match=message):
         read_bundle(archive, temp_dir=tmp_path / "extract")

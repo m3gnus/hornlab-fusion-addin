@@ -3446,16 +3446,16 @@ def test_launch_metadata_lists_expected_logs_and_manifests(tmp_path):
         str(Path("logs/solve_fusion_wg_metal.stdout.log"))
     )
     assert metadata["expected_paths"]["launch_metadata"].endswith(
-        "manifests/fusion_addin_launch.json"
+        str(Path("manifests/fusion_addin_launch.json"))
     )
     assert metadata["expected_paths"]["pipeline_manifest"].endswith(
-        "manifests/fusion_wg_pipeline_manifest.json"
+        str(Path("manifests/fusion_wg_pipeline_manifest.json"))
     )
     assert metadata["expected_paths"]["final_summary_manifest"].endswith(
-        "manifests/final_summary_manifest.json"
+        str(Path("manifests/final_summary_manifest.json"))
     )
     assert metadata["expected_paths"]["direct_solve_manifest"].endswith(
-        "manifests/direct_solve_manifest.json"
+        str(Path("manifests/direct_solve_manifest.json"))
     )
     assert metadata["expected_paths"]["prepare_manifest"].endswith("mesh/manifest.json")
     assert metadata["expected_paths"]["tagged_sources_msh"].endswith(

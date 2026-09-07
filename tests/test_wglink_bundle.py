@@ -777,7 +777,30 @@ def test_directory_and_zip_reject_corruption_identically(tmp_path):
     [
         ("/absolute", "absolute"),
         ("../escape", r"contains '\.\.'"),
-        (r"folder\evil", "backslash"),
+        pytest.param(
+            r"folder\evil",
+            "backslash",
+            marks=pytest.mark.skipif(
+                os.sep == "\\",
+                reason=(
+                    "A literal backslash member cannot survive being read back "
+                    "on Windows, so this input cannot be presented to the guard "
+                    "there at all. zipfile normalises os.sep to '/' on BOTH "
+                    "sides: ZipInfo.__init__ calls _sanitize_filename on write, "
+                    "and _RealGetContents rebuilds every entry as "
+                    "ZipInfo(filename) on read. Setting info.filename after "
+                    "construction defeats the write side but not the read side, "
+                    "so read_bundle sees 'folder/evil' and rejects it as a "
+                    "missing manifest instead. The backslash branch is "
+                    "therefore unreachable through zipfile on Windows, and "
+                    "traversal there is still blocked by the '..' and absolute "
+                    "rules that do run. The manifest-side twin, "
+                    "test_rejects_unsafe_manifest_file_names, does exercise the "
+                    "backslash rule on Windows, because a name written into "
+                    "wglink.json survives as typed."
+                ),
+            ),
+        ),
     ],
 )
 def test_zip_rejects_unsafe_member_names_before_writing(tmp_path, name, message):

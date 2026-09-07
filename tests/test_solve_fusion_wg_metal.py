@@ -3597,12 +3597,31 @@ def test_directivity_payload_serializers_preserve_frequency_angle_pairs():
     assert module._directivity_payload_from_arrays(angles, planes, directivity) == expected
     assert module._result_directivity_payload(result) == expected
 
+    # The two assertions above pass dB through unchanged, so == is right there.
+    # This one does not: it goes dB -> linear pressure -> dB, and pow() and
+    # log10() are not required to be bitwise inverses of each other. One ubuntu
+    # runner returned -8.499999999999998 for a -8.5 input while macOS and three
+    # local runs returned it exactly, so an == here is a coin flip on whichever
+    # libm the host happens to carry. Compare the round trip with a tolerance
+    # and keep the exact checks where exactness is actually the contract.
     pressure = 10.0 ** (directivity / 20.0)
-    assert module._directivity_payload_from_pressure(
+    from_pressure = module._directivity_payload_from_pressure(
         pressure.astype(np.complex128),
         angles_deg=angles,
         planes=planes,
-    ) == expected
+    )
+    assert from_pressure.keys() == expected.keys()
+    for plane, expected_curves in expected.items():
+        # np.testing rather than pytest.approx: approx refuses nested
+        # structures, and asarray also fails loudly if the shape drifts,
+        # which is half of what this test is for.
+        np.testing.assert_allclose(
+            np.asarray(from_pressure[plane], dtype=np.float64),
+            np.asarray(expected_curves, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-9,
+            err_msg=f"round-tripped directivity differs for plane {plane!r}",
+        )
 
 
 def test_directivity_power_integration_monopole_and_dipole():

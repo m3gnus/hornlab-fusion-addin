@@ -19,6 +19,18 @@ from typing import Iterable
 import meshio
 import numpy as np
 
+try:
+    from hornlab_mesher.step_import import _mesh_triangle_data, _signed_volume
+except (ImportError, ModuleNotFoundError) as exc:
+    missing = exc.name or ""
+    if missing != "hornlab_mesher" and not missing.startswith("hornlab_mesher."):
+        raise
+    raise RuntimeError(
+        "a compatible hornlab-waveguide-mesher is required to diagnose a "
+        "prepared mesh; install or update the exact revision pinned in this "
+        "add-in's requirements.txt"
+    ) from exc
+
 
 DEFAULT_TOPOLOGY_TOL = 1e-5
 RIGID_TAG = 1
@@ -41,14 +53,17 @@ def _parse_source(raw: str) -> Source:
     return Source(name=name, tag=int(tag_text))
 
 
-def _triangle_data(mesh_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mesh = meshio.read(mesh_path)
-    if "triangle" not in mesh.cells_dict:
-        raise RuntimeError(f"{mesh_path} has no triangle cells")
-    triangles = np.asarray(mesh.cells_dict["triangle"], dtype=np.int64)
-    points = np.asarray(mesh.points, dtype=np.float64)
-    tags = np.asarray(mesh.cell_data_dict["gmsh:physical"]["triangle"], dtype=np.int32)
-    return points, triangles, tags
+def _read_triangle_data(mesh_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``_mesh_triangle_data`` on a file, with the file named in any complaint.
+
+    The mesher raises about "mesh"; this is a command line tool pointed at one
+    path out of a run directory full of them, so the path is the actionable
+    half of the message.
+    """
+    try:
+        return _mesh_triangle_data(meshio.read(mesh_path))
+    except RuntimeError as exc:
+        raise RuntimeError(f"{mesh_path}: {exc}") from exc
 
 
 def _free_edges(triangles: np.ndarray) -> list[tuple[int, int]]:
@@ -58,15 +73,6 @@ def _free_edges(triangles: np.ndarray) -> list[tuple[int, int]]:
             edge = tuple(sorted((int(a), int(b))))
             counts[edge] = counts.get(edge, 0) + 1
     return [edge for edge, count in counts.items() if count == 1]
-
-
-def _signed_volume(points: np.ndarray, triangles: np.ndarray) -> float:
-    if len(triangles) == 0:
-        return 0.0
-    p0 = points[triangles[:, 0]]
-    p1 = points[triangles[:, 1]]
-    p2 = points[triangles[:, 2]]
-    return float(np.sum(p0 * np.cross(p1, p2)) / 6.0)
 
 
 def _mesh_orientation_sign(
@@ -376,7 +382,7 @@ def main() -> int:
     mesh_path = args.mesh.expanduser().resolve()
     out_dir = args.out.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    points, triangles, tags = _triangle_data(mesh_path)
+    points, triangles, tags = _read_triangle_data(mesh_path)
     sources = args.source or [
         Source(name=f"tag_{int(tag)}", tag=int(tag))
         for tag in sorted(set(tags.tolist()))

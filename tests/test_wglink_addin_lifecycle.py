@@ -1446,6 +1446,27 @@ def _tick_module(monkeypatch, name: str):
     return module, design, body
 
 
+def _unmoved_live_state(monkeypatch, module, signature_hash: str) -> None:
+    """Stand in for the guard's fresh measurement of an unmoved document.
+
+    Only for tests whose fixture is a bare namespace product, which no real
+    ``return_state`` can measure. Tests that exercise the guard itself run
+    against ``_linked_document`` and measure for real.
+    """
+
+    monkeypatch.setattr(
+        module,
+        "_fresh_geometry_state",
+        lambda: {
+            "document_signature_hash": signature_hash,
+            "document_body_count": "1",
+            "source_state_hash": "",
+            "instance_identities": {},
+            "bodies": {},
+        },
+    )
+
+
 def _count_measurements(monkeypatch, module) -> list[int]:
     calls: list[int] = []
     real = module.wglink_send.return_state
@@ -1556,6 +1577,346 @@ def test_a_costly_measurement_defers_the_next_one(monkeypatch) -> None:
 
     assert timings["geometry_state"] == "deferred"
     assert timings["geometry_state_ms"] < 20.0
+
+
+def _guarded_document(monkeypatch, name: str):
+    """A real linked document, one published heartbeat, and a deferring cache.
+
+    The cache is told its last measurement cost a second, so the duty cycle
+    postpones the next one for twelve; four seconds later the heartbeat still
+    publishes the token measured before the edit. That token is exactly what WG
+    holds and hands back as ``expected_return_state_hash``, which is what let a
+    guarded operation compare a stale value with itself and pass.
+    """
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, name, ui, app)
+    design, body = _linked_document(module)
+    app.activeProduct = design
+    body.revisionId = "revision-1"
+    clock = types.SimpleNamespace(value=100.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
+    active = {"document_id": "fusion:doc-a"}
+    monkeypatch.setattr(module, "_active_document_id", lambda: active["document_id"])
+    published = module._document_links()
+    assert published[0]["document_signature_hash"]
+    module._geometry_state_cache["cost_ms"] = 1000.0
+    clock.value += 4.0
+    return types.SimpleNamespace(
+        module=module,
+        ui=ui,
+        app=app,
+        design=design,
+        body=body,
+        clock=clock,
+        active=active,
+        published=published,
+    )
+
+
+def _heartbeat_snapshot(fixture) -> dict[str, object]:
+    """The snapshot a tick builds: live identity, heartbeat-cached measurement."""
+
+    timings: dict[str, float] = {}
+    links = fixture.module._document_links(timings)
+    return {
+        "document_id": fixture.module._active_document_id(),
+        "links": links,
+        "timings": timings,
+    }
+
+
+def _pending_return(fixture, monkeypatch, tmp_path, **overrides):
+    module = fixture.module
+    published = fixture.published[0]
+    fields = {
+        "request_id": "request-a",
+        "design_id": published["design_id"],
+        "document_id": "fusion:doc-a",
+        "instance_id": published["instance_id"],
+        "expected_return_state_hash": published["document_signature_hash"],
+    }
+    fields.update(overrides)
+    request = types.SimpleNamespace(**fields)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: request)
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.wglink_send, "send", lambda _app, options: sent.append(options)
+    )
+    monkeypatch.setattr(
+        module.wglink_watch, "acknowledge_return_request", lambda _request: True
+    )
+    return sent
+
+
+def _pending_update(fixture, monkeypatch, tmp_path, **overrides):
+    module = fixture.module
+    published = fixture.published[0]
+    fields = {
+        "export_id": "wge_2",
+        "bundle_path": str(tmp_path / "horn.wglink"),
+        "design_id": published["design_id"],
+        "expected_document_id": "fusion:doc-a",
+        "expected_instance_id": published["instance_id"],
+        "expected_return_state_hash": published["document_signature_hash"],
+    }
+    fields.update(overrides)
+    handoff = types.SimpleNamespace(**fields)
+    monkeypatch.setattr(module, "_pending_handoff", lambda: handoff)
+    mutations: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.wglink_core,
+        "update",
+        lambda _app, _path, options: mutations.append(options),
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "insert",
+        lambda *_args, **_kwargs: mutations.append({"insert": True}),
+    )
+    monkeypatch.setattr(
+        module.wglink_watch,
+        "acknowledge_handoff",
+        lambda _handoff, **_kwargs: True,
+    )
+    return mutations
+
+
+@pytest.mark.parametrize("channel", ["return", "update"])
+def test_a_cached_token_does_not_authorize_an_edited_managed_body(
+    monkeypatch, tmp_path: Path, channel: str
+) -> None:
+    """The guard is optimistic concurrency, so it has to observe the present.
+
+    WG holds the token the heartbeat published; the user then edits the managed
+    body; the next tick is still inside the duty cycle and republishes that same
+    token. Comparing WG's expectation against the snapshot therefore compared a
+    stale value with itself and passed, and ``wglink_core.update`` went on to
+    rebuild sketches and parameters over the edit.
+    """
+
+    fixture = _guarded_document(monkeypatch, f"WGLink_guard_revision_{channel}")
+    module = fixture.module
+    fixture.body.revisionId = "revision-2"
+    snapshot = _heartbeat_snapshot(fixture)
+    # The stale republication is the precondition, not the thing under test:
+    # the duty cycle is a deliberate performance guard and stays.
+    assert snapshot["timings"]["geometry_state"] == "deferred"
+    assert (
+        snapshot["links"][0]["document_signature_hash"]
+        == fixture.published[0]["document_signature_hash"]
+    )
+
+    if channel == "return":
+        effects = _pending_return(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_return_request(snapshot) == module.HANDLED
+        expected_title = "WGLink return to WG refused"
+        fragment = "changed after WG displayed its status"
+    else:
+        effects = _pending_update(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_handoff(snapshot) == module.HANDLED
+        expected_title = "WGLink automatic update refused"
+        fragment = "changed after WG prepared this update"
+
+    assert effects == []
+    assert [title for title, _text in fixture.ui.messages] == [expected_title]
+    assert fragment in fixture.ui.messages[0][1]
+
+
+@pytest.mark.parametrize("channel", ["return", "update"])
+def test_a_cached_token_does_not_authorize_changed_untracked_geometry(
+    monkeypatch, tmp_path: Path, channel: str
+) -> None:
+    """The cheap change key cannot see the whole document, and never could.
+
+    It reads the managed bodies' revisions and the timeline count. A body this
+    add-in does not manage, added or edited beside them, moves the return state
+    the guard is about while leaving that key exactly where it was -- so the
+    heartbeat reports ``cached``, not merely ``deferred``, for a document that
+    has genuinely moved.
+    """
+
+    fixture = _guarded_document(monkeypatch, f"WGLink_guard_untracked_{channel}")
+    module = fixture.module
+    neighbour = _managed_body("Bracket")
+    neighbour.parentComponent = fixture.design.rootComponent
+    fixture.design.rootComponent.bRepBodies.append(neighbour)
+    snapshot = _heartbeat_snapshot(fixture)
+    assert snapshot["timings"]["geometry_state"] == "cached"
+    assert (
+        snapshot["links"][0]["document_signature_hash"]
+        == fixture.published[0]["document_signature_hash"]
+    )
+
+    if channel == "return":
+        effects = _pending_return(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_return_request(snapshot) == module.HANDLED
+    else:
+        effects = _pending_update(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert effects == []
+    assert len(fixture.ui.messages) == 1
+
+
+def test_the_heartbeat_never_publishes_another_documents_measured_state(
+    monkeypatch,
+) -> None:
+    """Measured state belongs to the document it was measured in.
+
+    The change key carries the document id, so the *unchanged* branch already
+    refused a switch. The duty-cycle branch was time-only, so a switch inside
+    the wait handed back the previous document's fingerprint, which
+    ``_document_links`` then published beside the new document's identity.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_document_switch")
+    module = fixture.module
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    fixture.app.activeProduct = other_design
+    fixture.active["document_id"] = "fusion:doc-b"
+
+    snapshot = _heartbeat_snapshot(fixture)
+
+    assert snapshot["timings"]["geometry_state"] == "unavailable"
+    assert snapshot["links"][0]["instance_id"] == "wgi-other"
+    assert snapshot["links"][0]["document_signature_hash"] == ""
+    assert snapshot["links"][0]["local_body_state"] == "unknown"
+    assert snapshot["links"][0]["body_fingerprint_hash"] == ""
+
+
+def test_the_duty_cycle_may_delay_a_measurement_but_not_the_age_ceiling(
+    monkeypatch,
+) -> None:
+    """Sixty seconds is a promise about what is published, not only about the key.
+
+    The two caps are independent: the duty cycle waits up to
+    ``GEOMETRY_STATE_MAX_WAIT_SECONDS`` and the ceiling is
+    ``GEOMETRY_STATE_MAX_AGE_SECONDS``, so a document expensive enough to reach
+    the longer wait published a two-minute-old token under a one-minute
+    promise. The wait still holds -- nothing here forces a measurement onto
+    Fusion's main thread -- but past the ceiling the answer is "cannot tell".
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_age_ceiling")
+    module = fixture.module
+    calls = _count_measurements(monkeypatch, module)
+    # Twenty seconds a measurement: the duty cycle would wait its full cap.
+    module._geometry_state_cache["cost_ms"] = 20_000.0
+    fixture.clock.value += module.GEOMETRY_STATE_MAX_AGE_SECONDS + 10.0
+
+    snapshot = _heartbeat_snapshot(fixture)
+
+    assert snapshot["timings"]["geometry_state"] == "unavailable"
+    assert (
+        snapshot["timings"]["geometry_state_age_s"]
+        > module.GEOMETRY_STATE_MAX_AGE_SECONDS
+    )
+    assert snapshot["links"][0]["document_signature_hash"] == ""
+    assert calls == []
+
+
+@pytest.mark.parametrize("channel", ["return", "update"])
+def test_a_document_switch_does_not_authorize_the_other_documents_token(
+    monkeypatch, tmp_path: Path, channel: str
+) -> None:
+    """WG's expectation can only ever be honoured against the live document.
+
+    This is the switch seen from the consumer side: WG was handed the previous
+    document's signature labelled as this one's, and asks for an operation on
+    this one. The identity checks all pass -- the request names the active
+    document and a link that really is in it -- so the state guard is the only
+    thing between a foreign token and a rebuild.
+    """
+
+    fixture = _guarded_document(monkeypatch, f"WGLink_guard_switch_{channel}")
+    module = fixture.module
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    fixture.app.activeProduct = other_design
+    fixture.active["document_id"] = "fusion:doc-b"
+    snapshot = _heartbeat_snapshot(fixture)
+
+    if channel == "return":
+        effects = _pending_return(
+            fixture,
+            monkeypatch,
+            tmp_path,
+            document_id="fusion:doc-b",
+            instance_id="wgi-other",
+        )
+        assert module._apply_pending_return_request(snapshot) == module.HANDLED
+    else:
+        effects = _pending_update(
+            fixture,
+            monkeypatch,
+            tmp_path,
+            expected_document_id="fusion:doc-b",
+            expected_instance_id="wgi-other",
+        )
+        assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert effects == []
+    assert len(fixture.ui.messages) == 1
+
+
+@pytest.mark.parametrize("channel", ["return", "update"])
+def test_an_unchanged_exact_target_still_completes_its_guarded_operation(
+    monkeypatch, tmp_path: Path, channel: str
+) -> None:
+    """The guard refuses a moved model, not a slow one.
+
+    A document that has not moved measures to the token WG is holding, however
+    old the cached copy of it is, so the operation the user asked for runs.
+    """
+
+    fixture = _guarded_document(monkeypatch, f"WGLink_guard_unchanged_{channel}")
+    module = fixture.module
+    snapshot = _heartbeat_snapshot(fixture)
+    assert snapshot["timings"]["geometry_state"] == "cached"
+
+    if channel == "return":
+        effects = _pending_return(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_return_request(snapshot) == module.HANDLED
+        assert [options["anchor_instance_id"] for options in effects] == [
+            fixture.published[0]["instance_id"]
+        ]
+    else:
+        effects = _pending_update(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_handoff(snapshot) == module.HANDLED
+        assert effects == [{"instance_id": fixture.published[0]["instance_id"]}]
+
+    assert fixture.ui.messages == []
+
+
+def test_an_idle_tick_still_costs_the_document_no_measurement(monkeypatch) -> None:
+    """The fresh guard measurement belongs to an explicit operation only.
+
+    The duty cycle exists because ``return_state`` evaluates faces and volumes
+    on Fusion's main thread. Nothing here may reintroduce that cost on the
+    four-second timer: with no handoff and no return request pending, a tick
+    measures nothing at all.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_idle")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    calls = _count_measurements(monkeypatch, module)
+
+    for _tick in range(3):
+        module._on_watch_tick()
+        fixture.clock.value += 4.0
+
+    assert calls == []
+    assert module._geometry_state_cache is not None
 
 
 def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:
@@ -2160,6 +2521,10 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
         "design_id": "wgd-a", "instance_id": "instance-a",
         "document_signature_hash": "sha256:state-a",
     }])
+    # This test's subject is exact-link targeting, not the state guard: the
+    # model has not moved, so the guard's fresh measurement agrees with the
+    # token WG holds.
+    _unmoved_live_state(monkeypatch, module, "sha256:state-a")
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
@@ -2294,6 +2659,10 @@ def test_a_refused_handoff_does_not_starve_a_pending_return_request(
         "export_id": "wge_1",
         "document_signature_hash": "sha256:state-a",
     }])
+    # This test's subject is tick dispatch, not the state guard: the model has
+    # not moved, so the guard's fresh measurement agrees with the token WG
+    # holds. The guard itself has its own tests against a real document.
+    _unmoved_live_state(monkeypatch, module, "sha256:state-a")
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(

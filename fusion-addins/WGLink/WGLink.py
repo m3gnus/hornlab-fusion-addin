@@ -1272,12 +1272,32 @@ def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
     }
 
 
+def _unavailable_geometry_state() -> dict[str, object]:
+    """The shape of "this add-in cannot say", in the measured state's own keys.
+
+    Same shape as a failed :func:`_measure_geometry_state`, so every consumer
+    already degrades correctly: no signature token, no body fingerprints, and
+    ``local_body_state`` reads ``unknown``. Publishing this is always allowed;
+    publishing a *different* document's measurement never is.
+    """
+
+    return {
+        "document_signature_hash": "",
+        "document_body_count": "",
+        "source_state_hash": "",
+        "instance_identities": {},
+        "bodies": {},
+    }
+
+
 def _geometry_state(
     app: object,
     design: object,
     records: dict,
     document_id: str | None,
     timings: dict[str, float] | None = None,
+    *,
+    force: bool = False,
 ) -> tuple[dict[str, object], str]:
     """The measured state, recomputed only when it can have moved.
 
@@ -1291,31 +1311,53 @@ def _geometry_state(
     a few seconds behind is a far smaller problem than a CAD application that
     stops responding.
 
-    The age ceiling is the third: anything the key fails to notice -- a
-    visibility change on a body this add-in does not manage, say -- self-heals
-    within a minute rather than persisting for the session.
+    The age ceiling is the third, and it is a ceiling on what may be
+    *published*, not only on what the key may excuse: past
+    ``GEOMETRY_STATE_MAX_AGE_SECONDS`` the cached state is no longer offered at
+    all. The duty cycle owns a separate, longer cap
+    (``GEOMETRY_STATE_MAX_WAIT_SECONDS``), and while the two disagreed the
+    heartbeat could publish a two-minute-old token under a sixty-second
+    promise. The wait still holds -- no measurement is forced by the ceiling --
+    but the answer becomes "cannot tell" instead of a stale fingerprint.
+
+    Cached state belongs to the document it was measured in. The key carries
+    ``document_id`` so the *unchanged* branch already refuses a switch; the
+    duty-cycle branch is time-only and did not, so a document switch inside the
+    wait returned the previous document's fingerprint, which
+    :func:`_document_links` then combined with the new document's identity.
+    Another document's measurement is never evidence for the active one.
+
+    ``force`` bypasses the cache entirely. It is for an explicit, guarded
+    operation -- an update or a return WG asked for -- which happens once and
+    can pay for one measurement; never for a heartbeat tick.
     """
 
     global _geometry_state_cache
     started = time.perf_counter()
     key = (document_id, _geometry_change_key(design, records))
     now = time.monotonic()
-    cached = _geometry_state_cache
+    cached = None if force else _geometry_state_cache
     verdict = "measured"
     if cached is not None:
         age = now - float(cached["at"])
-        unchanged = cached["key"] == key and age < GEOMETRY_STATE_MAX_AGE_SECONDS
+        within_ceiling = age < GEOMETRY_STATE_MAX_AGE_SECONDS
+        unchanged = cached["key"] == key and within_ceiling
         wait = min(
             float(cached["cost_ms"]) / 1000.0 * GEOMETRY_STATE_DUTY_CYCLE,
             GEOMETRY_STATE_MAX_WAIT_SECONDS,
         )
-        if unchanged or age < wait:
+        deferred = age < wait
+        if unchanged or deferred:
             if timings is not None:
                 timings["geometry_state_ms"] = round(
                     (time.perf_counter() - started) * 1000.0, 1
                 )
                 timings["geometry_state_age_s"] = round(age, 1)
-            return dict(cached["state"]), "cached" if unchanged else "deferred"
+            if unchanged:
+                return dict(cached["state"]), "cached"
+            if cached["key"][0] != document_id or not within_ceiling:
+                return _unavailable_geometry_state(), "unavailable"
+            return dict(cached["state"]), "deferred"
     state = _measure_geometry_state(app, records)
     cost_ms = (time.perf_counter() - started) * 1000.0
     _geometry_state_cache = {
@@ -1454,6 +1496,70 @@ def _active_document_id() -> str | None:
     except Exception:  # noqa: BLE001 - unsaved local document
         pass
     return f"local:{_watch_session_id}:{id(document)}"
+
+
+def _fresh_geometry_state() -> dict[str, object] | None:
+    """Measure the live document now, ignoring the heartbeat cache.
+
+    ``None`` means the live state could not be measured at all -- no
+    application, no Design product, or an inventory this add-in cannot read.
+    A dict whose ``document_signature_hash`` is empty means the measurement ran
+    and declined to produce a token. Both are "cannot confirm" to a guard.
+
+    This deliberately goes through :func:`_geometry_state` rather than calling
+    ``return_state`` directly, so the token it produces is computed by exactly
+    the code, with exactly the anchor, that produced the token WG is holding.
+    A guard that measured under a different convention would compare two
+    honest hashes of two different things and refuse every unchanged document.
+    The measurement it takes also refreshes the cache, so the tick that
+    services the operation does not leave a stale entry behind it.
+    """
+
+    app = _app()
+    design = app.activeProduct if app else None
+    if design is None or not isinstance(getattr(design, "objectType", ""), str):
+        return None
+    if "Design" not in str(design.objectType):
+        return None
+    try:
+        records = wglink_core._resolved_link_records(design)
+    except Exception:  # noqa: BLE001 - a document we cannot read has no evidence
+        return None
+    try:
+        state, _verdict = _geometry_state(
+            app, design, records, _active_document_id(), force=True
+        )
+    except Exception:  # noqa: BLE001 - an unmeasurable document confirms nothing
+        return None
+    return state
+
+
+def _require_live_state(expected_hash: str, changed_message: str) -> None:
+    """Refuse an explicit guarded operation unless the live model still matches.
+
+    The heartbeat cache is advisory by construction: it exists so an idle
+    document does not pay a geometry evaluation every four seconds, and it
+    deliberately hands back a token that can be seconds old. Comparing WG's
+    expected token against *that* token compares a stale value with itself, so
+    a document edited after WG displayed its status passed the one guard whose
+    entire purpose is to catch that edit -- and ``wglink_core.update`` then
+    rebuilt sketches and parameters over it.
+
+    An update or a return happens once, at the user's request, so it can pay
+    for one measurement. Idle ticks still cannot, and still do not.
+    """
+
+    state = _fresh_geometry_state()
+    current_state_hash = (
+        str(state.get("document_signature_hash") or "") if state is not None else ""
+    )
+    if not current_state_hash:
+        raise wglink_core.WgLinkError(
+            "WGLink could not measure this Fusion document, so it cannot confirm "
+            "the model still matches what WG displayed."
+        )
+    if current_state_hash != expected_hash:
+        raise wglink_core.WgLinkError(changed_message)
 
 
 def _installed_source() -> dict[str, object]:
@@ -1626,13 +1732,13 @@ def _apply_pending_return_request(
             raise wglink_core.WgLinkError(
                 "The active Fusion document no longer contains the exact WG link requested by WG."
             )
-        current_state_hash = str(matching[0].get("document_signature_hash") or "")
-        if (
-            request.expected_return_state_hash
-            and current_state_hash != request.expected_return_state_hash
-        ):
-            raise wglink_core.WgLinkError(
-                "The Fusion model changed after WG displayed its status. Refresh CAD Link and try again."
+        if request.expected_return_state_hash:
+            # Measured here, not read off ``matching[0]``: the snapshot's token
+            # comes from the heartbeat cache and can equal the stale token WG
+            # is holding while the model has already moved.
+            _require_live_state(
+                str(request.expected_return_state_hash),
+                "The Fusion model changed after WG displayed its status. Refresh CAD Link and try again.",
             )
         output = wglink_workspace.return_folder()
         if output is None:
@@ -1776,13 +1882,14 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
             )
         if linked:
             link = linked[0]
-            current_state_hash = str(link.get("document_signature_hash") or "")
-            if (
-                handoff.expected_return_state_hash
-                and current_state_hash != handoff.expected_return_state_hash
-            ):
-                raise wglink_core.WgLinkError(
-                    "The Fusion model changed after WG prepared this update. Refresh CAD Link and choose a sync direction again."
+            if handoff.expected_return_state_hash:
+                # Measured here, not read off ``link``: the snapshot's token
+                # comes from the heartbeat cache and can equal the stale token
+                # WG is holding while the model has already moved. This one
+                # authorizes a rebuild of the user's sketches and parameters.
+                _require_live_state(
+                    str(handoff.expected_return_state_hash),
+                    "The Fusion model changed after WG prepared this update. Refresh CAD Link and choose a sync direction again.",
                 )
             if link.get("export_id") != handoff.export_id:
                 wglink_core.update(

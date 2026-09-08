@@ -56,7 +56,7 @@ carries what that tick cost:
 
 `geometry_state_ms` is the export-scope walk and body fingerprint — the work
 Send does short of writing STEP, and the only part of a tick that evaluates
-geometry rather than reading a property. `geometry_state` says which of three
+geometry rather than reading a property. `geometry_state` says which of four
 things the tick did:
 
 | | |
@@ -64,11 +64,19 @@ things the tick did:
 | `measured` | the document moved, so it was measured; this is the real cost |
 | `cached` | nothing moved — the tick was free |
 | `deferred` | it moved, but the last measurement was expensive enough that another one is not due yet |
+| `unavailable` | a measurement is not due yet *and* the cached one does not describe this document, or is older than the sixty-second ceiling — so the tick publishes no signature and no fingerprints rather than another document's, or a stale one |
 
 A healthy idle document reads `cached` with `geometry_state_ms` near zero. A
 run of `measured` ticks at hundreds of milliseconds on a document nobody is
 editing is the bug this instrumentation exists to catch. `source` appears only
 after a dev sync; a managed install stays silent.
+
+Everything under `geometry_state` is **advisory**, whichever verdict it
+carries. WG displays it; nothing authorizes a geometry-changing operation from
+it. An explicit update or return WG asks for measures the live document once,
+at the moment it runs, and refuses if that measurement disagrees with the token
+WG is holding or cannot be taken at all — a cached token cannot agree with
+itself into a rebuild of the user's sketches and parameters.
 
 ## Going back to the managed install
 

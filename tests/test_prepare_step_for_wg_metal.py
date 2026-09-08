@@ -755,6 +755,19 @@ def test_symmetry_source_anchor_is_translation_and_rotation_invariant():
 
 
 def test_symmetry_reduced_component_without_source_is_left_unjudged():
+    """A reduced component with no source cap keeps the winding it arrived with.
+
+    The mesh here is a literal in ``_open_unit_box`` -- gmsh never runs, and no
+    triangle or vertex ordering is being read off a mesher build. When this
+    fails with a winding diff (every triangle reversed, ``[1, 7, 3]`` arriving
+    as ``[1, 3, 7]``), the environment is importing a hornlab-waveguide-mesher
+    older than ``7cb949e`` "Leave a reduced component with no source cap
+    unjudged again"; its parent ``8e01ebe`` still orients such a component
+    from its signed volume and flips all eight faces. ``7cb949e`` is contained
+    in the revision ``requirements.txt`` pins, so the pinned mesher passes and
+    a stale local checkout does not -- see ``tests/conftest.py``, which now
+    stops the run before it gets this far.
+    """
     module = _load_script()
     points, triangles, _ = _open_unit_box(inward=True)
     tags = np.full(len(triangles), 1, dtype=np.int32)

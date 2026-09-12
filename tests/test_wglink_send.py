@@ -1424,6 +1424,223 @@ def test_selected_occurrence_exports_its_component_not_the_occurrence(
     assert manifest["scope"]["selection"] == "Speaker/Horn:1"
 
 
+# ------------------------------------------ FEM air volume inside the export
+
+
+class _ExecutionRecordingExportManager(ContractExportManager):
+    def __init__(self):
+        super().__init__()
+        self.executed = []
+
+    def execute(self, options):
+        self.executed.append(Path(options[0]).name)
+        return super().execute(options)
+
+
+class _FreshComponentWrapper(types.SimpleNamespace):
+    """An occurrence whose ``component`` is a new wrapper on every read.
+
+    Fusion can hand back a fresh Python wrapper on each property read, so two
+    reads of one Component are equal but not identical. The plain fake returns
+    one object every time, which would let an identity comparison pass here
+    that cannot be relied on in Fusion.
+    """
+
+    def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if name == "component" and value is not None:
+            return types.SimpleNamespace(**vars(value))
+        return value
+
+
+def _fem_chamber(
+    *,
+    air_visible=True,
+    fem_visible=True,
+    fem_suppressed=False,
+    fem_children=(),
+    parent_visible=None,
+):
+    """An exterior body at root and a ``FEM_MF_AIR`` occurrence beside it.
+
+    ``_scope_walk`` stops at the FEM component: its solid goes to a separate
+    ``fem/`` member and never becomes an exterior candidate. The root STEP
+    export still writes the whole ``rootComponent``, and with it every visible
+    body under the FEM occurrence. ``parent_visible`` puts the FEM occurrence
+    inside a sub-assembly occurrence with that visibility.
+    """
+
+    exterior = body("cabinet", faces=[face("LF")])
+    air = body("air", visible=air_visible)
+    fem = component("FEM_MF_AIR", [air])
+    air_proxy = _proxy_of(air, component_value=fem)
+    air_proxy.isVisible = air_visible
+    fem_occurrence = _occurrence(
+        fem, [air_proxy], name="FEM_MF_AIR:1", children=fem_children
+    )
+    fem_occurrence.isVisible = fem_visible
+    fem_occurrence.isSuppressed = fem_suppressed
+    root = component("Chamber", [exterior])
+    if parent_visible is None:
+        root.occurrences = Collection([fem_occurrence])
+    else:
+        rig = _occurrence(
+            component("Rig"), [], name="Rig:1", children=[fem_occurrence]
+        )
+        rig.isVisible = parent_visible
+        root.occurrences = Collection([rig])
+    return root
+
+
+def test_a_visible_fem_air_solid_under_root_refuses_by_name_before_export(
+    send_module, tmp_path, monkeypatch
+):
+    """A FEM air solid under root used to be invisible to the predicted inventory.
+
+    Before this refusal the Send reached Fusion's export and stopped at the
+    count gate with "inventory expects 1, but assembly.step contains 2". That
+    message is only arithmetic and names nothing the user can act on.
+    """
+
+    root = _fem_chamber()
+    manager = _ExecutionRecordingExportManager()
+    design, app, _manager = _contract_design(root, manager)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    # The file really would carry the air solid. This is the fake's own
+    # derivation from the component, not an assumption of the test.
+    assert exported_step_bodies(root) == ["solid", "solid"]
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as excinfo:
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+
+    message = str(excinfo.value)
+    assert "'Speaker/FEM_MF_AIR:1/air'" in message
+    assert "assembly.step" in message
+    assert "Hide the FEM occurrence 'Speaker/FEM_MF_AIR:1'" in message
+    assert "count gate" not in message
+    assert manager.executed == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_visible_body_nested_under_the_fem_component_is_named_too(
+    send_module, tmp_path, monkeypatch
+):
+    probe = component("Probe", [body("probe skin", solid=False)])
+    root = _fem_chamber(fem_children=[_occurrence(probe, [], name="Probe:1")])
+    manager = _ExecutionRecordingExportManager()
+    design, app, _manager = _contract_design(root, manager)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    assert exported_step_bodies(root) == ["solid", "solid", "surface"]
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as excinfo:
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+
+    message = str(excinfo.value)
+    assert "'Speaker/FEM_MF_AIR:1/air'" in message
+    assert "'Speaker/Probe:1/probe skin'" in message
+    assert manager.executed == []
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"fem_visible": False},
+        {"fem_suppressed": True},
+        {"parent_visible": False},
+    ],
+    ids=["hidden-fem-occurrence", "suppressed-fem-occurrence", "hidden-parent"],
+)
+def test_a_fem_occurrence_fusion_leaves_out_still_sends_unchanged(
+    send_module, tmp_path, monkeypatch, state
+):
+    """No over-refusal: a FEM occurrence Fusion leaves out still sends.
+
+    The WG-facing fields read here are the ones a base Send produced: the
+    exterior inventory expects one body, and the air volume travels as its own
+    one-solid ``fem/`` member, which the fake exports from the FEM component
+    directly.
+    """
+
+    root = _fem_chamber(**state)
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    bundle = Path(report["bundle_path"])
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (bundle / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    assert manifest["assembly"]["n_bodies_expected"] == 1
+    assert [record["name"] for record in manifest["scope"]["included"]] == ["cabinet"]
+    assert [record["file"] for record in manifest["scope"]["fem_air_volumes"]] == [
+        "fem/mf-air.step"
+    ]
+    assert send_module.count_step_bodies(bundle / "assembly.step") == 1
+    assert send_module.count_step_bodies(bundle / "fem" / "mf-air.step") == 1
+
+
+def test_a_hidden_fem_body_stays_out_of_assembly_step_and_this_refusal(
+    send_module, tmp_path, monkeypatch
+):
+    """Hiding the body keeps it out of the exterior file, so the new refusal
+    stays silent. The FEM member is then empty, and its own one-solid gate is
+    what refuses."""
+
+    root = _fem_chamber(air_visible=False)
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    assert exported_step_bodies(root) == ["solid"]
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as excinfo:
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+
+    message = str(excinfo.value)
+    assert "FEM STEP 'fem/mf-air.step' contains 0 bodies" in message
+    assert "would reach WG as exterior geometry" not in message
+
+
+def test_selecting_the_fem_occurrence_itself_refuses_with_a_scope_remedy(
+    send_module, tmp_path, monkeypatch
+):
+    """Hiding is no remedy when the FEM component is the one being exported."""
+
+    root = _fem_chamber()
+    fem_occurrence = _FreshComponentWrapper(**vars(root.occurrences[0]))
+    root.occurrences = Collection([fem_occurrence])
+    manager = _ExecutionRecordingExportManager()
+    design, app, _manager = _contract_design(root, manager)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as excinfo:
+        send_module.send(
+            app,
+            {
+                "output_folder": str(tmp_path),
+                "capture_document": False,
+                "selection": fem_occurrence,
+            },
+        )
+
+    message = str(excinfo.value)
+    assert (
+        "The export scope 'Speaker/FEM_MF_AIR:1' is itself a FEM air volume"
+        in message
+    )
+    assert "'Speaker/FEM_MF_AIR:1/air'" in message
+    assert "leave Assembly scope empty" in message
+    assert "Hide the FEM occurrence" not in message
+    assert manager.executed == []
+
+
 def test_export_step_refuses_a_non_component_before_calling_fusion(send_module):
     calls = []
 

@@ -581,6 +581,105 @@ def _refuse_inventory_disagreement(
     )
 
 
+def _fem_bodies_fusion_would_export(
+    component: object, path: str, occurrence: object | None, *, left_out: bool
+) -> list[str]:
+    """Name the B-rep bodies under a FEM air component that Fusion still writes.
+
+    ``_scope_walk`` stops at a FEM component, so none of its bodies becomes an
+    exterior candidate and :func:`_refuse_inventory_disagreement` never sees
+    them. The exported Component is written whole all the same, and a FEM
+    component inside it adds every visible, unsuppressed B-rep body to
+    ``assembly.step``: the air solid, and anything in occurrences below it.
+    The predicate is :func:`_fusion_would_export`'s, and so is its
+    limitation. A body hidden only through a hidden body GROUP reads as
+    hidden here, yet Fusion exports it, so the count gate after the export
+    stays the backstop for that case. Visibility is read the way ``add_body``
+    reads it, from the body and from its occurrence. ``left_out`` is True
+    when a suppressed or hidden occurrence above (or at) this one already
+    keeps the whole subtree out of the file. An unresolved external reference
+    has no bodies to read, so it is passed over here.
+    """
+
+    if left_out or _bool(occurrence, ("isSuppressed",), False):
+        return []
+    if not _bool(occurrence, ("isVisible", "isLightBulbOn"), True):
+        return []
+    owner = occurrence if _collection(occurrence, "bRepBodies") else component
+    names: list[str] = []
+    for body in _collection(owner, "bRepBodies"):
+        if _bool(body, ("isSuppressed",), False):
+            continue
+        if not _bool(body, ("isVisible", "isLightBulbOn"), True):
+            continue
+        names.append(f"{path}/{getattr(body, 'name', '') or 'unnamed body'}")
+    children = (
+        _collection(occurrence, "childOccurrences") if occurrence is not None else []
+    )
+    if not children:
+        children = _collection(component, "occurrences")
+    for child in children:
+        child_component = getattr(child, "component", None)
+        if child_component is None or _external_reference(child) == "unresolved":
+            continue
+        names.extend(
+            _fem_bodies_fusion_would_export(
+                child_component, _occurrence_path(child), child, left_out=False
+            )
+        )
+    return names
+
+
+def _refuse_fem_bodies_in_export(fem_exported: list[dict[str, Any]]) -> None:
+    """Refuse by name a FEM air body that the exterior STEP would carry.
+
+    Counting such a body into the exterior inventory is not an alternative.
+    WG's ingest requires ``scope.included`` to hold exactly
+    ``assembly.n_bodies_expected`` bodies and imports ``assembly.step`` as the
+    exterior geometry, so the air volume would be meshed as a radiating
+    surface. Fusion's only per-body export control is visibility, and the
+    separate FEM member is exported from the FEM component's own body, which a
+    hidden body would empty as well. So the remedy offered is to hide the
+    occurrence. It is not measured here whether Fusion still writes the FEM
+    component's body when only its occurrence is hidden. If it does not, the
+    one-solid gate on the FEM member refuses the empty file by name.
+
+    When the FEM component is itself the export scope, hiding it is no remedy,
+    so that case asks for a scope that contains it instead.
+    """
+
+    if not fem_exported:
+        return
+    bodies = sorted({item["body"] for item in fem_exported})
+    listed = ("body " if len(bodies) == 1 else "bodies ") + ", ".join(
+        repr(name) for name in bodies
+    )
+    itself = sorted(
+        {item["occurrence"] for item in fem_exported if item["is_export_scope"]}
+    )
+    if itself:
+        raise wglink_core.WgLinkError(
+            f"The export scope {itself[0]!r} is itself a FEM air volume, so "
+            f"assembly.step would carry its {listed} as exterior geometry. "
+            "Send the assembly that contains the FEM air volume instead: leave "
+            "Assembly scope empty, or select an occurrence that contains it."
+        )
+    occurrences = sorted({item["occurrence"] for item in fem_exported})
+    one = len(occurrences) == 1
+    noun = "occurrence" if one else "occurrences"
+    raise wglink_core.WgLinkError(
+        "Fusion writes every visible body of the exported component into "
+        f"assembly.step, so the {listed} under a FEM air volume would reach "
+        f"WG as exterior geometry. Hide the FEM {noun} "
+        + ", ".join(repr(name) for name in occurrences)
+        + f" in the browser before Send. Hide the {noun} rather than the "
+        f"bodies inside {'it' if one else 'them'}: Fusion exports visible "
+        "bodies only, so hidden bodies would leave the separate FEM file empty "
+        "as well. If Fusion leaves that file empty anyway, Send refuses it by "
+        "name."
+    )
+
+
 def _mark_uncovered_helper_sources(candidates: list[dict[str, Any]]) -> None:
     """Let a helper claim only the source roles its own insertion loses.
 
@@ -657,6 +756,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
     bodies: dict[str, object] = {}
     measured: dict[str, object] = {}
     fem_components: dict[str, object] = {}
+    fem_exported_bodies: list[dict[str, Any]] = []
     components: list[object] = []
     construction_count = 0
     serial = 0
@@ -722,6 +822,9 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         path: str,
         occurrence: object | None,
         suppressed: bool,
+        hidden: bool = False,
+        *,
+        export_scope: bool = False,
     ) -> None:
         nonlocal construction_count, serial
         components.append(component)
@@ -745,6 +848,21 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
                 }
             )
             fem_components[object_id] = component
+            # The walk stops here, but the exported component does not: every
+            # visible body under this one still lands in assembly.step.
+            fem_exported_bodies.extend(
+                {
+                    "occurrence": path,
+                    "body": name,
+                    # Passed down by the top-level call, not ``component is
+                    # geometry``: Fusion can mint a fresh wrapper per read,
+                    # so identity says nothing about which Component it is.
+                    "is_export_scope": export_scope,
+                }
+                for name in _fem_bodies_fusion_would_export(
+                    component, path, occurrence, left_out=suppressed or hidden
+                )
+            )
             return
 
         body_owner = occurrence if _collection(occurrence, "bRepBodies") else component
@@ -793,10 +911,22 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
                     }
                 )
                 continue
-            walk_component(child_component, child_path, child, child_suppressed)
+            # Only the FEM check reads this; ``add_body`` keeps its own reading.
+            child_hidden = hidden or not _bool(
+                child, ("isVisible", "isLightBulbOn"), True
+            )
+            walk_component(
+                child_component, child_path, child, child_suppressed, child_hidden
+            )
 
     if selection == "root":
-        walk_component(design.rootComponent, _component_name(design.rootComponent), None, False)
+        walk_component(
+            design.rootComponent,
+            _component_name(design.rootComponent),
+            None,
+            False,
+            export_scope=True,
+        )
     else:
         occurrence = selected_entity
         component = getattr(occurrence, "component", None)
@@ -820,6 +950,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
                 _occurrence_path(occurrence),
                 occurrence,
                 _bool(occurrence, ("isSuppressed",), False),
+                export_scope=True,
             )
 
     if construction_count:
@@ -851,6 +982,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         "bodies": bodies,
         "measured": measured,
         "fem_components": fem_components,
+        "fem_exported_bodies": fem_exported_bodies,
         "components": components,
     }
 
@@ -2348,6 +2480,10 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     domain_planes = resolve_domain_planes(options.get("domain"))
     design = wglink_core._design(app)
     walk = _scope_walk(design, options.get("selection"))
+    # First, and before anything is written: a FEM air body inside the exported
+    # component would land in assembly.step, and no inventory rule can account
+    # for it there.
+    _refuse_fem_bodies_in_export(walk["fem_exported_bodies"])
     records = _records_in_scope(design, walk)
     instance_ids = [str(record["instance_id"]) for record in records]
     requested_anchor = _nullable(options.get("anchor_instance_id"))

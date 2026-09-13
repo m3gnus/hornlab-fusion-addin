@@ -2602,3 +2602,23 @@ def test_a_later_completed_update_of_the_instance_clears_an_old_marker(
     design.rootComponent.attributes.add(core.ATTRIBUTE_GROUP, core.APPLYING_ATTRIBUTE, other)
     core._clear_applying(design, instance_id="wgi_one")
     assert core.applying_operation(design)["operation_id"] == "req-b"
+
+
+def test_a_refusal_before_the_first_model_write_leaves_no_applying_mark(
+    core, monkeypatch, tmp_path: Path
+):
+    """A mark with nothing changed behind it would read as an interrupted update."""
+
+    calls: list[tuple[str, object]] = []
+    design = _stub_rebuilding_update(core, monkeypatch, calls)
+    monkeypatch.setattr(core, "_last_managed_sketch_index", lambda *_a: None)
+
+    with pytest.raises(core.WgLinkError, match="could not locate its own sketches"):
+        core.update(object(), None, {
+            "instance_id": "wgi_one",
+            "operation_id": "req-7",
+            "progress_path": str(tmp_path / "progress.json"),
+        })
+
+    assert calls == []
+    assert core.applying_operation(design) is None

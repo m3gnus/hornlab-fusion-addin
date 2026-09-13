@@ -183,25 +183,29 @@ Commands and requests cross through WG's machine-local IPC folder,
   insert, and it is refused if the active document already links that design:
   WGLink never picks "the one matching link" for WG. A return request names
   its document, instance and baseline too.
-- **The baseline, immediately before mutating.** Update and Insert take the
-  check as a precondition and run it after their last read and before their
-  first write. A document that moved in between is a conflict, never an
-  overwrite.
+- **The target, immediately before mutating.** Update and Insert take a
+  precondition and run it after their last read and before their first write:
+  for an update, the live model state against WG's baseline; for an insert, the
+  active document and "no link of this design yet". A document that moved in
+  between is a conflict, never an overwrite.
 - **Reconciliation, then interruption.** Update and Insert stamp WG's operation
   id beside the export identity, as their last write. A handoff whose operation
   id is already on a link is acknowledged without mutating, and before the
   baseline check, so a lost acknowledgement never reads as a conflict. Before
-  its first write a WG operation is marked as applying on the root component;
-  the mark is cleared after the evidence. A mark with no evidence means the
+  its first write that changes the model, a WG operation is marked as applying
+  on the root component; the mark is cleared after the evidence, and a refusal
+  before that first write leaves none. A mark with no evidence means the
   change began and did not finish: **Update interrupted — recovery required**.
   That operation is never run again, and the heartbeat publishes the mark as
   `document.applyingOperation` so WG can say so too.
 - **Supersession.** An update that has not started yet is dropped when a newer
   one for the same document and instance arrives; only the newest runs. WG
   withdraws the older file itself; WGLink covers a file WG could not remove.
-  The heartbeat names the dropped request with the outcome `superseded`.
-- **Leftover claims.** The first tick of a session settles every claim an
-  interrupted session left behind, read-only: evidence on a link means it
+  The heartbeat's `diagnostics.recentOutcomes` names the dropped request with
+  the outcome `superseded`.
+- **Leftover claims.** The first tick with an active document settles every
+  claim an interrupted session left behind, read-only, and lists each in
+  `diagnostics.recentOutcomes`: evidence on a link means it
   applied, the applying mark means recovery is required, and neither means it
   never started. None is run again; each claim is removed.
 - **Correlation.** The heartbeat's `diagnostics.lastRequest` names the last

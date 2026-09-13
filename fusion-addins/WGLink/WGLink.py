@@ -180,6 +180,27 @@ _wg_outdated_noticed = False
 # written, and the ones the user has already been told about.
 _untaken_solves: dict[Path, float] = {}
 _untaken_noticed: set[Path] = set()
+# Outcomes the per-request trace would overwrite within one tick -- a request
+# dropped as superseded, a leftover claim settled -- kept for the heartbeat's
+# ``diagnostics.recentOutcomes``, newest last.
+_recent_outcomes: list[dict[str, str]] = []
+_RECENT_OUTCOMES_LIMIT = 16
+
+
+def _note_outcome(channel: str, request_id: str, outcome: str) -> None:
+    _recent_outcomes.append({"channel": channel, "requestId": request_id, "outcome": outcome})
+    del _recent_outcomes[:-_RECENT_OUTCOMES_LIMIT]
+
+
+def _modal(text: str, title: str) -> None:
+    """A message box shown from the watch tick, which no tick may run inside."""
+
+    global _command_busy
+    _command_busy = True
+    try:
+        _message(text, title)
+    finally:
+        _command_busy = False
 
 # What one IPC channel did for a single watch tick. The distinction exists
 # because suppressing a repeat error is not the same as doing work: a refused
@@ -889,8 +910,8 @@ def _notice_untaken_solves() -> None:
         if path in _untaken_noticed or now - written_at < wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS:
             continue
         _untaken_noticed.add(path)
-        _begin_request("solveCommand", path.stem, DELIVERY)["outcome"] = "notTaken"
-        _message(wglink_watch.SOLVE_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} solve request waiting")
+        _note_outcome("solveCommand", path.stem, "notTaken")
+        _modal(wglink_watch.SOLVE_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} solve request waiting")
 
 
 def _show_export_progress(operation: str) -> object | None:
@@ -1701,6 +1722,8 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
     diagnostics = dict(current.get("diagnostics") or {})
     if _request_trace is not None:
         diagnostics["lastRequest"] = dict(_request_trace)
+    if _recent_outcomes:
+        diagnostics["recentOutcomes"] = [dict(item) for item in _recent_outcomes]
     try:
         wglink_watch.write_fusion_status(
             folder,
@@ -1746,10 +1769,9 @@ def _pending_handoff() -> wglink_watch.PendingHandoff | None:
     bundles = wglink_workspace.bundle_folder()
     if ipc is None or bundles is None:
         return None
-    superseded = wglink_watch.discard_superseded_handoffs(ipc, bundle_root=bundles)
-    if superseded:
-        # Visible in the heartbeat: WG reads which request was dropped, and why.
-        _begin_request("handoff", superseded[-1], DELIVERY)["outcome"] = "superseded"
+    for request_id in wglink_watch.discard_superseded_handoffs(ipc, bundle_root=bundles):
+        # Visible in the heartbeat: which request was dropped, and why.
+        _note_outcome("handoff", request_id, "superseded")
     return wglink_watch.next_pending_handoff(ipc, bundle_root=bundles)
 
 
@@ -1866,6 +1888,45 @@ def _reconciled(
     )
 
 
+def _linked_to(handoff: object, links: list[dict[str, object]]) -> list[dict[str, object]]:
+    """The links in ``links`` that already hold this handoff's design."""
+
+    try:
+        pending_path = Path(handoff.bundle_path).resolve()
+    except OSError:
+        pending_path = None
+    return [
+        link
+        for link in links
+        if (handoff.design_id and link.get("design_id") == handoff.design_id)
+        or (
+            not handoff.design_id
+            and pending_path is not None
+            and link.get("bundle_path")
+            and Path(str(link.get("bundle_path"))).expanduser().resolve() == pending_path
+        )
+    ]
+
+
+_ALREADY_LINKED_TEXT = (
+    "This WG design is already linked in the active Fusion document. Choose that "
+    "link in WG's CAD Link panel and send the update from there, so WG names the "
+    "exact instance to change."
+)
+
+
+def _require_insert_target(handoff: object) -> None:
+    """Re-read the live document immediately before an insert's first write."""
+
+    if handoff.expected_document_id and handoff.expected_document_id != _active_document_id():
+        raise wglink_core.WgLinkError(
+            "The active Fusion document changed after WG prepared this insert. "
+            "Refresh CAD Link and try again."
+        )
+    if _linked_to(handoff, _document_links()):
+        raise wglink_core.WgLinkError(_ALREADY_LINKED_TEXT)
+
+
 def _interrupted(operation_id: str, applying: dict[str, str] | None) -> bool:
     """Whether this operation began mutating and left no evidence."""
 
@@ -1972,14 +2033,9 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
                 "The active Fusion document changed after WG prepared this "
                 f"{operation}. Refresh CAD Link and try again."
             )
-        if _reconciled(handoff.operation_id, handoff.export_id, links):
-            # This operation's own evidence is already on a link: it applied,
-            # and its write is why the document moved. Nothing mutates.
-            outcome = "reconciled"
-        elif _interrupted(handoff.operation_id, applying):
-            outcome = "recoveryRequired"
-            raise wglink_core.WgLinkError(_RECOVERY_REQUIRED_TEXT)
-        elif operation == "update":
+        if operation == "update":
+            # The exact target first: the document (above), the instance, and
+            # the model state WG measured.
             if not handoff.expected_document_id or not handoff.expected_return_state_hash:
                 raise wglink_core.WgLinkError(
                     "WG sent an update without the exact Fusion document and the "
@@ -1998,7 +2054,14 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
                     "try again."
                 )
             link = selected[0]
-            if link.get("export_id") == handoff.export_id:
+            if _reconciled(handoff.operation_id, handoff.export_id, [link]):
+                # This operation's own evidence is on the exact link: it
+                # applied, and its write is why the document moved. A read.
+                outcome = "reconciled"
+            elif _interrupted(handoff.operation_id, applying):
+                outcome = "recoveryRequired"
+                raise wglink_core.WgLinkError(_RECOVERY_REQUIRED_TEXT)
+            elif link.get("export_id") == handoff.export_id:
                 # The export got there another way -- a manual Update, or
                 # another operation. There is nothing left to do.
                 outcome = "alreadyCurrent"
@@ -2022,33 +2085,25 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
                     },
                 )
                 outcome = "applied"
+        elif _reconciled(handoff.operation_id, handoff.export_id, links):
+            # A redelivered insert: its own evidence is on the link it made.
+            outcome = "reconciled"
+        elif _interrupted(handoff.operation_id, applying):
+            outcome = "recoveryRequired"
+            raise wglink_core.WgLinkError(_RECOVERY_REQUIRED_TEXT)
+        elif _linked_to(handoff, links):
+            raise wglink_core.WgLinkError(_ALREADY_LINKED_TEXT)
         else:
-            try:
-                pending_path = Path(handoff.bundle_path).resolve()
-            except OSError:
-                pending_path = None
-            linked = [
-                link
-                for link in links
-                if (handoff.design_id and link.get("design_id") == handoff.design_id)
-                or (
-                    not handoff.design_id
-                    and pending_path is not None
-                    and link.get("bundle_path")
-                    and Path(str(link.get("bundle_path"))).expanduser().resolve()
-                    == pending_path
-                )
-            ]
-            if linked:
-                raise wglink_core.WgLinkError(
-                    "This WG design is already linked in the active Fusion document. "
-                    "Choose that link in WG's CAD Link panel and send the update "
-                    "from there, so WG names the exact instance to change."
-                )
             wglink_core.insert(
                 _app(),
                 handoff.bundle_path,
-                {"allow_root_fallback": True, "operation_id": handoff.operation_id},
+                {
+                    "allow_root_fallback": True,
+                    "operation_id": handoff.operation_id,
+                    # The document and "no link of this design yet", read live
+                    # again immediately before the insert's first write.
+                    "precondition": lambda: _require_insert_target(handoff),
+                },
             )
             outcome = "applied"
         _watcher.reset()
@@ -2094,6 +2149,10 @@ def _sweep_leftover_claims(snapshot: dict[str, object]) -> None:
     """
 
     global _claims_swept
+    if snapshot.get("document_id") is None:
+        # Fusion is still opening: a claim for a document is settled against
+        # that document, so wait until one is active.
+        return
     _claims_swept = True
     ipc = wglink_workspace.ipc_folder(create=True)
     if ipc is None:
@@ -2112,14 +2171,12 @@ def _sweep_leftover_claims(snapshot: dict[str, object]) -> None:
                 outcome = "reconciled"
             elif _interrupted(claim.request_id, snapshot.get("applying_operation")):
                 outcome = "recoveryRequired"
-                _message(
+                _modal(
                     _refusal_text(_RECOVERY_REQUIRED_TEXT, _HANDOFF_RETRY_HINT),
                     "WGLink update interrupted",
                 )
         if wglink_watch.remove_leftover_claim(claim):
-            _begin_request(
-                claim.channel, claim.request_id or claim.path.name, DELIVERY
-            )["outcome"] = outcome
+            _note_outcome(claim.channel, claim.request_id or claim.path.name, outcome)
 
 
 def _notice_outdated_wg() -> None:
@@ -2135,8 +2192,8 @@ def _notice_outdated_wg() -> None:
     if not found:
         return
     _wg_outdated_noticed = True
-    _begin_request("wgRequest", found[0], DELIVERY)["outcome"] = "wgOutdated"
-    _message(wglink_watch.WG_OUTDATED_MESSAGE, f"{PANEL_NAME} cannot read this request")
+    _note_outcome("wgRequest", found[0], "wgOutdated")
+    _modal(wglink_watch.WG_OUTDATED_MESSAGE, f"{PANEL_NAME} cannot read this request")
 
 
 def _on_watch_tick() -> None:
@@ -2279,6 +2336,7 @@ def _start_watch(app: object) -> bool:
     _wg_outdated_noticed = False
     _untaken_solves.clear()
     _untaken_noticed.clear()
+    _recent_outcomes.clear()
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
         return False
@@ -2329,6 +2387,7 @@ def _stop_watch(app: object) -> None:
     _wg_outdated_noticed = False
     _untaken_solves.clear()
     _untaken_noticed.clear()
+    _recent_outcomes.clear()
     _watcher.reset()
 
 

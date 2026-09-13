@@ -2183,11 +2183,16 @@ def test_a_pending_new_bundle_is_inserted_once_and_acknowledged(
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root)
     monkeypatch.setattr(module.wglink_core, "_link_records", lambda _design: {})
     inserted: list[tuple[object, str, dict[str, object]]] = []
+    def insert(active_app, path, options):
+        options = dict(options)
+        options.pop("precondition")()
+        inserted.append((active_app, path, options))
+
     monkeypatch.setattr(
         module.wglink_core,
         "insert",
         lambda active_app, path, options: (
-            inserted.append((active_app, path, options))
+            insert(active_app, path, options)
             or {
                 "instance_id": "horn-1",
                 "wrapper": "WGLink horn",
@@ -3447,7 +3452,9 @@ def test_a_claim_an_interrupted_session_left_is_settled_once_and_never_run(
     assert list((ipc / ".fusion-handoffs").iterdir()) == []
     assert len(ui.messages) == messages
     status = json.loads((ipc / ".fusion-status.json").read_text())
-    assert status["diagnostics"]["lastRequest"]["outcome"] == outcome
+    assert {"channel": "handoff", "requestId": "req-1", "outcome": outcome} in (
+        status["diagnostics"]["recentOutcomes"]
+    )
 
 
 def test_a_request_from_an_older_wg_is_never_run_and_asks_once_for_an_update(
@@ -3523,6 +3530,15 @@ def test_a_newer_update_for_the_same_target_supersedes_an_unstarted_one(
 
     assert [options["operation_id"] for _path, options in updated] == ["req-2"]
     assert list((ipc / ".fusion-handoffs").iterdir()) == []
+    # Recorded visibly: the trace names req-2, and the heartbeat still names
+    # the request dropped for it.
+    monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: True)
+    module._publish_fusion_status(snapshot)
+    status = json.loads((ipc / ".fusion-status.json").read_text())
+    assert status["diagnostics"]["lastRequest"]["correlationId"] == "req-2"
+    assert {"channel": "handoff", "requestId": "req-1", "outcome": "superseded"} in (
+        status["diagnostics"]["recentOutcomes"]
+    )
 
 
 def test_a_solve_request_wg_leaves_untaken_is_reported_once_and_never_dropped(
@@ -3546,6 +3562,14 @@ def test_a_solve_request_wg_leaves_untaken_is_reported_once_and_never_dropped(
     monkeypatch.setattr(module, "_apply_pending_handoff", lambda _snapshot: module.IDLE)
     monkeypatch.setattr(module, "_apply_pending_return_request", lambda _snapshot: module.IDLE)
     monkeypatch.setattr(module._watcher, "survey", lambda _links: [])
+    busy_while_shown: list[bool] = []
+    real_message = module._message
+
+    def message(text, title):
+        busy_while_shown.append(module._command_busy)
+        real_message(text, title)
+
+    monkeypatch.setattr(module, "_message", message)
 
     assert module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)}) is True
     written = [path for path in (ipc / ".wg-solve-requests").iterdir() if not path.name.startswith(".")]
@@ -3558,6 +3582,8 @@ def test_a_solve_request_wg_leaves_untaken_is_reported_once_and_never_dropped(
 
     assert [title for title, _text in ui.messages] == ["WGLink solve request waiting"]
     assert "has not taken the solve request" in ui.messages[0][1]
+    # The modal was shown with the dispatcher held, so no tick ran inside it.
+    assert busy_while_shown == [True]
     assert written[0].exists()
 
     # Taken: nothing more is said about it.
@@ -3565,3 +3591,51 @@ def test_a_solve_request_wg_leaves_untaken_is_reported_once_and_never_dropped(
     clock.value += 120.0
     module._on_watch_tick()
     assert len(ui.messages) == 1
+
+
+def test_an_insert_rechecks_the_live_document_immediately_before_it_writes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Item 5 for inserts: the target is read again, live, before the first write."""
+
+    module, ui = _design_module(monkeypatch, "WGLink_insert_precondition")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    bundle = bundles / "horn.wglink"
+    bundle.mkdir()
+    _publish_like_wg(ipc, "", ".fusion-handoffs", "req-1", 1, {
+        "target": "fusion360",
+        "bundlePath": str(bundle),
+        "bundleId": "wgb_5",
+        "exportId": "wge_5",
+        "sequence": 5,
+        "designId": "wgd-shared",
+    })
+    snapshot = {**_shared_snapshot(), "links": []}
+    # By the time the insert is about to write, the design is linked.
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [
+        {"instance_id": "instance-z", "design_id": "wgd-shared", "export_id": "wge_4"},
+    ])
+    inserted: list[object] = []
+    monkeypatch.setattr(module.wglink_core, "insert", _recording(inserted))
+
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert inserted == []
+    assert "already linked in the active Fusion document" in ui.messages[0][1]
+
+
+def test_leftover_claims_wait_for_an_active_document(monkeypatch, tmp_path: Path) -> None:
+    module, _ui = _design_module(monkeypatch, "WGLink_leftover_waits")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(ipc, bundles, export_id="wge_5")
+    left = module.wglink_watch.claim_request(
+        module.wglink_watch.next_pending_handoff(ipc, bundle_root=bundles)
+    )
+    opening = {**_shared_snapshot(), "document_id": None, "links": [], "applying_operation": None}
+
+    module._sweep_leftover_claims(opening)
+    assert left.marker_path.exists() and module._claims_swept is False
+
+    module._sweep_leftover_claims({**_shared_snapshot(), "applying_operation": None})
+    assert not left.marker_path.exists() and module._claims_swept is True

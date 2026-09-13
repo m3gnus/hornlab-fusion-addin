@@ -3376,8 +3376,12 @@ def insert(
             raise WgLinkError(
                 f"{exc} A partial WGLink insertion exists; Undo will clear it."
             ) from exc
+        # Nothing was built, so there is nothing to recover: no mark.
+        _clear_applying(design, instance_id=instance_id)
         raise
     except Exception as exc:  # noqa: BLE001 - one head-less Fusion boundary
+        if not mutated:
+            _clear_applying(design, instance_id=instance_id)
         remedy = " Use Undo to recover the partial insertion." if mutated else ""
         raise WgLinkError(f"Fusion refused WGLink Insert: {exc}.{remedy}") from exc
 
@@ -3623,14 +3627,6 @@ def update(
         _hide_link_helpers(record, no_op_report)
         return no_op_report
 
-    if operation_id:
-        _mark_applying(
-            design,
-            operation_id=operation_id,
-            kind="update",
-            instance_id=record["instance_id"],
-            export_id=bundle.identity.export_id,
-        )
     _expand_groups(design.timeline)
     entries = _timeline_entries(design.timeline)
     if "last_managed_sketch_index" not in record["payload"]:
@@ -3688,6 +3684,17 @@ def update(
             f"Health diagnostics skipped {len(before_skipped)} unreadable timeline entries."
         )
     local_state = _local_body_state(record)
+    # Immediately before the first write that changes the model. Every refusal
+    # above leaves the document as it was, so it must leave no mark either: a
+    # mark with no change behind it would read as an interrupted update.
+    if operation_id:
+        _mark_applying(
+            design,
+            operation_id=operation_id,
+            kind="update",
+            instance_id=record["instance_id"],
+            export_id=bundle.identity.export_id,
+        )
     marker_moved = False
     failure: Exception | None = None
     try:

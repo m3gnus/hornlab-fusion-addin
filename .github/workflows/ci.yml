@@ -1,6 +1,11 @@
 name: CI
 
 on:
+  # Qualify an exact candidate SHA on every platform before it is landed:
+  # push a topic branch, then `gh workflow run ci.yml --ref <branch>`. It is
+  # also the only way to re-run CI on a trunk commit whose push run GitHub
+  # lost. The job reads no event payload, so a dispatch runs it unchanged.
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:

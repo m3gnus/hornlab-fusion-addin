@@ -176,6 +176,10 @@ _request_trace: dict[str, str] | None = None
 # and whether it has told the user WG is too old to exchange requests with.
 _claims_swept = False
 _wg_outdated_noticed = False
+# Solve commands this session wrote and WG has not taken yet: file -> when
+# written, and the ones the user has already been told about.
+_untaken_solves: dict[Path, float] = {}
+_untaken_noticed: set[Path] = set()
 
 # What one IPC channel did for a single watch tick. The distinction exists
 # because suppressing a repeat error is not the same as doing work: a refused
@@ -854,7 +858,7 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
         )
     command_id = str(uuid.uuid4())
     try:
-        wglink_watch.write_solve_request(
+        written = wglink_watch.write_solve_request(
             ipc,
             command_id=command_id,
             return_id=str(report.get("return_id") or ""),
@@ -863,8 +867,30 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
         )
     except wglink_watch.WgOutdatedError as exc:
         raise wglink_core.WgLinkError(str(exc)) from exc
+    _untaken_solves[Path(written)] = time.monotonic()
     _begin_request("solveCommand", command_id, DELIVERY)["outcome"] = "requested"
     return True
+
+
+def _notice_untaken_solves() -> None:
+    """Tell the user once when WG has left a solve command untaken too long.
+
+    The bound on a stale capability file: after a downgrade it can still say 3
+    while an older WG, which never reads these files, runs. The command stays
+    where it is and runs when a WG that reads it takes it.
+    """
+
+    now = time.monotonic()
+    for path, written_at in list(_untaken_solves.items()):
+        if not path.exists():
+            _untaken_solves.pop(path, None)
+            _untaken_noticed.discard(path)
+            continue
+        if path in _untaken_noticed or now - written_at < wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS:
+            continue
+        _untaken_noticed.add(path)
+        _begin_request("solveCommand", path.stem, DELIVERY)["outcome"] = "notTaken"
+        _message(wglink_watch.SOLVE_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} solve request waiting")
 
 
 def _show_export_progress(operation: str) -> object | None:
@@ -2124,6 +2150,7 @@ def _on_watch_tick() -> None:
         if not _claims_swept:
             _sweep_leftover_claims(snapshot)
         _notice_outdated_wg()
+        _notice_untaken_solves()
         # Only a channel that actually did something claims the tick. A
         # suppressed refusal did nothing, so the channels behind it are still
         # owed this tick -- otherwise one refused handoff silently swallows
@@ -2250,6 +2277,8 @@ def _start_watch(app: object) -> bool:
     _request_trace = None
     _claims_swept = False
     _wg_outdated_noticed = False
+    _untaken_solves.clear()
+    _untaken_noticed.clear()
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
         return False
@@ -2298,6 +2327,8 @@ def _stop_watch(app: object) -> None:
     _request_trace = None
     _claims_swept = False
     _wg_outdated_noticed = False
+    _untaken_solves.clear()
+    _untaken_noticed.clear()
     _watcher.reset()
 
 

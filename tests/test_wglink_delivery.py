@@ -596,16 +596,23 @@ def test_requests_from_an_older_wg_are_reported(
     assert found == [slot, f"{folder}/old-req-{kind}-1.json"]
 
 
-def test_stale_old_files_beside_a_current_wg_are_not_reported(
+def test_old_files_beside_a_version_3_advertisement_are_still_an_older_wgs(
     ipc: Path, bundles: Path
 ) -> None:
-    """A WG that speaks version 3 removes such files itself at its start."""
+    """After a downgrade the advertisement can still say 3.
+
+    A WG that speaks version 3 removes such files at its start, before it
+    advertises, so these were written since -- by an older WG, which never
+    rewrites the capability file.
+    """
 
     OldWG(ipc, bundles).publish(HANDOFFS, 1)
     _write(ipc / CAPABILITIES, ADVERTISED)
 
-    assert wglink_watch.outdated_wg_requests(ipc) == []
     assert wglink_watch.wg_speaks_delivery_version(ipc) is True
+    assert wglink_watch.outdated_wg_requests(ipc) == [
+        ".fusion-handoff.json", ".fusion-handoffs/old-req-handoff-1.json",
+    ]
 
 
 # -- what the reader hands the dispatcher ---------------------------------------

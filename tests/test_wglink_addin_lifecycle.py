@@ -3523,3 +3523,45 @@ def test_a_newer_update_for_the_same_target_supersedes_an_unstarted_one(
 
     assert [options["operation_id"] for _path, options in updated] == ["req-2"]
     assert list((ipc / ".fusion-handoffs").iterdir()) == []
+
+
+def test_a_solve_request_wg_leaves_untaken_is_reported_once_and_never_dropped(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The bound on a stale advertisement (CAD-OPERATIONS.md, "Capability file").
+
+    After a downgrade the file can still say 3 while an older WG, which never
+    reads per-command files, runs. The user is told after a minute; the
+    command is not moved or deleted.
+    """
+
+    module, ui = _design_module(monkeypatch, "WGLink_untaken_solve")
+    ipc, _bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    bundle = tmp_path / "workspace" / "wgreturn" / "speaker.wgreturn"
+    bundle.mkdir(parents=True)
+    (bundle / "wgreturn.json").write_bytes(b"{}")
+    clock = types.SimpleNamespace(value=1000.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
+    monkeypatch.setattr(module, "_fusion_snapshot", _shared_snapshot)
+    monkeypatch.setattr(module, "_apply_pending_handoff", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module, "_apply_pending_return_request", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module._watcher, "survey", lambda _links: [])
+
+    assert module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)}) is True
+    written = [path for path in (ipc / ".wg-solve-requests").iterdir() if not path.name.startswith(".")]
+    module._on_watch_tick()
+    assert ui.messages == []
+
+    clock.value += 61.0
+    module._on_watch_tick()
+    module._on_watch_tick()
+
+    assert [title for title, _text in ui.messages] == ["WGLink solve request waiting"]
+    assert "has not taken the solve request" in ui.messages[0][1]
+    assert written[0].exists()
+
+    # Taken: nothing more is said about it.
+    written[0].unlink()
+    clock.value += 120.0
+    module._on_watch_tick()
+    assert len(ui.messages) == 1

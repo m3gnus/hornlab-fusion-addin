@@ -64,6 +64,17 @@ CLAIM_PREFIX = ".wglink-claim-"
 # command ids.
 _PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
+# How long a solve command may wait untaken before the user is told. WG takes
+# a file on its next poll while its window is open, so a minute is far past
+# normal; past it, WG is closed or older than version 3 (after a downgrade the
+# capability file can still say 3). The command is never dropped or rerouted.
+SOLVE_PICKUP_NOTICE_SECONDS = 60.0
+SOLVE_NOT_TAKEN_MESSAGE = (
+    "Waveguide Generator has not taken the solve request for a minute. Open "
+    "Waveguide Generator; if an older version is running, update it. The request "
+    "waits, and is solved once WG takes it."
+)
+
 WG_OUTDATED_MESSAGE = (
     "This Waveguide Generator is older than its WGLink add-in, so the two cannot "
     "exchange requests. Update Waveguide Generator; it installs the WGLink that "
@@ -520,17 +531,15 @@ def remove_leftover_claim(claim: LeftoverClaim) -> bool:
 
 
 def outdated_wg_requests(ipc_folder: Path) -> list[str]:
-    """Requests an older WG wrote, when WG does not advertise version 3.
+    """Requests an older WG wrote: a single-slot marker, or another schema.
 
-    A single-slot marker, or a request file of another schema version. None of
-    them is ever run. A stale file left beside a WG that does advertise version
-    3 is not evidence of anything -- that WG removes such files at its start --
-    so it is not reported.
+    None of them is ever run. The capability file is not consulted: a WG that
+    speaks version 3 removes such files at its start, before it advertises, so
+    one beside a "3" was written after that -- by an older WG running on the
+    same data folder since a downgrade, which never rewrites the file.
     """
 
     folder = Path(ipc_folder)
-    if wg_speaks_delivery_version(folder):
-        return []
     found = [
         name
         for name in (LEGACY_HANDOFF_FILENAME, LEGACY_RETURN_REQUEST_FILENAME)

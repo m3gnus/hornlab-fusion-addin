@@ -111,6 +111,8 @@ _PAYLOAD_KEYS = {
     "formula",
     "geometry_hash",
     "instance_id",
+    # The WG operation that last updated the link, beside its export id.
+    "operation_id",
     "lineage_id",
     "link_name",
     "local_body_state",
@@ -3724,6 +3726,11 @@ def update(
         "edit_version": str(bundle.manifest.get("design", {}).get("edit_version", "")),
         "export_id": bundle.identity.export_id,
         "export_sequence": str(bundle.identity.export_sequence),
+        # Reconciliation evidence: the WG operation that asked for this
+        # Update, written beside the export identity (both moved to the end
+        # below). An Update no operation asked for writes an empty id, so an
+        # older operation's id does not stay beside a newer export.
+        "operation_id": str(opts.get("operation_id") or ""),
         "geometry_hash": str(bundle.manifest.get("export", {}).get("geometry_hash", "")),
         "lineage_id": bundle.identity.lineage_id or "",
         "local_body_state": evidence_state,
@@ -3743,6 +3750,11 @@ def update(
     }
     if evidence_fingerprint is not None:
         refresh["body_fingerprint"] = evidence_fingerprint
+    # The evidence is the last write. Attributes are written one at a time in
+    # this order, so the export identity and then the operation id follow
+    # every other refreshed field.
+    for name in ("export_sequence", "export_id", "operation_id"):
+        refresh[name] = refresh.pop(name)
     _update_payload_attributes(design, record["instance_id"], refresh)
     _warn_unmeasured(report.get("deviation"), report.setdefault("warnings", []))
     _write_progress(progress_path, report)

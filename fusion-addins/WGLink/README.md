@@ -157,6 +157,34 @@ never ran, the folder is on a disconnected drive, the bundle came from another
 machine — the Insert dropdown falls back to the browse entries and manual picker
 behaves as it always did.
 
+## Delivery with Waveguide Generator
+
+Commands and requests cross through WG's machine-local IPC folder,
+`<WG data folder>/ipc/wglink`. The contract is WG's
+`docs/architecture/CAD-OPERATIONS.md`; WGLink implements the add-in's half.
+
+- **Solve commands.** WG advertises what it reads in `wg-capabilities.json`.
+  When that file names `solveCommandDelivery` 2 or later, **Solve in WG** writes
+  `.wg-solve-requests/<commandId>.json`, so a second command never replaces one
+  WG has not read yet. A missing, unreadable or older file means the legacy
+  single slot, `.wg-solve-request.json`, which every WG reads.
+- **WG's requests.** A WG that publishes each return request and handoff as its
+  own file (`.fusion-return-requests/<id>.json`, `.fusion-handoffs/<id>.json`)
+  also writes a legacy twin under the same id into the old single slot. WGLink
+  takes the files in `deliverySequence` order, claims each by renaming it to a
+  hidden name, runs it once and deletes the claim, also when the request is
+  refused. It never runs or deletes a slot that names an `operationId`: that
+  twin exists for an add-in that reads only the slot. A slot without one comes
+  from an older WG; it runs once and is acknowledged as before. Requests an
+  add-in that reads only the slot has already taken are discarded unrun.
+- **Reconciliation.** An automatic Update stamps WG's operation id beside the
+  export identity, as its last write. A handoff whose export the exact link
+  already carries is acknowledged without mutating and before the
+  stale-document check, so a lost acknowledgement never reads as a conflict.
+- **Correlation.** The heartbeat's `diagnostics.lastRequest` names the last
+  round trip (`channel`, `correlationId`, `attemptId`, `delivery`, `outcome`),
+  and each link publishes the `operationId` stamped on it.
+
 ## Duplicate-registration ownership and recovery
 
 Fusion may load several registered WGLink paths into one Python process. Each

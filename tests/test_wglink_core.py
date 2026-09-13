@@ -2333,3 +2333,138 @@ def test_send_duplicate_body_refusal_names_a_detach_that_runs(core, monkeypatch)
     records = send._records_in_scope(design, walk)
     assert [record["instance_id"] for record in records] == ["wg-1"]
     assert records[0]["body"] is original
+
+
+# --- Reconciliation evidence: the operation id beside the export identity ----
+
+
+def test_the_operation_id_is_a_recognised_payload_attribute(core):
+    # _link_records only copies whitelisted direct attributes off an entity;
+    # the evidence would vanish on every read without it.
+    assert "operation_id" in core._PAYLOAD_KEYS
+
+
+def _stub_rebuilding_update(core, monkeypatch, calls):
+    """Everything around a rebuilding Update, recording the document writes.
+
+    Only ``update`` itself is production code here. The timeline, parameter
+    push, tag repair and payload write each record themselves, so the test
+    can say which write came last.
+    """
+
+    class _Timeline:
+        count = 9
+
+        def __init__(self) -> None:
+            self._marker = 9
+
+        @property
+        def markerPosition(self) -> int:
+            return self._marker
+
+        @markerPosition.setter
+        def markerPosition(self, value: int) -> None:
+            calls.append(("timeline", value))
+            self._marker = value
+
+        def moveToEnd(self) -> None:
+            calls.append(("timeline", "end"))
+
+    design = types.SimpleNamespace(timeline=_Timeline())
+    bundle = types.SimpleNamespace(
+        identity=types.SimpleNamespace(
+            design_id="wgd_one",
+            export_id="wge_new",
+            export_sequence=5,
+            lineage_id="wgl_one",
+        ),
+        manifest={"design": {"build_mode": "freestanding"}, "export": {}, "bundle": {}},
+        grid={},
+    )
+    record = {
+        "instance_id": "wgi_one",
+        "body": object(),
+        "payload": {
+            "build_mode": "freestanding",
+            "slug": "horn",
+            "topology": "{}",
+            "last_managed_sketch_index": "3",
+            "parameter_prefix": "wg_horn_",
+            "source_role": "HF",
+            "throat_z_mm": "0.0",
+        },
+    }
+    for name, replacement in {
+        "_design": lambda _app: design,
+        "_resolve_link": lambda *_a, **_k: record,
+        "_link_frame_report": lambda *_a: {"verdict": "in_frame"},
+        "_refuse_bad_link_frame": lambda *_a, **_k: None,
+        "_bundle_for_update": lambda *_a: (Path("horn.wglink"), bundle),
+        "link_state": lambda *_a: types.SimpleNamespace(verdict="newer_export"),
+        "parameter_slug": lambda _bundle: "horn",
+        "_record_parameter_prefix": lambda _payload: "wg_horn_",
+        "_validate_enclosure_placement": lambda _bundle: None,
+        "_validate_mouth_outline": lambda _bundle: None,
+        "_resample_payload": lambda *_a, **_k: {},
+        "_ring_sketches": lambda *_a: [],
+        "_interface_sketches": lambda *_a: {},
+        "_validate_rebuild_topology": lambda *_a: (0, 0),
+        "_expand_groups": lambda _timeline: None,
+        "_timeline_entries": lambda _timeline: [{"index": 4, "kind": "Sketch"}],
+        "_last_managed_sketch_index": lambda *_a: 3,
+        "rollback_target": lambda _entries, after_index: 4,
+        "_feature_health": lambda _design: ([], []),
+        "_local_body_state": lambda _record: "unmodified",
+        "_push_parameters": lambda *_a: calls.append(("parameters", None)) or {},
+        "_rebuild_interface_points": lambda _payload: {},
+        "_fixed_enclosure_sketch": lambda *_a: None,
+        "_write_progress": lambda *_a: None,
+        "_hide_link_helpers": lambda *_a: None,
+        "_tag_report": lambda *_a, **_k: calls.append(("tag", None)) or {},
+        "throat_area_mm2": lambda _bundle: 1.0,
+        "health_regressions": lambda *_a: [],
+        "_assembly_from_link": lambda *_a: {},
+        "_body_measurement": lambda *_a: {},
+        "transform_points": lambda *_a: [],
+        "_deviation": lambda *_a: {},
+        "_body_fingerprint": lambda _body: {},
+        "refreshed_body_evidence": lambda *_a: ("unmodified", "sha256:fingerprint"),
+        "_managed_parameter_expressions": lambda *_a, **_k: {},
+        "_warn_unmeasured": lambda *_a: None,
+        "_update_payload_attributes": lambda _design, _instance, updates: calls.append(
+            ("evidence", dict(updates))
+        ),
+    }.items():
+        monkeypatch.setattr(core, name, replacement)
+
+
+@pytest.mark.parametrize("operation_id", ["req-7", None], ids=["wg-operation", "manual"])
+def test_update_stamps_the_operation_id_beside_the_export_identity_as_its_last_write(
+    core, monkeypatch, tmp_path: Path, operation_id
+):
+    """Evidence is the last write (CAD-OPERATIONS.md, "Fusion-bound mutations").
+
+    A redelivered handoff is reconciled by reading the link, never by running
+    Update again, so the operation id has to land with the export identity
+    and after every mutation. An Update no WG operation asked for writes an
+    empty id, so an older operation's id never sits beside a newer export.
+    """
+
+    calls: list[tuple[str, object]] = []
+    _stub_rebuilding_update(core, monkeypatch, calls)
+    options = {"instance_id": "wgi_one", "progress_path": str(tmp_path / "progress.json")}
+    if operation_id is not None:
+        options["operation_id"] = operation_id
+
+    core.update(object(), None, options)
+
+    assert [kind for kind, _ in calls] == [
+        "timeline", "parameters", "timeline", "tag", "evidence",
+    ]
+    evidence = calls[-1][1]
+    assert evidence["export_id"] == "wge_new"
+    assert evidence["operation_id"] == (operation_id or "")
+    assert evidence["body_fingerprint"] == "sha256:fingerprint"
+    # One attribute is written at a time, in this order: the export identity
+    # and then the operation id come last, after every other refreshed field.
+    assert list(evidence)[-3:] == ["export_sequence", "export_id", "operation_id"]

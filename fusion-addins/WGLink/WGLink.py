@@ -167,6 +167,11 @@ _handoff_attempted_id: str | None = None
 # A refused return request also remains on disk. Suppress repeated attempts for
 # that exact request while allowing a later request id through normally.
 _return_request_attempted_id: str | None = None
+# The WG round trip this add-in last worked on, and which attempt that was,
+# published in the heartbeat's diagnostics. One correlation id per round trip:
+# WG's operation id for its own requests (the export id for a handoff from a
+# WG that predates them), the command id for a solve command.
+_request_trace: dict[str, str] | None = None
 
 # What one IPC channel did for a single watch tick. The distinction exists
 # because suppressing a repeat error is not the same as doing work: a refused
@@ -191,8 +196,33 @@ _RETURN_RETRY_HINT = (
 )
 
 
+# A request read from its own file runs once and is then spent. The legacy
+# slot beside it holds a twin this add-in never runs, so naming that file as a
+# remedy would send the user to a file that cannot help.
+_HANDOFF_RETRY_HINT_PER_REQUEST = (
+    "WGLink will not retry this handoff by itself. Send the model from WG again."
+)
+_RETURN_RETRY_HINT_PER_REQUEST = (
+    "WGLink will not retry this request by itself. Ask WG for the model again."
+)
+
+
 def _refusal_text(reason: str, hint: str) -> str:
     return f"{reason}\n\n{hint}"
+
+
+def _begin_request(channel: str, correlation_id: str, delivery: str) -> dict[str, str]:
+    """Start one attempt at a WG round trip, named for the heartbeat."""
+
+    global _request_trace
+    _request_trace = {
+        "channel": channel,
+        "correlationId": correlation_id,
+        "attemptId": str(uuid.uuid4()),
+        "delivery": delivery,
+        "outcome": "running",
+    }
+    return _request_trace
 
 
 def _lease_now() -> float:
@@ -831,13 +861,18 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
         raise wglink_core.WgLinkError(
             "Waveguide Generator has no selected CAD Link workspace, so it cannot be asked to solve."
         )
-    wglink_watch.write_solve_request(
+    command_id = str(uuid.uuid4())
+    marker = wglink_watch.write_solve_request(
         ipc,
-        command_id=str(uuid.uuid4()),
+        command_id=command_id,
         return_id=str(report.get("return_id") or ""),
         bundle_path=Path(str(report.get("bundle_path") or "")),
         workspace_root=workspace,
     )
+    per_command = marker.parent.name == wglink_watch.SOLVE_REQUESTS_DIRECTORY
+    _begin_request(
+        "solveCommand", command_id, "perCommand" if per_command else "legacySlot"
+    )["outcome"] = "requested"
     return True
 
 
@@ -1469,6 +1504,7 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
             "source_state_hash": state["source_state_hash"],
             "export_id": str(payload.get("export_id") or ""),
             "export_sequence": str(payload.get("export_sequence") or ""),
+            "operation_id": str(payload.get("operation_id") or ""),
         }
         identity = instance_identities.get(str(instance_id))
         if isinstance(identity, dict):
@@ -1631,6 +1667,9 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
     if folder is None:
         return
     current = snapshot if snapshot is not None else _fusion_snapshot()
+    diagnostics = dict(current.get("diagnostics") or {})
+    if _request_trace is not None:
+        diagnostics["lastRequest"] = dict(_request_trace)
     try:
         wglink_watch.write_fusion_status(
             folder,
@@ -1640,7 +1679,7 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
             adapter_version=wglink_send.ADAPTER_VERSION,
             workspace_root=wglink_workspace.workspace_root(),
             links=current["links"],
-            diagnostics=current.get("diagnostics"),
+            diagnostics=diagnostics,
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
         pass
@@ -1675,20 +1714,14 @@ def _pending_handoff() -> wglink_watch.PendingHandoff | None:
     bundles = wglink_workspace.bundle_folder()
     if ipc is None or bundles is None:
         return None
-    return wglink_watch.read_pending_handoff(
-        ipc / wglink_watch.HANDOFF_FILENAME,
-        bundle_root=bundles,
-    )
+    return wglink_watch.next_pending_handoff(ipc, bundle_root=bundles)
 
 
 def _pending_return_request() -> wglink_watch.PendingReturnRequest | None:
     ipc = wglink_workspace.ipc_folder(create=True)
     if ipc is None:
         return None
-    return wglink_watch.read_return_request(
-        ipc / wglink_watch.RETURN_REQUEST_FILENAME,
-        session_id=_watch_session_id,
-    )
+    return wglink_watch.next_return_request(ipc, session_id=_watch_session_id)
 
 
 def _apply_pending_return_request(
@@ -1700,6 +1733,10 @@ def _apply_pending_return_request(
     attempted this session is ``SUPPRESSED``: the user has seen its refusal and
     must not see it again, but nothing ran, so the tick still belongs to the
     survey channel behind this one.
+
+    A request read from its own file is claimed before it runs, and its claim
+    is deleted afterwards whatever the outcome: it runs at most once. A legacy
+    slot is acknowledged only on success, as before.
     """
 
     global _command_busy, _return_request_attempted_id
@@ -1708,7 +1745,22 @@ def _apply_pending_return_request(
         return IDLE
     if _return_request_attempted_id == request.request_id:
         return SUPPRESSED
+    if request.per_request:
+        claimed = wglink_watch.claim_request(request)
+        if claimed is None:
+            # Gone, or held open by WG on Windows: the next tick looks again.
+            return IDLE
+        request = claimed
     _return_request_attempted_id = request.request_id
+    retry_hint = (
+        _RETURN_RETRY_HINT_PER_REQUEST if request.per_request else _RETURN_RETRY_HINT
+    )
+    trace = _begin_request(
+        "returnRequest",
+        request.request_id,
+        "perRequest" if request.per_request else "legacySlot",
+    )
+    outcome = "failed"
     _command_busy = True
     try:
         if not request.design_id or not request.document_id or not request.instance_id:
@@ -1754,15 +1806,21 @@ def _apply_pending_return_request(
             "capture_document": wglink_workspace.capture_document(),
         }
         wglink_send.send(_app(), options)
-        wglink_watch.acknowledge_return_request(request)
+        outcome = "applied"
+        if not request.per_request:
+            wglink_watch.acknowledge_return_request(request)
     except wglink_core.WgLinkError as exc:
+        outcome = "refused"
         _message(
-            _refusal_text(str(exc), _RETURN_RETRY_HINT),
+            _refusal_text(str(exc), retry_hint),
             "WGLink return to WG refused",
         )
     except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
         _report_error("Returning this model to WG", "WGLink return to WG error", exc)
     finally:
+        if request.per_request:
+            wglink_watch.acknowledge_return_request(request)
+        trace["outcome"] = outcome
         _command_busy = False
     return HANDLED
 
@@ -1798,6 +1856,10 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
     the rest of the session, so every later tick takes the ``SUPPRESSED``
     branch. That must not read as "this tick is spoken for" -- a return request
     or a newer export behind it would then never be looked at again.
+
+    A handoff read from its own file is claimed before it runs, and its claim
+    is deleted afterwards whatever the outcome: it runs at most once, under
+    its request id. A legacy slot is acknowledged only on success, as before.
     """
 
     global _command_busy, _handoff_attempted_id
@@ -1805,19 +1867,39 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
     if handoff is None:
         return IDLE
 
-    if _handoff_attempted_id == handoff.export_id:
+    attempt_key = handoff.request_id if handoff.per_request else handoff.export_id
+    if _handoff_attempted_id == attempt_key:
         return SUPPRESSED
+    retry_hint = (
+        _HANDOFF_RETRY_HINT_PER_REQUEST if handoff.per_request else _HANDOFF_RETRY_HINT
+    )
+    delivery = "perRequest" if handoff.per_request else "legacySlot"
+    correlation_id = handoff.operation_id or handoff.request_id or handoff.export_id
     try:
         ready = _ensure_design_ready()
     except wglink_core.WgLinkError as exc:
-        _handoff_attempted_id = handoff.export_id
+        if handoff.per_request:
+            # Claimed first: a failed claim is retried on the next pass, so a
+            # refusal is shown and remembered only for a request it spent.
+            claimed = wglink_watch.claim_request(handoff)
+            if claimed is None:
+                return IDLE
+            wglink_watch.acknowledge_handoff(claimed)
+        _handoff_attempted_id = attempt_key
+        _begin_request("handoff", correlation_id, delivery)["outcome"] = "refused"
         _message(
-            _refusal_text(str(exc), _HANDOFF_RETRY_HINT),
+            _refusal_text(str(exc), retry_hint),
             "WGLink automatic open refused",
         )
         return HANDLED
     if not ready:
         return IDLE
+    if handoff.per_request:
+        claimed = wglink_watch.claim_request(handoff)
+        if claimed is None:
+            # Gone, or held open by WG on Windows: the next tick looks again.
+            return IDLE
+        handoff = claimed
 
     links = snapshot["links"] if snapshot is not None else _document_links()
     try:
@@ -1838,7 +1920,9 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
     except OSError:
         linked = []
 
-    _handoff_attempted_id = handoff.export_id
+    _handoff_attempted_id = attempt_key
+    trace = _begin_request("handoff", correlation_id, delivery)
+    outcome = "failed"
     _command_busy = True
     try:
         if handoff.expected_instance_id and not handoff.expected_document_id:
@@ -1882,29 +1966,50 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
             )
         if linked:
             link = linked[0]
-            if handoff.expected_return_state_hash:
-                # Measured here, not read off ``link``: the snapshot's token
-                # comes from the heartbeat cache and can equal the stale token
-                # WG is holding while the model has already moved. This one
-                # authorizes a rebuild of the user's sketches and parameters.
-                _require_live_state(
-                    str(handoff.expected_return_state_hash),
-                    "The Fusion model changed after WG prepared this update. Refresh CAD Link and choose a sync direction again.",
+            if link.get("export_id") == handoff.export_id:
+                # Reconciliation comes before the baseline check, and it is a
+                # read. This exact link already carries the export, so the
+                # work is done: nothing mutates. The update's own write is what
+                # moved the document-wide token, so checking the baseline first
+                # would turn a lost acknowledgement into a false conflict. And
+                # Update's no-op path writes, so it is not run either. Only
+                # this operation's own id beside that export says it applied;
+                # otherwise the export got there another way (a manual Update,
+                # another operation), and there is still nothing to do.
+                outcome = (
+                    "reconciled"
+                    if not handoff.operation_id
+                    or link.get("operation_id") == handoff.operation_id
+                    else "alreadyCurrent"
                 )
-            if link.get("export_id") != handoff.export_id:
-                wglink_core.update(
-                    _app(),
-                    handoff.bundle_path,
-                    {"instance_id": link["instance_id"]},
-                )
+            else:
+                if handoff.expected_return_state_hash:
+                    # Measured here, not read off ``link``: the snapshot's
+                    # token comes from the heartbeat cache and can equal the
+                    # stale token WG is holding while the model has already
+                    # moved. This one authorizes a rebuild of the user's
+                    # sketches and parameters.
+                    _require_live_state(
+                        str(handoff.expected_return_state_hash),
+                        "The Fusion model changed after WG prepared this update. Refresh CAD Link and choose a sync direction again.",
+                    )
+                update_options: dict[str, object] = {"instance_id": link["instance_id"]}
+                if handoff.operation_id:
+                    # Stamped beside the export identity as Update's last
+                    # write: the evidence a redelivery is reconciled against.
+                    update_options["operation_id"] = handoff.operation_id
+                wglink_core.update(_app(), handoff.bundle_path, update_options)
+                outcome = "applied"
         else:
             wglink_core.insert(
                 _app(), handoff.bundle_path, {"allow_root_fallback": True}
             )
-        wglink_watch.acknowledge_handoff(
-            handoff,
-            bundle_root=wglink_workspace.bundle_folder(),
-        )
+            outcome = "applied"
+        if not handoff.per_request:
+            wglink_watch.acknowledge_handoff(
+                handoff,
+                bundle_root=wglink_workspace.bundle_folder(),
+            )
         _watcher.reset()
         # An automatic send already has two visible success signals: the model
         # appears and the browser reports the completed bundle. A modal report
@@ -1913,9 +2018,10 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
         # the manual Insert command; automatic success stays silent. Genuine
         # refusals and unexpected failures below still demand attention.
     except wglink_core.WgLinkError as exc:
+        outcome = "refused"
         operation = "update" if linked else "insert"
         _message(
-            _refusal_text(str(exc), _HANDOFF_RETRY_HINT),
+            _refusal_text(str(exc), retry_hint),
             f"WGLink automatic {operation} refused",
         )
     except Exception as exc:  # noqa: BLE001 - main-thread add-in boundary
@@ -1924,6 +2030,9 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
             f"The automatic {operation}", f"WGLink automatic {operation} error", exc
         )
     finally:
+        if handoff.per_request:
+            wglink_watch.acknowledge_handoff(handoff)
+        trace["outcome"] = outcome
         _command_busy = False
     return HANDLED
 
@@ -2054,10 +2163,11 @@ def _stop_candidate(app: object) -> None:
 
 def _start_watch(app: object) -> bool:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
-    global _handoff_attempted_id, _return_request_attempted_id
+    global _handoff_attempted_id, _return_request_attempted_id, _request_trace
     _watcher.reset()
     _handoff_attempted_id = None
     _return_request_attempted_id = None
+    _request_trace = None
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
         return False
@@ -2076,7 +2186,7 @@ def _start_watch(app: object) -> bool:
 
 def _stop_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
-    global _handoff_attempted_id, _return_request_attempted_id
+    global _handoff_attempted_id, _return_request_attempted_id, _request_trace
     if _watch_stop is not None:
         _watch_stop.set()
     if _watch_thread is not None and _watch_thread.is_alive():
@@ -2102,6 +2212,7 @@ def _stop_watch(app: object) -> None:
     _watch_event = _watch_handler = _watch_stop = _watch_thread = None
     _handoff_attempted_id = None
     _return_request_attempted_id = None
+    _request_trace = None
     _watcher.reset()
 
 

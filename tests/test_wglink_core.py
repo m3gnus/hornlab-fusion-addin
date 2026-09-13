@@ -2370,7 +2370,43 @@ def _stub_rebuilding_update(core, monkeypatch, calls):
         def moveToEnd(self) -> None:
             calls.append(("timeline", "end"))
 
-    design = types.SimpleNamespace(timeline=_Timeline())
+    class _RootAttributes:
+        """The root component's attribute table, recording the applying marker."""
+
+        def __init__(self) -> None:
+            self.values: dict[tuple[str, str], str] = {}
+
+        def itemByName(self, group: str, name: str):
+            key = (group, name)
+            if key not in self.values:
+                return None
+            table = self
+
+            class _Attribute:
+                @property
+                def value(self) -> str:
+                    return table.values[key]
+
+                @value.setter
+                def value(self, value: str) -> None:
+                    table.values[key] = value
+                    calls.append(("marker", value))
+
+                def deleteMe(self) -> bool:
+                    table.values.pop(key, None)
+                    calls.append(("clear", None))
+                    return True
+
+            return _Attribute()
+
+        def add(self, group: str, name: str, value: str) -> None:
+            self.values[(group, name)] = value
+            calls.append(("marker", value))
+
+    design = types.SimpleNamespace(
+        timeline=_Timeline(),
+        rootComponent=types.SimpleNamespace(attributes=_RootAttributes()),
+    )
     bundle = types.SimpleNamespace(
         identity=types.SimpleNamespace(
             design_id="wgd_one",
@@ -2436,6 +2472,7 @@ def _stub_rebuilding_update(core, monkeypatch, calls):
         ),
     }.items():
         monkeypatch.setattr(core, name, replacement)
+    return design
 
 
 @pytest.mark.parametrize("operation_id", ["req-7", None], ids=["wg-operation", "manual"])
@@ -2458,13 +2495,110 @@ def test_update_stamps_the_operation_id_beside_the_export_identity_as_its_last_w
 
     core.update(object(), None, options)
 
-    assert [kind for kind, _ in calls] == [
-        "timeline", "parameters", "timeline", "tag", "evidence",
-    ]
-    evidence = calls[-1][1]
+    if operation_id is None:
+        # No WG operation: nothing is marked, and nothing is left to clear.
+        assert [kind for kind, _ in calls] == [
+            "timeline", "parameters", "timeline", "tag", "evidence",
+        ]
+    else:
+        # Marked as applying before the first write, cleared after the evidence.
+        assert [kind for kind, _ in calls] == [
+            "marker", "timeline", "parameters", "timeline", "tag", "evidence", "clear",
+        ]
+    evidence = next(value for kind, value in calls if kind == "evidence")
     assert evidence["export_id"] == "wge_new"
     assert evidence["operation_id"] == (operation_id or "")
     assert evidence["body_fingerprint"] == "sha256:fingerprint"
     # One attribute is written at a time, in this order: the export identity
     # and then the operation id come last, after every other refreshed field.
     assert list(evidence)[-3:] == ["export_sequence", "export_id", "operation_id"]
+
+
+# --- The precondition and the applying marker ---------------------------------
+
+
+def test_update_rechecks_its_precondition_after_the_last_read_and_before_any_write(
+    core, monkeypatch, tmp_path: Path
+):
+    """WG's baseline is re-checked immediately before mutating (Phase 0B item 5).
+
+    The dispatcher cannot do it early enough on its own: Update reads the
+    bundle, resamples and validates sketch topology first. So the check is
+    handed to Update, which runs it after those reads and before the marker,
+    the timeline and every other write. A refusal there writes nothing.
+    """
+
+    calls: list[tuple[str, object]] = []
+    _stub_rebuilding_update(core, monkeypatch, calls)
+    options = {
+        "instance_id": "wgi_one",
+        "operation_id": "req-7",
+        "progress_path": str(tmp_path / "progress.json"),
+        "precondition": lambda: calls.append(("precondition", None)),
+    }
+
+    core.update(object(), None, options)
+
+    assert [kind for kind, _ in calls][:3] == ["precondition", "marker", "timeline"]
+
+    calls.clear()
+
+    def the_document_moved() -> None:
+        calls.append(("precondition", None))
+        raise core.WgLinkError("The Fusion model changed after WG prepared this update.")
+
+    options["precondition"] = the_document_moved
+    with pytest.raises(core.WgLinkError, match="changed after WG prepared"):
+        core.update(object(), None, options)
+
+    assert calls == [("precondition", None)]
+
+
+def test_an_update_interrupted_after_its_first_write_leaves_the_applying_marker(
+    core, monkeypatch, tmp_path: Path
+):
+    """Began and did not finish: the marker names it, and no evidence does."""
+
+    calls: list[tuple[str, object]] = []
+    design = _stub_rebuilding_update(core, monkeypatch, calls)
+
+    def fusion_fails_midway(*_args, **_kwargs):
+        raise RuntimeError("compute failed")
+
+    monkeypatch.setattr(core, "_push_parameters", fusion_fails_midway)
+
+    with pytest.raises(core.WgLinkError, match="rebuild failed"):
+        core.update(object(), None, {
+            "instance_id": "wgi_one",
+            "operation_id": "req-7",
+            "progress_path": str(tmp_path / "progress.json"),
+        })
+
+    assert "evidence" not in [kind for kind, _ in calls]
+    assert core.applying_operation(design) == {
+        "operation_id": "req-7",
+        "kind": "update",
+        "instance_id": "wgi_one",
+        "export_id": "wge_new",
+    }
+
+
+def test_a_later_completed_update_of_the_instance_clears_an_old_marker(
+    core, monkeypatch, tmp_path: Path
+):
+    calls: list[tuple[str, object]] = []
+    design = _stub_rebuilding_update(core, monkeypatch, calls)
+    core._mark_applying(
+        design, operation_id="req-old", kind="update", instance_id="wgi_one", export_id="wge_x"
+    )
+    other = core._json({"operation_id": "req-b", "kind": "update", "instance_id": "wgi_two"})
+
+    core.update(object(), None, {
+        "instance_id": "wgi_one", "progress_path": str(tmp_path / "progress.json"),
+    })
+
+    assert core.applying_operation(design) is None
+    # A marker naming another instance is that instance's, and stays.
+    design.rootComponent.attributes.add(core.ATTRIBUTE_GROUP, core.APPLYING_ATTRIBUTE, other)
+    core._clear_applying(design, instance_id="wgi_one")
+    assert core.applying_operation(design)["operation_id"] == "req-b"

@@ -278,6 +278,82 @@ def _set_attribute(entity: object, name: str, value: object) -> None:
     attributes.add(ATTRIBUTE_GROUP, name, text)
 
 
+# The WG operation a Fusion-bound mutation is applying. It is stamped on the
+# root component immediately before the mutation's first write, and removed
+# once its evidence -- the operation id beside the export identity -- has been
+# written. A marker whose operation left no evidence means the mutation began
+# and did not finish: WG's contract (CAD-OPERATIONS.md, "Fusion-bound
+# mutations") calls that recovery_required, and the operation is never run
+# again. WGLink.py reads it and the heartbeat publishes it.
+APPLYING_ATTRIBUTE = "applying_operation"
+_APPLYING_FIELDS = ("operation_id", "kind", "instance_id", "export_id")
+
+
+def applying_operation(design: object) -> dict[str, str] | None:
+    """The WG operation this document is marked as applying, or None."""
+
+    root = getattr(design, "rootComponent", None)
+    raw = _attribute_value(root, APPLYING_ATTRIBUTE) if root is not None else None
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    marker = {field: str(value.get(field) or "") for field in _APPLYING_FIELDS}
+    return marker if marker["operation_id"] else None
+
+
+def _mark_applying(
+    design: object, *, operation_id: str, kind: str, instance_id: str, export_id: str
+) -> None:
+    """Mark a WG operation as applying, before its first write.
+
+    A document that cannot carry the marker is not changed: without it an
+    interrupted mutation could not be told from one that never started.
+    """
+
+    root = getattr(design, "rootComponent", None)
+    if root is None:
+        raise WgLinkError(
+            "WGLink cannot mark this document before changing it, so it will not "
+            "change it."
+        )
+    _set_attribute(
+        root,
+        APPLYING_ATTRIBUTE,
+        _json(
+            {
+                "operation_id": operation_id,
+                "kind": kind,
+                "instance_id": instance_id,
+                "export_id": export_id,
+            }
+        ),
+    )
+
+
+def _clear_applying(design: object, *, instance_id: str) -> None:
+    """Remove the marker for this instance, after the mutation's evidence.
+
+    Any completed change of the instance clears it, a manual Update included:
+    the geometry it leaves is whole again.
+    """
+
+    marker = applying_operation(design)
+    if marker is None or marker["instance_id"] not in ("", instance_id):
+        return
+    attribute = _attribute(getattr(design, "rootComponent", None), APPLYING_ATTRIBUTE)
+    if attribute is None:
+        return
+    try:
+        attribute.deleteMe()
+    except Exception:  # noqa: BLE001 - an empty value reads as no marker
+        attribute.value = ""
+
+
 def _entity_token(entity: object) -> str:
     try:
         return str(entity.entityToken)
@@ -2962,6 +3038,11 @@ def insert(
     """Materialize one full Waveguide Generator viewport model."""
 
     opts = _options(options)
+    # As in update(): re-checked immediately before the first write, and the
+    # WG operation this insertion applies, stamped with the payload as its
+    # evidence. Both are optional.
+    precondition = opts.pop("precondition", None)
+    operation_id = str(opts.get("operation_id") or "")
     design = _design(app)
     bundle = _read_owned_bundle(bundle_path)
     mode = bundle.manifest["design"]["build_mode"]
@@ -3039,6 +3120,17 @@ def insert(
         "assembly_from_link": [list(row) for row in IDENTITY_MATRIX],
         "warnings": warnings,
     }
+    # Everything above only reads.
+    if precondition is not None:
+        precondition()
+    if operation_id:
+        _mark_applying(
+            design,
+            operation_id=operation_id,
+            kind="insert",
+            instance_id=instance_id,
+            export_id=bundle.identity.export_id,
+        )
     timeline_start = design.timeline.count
     started = time.time()
     mutated = False
@@ -3168,6 +3260,10 @@ def insert(
             # this field existed reads exactly as it always did.
             payload["link_name"] = link_name
         payload["throat_z_mm"] = repr(throat_z)
+        if operation_id:
+            # Reconciliation evidence: a redelivered insert is recognised by
+            # this operation's id beside the export identity on the link.
+            payload["operation_id"] = operation_id
         managed_sketch_indices = [
             index
             for entity in (*interfaces.values(), *ring_sketches, *made)
@@ -3212,6 +3308,7 @@ def insert(
         for entity in made:
             if _kind(entity) not in {"Sketch", "ConstructionPlane", "ConstructionAxis"}:
                 _stamp_payload(entity, payload)
+        _clear_applying(design, instance_id=instance_id)
 
         # The timeline group is a label the user reads in their own document,
         # so their own name for the link wins over WG's name for the design.
@@ -3439,6 +3536,11 @@ def update(
     """
 
     opts = _options(options)
+    # A callable the caller re-checks immediately before the first write (for
+    # WG's handoff: the exact target's baseline), and the WG operation this
+    # update applies. Both are optional; a manual Update has neither.
+    precondition = opts.pop("precondition", None)
+    operation_id = str(opts.get("operation_id") or "")
     design = _design(app)
     record = _resolve_link(design, opts)
     link_frame = _link_frame_report(design, record)
@@ -3505,6 +3607,10 @@ def update(
         design, record["instance_id"], record["payload"]
     )
     sections, _points = _validate_rebuild_topology(rings, interfaces, payload, topology)
+    # Everything above only reads. The precondition runs here, after the last
+    # read and before either path's first write.
+    if precondition is not None:
+        precondition()
     if no_op:
         no_op_report = _no_op_update_report(
             app, design, record, bundle, opts, link_frame
@@ -3517,6 +3623,14 @@ def update(
         _hide_link_helpers(record, no_op_report)
         return no_op_report
 
+    if operation_id:
+        _mark_applying(
+            design,
+            operation_id=operation_id,
+            kind="update",
+            instance_id=record["instance_id"],
+            export_id=bundle.identity.export_id,
+        )
     _expand_groups(design.timeline)
     entries = _timeline_entries(design.timeline)
     if "last_managed_sketch_index" not in record["payload"]:
@@ -3756,6 +3870,7 @@ def update(
     for name in ("export_sequence", "export_id", "operation_id"):
         refresh[name] = refresh.pop(name)
     _update_payload_attributes(design, record["instance_id"], refresh)
+    _clear_applying(design, instance_id=record["instance_id"])
     _warn_unmeasured(report.get("deviation"), report.setdefault("warnings", []))
     _write_progress(progress_path, report)
     return report

@@ -39,12 +39,19 @@ def _link(bundle: Path, export_id: str, instance_id: str = "instance-a") -> dict
     }
 
 
-def _handoff(root: Path, bundle: Path, export_id: str = "wge_2") -> Path:
-    marker = root / wglink_watch.HANDOFF_FILENAME
+def _handoff(
+    root: Path, bundle: Path, export_id: str = "wge_2", request_id: str = "req-1"
+) -> Path:
+    """One handoff file as WG writes it (delivery version 3)."""
+
+    marker = root / f"{request_id}.json"
     marker.write_text(
         json.dumps({
-            "schemaVersion": 1,
+            "schemaVersion": 3,
             "target": "fusion360",
+            "requestId": request_id,
+            "operationId": request_id,
+            "deliverySequence": 1,
             "bundlePath": str(bundle),
             "bundleId": "wgb_2",
             "exportId": export_id,
@@ -66,6 +73,7 @@ def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> No
     handoff = wglink_watch.read_pending_handoff(marker)
 
     assert handoff is not None
+    assert handoff.request_id == handoff.operation_id == "req-1"
     assert handoff.bundle_path == str(bundle)
     assert handoff.export_id == "wge_2"
     assert handoff.sequence == "2"
@@ -73,20 +81,29 @@ def test_a_scoped_pending_handoff_is_read_and_acknowledged(tmp_path: Path) -> No
     assert handoff.expected_document_id == "fusion:doc-a"
     assert handoff.expected_instance_id == "instance-b"
     assert handoff.expected_return_state_hash == "sha256:return-state"
-    assert wglink_watch.acknowledge_handoff(handoff) is True
-    assert not marker.exists()
+    claimed = wglink_watch.claim_request(handoff)
+    assert claimed is not None and not marker.exists()
+    assert wglink_watch.acknowledge_handoff(claimed) is True
+    assert not claimed.marker_path.exists()
 
 
-def test_acknowledging_an_insert_never_deletes_a_newer_send(tmp_path: Path) -> None:
+def test_acknowledging_a_handoff_deletes_only_its_own_claim(tmp_path: Path) -> None:
+    """A file written at the same name after the claim is a new request."""
+
     bundle = _bundle(tmp_path, "horn", "wge_2")
     marker = _handoff(tmp_path, bundle)
     handoff = wglink_watch.read_pending_handoff(marker)
     assert handoff is not None
+    claimed = wglink_watch.claim_request(handoff)
+    assert claimed is not None
 
     _handoff(tmp_path, bundle, export_id="wge_3")
 
-    assert wglink_watch.acknowledge_handoff(handoff) is False
+    assert wglink_watch.acknowledge_handoff(claimed) is True
     assert json.loads(marker.read_text())["exportId"] == "wge_3"
+    # Acknowledging the request itself -- not a claim -- deletes nothing.
+    assert wglink_watch.acknowledge_handoff(handoff) is False
+    assert marker.exists()
 
 
 def test_fusion_status_publishes_document_config_and_parameters_atomically(
@@ -203,11 +220,13 @@ def test_fusion_status_omits_unproven_or_malformed_optional_identities(
 
 
 def test_return_request_is_targeted_to_one_addin_session_and_acknowledged(tmp_path: Path) -> None:
-    marker = tmp_path / wglink_watch.RETURN_REQUEST_FILENAME
+    marker = tmp_path / "request-a.json"
     marker.write_text(json.dumps({
-        "schemaVersion": 1,
+        "schemaVersion": 3,
         "target": "fusion360",
         "requestId": "request-a",
+        "operationId": "request-a",
+        "deliverySequence": 1,
         "sessionId": "session-a",
         "designId": "wgd_a",
         "documentId": "fusion:doc-a",
@@ -222,8 +241,10 @@ def test_return_request_is_targeted_to_one_addin_session_and_acknowledged(tmp_pa
     assert request.document_id == "fusion:doc-a"
     assert request.instance_id == "instance-a"
     assert request.expected_return_state_hash == "sha256:return-state"
-    assert wglink_watch.acknowledge_return_request(request) is True
-    assert not marker.exists()
+    claimed = wglink_watch.claim_request(request)
+    assert claimed is not None
+    assert wglink_watch.acknowledge_return_request(claimed) is True
+    assert not marker.exists() and not claimed.marker_path.exists()
 
 
 def test_handoff_refuses_an_out_of_workspace_bundle(tmp_path: Path) -> None:
@@ -248,22 +269,30 @@ def test_machine_local_handoff_accepts_only_the_selected_workspace_bundle_root(
     handoff = wglink_watch.read_pending_handoff(marker, bundle_root=bundles)
 
     assert handoff is not None
-    assert wglink_watch.acknowledge_handoff(handoff, bundle_root=bundles) is True
+    claimed = wglink_watch.claim_request(handoff)
+    assert claimed is not None
+    assert wglink_watch.acknowledge_handoff(claimed) is True
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {},
-        {"schemaVersion": 2, "target": "fusion360"},
-        {"schemaVersion": 1, "target": "other"},
-        {"schemaVersion": 1, "target": "fusion360", "bundlePath": ""},
+        # What a WG before delivery version 3 wrote.
+        {"schemaVersion": 1, "target": "fusion360", "bundlePath": "x", "bundleId": "b",
+         "exportId": "e"},
+        {"schemaVersion": 2, "target": "fusion360", "requestId": "r", "operationId": "r",
+         "deliverySequence": 1},
+        {"schemaVersion": 3, "target": "other", "requestId": "r", "operationId": "r",
+         "deliverySequence": 1},
+        {"schemaVersion": 3, "target": "fusion360", "requestId": "r", "operationId": "r",
+         "deliverySequence": 1, "bundlePath": ""},
     ],
 )
 def test_an_invalid_pending_handoff_is_silent(
     tmp_path: Path, payload: dict[str, object]
 ) -> None:
-    marker = tmp_path / wglink_watch.HANDOFF_FILENAME
+    marker = tmp_path / "r.json"
     marker.write_text(json.dumps(payload))
     assert wglink_watch.read_pending_handoff(marker) is None
 
@@ -410,6 +439,13 @@ def test_prompt_text_lists_every_link_when_several_moved(tmp_path: Path) -> None
     assert "sequence 5" in text and "sequence 7" in text
 
 
+def _advertise_version_3(ipc: Path) -> None:
+    ipc.mkdir(parents=True, exist_ok=True)
+    (ipc / wglink_watch.CAPABILITIES_FILENAME).write_text(json.dumps({
+        "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3,
+    }))
+
+
 def test_a_solve_request_names_the_bundle_and_pins_its_manifest(tmp_path) -> None:
     """The intent is a separate marker, not a field in the geometry manifest.
 
@@ -423,6 +459,7 @@ def test_a_solve_request_names_the_bundle_and_pins_its_manifest(tmp_path) -> Non
     bundle = workspace / "wgreturn" / "speaker.wgreturn"
     bundle.mkdir(parents=True)
     (bundle / "wgreturn.json").write_bytes(b'{"document": {}}')
+    _advertise_version_3(tmp_path / "ipc")
 
     marker = wglink_watch.write_solve_request(
         tmp_path / "ipc",
@@ -433,7 +470,8 @@ def test_a_solve_request_names_the_bundle_and_pins_its_manifest(tmp_path) -> Non
     )
 
     payload = json.loads(marker.read_text())
-    assert marker.name == wglink_watch.SOLVE_REQUEST_FILENAME
+    assert marker.parent.name == wglink_watch.SOLVE_REQUESTS_DIRECTORY
+    assert marker.name == "cmd-1.json"
     assert payload["target"] == "waveguide-generator"
     assert payload["commandId"] == "cmd-1"
     # Workspace-relative, so WG resolves it inside its own selected folder.
@@ -449,6 +487,7 @@ def test_a_solve_request_refuses_a_bundle_outside_the_workspace(tmp_path) -> Non
     (outside / "wgreturn.json").write_bytes(b"{}")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    _advertise_version_3(tmp_path / "ipc")
 
     with pytest.raises(OSError):
         wglink_watch.write_solve_request(

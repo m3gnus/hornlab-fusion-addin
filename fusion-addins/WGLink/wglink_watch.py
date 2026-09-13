@@ -11,12 +11,13 @@ a couple of megabytes of STEP and point grid, which is the right thing to do
 before mutating a document and the wrong thing to do every few seconds.
 
 Delivery between the add-in and Waveguide Generator follows WG's contract,
-docs/architecture/CAD-OPERATIONS.md in that repository ("Capability file",
-"Solve-command delivery" and "WG-produced Fusion requests"). A solve command
-is written as its own file only when WG advertises that it reads them. WG's
-return requests and handoffs are read from their own files; the legacy slot
-then holds a twin under the same id, which only an add-in that reads the slot
-alone may take, so this one never runs or deletes it.
+docs/architecture/CAD-OPERATIONS.md in that repository ("Delivery version",
+"Solve-command delivery" and "WG-produced Fusion requests"). Both sides speak
+delivery version 3 and nothing older: every request, in either direction, is
+its own file, and there is no single-slot marker and no twin. This add-in
+reports its version in the heartbeat, and WG refuses an add-in that reports
+less. It refuses a WG that advertises less in turn, and asks for WG to be
+updated instead of guessing at an older format.
 """
 
 from __future__ import annotations
@@ -33,31 +34,45 @@ from typing import Any, Iterable, Mapping, TypeVar
 import uuid
 
 
-HANDOFF_FILENAME = ".fusion-handoff.json"
 FUSION_STATUS_FILENAME = ".fusion-status.json"
-RETURN_REQUEST_FILENAME = ".fusion-return-request.json"
-SOLVE_REQUEST_FILENAME = ".wg-solve-request.json"
 
+# The delivery version this add-in speaks, published in its heartbeat. WG
+# refuses an add-in that reports anything lower, and this add-in refuses a WG
+# that advertises anything lower.
+DELIVERY_VERSION = 3
 # WG's advertisement of the delivery versions it reads.
 CAPABILITIES_FILENAME = "wg-capabilities.json"
 CAPABILITIES_SCHEMA_VERSION = 1
 SOLVE_COMMAND_DELIVERY = "solveCommandDelivery"
-# One file per solve command, written only when WG advertises that it reads them.
+FUSION_REQUEST_DELIVERY = "fusionRequestDelivery"
+# Every request file, in both directions, carries this schema version.
+REQUEST_SCHEMA_VERSION = 3
+# One file per solve command, one per WG request.
 SOLVE_REQUESTS_DIRECTORY = ".wg-solve-requests"
-# One file per WG request. The legacy slot beside it then holds only a twin.
 RETURN_REQUESTS_DIRECTORY = ".fusion-return-requests"
 HANDOFFS_DIRECTORY = ".fusion-handoffs"
-# WG's record of the twin now in a legacy slot. Read here, never written.
-SLOT_RECORD_FILENAME = ".legacy-slot.json"
 SEQUENCE_FIELD = "deliverySequence"
-LEGACY_SCHEMA_VERSION = 1
-PER_REQUEST_SCHEMA_VERSION = 2
+# The single slots a WG older than delivery version 3 writes. This add-in never
+# runs one; finding one while WG advertises less than 3 is how it knows to ask
+# for a WG update.
+LEGACY_HANDOFF_FILENAME = ".fusion-handoff.json"
+LEGACY_RETURN_REQUEST_FILENAME = ".fusion-return-request.json"
 # A request this add-in has claimed. The leading "." keeps it out of every
 # reader's listing, WG's included.
 CLAIM_PREFIX = ".wglink-claim-"
 # An id that becomes part of a file name: WG's request ids, this add-in's
 # command ids.
 _PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+WG_OUTDATED_MESSAGE = (
+    "This Waveguide Generator is older than its WGLink add-in, so the two cannot "
+    "exchange requests. Update Waveguide Generator; it installs the WGLink that "
+    "matches it."
+)
+
+
+class WgOutdatedError(RuntimeError):
+    """WG does not read this add-in's delivery version; nothing was written."""
 
 
 def _read_json(path: Path) -> Any:
@@ -91,12 +106,11 @@ def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> Path:
 
 
 def wg_delivery_version(ipc_folder: Path, name: str) -> int:
-    """The delivery version WG advertises for ``name``; 1 is the legacy route.
+    """The delivery version WG advertises for ``name``; 1 when it names none.
 
     The capability file's reading rules: fields this add-in does not know are
     ignored, and a missing or unreadable file, a ``schemaVersion`` it does not
-    know, or a value that is not an integer of at least 2 all mean the legacy
-    route -- never a refusal.
+    know, or a value that is not an integer of at least 2 all read as 1.
     """
 
     payload = _read_json(Path(ipc_folder) / CAPABILITIES_FILENAME)
@@ -115,6 +129,16 @@ def wg_delivery_version(ipc_folder: Path, name: str) -> int:
     return value
 
 
+def wg_speaks_delivery_version(ipc_folder: Path) -> bool:
+    """Whether WG advertises this add-in's delivery version on both channels."""
+
+    folder = Path(ipc_folder)
+    return all(
+        wg_delivery_version(folder, name) >= DELIVERY_VERSION
+        for name in (SOLVE_COMMAND_DELIVERY, FUSION_REQUEST_DELIVERY)
+    )
+
+
 def write_solve_request(
     ipc_folder: Path,
     *,
@@ -128,18 +152,26 @@ def write_solve_request(
 
     Deliberately separate from ``wgreturn.json``: that manifest is immutable
     geometry evidence which WG re-reads whenever it re-lists the workspace, so
-    an intent flag inside it would be re-observed and re-solved. A marker with
-    its own command id can be spent exactly once.
+    an intent flag inside it would be re-observed and re-solved. A command with
+    its own id can be spent exactly once.
 
     The manifest hash is recorded here, after the bundle has been published, so
     WG can refuse a bundle that changed between the publish and this write.
 
-    When WG advertises ``solveCommandDelivery`` 2 or later, the command is
-    written as its own file, ``.wg-solve-requests/<commandId>.json``, so a
-    second command never replaces one WG has not read yet. Otherwise it goes
-    into the legacy single slot, which every WG reads.
+    The command is written as its own file,
+    ``.wg-solve-requests/<commandId>.json``, so a second command never replaces
+    one WG has not read yet. A WG that does not advertise this add-in's
+    delivery version gets nothing: ``WgOutdatedError`` asks for it to be
+    updated instead.
     """
 
+    folder = ipc_folder.expanduser().resolve()
+    if wg_delivery_version(folder, SOLVE_COMMAND_DELIVERY) < DELIVERY_VERSION:
+        raise WgOutdatedError(WG_OUTDATED_MESSAGE)
+    if not _PLAIN_ID.fullmatch(str(command_id)):
+        raise ValueError(
+            f"A solve command id must be a plain file name, got {command_id!r}."
+        )
     bundle = bundle_path.expanduser().resolve()
     root = workspace_root.expanduser().resolve()
     try:
@@ -149,16 +181,11 @@ def write_solve_request(
             f"Return bundle {bundle} is not inside the WGLink workspace {root}."
         ) from exc
     digest = hashlib.sha256((bundle / "wgreturn.json").read_bytes()).hexdigest()
-    folder = ipc_folder.expanduser().resolve()
-    per_command = wg_delivery_version(folder, SOLVE_COMMAND_DELIVERY) >= 2
-    if per_command and not _PLAIN_ID.fullmatch(str(command_id)):
-        raise ValueError(
-            f"A solve command id must be a plain file name, got {command_id!r}."
-        )
     payload = {
-        "schemaVersion": LEGACY_SCHEMA_VERSION,
+        "schemaVersion": REQUEST_SCHEMA_VERSION,
         "target": "waveguide-generator",
         "commandId": str(command_id),
+        "operationId": str(command_id),
         "returnId": str(return_id),
         "bundlePath": relative.as_posix(),
         "manifestSha256": f"sha256:{digest}",
@@ -167,44 +194,25 @@ def write_solve_request(
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
     }
-    folder.mkdir(parents=True, exist_ok=True)
-    if not per_command:
-        return _write_json_atomically(folder / SOLVE_REQUEST_FILENAME, payload)
-    payload["schemaVersion"] = PER_REQUEST_SCHEMA_VERSION
-    payload["operationId"] = payload["commandId"]
     directory = folder / SOLVE_REQUESTS_DIRECTORY
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     return _write_json_atomically(directory / f"{payload['commandId']}.json", payload)
-
-
-@dataclass(frozen=True)
-class Announcement:
-    """A link whose bundle on disk has moved past what the document holds."""
-
-    instance_id: str
-    bundle_path: str
-    stored_export_id: str
-    available_export_id: str
-    available_sequence: str
-
-    def describe(self) -> str:
-        return (
-            f"{self.instance_id} — export sequence {self.available_sequence or '?'}"
-        )
 
 
 @dataclass(frozen=True)
 class PendingHandoff:
     """A completed WG export that the user explicitly sent to Fusion.
 
-    ``per_request`` is true for a request read from its own file. Such a
-    request carries ``request_id`` = ``operation_id`` and a
-    ``delivery_sequence``, and must be claimed (``claim_request``) before it
-    runs. A legacy slot from a WG that predates per-request files carries
-    neither id, and is acknowledged by its export id as before.
+    Read from its own file, ``.fusion-handoffs/<requestId>.json``. The request
+    id is its operation id, and the request must be claimed (``claim_request``)
+    before it runs. An update names its exact target -- document and instance
+    -- and the baseline it expects; an insert names neither instance nor
+    baseline.
     """
 
     marker_path: Path
+    request_id: str
+    delivery_sequence: int
     bundle_path: str
     bundle_id: str
     export_id: str
@@ -213,10 +221,18 @@ class PendingHandoff:
     expected_document_id: str
     expected_instance_id: str
     expected_return_state_hash: str
-    request_id: str = ""
-    operation_id: str = ""
-    delivery_sequence: int | None = None
-    per_request: bool = False
+
+    @property
+    def operation_id(self) -> str:
+        return self.request_id
+
+    @property
+    def exact_target(self) -> tuple[str, str] | None:
+        """``(document_id, instance_id)`` for an update, None for an insert."""
+
+        if self.expected_document_id and self.expected_instance_id:
+            return self.expected_document_id, self.expected_instance_id
+        return None
 
 
 @dataclass(frozen=True)
@@ -225,14 +241,16 @@ class PendingReturnRequest:
 
     marker_path: Path
     request_id: str
+    delivery_sequence: int
     session_id: str
     design_id: str
     document_id: str
     instance_id: str
     expected_return_state_hash: str
-    operation_id: str = ""
-    delivery_sequence: int | None = None
-    per_request: bool = False
+
+    @property
+    def operation_id(self) -> str:
+        return self.request_id
 
 
 _Pending = TypeVar("_Pending", PendingHandoff, PendingReturnRequest)
@@ -245,14 +263,20 @@ def _sequence(payload: Any) -> int | None:
     return None
 
 
-def _per_request_identity(payload: Mapping[str, Any]) -> tuple[str, int] | None:
+def _request_identity(payload: Any) -> tuple[str, int] | None:
     """``(request_id, sequence)`` of a request file WG wrote, or None.
 
-    WG writes the request id as the operation id and gives every request a
-    positive sequence. A file without both is not one of WG's, and is left
-    where it is.
+    WG writes schema version 3, the request id as the operation id, and a
+    positive sequence. A file without all of them is not one of this delivery
+    version's requests, and is left where it is.
     """
 
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schemaVersion") != REQUEST_SCHEMA_VERSION
+        or payload.get("target") != "fusion360"
+    ):
+        return None
     request_id = payload.get("requestId")
     sequence = _sequence(payload)
     if (
@@ -265,120 +289,35 @@ def _per_request_identity(payload: Mapping[str, Any]) -> tuple[str, int] | None:
     return request_id, sequence
 
 
-def _names_an_operation(payload: Mapping[str, Any]) -> bool:
-    """A legacy slot that names an operation id is a twin: never run it."""
-
-    return bool(payload.get("operationId"))
-
-
 def read_return_request(
-    marker_path: Path,
-    *,
-    session_id: str,
-    schema_version: int = LEGACY_SCHEMA_VERSION,
+    marker_path: Path, *, session_id: str
 ) -> PendingReturnRequest | None:
-    """Read one return request: the legacy slot, or with schema 2 its own file.
-
-    A request runs only in the add-in session it names. A legacy slot that
-    names an ``operationId`` is a twin of a per-request file and reads as
-    nothing.
-    """
+    """Read one return request. It runs only in the add-in session it names."""
 
     payload = _read_json(marker_path)
-    if not isinstance(payload, Mapping):
-        return None
-    request_id = payload.get("requestId")
-    target_session = payload.get("sessionId")
-    if (
-        payload.get("schemaVersion") != schema_version
-        or payload.get("target") != "fusion360"
-        or not isinstance(request_id, str)
-        or not request_id
-        or target_session != session_id
-    ):
-        return None
-    per_request = schema_version == PER_REQUEST_SCHEMA_VERSION
-    sequence: int | None = None
-    if per_request:
-        identity = _per_request_identity(payload)
-        if identity is None:
-            return None
-        sequence = identity[1]
-    elif _names_an_operation(payload):
+    identity = _request_identity(payload)
+    if identity is None or payload.get("sessionId") != session_id:
         return None
     return PendingReturnRequest(
         marker_path=marker_path,
-        request_id=request_id,
+        request_id=identity[0],
+        delivery_sequence=identity[1],
         session_id=session_id,
         design_id=str(payload.get("designId") or ""),
         document_id=str(payload.get("documentId") or ""),
         instance_id=str(payload.get("instanceId") or ""),
         expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
-        operation_id=request_id if per_request else "",
-        delivery_sequence=sequence,
-        per_request=per_request,
     )
 
 
-def _remove_claim(pending: PendingHandoff | PendingReturnRequest) -> bool:
-    """Delete a claim this add-in made, and nothing else."""
-
-    if not pending.marker_path.name.startswith(CLAIM_PREFIX):
-        return False
-    try:
-        pending.marker_path.unlink()
-    except OSError:
-        return False
-    return True
-
-
-def acknowledge_return_request(request: PendingReturnRequest) -> bool:
-    """Retire a request that ran.
-
-    A per-request file: delete its claim. A legacy slot: delete it only while
-    it still holds this request and still names no operation id, so a newer
-    request, or WG's twin of one, is never removed.
-    """
-
-    if request.per_request:
-        return _remove_claim(request)
-    current = read_return_request(request.marker_path, session_id=request.session_id)
-    if current is None or current.request_id != request.request_id:
-        return False
-    try:
-        request.marker_path.unlink()
-    except OSError:
-        return False
-    return True
-
-
 def read_pending_handoff(
-    marker_path: Path,
-    *,
-    bundle_root: Path | None = None,
-    schema_version: int = LEGACY_SCHEMA_VERSION,
+    marker_path: Path, *, bundle_root: Path | None = None
 ) -> PendingHandoff | None:
-    """Read a scoped one-shot handoff without trusting an arbitrary path.
-
-    The legacy slot by default, or with schema 2 a handoff's own file. A
-    legacy slot that names an ``operationId`` is a twin and reads as nothing.
-    """
+    """Read one handoff without trusting an arbitrary bundle path."""
 
     payload = _read_json(marker_path)
-    if not isinstance(payload, Mapping):
-        return None
-    if (
-        payload.get("schemaVersion") != schema_version
-        or payload.get("target") != "fusion360"
-    ):
-        return None
-    per_request = schema_version == PER_REQUEST_SCHEMA_VERSION
-    identity: tuple[str, int] | None = None
-    if per_request:
-        identity = _per_request_identity(payload)
-        if identity is None:
-            return None
-    elif _names_an_operation(payload):
+    identity = _request_identity(payload)
+    if identity is None:
         return None
     bundle_id = payload.get("bundleId")
     export_id = payload.get("exportId")
@@ -397,6 +336,8 @@ def read_pending_handoff(
     sequence = payload.get("sequence")
     return PendingHandoff(
         marker_path=marker_path,
+        request_id=identity[0],
+        delivery_sequence=identity[1],
         bundle_path=str(bundle_path),
         bundle_id=str(bundle_id),
         export_id=str(export_id),
@@ -405,34 +346,31 @@ def read_pending_handoff(
         expected_document_id=str(payload.get("expectedDocumentId") or ""),
         expected_instance_id=str(payload.get("expectedInstanceId") or ""),
         expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
-        request_id=identity[0] if identity else str(payload.get("requestId") or ""),
-        operation_id=identity[0] if identity else "",
-        delivery_sequence=identity[1] if identity else None,
-        per_request=per_request,
     )
 
 
-def acknowledge_handoff(
-    handoff: PendingHandoff,
-    *,
-    bundle_root: Path | None = None,
-) -> bool:
-    """Remove only the marker this insert consumed, never a newer send.
+def _remove_claim(path: Path) -> bool:
+    """Delete a claim this add-in made, and nothing else."""
 
-    A per-request handoff: delete its claim. A legacy slot: delete it only
-    while it still holds this export and names no operation id.
-    """
-
-    if handoff.per_request:
-        return _remove_claim(handoff)
-    current = read_pending_handoff(handoff.marker_path, bundle_root=bundle_root)
-    if current is None or current.export_id != handoff.export_id:
+    if not path.name.startswith(CLAIM_PREFIX):
         return False
     try:
-        handoff.marker_path.unlink()
+        path.unlink()
     except OSError:
         return False
     return True
+
+
+def acknowledge_return_request(request: PendingReturnRequest) -> bool:
+    """Retire a return request that ran: delete its claim."""
+
+    return _remove_claim(request.marker_path)
+
+
+def acknowledge_handoff(handoff: PendingHandoff) -> bool:
+    """Retire a handoff that ran: delete its claim."""
+
+    return _remove_claim(handoff.marker_path)
 
 
 def _request_files(directory: Path) -> list[Path]:
@@ -461,96 +399,160 @@ def _requests_in_order(directory: Path) -> list[Path]:
     return [path for _sequence_value, _name, path in sorted(ordered)]
 
 
-def discard_what_a_legacy_reader_took(
-    ipc_folder: Path, slot_name: str, directory_name: str
-) -> list[str]:
-    """Step 1 of the contract: drop the files of requests a slot reader took.
-
-    Applies only when the record names a request and its sequence, the
-    legacy slot is absent, and that request's own file is still present --
-    read in that order. WG writes the twin before the record, so a record
-    read first is never newer than the slot seen after it; checking the slot
-    first could discard a request WG publishes in between. That file goes,
-    with every file whose sequence is not above the record's; none of them
-    runs. Files with a higher sequence stay: WG may be writing their twins.
-    """
-
-    folder = Path(ipc_folder)
-    directory = folder / directory_name
-    record = _read_json(directory / SLOT_RECORD_FILENAME)
-    twin_id = record.get("operationId") if isinstance(record, Mapping) else None
-    last = _sequence(record)
-    if not isinstance(twin_id, str) or not _PLAIN_ID.fullmatch(twin_id) or last is None:
-        return []
-    if os.path.lexists(folder / slot_name):
-        return []
-    taken = directory / f"{twin_id}.json"
-    if not taken.is_file():
-        return []
-    discarded: list[str] = []
-    for path in _request_files(directory):
-        sequence = _sequence(_read_json(path))
-        if path != taken and (sequence is None or sequence > last):
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            continue
-        discarded.append(path.stem)
-    return discarded
-
-
 def next_return_request(
     ipc_folder: Path, *, session_id: str
 ) -> PendingReturnRequest | None:
-    """The next return request for this session, or None.
+    """The next return request for this session, in sequence order, or None.
 
-    Per-request files first, in sequence order; then a legacy slot, which
-    runs only when it names no operation id (a WG that predates per-request
-    files). A per-request result must be claimed before it runs.
+    The result must be claimed before it runs.
     """
 
-    folder = Path(ipc_folder)
-    discard_what_a_legacy_reader_took(
-        folder, RETURN_REQUEST_FILENAME, RETURN_REQUESTS_DIRECTORY
-    )
-    for path in _requests_in_order(folder / RETURN_REQUESTS_DIRECTORY):
-        request = read_return_request(
-            path, session_id=session_id, schema_version=PER_REQUEST_SCHEMA_VERSION
-        )
+    for path in _requests_in_order(Path(ipc_folder) / RETURN_REQUESTS_DIRECTORY):
+        request = read_return_request(path, session_id=session_id)
         if request is not None:
             return request
-    return read_return_request(folder / RETURN_REQUEST_FILENAME, session_id=session_id)
+    return None
 
 
 def next_pending_handoff(
     ipc_folder: Path, *, bundle_root: Path | None
 ) -> PendingHandoff | None:
-    """The next handoff, or None; the same order as ``next_return_request``."""
+    """The next handoff, in sequence order, or None; claim it before it runs."""
 
-    folder = Path(ipc_folder)
-    discard_what_a_legacy_reader_took(folder, HANDOFF_FILENAME, HANDOFFS_DIRECTORY)
-    for path in _requests_in_order(folder / HANDOFFS_DIRECTORY):
-        handoff = read_pending_handoff(
-            path, bundle_root=bundle_root, schema_version=PER_REQUEST_SCHEMA_VERSION
-        )
+    for path in _requests_in_order(Path(ipc_folder) / HANDOFFS_DIRECTORY):
+        handoff = read_pending_handoff(path, bundle_root=bundle_root)
         if handoff is not None:
             return handoff
-    return read_pending_handoff(folder / HANDOFF_FILENAME, bundle_root=bundle_root)
+    return None
+
+
+def discard_superseded_handoffs(
+    ipc_folder: Path, *, bundle_root: Path | None
+) -> list[str]:
+    """Drop every unstarted update a newer update for the same target replaces.
+
+    WG's supersession policy (CAD-OPERATIONS.md, "Ordering"): an update that has
+    not started may be superseded only by a newer one for the same exact
+    target, the same document and instance. WG withdraws the older file when it
+    publishes the newer one; this covers the file it could not remove, on
+    Windows while this add-in held it open. An insert is never superseded.
+    Each superseded file is claimed first, so a request is either run or
+    dropped, never both. Returns the request ids dropped.
+    """
+
+    handoffs = [
+        handoff
+        for path in _requests_in_order(Path(ipc_folder) / HANDOFFS_DIRECTORY)
+        if (handoff := read_pending_handoff(path, bundle_root=bundle_root)) is not None
+    ]
+    newest: dict[tuple[str, str], PendingHandoff] = {}
+    for handoff in handoffs:
+        target = handoff.exact_target
+        if target is not None:
+            newest[target] = handoff
+    dropped: list[str] = []
+    for handoff in handoffs:
+        target = handoff.exact_target
+        if target is None or newest[target] is handoff:
+            continue
+        claimed = claim_request(handoff)
+        if claimed is not None and _remove_claim(claimed.marker_path):
+            dropped.append(handoff.request_id)
+    return dropped
+
+
+@dataclass(frozen=True)
+class LeftoverClaim:
+    """A claim an earlier session made and never finished.
+
+    Claims are hidden from every listing, so nothing else will ever look at
+    one again. ``channel`` is ``"handoff"`` or ``"returnRequest"``; the other
+    fields are what reconciliation reads, empty when the claim is unreadable.
+    """
+
+    path: Path
+    channel: str
+    request_id: str
+    export_id: str
+    design_id: str
+    expected_document_id: str
+    expected_instance_id: str
+
+
+def leftover_claims(ipc_folder: Path) -> list[LeftoverClaim]:
+    """Every claim left in WG's request folders by an interrupted session."""
+
+    found: list[LeftoverClaim] = []
+    for directory, channel in (
+        (HANDOFFS_DIRECTORY, "handoff"),
+        (RETURN_REQUESTS_DIRECTORY, "returnRequest"),
+    ):
+        try:
+            paths = sorted(
+                path for path in (Path(ipc_folder) / directory).iterdir()
+                if path.name.startswith(CLAIM_PREFIX) and path.suffix == ".json"
+            )
+        except OSError:
+            continue
+        for path in paths:
+            payload = _read_json(path)
+            fields = payload if isinstance(payload, Mapping) else {}
+            found.append(
+                LeftoverClaim(
+                    path=path,
+                    channel=channel,
+                    request_id=str(fields.get("requestId") or ""),
+                    export_id=str(fields.get("exportId") or ""),
+                    design_id=str(fields.get("designId") or ""),
+                    expected_document_id=str(
+                        fields.get("expectedDocumentId") or fields.get("documentId") or ""
+                    ),
+                    expected_instance_id=str(
+                        fields.get("expectedInstanceId") or fields.get("instanceId") or ""
+                    ),
+                )
+            )
+    return found
+
+
+def remove_leftover_claim(claim: LeftoverClaim) -> bool:
+    return _remove_claim(claim.path)
+
+
+def outdated_wg_requests(ipc_folder: Path) -> list[str]:
+    """Requests an older WG wrote, when WG does not advertise version 3.
+
+    A single-slot marker, or a request file of another schema version. None of
+    them is ever run. A stale file left beside a WG that does advertise version
+    3 is not evidence of anything -- that WG removes such files at its start --
+    so it is not reported.
+    """
+
+    folder = Path(ipc_folder)
+    if wg_speaks_delivery_version(folder):
+        return []
+    found = [
+        name
+        for name in (LEGACY_HANDOFF_FILENAME, LEGACY_RETURN_REQUEST_FILENAME)
+        if (folder / name).is_file()
+    ]
+    for directory in (HANDOFFS_DIRECTORY, RETURN_REQUESTS_DIRECTORY):
+        for path in _request_files(folder / directory):
+            payload = _read_json(path)
+            if isinstance(payload, Mapping) and payload.get("schemaVersion") != REQUEST_SCHEMA_VERSION:
+                found.append(f"{directory}/{path.name}")
+    return found
 
 
 def claim_request(pending: _Pending) -> _Pending | None:
-    """Take a per-request file by renaming it to a hidden claim.
+    """Take a request file by renaming it to a hidden claim.
 
     Returns the request with ``marker_path`` naming the claim, or None when
     the rename failed -- the file is gone, or on Windows WG still has it
     open -- in which case the next pass tries again. What the rename took is
     the request: a claim that no longer holds the same request is put back.
-    A legacy slot is not claimed; it is returned unchanged.
     """
 
-    if not pending.per_request:
-        return pending
     source = pending.marker_path
     claim = source.with_name(
         f"{CLAIM_PREFIX}{pending.request_id}-{uuid.uuid4().hex[:12]}.json"
@@ -573,6 +575,22 @@ def claim_request(pending: _Pending) -> _Pending | None:
     return replace(pending, marker_path=claim)
 
 
+@dataclass(frozen=True)
+class Announcement:
+    """A link whose bundle on disk has moved past what the document holds."""
+
+    instance_id: str
+    bundle_path: str
+    stored_export_id: str
+    available_export_id: str
+    available_sequence: str
+
+    def describe(self) -> str:
+        return (
+            f"{self.instance_id} — export sequence {self.available_sequence or '?'}"
+        )
+
+
 def write_fusion_status(
     bundle_root: Path,
     *,
@@ -584,8 +602,15 @@ def write_fusion_status(
     links: Iterable[Mapping[str, Any]],
     updated_at: datetime | None = None,
     diagnostics: Mapping[str, Any] | None = None,
+    applying_operation: Mapping[str, Any] | None = None,
 ) -> Path:
     """Atomically publish the active Fusion document as inert JSON.
+
+    ``deliveryVersion`` tells WG which delivery version this add-in speaks; WG
+    refuses an add-in that reports less than its own. ``applying_operation``
+    is the WG operation the document is marked as applying, from
+    ``wglink_core.applying_operation``: one whose evidence never followed is an
+    interrupted mutation, and WG reports it as needing recovery.
 
     ``diagnostics`` is advisory and additive under heartbeat schema 1: it
     carries what the last tick cost and which source the add-in is running, so
@@ -678,6 +703,7 @@ def write_fusion_status(
         "cadApplication": "fusion360",
         "sessionId": str(session_id),
         "adapterVersion": str(adapter_version or "") or None,
+        "deliveryVersion": DELIVERY_VERSION,
         "workspaceRoot": (
             str(workspace_root.expanduser().resolve())
             if workspace_root is not None
@@ -690,6 +716,23 @@ def write_fusion_status(
             else None
         ),
     }
+    operation_id = (
+        str(applying_operation.get("operation_id") or "")
+        if isinstance(applying_operation, Mapping)
+        else ""
+    )
+    if payload["document"] is not None and operation_id:
+        payload["document"]["applyingOperation"] = {
+            "operationId": operation_id,
+            **{
+                wire: str(applying_operation.get(name) or "") or None
+                for name, wire in (
+                    ("kind", "kind"),
+                    ("instance_id", "instanceId"),
+                    ("export_id", "exportId"),
+                )
+            },
+        }
     if diagnostics:
         payload["diagnostics"] = json.loads(json.dumps(diagnostics, default=str))
     marker = root / FUSION_STATUS_FILENAME

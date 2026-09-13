@@ -163,24 +163,47 @@ Commands and requests cross through WG's machine-local IPC folder,
 `<WG data folder>/ipc/wglink`. The contract is WG's
 `docs/architecture/CAD-OPERATIONS.md`; WGLink implements the add-in's half.
 
-- **Solve commands.** WG advertises what it reads in `wg-capabilities.json`.
-  When that file names `solveCommandDelivery` 2 or later, **Solve in WG** writes
-  `.wg-solve-requests/<commandId>.json`, so a second command never replaces one
-  WG has not read yet. A missing, unreadable or older file means the legacy
-  single slot, `.wg-solve-request.json`, which every WG reads.
-- **WG's requests.** A WG that publishes each return request and handoff as its
-  own file (`.fusion-return-requests/<id>.json`, `.fusion-handoffs/<id>.json`)
-  also writes a legacy twin under the same id into the old single slot. WGLink
-  takes the files in `deliverySequence` order, claims each by renaming it to a
-  hidden name, runs it once and deletes the claim, also when the request is
-  refused. It never runs or deletes a slot that names an `operationId`: that
-  twin exists for an add-in that reads only the slot. A slot without one comes
-  from an older WG; it runs once and is acknowledged as before. Requests an
-  add-in that reads only the slot has already taken are discarded unrun.
-- **Reconciliation.** An automatic Update stamps WG's operation id beside the
-  export identity, as its last write. A handoff whose export the exact link
-  already carries is acknowledged without mutating and before the
-  stale-document check, so a lost acknowledgement never reads as a conflict.
+- **Delivery version 3, and nothing older.** Every request, in either
+  direction, is its own file with `schemaVersion` 3. There is no single-slot
+  marker and no twin. The heartbeat reports `deliveryVersion: 3`, and WG
+  refuses an add-in that reports less, asking for the add-in it installs. WGLink
+  in turn needs WG to advertise version 3 in `wg-capabilities.json`; an older WG
+  gets no solve command, its requests are never run, and WGLink says once per
+  session that WG needs updating. WG installs and updates its own managed
+  WGLink, so the two are always the pair that shipped together.
+- **Solve commands.** **Solve in WG** writes `.wg-solve-requests/<commandId>.json`.
+  A second command never replaces one WG has not read yet.
+- **WG's requests.** Return requests and handoffs arrive as
+  `.fusion-return-requests/<id>.json` and `.fusion-handoffs/<id>.json`. WGLink
+  takes them in `deliverySequence` order, claims each by renaming it to a
+  hidden name, runs it at most once and deletes the claim, also when the
+  request is refused.
+- **Exact targets.** An update names the Fusion document, the exact instance
+  and the model state WG measured. A handoff that names no instance is an
+  insert, and it is refused if the active document already links that design:
+  WGLink never picks "the one matching link" for WG. A return request names
+  its document, instance and baseline too.
+- **The baseline, immediately before mutating.** Update and Insert take the
+  check as a precondition and run it after their last read and before their
+  first write. A document that moved in between is a conflict, never an
+  overwrite.
+- **Reconciliation, then interruption.** Update and Insert stamp WG's operation
+  id beside the export identity, as their last write. A handoff whose operation
+  id is already on a link is acknowledged without mutating, and before the
+  baseline check, so a lost acknowledgement never reads as a conflict. Before
+  its first write a WG operation is marked as applying on the root component;
+  the mark is cleared after the evidence. A mark with no evidence means the
+  change began and did not finish: **Update interrupted — recovery required**.
+  That operation is never run again, and the heartbeat publishes the mark as
+  `document.applyingOperation` so WG can say so too.
+- **Supersession.** An update that has not started yet is dropped when a newer
+  one for the same document and instance arrives; only the newest runs. WG
+  withdraws the older file itself; WGLink covers a file WG could not remove.
+  The heartbeat names the dropped request with the outcome `superseded`.
+- **Leftover claims.** The first tick of a session settles every claim an
+  interrupted session left behind, read-only: evidence on a link means it
+  applied, the applying mark means recovery is required, and neither means it
+  never started. None is run again; each claim is removed.
 - **Correlation.** The heartbeat's `diagnostics.lastRequest` names the last
   round trip (`channel`, `correlationId`, `attemptId`, `delivery`, `outcome`),
   and each link publishes the `operationId` stamped on it.

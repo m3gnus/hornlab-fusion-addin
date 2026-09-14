@@ -28,10 +28,10 @@ def test_dependency_pins_cover_required_solver_contracts():
         in requirements
     )
     assert (
-        "hornlab-sim.git@d6a0c36da229eb7d5a71823052b60f0a82847646"
+        "hornlab-sim.git@260155deac6c539b2e55bd8573b007da1114c004"
         in requirements
     )
     assert (
-        "hornlab-plots.git@a15bcf5b7498dd60437ef5f567e852af6f270c0b"
+        "hornlab-plots.git@ff30cafbe1631012f2e69c378dfe1fcc27ec7e75"
         in requirements
     )

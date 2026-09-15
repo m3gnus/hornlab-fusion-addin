@@ -1682,13 +1682,263 @@ def _xyz(value: object, *, scale: float) -> list[float]:
     return [float(value.x) * scale, float(value.y) * scale, float(value.z) * scale]
 
 
+# The datums a source contract reads: Fusion's object type for each, and the
+# component collection a legacy name lookup searches.
+_CONTRACT_DATUM_KINDS = {
+    "WG_THROAT_PLANE": ("ConstructionPlane", "constructionPlanes"),
+    "WG_AXIS": ("ConstructionAxis", "constructionAxes"),
+}
+
+
+_DATUM_KINDS = frozenset(kind for kind, _collection in _CONTRACT_DATUM_KINDS.values())
+
+
+def _same_live_entity(left: object, right: object) -> bool:
+    """Whether two Fusion handles wrap one entity.
+
+    Fusion mints a Python wrapper per lookup, and Autodesk documents that the
+    token strings two reads report for one entity may differ -- compare the
+    entities, it says, not the strings. Fusion's own wrapper equality does
+    that. ``_same_entity``'s token comparison is only the fallback for a handle
+    that is not a Fusion object.
+    """
+
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    base = getattr(adsk.core, "Base", None)
+    if isinstance(base, type) and isinstance(left, base) and isinstance(right, base):
+        try:
+            return bool(left == right)
+        except Exception:  # noqa: BLE001 - fall back to the entity token
+            pass
+    return _same_entity(left, right)
+
+
+def _distinct_entities(entities: list[object]) -> list[object]:
+    """Drop repeated handles on one Fusion entity, keeping the first of each."""
+
+    unique: list[object] = []
+    for entity in entities:
+        if not any(_same_live_entity(entity, seen) for seen in unique):
+            unique.append(entity)
+    return unique
+
+
+def _named_all(collection: object, name: str) -> list[object]:
+    """Every item of a Fusion collection whose browser name is ``name``."""
+
+    matches: list[object] = []
+    for item in wglink_core._items(collection):
+        try:
+            if str(item.name) == name:
+                matches.append(item)
+        except Exception:  # noqa: BLE001 - an unreadable name is not a match
+            continue
+    if not matches:
+        found = _named(collection, name)
+        if found is not None:
+            matches.append(found)
+    return _distinct_entities(matches)
+
+
+def _link_components(record: dict[str, Any]) -> list[object]:
+    """Every component one raw link record lives in."""
+
+    found = [
+        entity
+        for entity in record.get("wrappers", [])
+        if wglink_core._kind(entity) == "Component" or hasattr(entity, "bRepBodies")
+    ]
+    for entity in record.get("entities", []):
+        parent = wglink_core._parent_component(entity)
+        if parent is None and wglink_core._kind(entity) in _DATUM_KINDS:
+            # A construction plane or axis names its owner ``component``.
+            try:
+                parent = entity.component
+            except Exception:  # noqa: BLE001
+                parent = None
+        if parent is not None:
+            found.append(parent)
+    return _distinct_entities(found)
+
+
+def _shares_component(design: object, record: dict[str, Any], component: object) -> bool:
+    """Whether another WG link lives in ``component`` beside this one."""
+
+    instance_id = str(record["instance_id"])
+    for other_id, other in wglink_core._link_records(design).items():
+        if other_id == instance_id:
+            continue
+        if any(_same_live_entity(component, owner) for owner in _link_components(other)):
+            return True
+    return False
+
+
+def _datum_refusal(instance_id: str, name: str, reason: str) -> wglink_core.WgLinkError:
+    return wglink_core.WgLinkError(
+        f"WGLink instance {instance_id!r}: {reason}, so Send cannot tell which "
+        f"datum is this link's {name} and will not guess. Delete the extra copy, "
+        "or re-insert the link from WG, and send again."
+    )
+
+
+def _contract_datum(
+    design: object, record: dict[str, Any], component: object | None, name: str
+) -> object | None:
+    """This link's own ``name`` datum, found by ownership rather than by name.
+
+    Insert stamps each datum it builds with its owner (``instance_id``) and its
+    role (``datum``), and records the datum's entity token in the link's
+    ``entity_tokens`` under ``datum:<name>``. Those records are the identity.
+    The browser name is presentation a user may change, and a Part Design
+    document keeps every root-fallback link's datums in one component under
+    the same names, so a name lookup there answers for whichever link it meets
+    first.
+
+    The stored token is resolved with ``findEntityByToken`` and the entity it
+    names is compared with the stamped one -- never the token strings, which
+    Fusion documents may differ over time for one entity. Where the two records
+    disagree, or two datums claim one role, Send refuses by name rather than
+    choose. A datum Insert recorded that is now gone gives no contract, never a
+    namesake. Only a link with neither record is read by name, and only while
+    it is the only link in its component.
+    """
+
+    kind, collection_name = _CONTRACT_DATUM_KINDS[name]
+    instance_id = str(record["instance_id"])
+    stamped = _distinct_entities([
+        entity
+        for entity in record.get("entities", [])
+        if wglink_core._kind(entity) == kind
+        and wglink_core._attribute_value(entity, "datum") == name
+        and wglink_core._attribute_value(entity, "instance_id") == instance_id
+    ])
+    token = wglink_core._token_table(record.get("payload", {})).get(f"datum:{name}", "")
+    recorded = _distinct_entities([
+        entity
+        for entity in wglink_core._find_by_token(design, token)
+        if wglink_core._kind(entity) == kind
+    ])
+    for entity in recorded:
+        owner = wglink_core._attribute_value(entity, "instance_id")
+        role = wglink_core._attribute_value(entity, "datum")
+        if owner not in (None, "", instance_id) or role not in (None, "", name):
+            raise wglink_core.WgLinkError(
+                f"WGLink instance {instance_id!r} recorded its {name} as a datum "
+                f"WGLink stamped as {role or 'a datum'} of instance {owner or instance_id!r}. "
+                "The two ownership records disagree, so Send will not guess which "
+                "datum is this link's. Re-insert the link from WG and send again."
+            )
+    if stamped and recorded:
+        agreed = [
+            entity
+            for entity in stamped
+            if any(_same_live_entity(entity, match) for match in recorded)
+        ]
+        if len(agreed) == 1:
+            return agreed[0]
+        if not agreed:
+            raise _datum_refusal(
+                instance_id,
+                name,
+                f"the datum stamped as its {name} is not the one Insert recorded for it",
+            )
+        raise _datum_refusal(
+            instance_id, name, f"{len(agreed)} datums answer to its recorded {name}"
+        )
+    if stamped:
+        if len(stamped) == 1:
+            return stamped[0]
+        raise _datum_refusal(
+            instance_id, name, f"{len(stamped)} datums are stamped as its {name}"
+        )
+    if recorded:
+        if len(recorded) == 1:
+            return recorded[0]
+        raise _datum_refusal(
+            instance_id, name, f"its recorded {name} names {len(recorded)} datums"
+        )
+    if token:
+        # Insert recorded this datum and it is gone. A datum of the same name
+        # is somebody else's, or the user's.
+        return None
+    named = (
+        _named_all(getattr(component, collection_name, None), name)
+        if component is not None
+        else []
+    )
+    if not named:
+        return None
+    if _shares_component(design, record, component):
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} has no record of which {name} is its "
+            "own, and its component holds another WG link whose datums share that "
+            "name, so Send will not guess between them. Re-insert this link from "
+            "WG, which records its datums, or give each link its own component."
+        )
+    if len(named) > 1:
+        raise _datum_refusal(
+            instance_id, name, f"{len(named)} datums in its component are named {name}"
+        )
+    return named[0]
+
+
+# WG's rigid-placement tolerance: ``rigid_inverse`` (server/mesh/imported.py)
+# refuses a mirrored or non-rigid solver anchor by it. Send applies the same rule
+# to every instance, before anything is written, so no placement it labels
+# ``original`` is one WG would refuse.
+_RIGID_TOLERANCE = 1.0e-6
+
+
+def _chirality(matrix: list[list[float]], instance_id: str) -> str:
+    """The manifest's ``chirality`` for one placement, measured, or a refusal.
+
+    ``original`` is the only value the contract has, and it is true only of a
+    proper rotation. Send used to write it for every instance, which labelled a
+    mirrored wrapper as the one thing it is not; the determinant says which it
+    is.
+    """
+
+    rotation = [[float(matrix[row][column]) for column in range(3)] for row in range(3)]
+    (a, b, c), (d, e, f), (g, h, i) = rotation
+    determinant = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if determinant < 0.0:
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} is placed mirrored (its placement's "
+            f"determinant is {determinant:.6g}). The return contract's only "
+            "chirality, 'original', is true of an unmirrored placement alone, so "
+            "Send refuses it rather than mislabel it. "
+            "Place an unmirrored copy instead: insert it from WG and move or "
+            "rotate it into position."
+        )
+    orthonormal = all(
+        abs(
+            sum(rotation[k][p] * rotation[k][q] for k in range(3))
+            - (1.0 if p == q else 0.0)
+        )
+        <= _RIGID_TOLERANCE
+        for p in range(3)
+        for q in range(3)
+    )
+    if not orthonormal or abs(determinant - 1.0) > _RIGID_TOLERANCE:
+        raise wglink_core.WgLinkError(
+            f"WGLink instance {instance_id!r} is not a rigid placement: its rotation "
+            f"is not orthonormal within {_RIGID_TOLERANCE:g} (determinant "
+            f"{determinant:.9g}). The return contract places a link by a rotation "
+            "plus a translation only, so Send refuses it. Remove any scale or "
+            "skew from the wrapper's "
+            "placement and send again."
+        )
+    return "original"
+
+
 def _source_contract(design: object, record: dict[str, Any]) -> dict[str, Any] | None:
     payload = record.get("payload", {})
     component = record.get("wrapper_component") or getattr(record.get("body"), "parentComponent", None)
-    if component is None:
-        return None
-    plane = _named(getattr(component, "constructionPlanes", None), "WG_THROAT_PLANE")
-    axis = _named(getattr(component, "constructionAxes", None), "WG_AXIS")
+    plane = _contract_datum(design, record, component, "WG_THROAT_PLANE")
+    axis = _contract_datum(design, record, component, "WG_AXIS")
     prefix = _nullable(payload.get("parameter_prefix"))
     role = _nullable(payload.get("source_role"))
     throat_z = _float_echo(payload, "throat_z_mm")
@@ -1762,7 +2012,7 @@ def _instance_record(
         "parameter_prefix": _nullable(payload.get("parameter_prefix")),
         "occurrence_path": occurrence_path,
         "assembly_from_link": matrix,
-        "chirality": "original",
+        "chirality": _chirality(matrix, str(record["instance_id"])),
         "body_evidence": {
             "local_body_state": wglink_core._local_body_state(record),
             "baseline_fingerprint": baseline,

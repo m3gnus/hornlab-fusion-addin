@@ -575,7 +575,11 @@ def _link_records(design: adsk.fusion.Design) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     for entry in by_parent.values():
         attrs = entry["attrs"]
-        wrapper_payload = None
+        # One parent can host several links: a root component carries one
+        # ``link_<id>`` payload per root-fallback link. Each payload is its own
+        # link's, so each becomes its own record -- the first one found must
+        # not stand for the others.
+        wrapper_payloads: dict[str, dict[str, str]] = {}
         for name, value in attrs.items():
             if not name.startswith("link_"):
                 continue
@@ -584,24 +588,25 @@ def _link_records(design: adsk.fusion.Design) -> dict[str, dict[str, Any]]:
             except (TypeError, ValueError):
                 continue
             if isinstance(candidate, dict) and candidate.get("instance_id"):
-                wrapper_payload = {str(key): str(item) for key, item in candidate.items()}
-                break
-        instance_id = attrs.get("instance_id")
-        if wrapper_payload is not None:
-            instance_id = wrapper_payload["instance_id"]
-        if not instance_id:
-            continue
-        record = records.setdefault(
-            instance_id,
-            {"instance_id": instance_id, "entities": [], "payload": {}},
-        )
-        record["entities"].append(entry["entity"])
-        if wrapper_payload:
-            record["payload"].update(wrapper_payload)
-            record.setdefault("wrappers", []).append(entry["entity"])
+                payload = {str(key): str(item) for key, item in candidate.items()}
+                wrapper_payloads.setdefault(payload["instance_id"], payload)
+        direct_id = attrs.get("instance_id")
+        owners = list(wrapper_payloads)
+        if direct_id and direct_id not in wrapper_payloads:
+            owners.append(direct_id)
         direct_payload = {key: value for key, value in attrs.items() if key in _PAYLOAD_KEYS}
-        if "topology" in direct_payload:
-            record["payload"].update(direct_payload)
+        for instance_id in owners:
+            record = records.setdefault(
+                instance_id,
+                {"instance_id": instance_id, "entities": [], "payload": {}},
+            )
+            record["entities"].append(entry["entity"])
+            wrapper_payload = wrapper_payloads.get(instance_id)
+            if wrapper_payload:
+                record["payload"].update(wrapper_payload)
+                record.setdefault("wrappers", []).append(entry["entity"])
+            if instance_id == direct_id and "topology" in direct_payload:
+                record["payload"].update(direct_payload)
     return records
 
 

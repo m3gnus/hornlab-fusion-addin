@@ -54,6 +54,24 @@ The supported reference layer is:
 - the managed enclosure or waveguide body, with the documented update limits
   below.
 
+Send reads each link's `WG_THROAT_PLANE` and `WG_AXIS` by ownership, not by
+name. Insert stamps every datum with the link that owns it and records its
+entity token; Send resolves that token and requires it to name the stamped
+datum. A renamed datum therefore still sends, and two links in one component —
+the root-fallback links of a Part Design document — each send their own
+throat frame. A recorded datum that has since been deleted sends no throat
+contract for its link, never a neighbour's. Where the two records disagree, or
+two datums claim one link, Send refuses and names the link. A link with no
+such record is read by datum name only while it is the only link in its
+component; beside another link it is refused. Re-insert it from WG to record
+its datums.
+
+Send also refuses a link whose wrapper placement is mirrored or not rigid. The
+return contract's only chirality, `original`, is true of a rotation plus a
+translation alone (determinant +1 within 1e-6, WG's rigid-placement
+tolerance), so Send measures each placement and names the link instead of
+labelling it `original`.
+
 ## Commands
 
 The panel promotes the three everyday commands, **Set WG Source…**, **Solve in

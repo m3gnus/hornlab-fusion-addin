@@ -2224,6 +2224,7 @@ def _linked_wrapper_document(
     instance_id="wgi-occ",
     token_lookup="same-object",
     nested=False,
+    placement=None,
 ):
     """A managed link whose wrapper occurrence is moved 120 mm along +Y.
 
@@ -2238,6 +2239,8 @@ def _linked_wrapper_document(
     ``nested`` puts that wrapper inside a parent occurrence, so it carries an
     ``assemblyContext`` -- the case the guide tells the user to recover from by
     selecting the instance's own occurrence.
+
+    ``placement`` replaces the wrapper's ``transform2``.
     """
 
     core = send_module.wglink_core
@@ -2250,7 +2253,7 @@ def _linked_wrapper_document(
     inner = component("Horn component", [native])
     _datum_collections(inner)
     proxy = _proxy_of(native, offset_mm=(0.0, 120.0, 0.0), component_value=inner)
-    placement = moved_transform(y_cm=12.0)
+    placement = placement or moved_transform(y_cm=12.0)
     occurrence = _occurrence(inner, [proxy], placement=placement)
     occurrence.entityToken = "token-horn-occurrence"
     occurrence.assemblyContext = None
@@ -2471,6 +2474,101 @@ def test_a_link_that_is_not_the_selected_occurrence_is_refused_by_both_halves(
     assert state["hash"] is None
     assert "is not the selected occurrence" in state["reason"]
     assert not list(tmp_path.iterdir())
+
+
+# --- M1 at the producer: the chirality Send writes is measured --------------
+#
+# Send wrote ``"chirality": "original"`` for every instance whatever its
+# placement, and ``original`` is true only of a proper rotation (determinant
+# +1 within 1e-6, the tolerance WG's ``rigid_inverse`` refuses an anchor by).
+# A mirrored wrapper was labelled the one thing it is not. These send the root
+# assembly, so each wrapper's own ``transform2`` is what gets recorded.
+
+
+def _send_root_scope_with_placement(send_module, tmp_path, monkeypatch, rows):
+    design, app, _occurrence_value = _linked_wrapper_document(
+        send_module, placement=transform(rows)
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    return app
+
+
+def test_a_mirrored_placement_is_refused_at_send(send_module, tmp_path, monkeypatch):
+    app = _send_root_scope_with_placement(
+        send_module,
+        tmp_path,
+        monkeypatch,
+        [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, -1.0, 0.0, 12.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    )
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match=r"'wgi-occ'.*mirrored"
+    ):
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_non_rigid_placement_is_refused_at_send(send_module, tmp_path, monkeypatch):
+    app = _send_root_scope_with_placement(
+        send_module,
+        tmp_path,
+        monkeypatch,
+        [
+            2.0, 0.0, 0.0, 0.0,
+            0.0, 2.0, 0.0, 12.0,
+            0.0, 0.0, 2.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    )
+
+    with pytest.raises(
+        send_module.wglink_core.WgLinkError, match=r"'wgi-occ'.*not a rigid placement"
+    ):
+        send_module.send(
+            app, {"output_folder": str(tmp_path), "capture_document": False}
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_rotated_placement_is_still_labelled_original(
+    send_module, tmp_path, monkeypatch
+):
+    """A proper rotation is what WG accepts, so it is what Send still writes."""
+
+    app = _send_root_scope_with_placement(
+        send_module,
+        tmp_path,
+        monkeypatch,
+        [
+            0.0, -1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 12.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+    )
+
+    report = send_module.send(
+        app, {"output_folder": str(tmp_path), "capture_document": False}
+    )
+
+    manifest = sys.modules["wglink_return"].loads_return_manifest(
+        (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+    )
+    (instance,) = manifest["instances"]
+    assert instance["chirality"] == "original"
+    assert instance["assembly_from_link"] == [
+        [0.0, -1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 120.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 
 
 # ------------------------------------- the leftover shell a freestanding

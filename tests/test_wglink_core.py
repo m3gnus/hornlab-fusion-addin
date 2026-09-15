@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import types
@@ -2622,3 +2623,548 @@ def test_a_refusal_before_the_first_model_write_leaves_no_applying_mark(
 
     assert calls == []
     assert core.applying_operation(design) is None
+
+
+# --- M2: a link's source contract reads its OWN datums ---------------------
+#
+# Send found a link's throat plane and axis with ``itemByName("WG_THROAT_PLANE")``
+# on the link's component. A Part Design document puts every link in the root
+# component, so two links there share one set of names and the second sent the
+# first one's throat frame; a renamed datum sent no contract at all. Insert has
+# always stamped each datum with its owner and recorded its entity token, and
+# these tests hold Send to that ownership record.
+#
+# The fakes are Fusion's documented surface, not stand-ins for the code under
+# test: an attribute knows its parent; ``findEntityByToken`` hands back a FRESH
+# Python handle (Fusion mints wrappers per call); and an entity's
+# ``entityToken`` string drifts after Insert while every token it ever had
+# still resolves to it -- Autodesk documents exactly that, and says never to
+# compare token strings. A resolver that compared a stored token with a live
+# one, or used ``is`` on a looked-up handle, fails here.
+
+THROAT_DIA_CM = 2.54
+THROAT_AREA_MM2 = math.pi * 25.4 * 25.4 / 4.0
+
+
+class _FusionBase:
+    """``adsk.core.Base`` equality: two wrappers are equal when they wrap one entity."""
+
+    def _underlying(self):
+        return self
+
+    def __eq__(self, other):
+        return isinstance(other, _FusionBase) and self._underlying() is other._underlying()
+
+    def __hash__(self):
+        return id(self._underlying())
+
+
+class _Handle(_FusionBase):
+    """A second Python wrapper for one Fusion entity, minted by a lookup.
+
+    Its ``entityToken`` is the string Fusion hands out at the time of that
+    lookup, which need not match the string the first wrapper reports.
+    """
+
+    def __init__(self, entity, token):
+        object.__setattr__(self, "_entity", entity)
+        object.__setattr__(self, "entityToken", token)
+
+    def _underlying(self):
+        return self._entity
+
+    def __getattr__(self, name):
+        return getattr(self._entity, name)
+
+
+class _Datum(_LiveEntity, _FusionBase):
+    """A construction plane or axis with the geometry a source contract reads.
+
+    Fusion's ConstructionPlane and ConstructionAxis name their owner
+    ``component``; they have no ``parentComponent``.
+    """
+
+    def __init__(self, kind, name, token, parent_component, *, origin_cm):
+        super().__init__(kind, name, token, parent_component)
+        del self.parentComponent
+        self.component = parent_component
+        origin = types.SimpleNamespace(x=origin_cm[0], y=origin_cm[1], z=origin_cm[2])
+        direction = types.SimpleNamespace(x=0.0, y=0.0, z=1.0)
+        if kind == "ConstructionPlane":
+            self.geometry = types.SimpleNamespace(origin=origin, normal=direction)
+        else:
+            self.geometry = types.SimpleNamespace(origin=origin, direction=direction)
+
+
+def _drift_token(entity):
+    """Fusion: a token read later may differ, and both still find the entity."""
+
+    tokens = getattr(entity, "tokens", {entity.entityToken})
+    entity.entityToken = f"{entity.entityToken}~later"
+    tokens.add(entity.entityToken)
+    entity.tokens = tokens
+
+
+def _find_entity_by_token(entities):
+    """``Design.findEntityByToken``: every entity the token resolves to.
+
+    A datum comes back as a fresh wrapper reporting a token string of its own,
+    so only entity equality can tell it is the stamped one.
+    """
+
+    reads = iter(range(1, 1_000_000))
+
+    def find(token):
+        found = _Collection()
+        for entity in entities:
+            tokens = getattr(entity, "tokens", {entity.entityToken})
+            if not token or token not in tokens:
+                continue
+            if isinstance(entity, _FusionBase):
+                alias = f"{token}~read{next(reads)}"
+                tokens.add(alias)
+                entity.tokens = tokens
+                found.append(_Handle(entity, alias))
+            else:
+                found.append(entity)
+        return found
+
+    return find
+
+
+def _root_links_document(core, links, *, stamp_datums=True, record_datums=True):
+    """A Part Design document: every link lives in the root component.
+
+    ``links`` maps an instance id to that link's throat origin in cm. Each link
+    gets a body, a ``WG_THROAT_PLANE`` and a ``WG_AXIS`` in the root, stamped
+    the way ``_build_datums`` stamps them, and the root carries each link's
+    wrapper payload the way a root-fallback Insert writes it. With
+    ``stamp_datums``/``record_datums`` off, the datums carry no ownership
+    record -- the one shape a name lookup is still allowed for.
+    """
+
+    root = _LiveEntity("Component", "Party", "tok-root")
+    planes, axes, parameters, entities = _Collection(), _Collection(), [], [root]
+    parts = {}
+    for index, (instance_id, origin_cm) in enumerate(links.items()):
+        prefix = f"wg_horn{index + 1}_"
+        body = _LiveEntity(
+            "BRepBody", "WGLink freestanding waveguide", f"tok-body-{instance_id}", root
+        )
+        plane = _Datum(
+            "ConstructionPlane", "WG_THROAT_PLANE", f"tok-plane-{instance_id}", root,
+            origin_cm=origin_cm,
+        )
+        axis = _Datum(
+            "ConstructionAxis", "WG_AXIS", f"tok-axis-{instance_id}", root,
+            origin_cm=origin_cm,
+        )
+        if stamp_datums:
+            core._stamp_managed(plane, instance_id, "datum", "WG_THROAT_PLANE")
+            core._stamp_managed(axis, instance_id, "datum", "WG_AXIS")
+        tokens = {"body:final": body.entityToken, "wrapper:component": root.entityToken}
+        if record_datums:
+            tokens["datum:WG_THROAT_PLANE"] = plane.entityToken
+            tokens["datum:WG_AXIS"] = axis.entityToken
+        payload = {
+            "instance_id": instance_id,
+            "topology": "wg",
+            "design_id": f"design-{instance_id}",
+            "export_id": f"export-{instance_id}",
+            "export_sequence": "1",
+            "build_mode": "freestanding",
+            "parameter_prefix": prefix,
+            "source_role": "HF",
+            "expected_throat_area_mm2": repr(THROAT_AREA_MM2),
+            "throat_z_mm": "0.0",
+            "wrapper": "root",
+            "entity_tokens": core._json(tokens),
+        }
+        core._stamp_managed(body, instance_id, "role", "waveguide")
+        core._stamp_payload(body, payload)
+        core._stamp_wrapper(root, payload)
+        parameters.append(
+            types.SimpleNamespace(name=f"{prefix}throat_dia", value=THROAT_DIA_CM)
+        )
+        planes.append(plane)
+        axes.append(axis)
+        entities.extend([body, plane, axis])
+        parts[instance_id] = {"body": body, "plane": plane, "axis": axis}
+    root.constructionPlanes = planes
+    root.constructionAxes = axes
+    for entity in entities:
+        _drift_token(entity)
+    design = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        rootComponent=root,
+        findAttributes=lambda _group, _name: [
+            attribute for entity in entities for attribute in list(entity.attributes.items)
+        ],
+        findEntityByToken=_find_entity_by_token(entities),
+        userParameters=_Collection(parameters),
+    )
+    return design, parts, entities
+
+
+def _send_against(core, monkeypatch):
+    monkeypatch.setattr(core.adsk.core, "Base", _FusionBase, raising=False)
+    monkeypatch.setitem(sys.modules, "wglink_core", core)
+    spec = importlib.util.spec_from_file_location(
+        "wglink_send_datum_ownership_test", ADDIN / "wglink_send.py"
+    )
+    assert spec is not None and spec.loader is not None
+    send = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, send)
+    spec.loader.exec_module(send)
+    return send
+
+
+def _contracts(send, design):
+    records = send._records_in_scope(design, {"selection": "root"})
+    return {
+        record["instance_id"]: send._source_contract(design, record)
+        for record in records
+    }
+
+
+def _set_recorded_tokens(core, root, body, instance_id, tokens):
+    """Rewrite one link's recorded token table on both carriers Insert writes."""
+
+    text = core._json(tokens)
+    core._set_attribute(body, "entity_tokens", text)
+    name = core._wrapper_attribute_name(instance_id)
+    payload = json.loads(core._attribute_value(root, name))
+    payload["entity_tokens"] = text
+    core._set_attribute(root, name, core._json(payload))
+
+
+def test_link_records_keep_every_payload_on_one_parent(core):
+    """A root component hosting two root-fallback links carries both payloads.
+
+    ``_link_records`` stopped at the first ``link_*`` attribute on a parent, so
+    the second link lost its wrapper -- and with no body of its own, the whole
+    record.
+    """
+
+    root = _LiveEntity("Component", "Party", "tok-root")
+    for instance_id, prefix in (("wg-a", "wg_horn1_"), ("wg-b", "wg_horn2_")):
+        core._stamp_wrapper(
+            root,
+            {"instance_id": instance_id, "parameter_prefix": prefix, "wrapper": "root"},
+        )
+    design = types.SimpleNamespace(
+        findAttributes=lambda _group, _name: list(root.attributes.items)
+    )
+
+    records = core._link_records(design)
+
+    assert sorted(records) == ["wg-a", "wg-b"]
+    for instance_id, prefix in (("wg-a", "wg_horn1_"), ("wg-b", "wg_horn2_")):
+        record = records[instance_id]
+        assert record["payload"]["instance_id"] == instance_id
+        assert record["payload"]["parameter_prefix"] == prefix
+        assert record["wrappers"] == [root]
+        assert record["entities"] == [root]
+
+
+def test_two_root_fallback_links_each_carry_their_own_axis(core, monkeypatch):
+    send = _send_against(core, monkeypatch)
+    design, _parts, _entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0), "wg-b": (0.0, 3.0, 0.0)}
+    )
+
+    contracts = _contracts(send, design)
+
+    assert contracts["wg-a"]["axis_link"]["origin_mm"] == [0.0, 0.0, 0.0]
+    assert contracts["wg-a"]["throat_plane_link"]["origin_mm"] == [0.0, 0.0, 0.0]
+    assert contracts["wg-b"]["axis_link"]["origin_mm"] == [0.0, 30.0, 0.0]
+    assert contracts["wg-b"]["throat_plane_link"]["origin_mm"] == [0.0, 30.0, 0.0]
+
+
+def test_a_renamed_datum_still_resolves_by_ownership(core, monkeypatch):
+    """A datum's browser name is presentation; its owner stamp is identity."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, _entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0), "wg-b": (0.0, 3.0, 0.0)}
+    )
+    parts["wg-b"]["plane"].name = "Right horn throat"
+    parts["wg-b"]["axis"].name = "Right horn axis"
+
+    contracts = _contracts(send, design)
+
+    assert contracts["wg-b"]["throat_plane_link"]["origin_mm"] == [0.0, 30.0, 0.0]
+    assert contracts["wg-b"]["axis_link"]["origin_mm"] == [0.0, 30.0, 0.0]
+    assert contracts["wg-a"]["axis_link"]["origin_mm"] == [0.0, 0.0, 0.0]
+
+
+def test_a_legacy_component_with_two_links_is_refused_not_guessed(core, monkeypatch):
+    """No ownership record and a shared component: a name could be either link's."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(
+        core,
+        {"wg-a": (0.0, 0.0, 0.0), "wg-b": (0.0, 3.0, 0.0)},
+        stamp_datums=False,
+        record_datums=False,
+    )
+    records = send._records_in_scope(design, {"selection": "root"})
+
+    assert [record["instance_id"] for record in records] == ["wg-a", "wg-b"]
+    for record in records:
+        with pytest.raises(core.WgLinkError) as refusal:
+            send._source_contract(design, record)
+        assert repr(record["instance_id"]) in str(refusal.value)
+        assert "WG_THROAT_PLANE" in str(refusal.value)
+        assert "another WG link" in str(refusal.value)
+
+    # One namesake left is no better: it is wg-b's, and wg-a must not take it.
+    root = design.rootComponent
+    for datum, collection in (
+        (parts["wg-a"]["plane"], root.constructionPlanes),
+        (parts["wg-a"]["axis"], root.constructionAxes),
+    ):
+        entities.remove(datum)
+        collection.remove(datum)
+    records = {
+        record["instance_id"]: record
+        for record in send._records_in_scope(design, {"selection": "root"})
+    }
+
+    with pytest.raises(core.WgLinkError, match=r"'wg-a'.*another WG link"):
+        send._source_contract(design, records["wg-a"])
+
+
+def test_a_legacy_link_alone_in_its_component_still_resolves_by_name(core, monkeypatch):
+    send = _send_against(core, monkeypatch)
+    design, _parts, _entities = _root_links_document(
+        core, {"wg-a": (0.0, 2.0, 0.0)}, stamp_datums=False, record_datums=False
+    )
+
+    contracts = _contracts(send, design)
+
+    assert contracts["wg-a"]["axis_link"]["origin_mm"] == [0.0, 20.0, 0.0]
+
+
+def test_a_copied_datum_resolves_to_the_one_insert_recorded(core, monkeypatch):
+    """Copy/paste duplicates the owner stamp; the recorded token decides."""
+
+    send = _send_against(core, monkeypatch)
+    design, _parts, entities = _root_links_document(core, {"wg-a": (0.0, 0.0, 0.0)})
+    root = design.rootComponent
+    copy = _Datum(
+        "ConstructionPlane", "WG_THROAT_PLANE", "tok-plane-copy", root,
+        origin_cm=(5.0, 0.0, 0.0),
+    )
+    core._stamp_managed(copy, "wg-a", "datum", "WG_THROAT_PLANE")
+    # The copy is listed first, where a lookup by name would pick it.
+    entities.insert(1, copy)
+    root.constructionPlanes.insert(0, copy)
+
+    contracts = _contracts(send, design)
+
+    assert contracts["wg-a"]["throat_plane_link"]["origin_mm"] == [0.0, 0.0, 0.0]
+
+
+def test_two_stamped_datums_without_a_recorded_token_are_refused(core, monkeypatch):
+    send = _send_against(core, monkeypatch)
+    design, _parts, entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0)}, record_datums=False
+    )
+    root = design.rootComponent
+    copy = _Datum(
+        "ConstructionPlane", "WG_THROAT_PLANE", "tok-plane-copy", root,
+        origin_cm=(5.0, 0.0, 0.0),
+    )
+    core._stamp_managed(copy, "wg-a", "datum", "WG_THROAT_PLANE")
+    entities.append(copy)
+    root.constructionPlanes.append(copy)
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(core.WgLinkError, match=r"'wg-a'.*WG_THROAT_PLANE"):
+        send._source_contract(design, record)
+
+
+def test_a_recorded_datum_owned_by_another_link_is_refused(core, monkeypatch):
+    """The stamp and the token must agree; a contradiction is not settled by picking."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0), "wg-b": (0.0, 3.0, 0.0)}
+    )
+    # wg-a's recorded axis token now names wg-b's axis -- a payload carried
+    # across links. The original token still resolves; Fusion keeps them all.
+    _set_recorded_tokens(
+        core,
+        design.rootComponent,
+        parts["wg-a"]["body"],
+        "wg-a",
+        {
+            "datum:WG_THROAT_PLANE": "tok-plane-wg-a",
+            "datum:WG_AXIS": "tok-axis-wg-b",
+        },
+    )
+    records = {
+        record["instance_id"]: record
+        for record in send._records_in_scope(design, {"selection": "root"})
+    }
+
+    with pytest.raises(core.WgLinkError, match=r"'wg-a'.*WG_AXIS"):
+        send._source_contract(design, records["wg-a"])
+    assert send._source_contract(design, records["wg-b"])["axis_link"]["origin_mm"] == [
+        0.0, 30.0, 0.0,
+    ]
+
+    # With wg-a's own axis gone, only the owner stamp on the recorded datum
+    # stands between wg-a and its neighbour's axis.
+    entities.remove(parts["wg-a"]["axis"])
+    design.rootComponent.constructionAxes.remove(parts["wg-a"]["axis"])
+    records = {
+        record["instance_id"]: record
+        for record in send._records_in_scope(design, {"selection": "root"})
+    }
+
+    with pytest.raises(core.WgLinkError, match=r"'wg-a'.*WG_AXIS.*'wg-b'"):
+        send._source_contract(design, records["wg-a"])
+
+
+def test_a_recorded_token_naming_another_of_its_datums_is_refused(core, monkeypatch):
+    """A recorded throat token that names the link's baffle plane is not its throat."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(core, {"wg-a": (0.0, 0.0, 0.0)})
+    root = design.rootComponent
+    baffle = _Datum(
+        "ConstructionPlane", "WG_BAFFLE_PLANE", "tok-baffle-wg-a", root,
+        origin_cm=(0.0, 0.0, 9.0),
+    )
+    core._stamp_managed(baffle, "wg-a", "datum", "WG_BAFFLE_PLANE")
+    entities.append(baffle)
+    root.constructionPlanes.append(baffle)
+    entities.remove(parts["wg-a"]["plane"])
+    root.constructionPlanes.remove(parts["wg-a"]["plane"])
+    _set_recorded_tokens(
+        core,
+        root,
+        parts["wg-a"]["body"],
+        "wg-a",
+        {
+            "datum:WG_THROAT_PLANE": "tok-baffle-wg-a",
+            "datum:WG_AXIS": "tok-axis-wg-a",
+        },
+    )
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(
+        core.WgLinkError, match=r"'wg-a'.*WG_THROAT_PLANE.*WG_BAFFLE_PLANE"
+    ):
+        send._source_contract(design, record)
+
+
+def test_a_deleted_owned_datum_is_never_replaced_by_a_namesake(core, monkeypatch):
+    """A link whose own datums are gone has no contract -- not its neighbour's."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0), "wg-b": (0.0, 3.0, 0.0)}
+    )
+    root = design.rootComponent
+    entities.remove(parts["wg-a"]["plane"])
+    entities.remove(parts["wg-a"]["axis"])
+    root.constructionPlanes.remove(parts["wg-a"]["plane"])
+    root.constructionAxes.remove(parts["wg-a"]["axis"])
+
+    contracts = _contracts(send, design)
+
+    assert contracts["wg-a"] is None
+    assert contracts["wg-b"]["axis_link"]["origin_mm"] == [0.0, 30.0, 0.0]
+
+
+def test_a_datum_names_its_component_for_the_shared_component_check(core, monkeypatch):
+    """Fusion's datums name their owner ``component``; that still counts as living there."""
+
+    send = _send_against(core, monkeypatch)
+    root = _LiveEntity("Component", "Party", "tok-root")
+    plane = _Datum(
+        "ConstructionPlane", "WG_THROAT_PLANE", "tok-plane", root, origin_cm=(0.0, 0.0, 0.0)
+    )
+
+    assert not hasattr(plane, "parentComponent")
+    assert send._link_components({"instance_id": "wg-b", "entities": [plane]}) == [root]
+
+
+def test_a_recorded_datum_the_stamp_does_not_name_is_refused(core, monkeypatch):
+    """Stamp and token each name a datum, and not the same one: Send will not pick."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(core, {"wg-a": (0.0, 0.0, 0.0)})
+    root = design.rootComponent
+    stray = _Datum(
+        "ConstructionPlane", "Plane1", "tok-stray", root, origin_cm=(0.0, 0.0, 4.0)
+    )
+    entities.append(stray)
+    root.constructionPlanes.append(stray)
+    _set_recorded_tokens(
+        core,
+        root,
+        parts["wg-a"]["body"],
+        "wg-a",
+        {"datum:WG_THROAT_PLANE": "tok-stray", "datum:WG_AXIS": "tok-axis-wg-a"},
+    )
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(core.WgLinkError, match=r"'wg-a'.*not the one Insert recorded"):
+        send._source_contract(design, record)
+
+
+def test_a_legacy_link_with_two_namesakes_is_refused(core, monkeypatch):
+    send = _send_against(core, monkeypatch)
+    design, _parts, entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0)}, stamp_datums=False, record_datums=False
+    )
+    root = design.rootComponent
+    twin = _Datum(
+        "ConstructionPlane", "WG_THROAT_PLANE", "tok-plane-twin", root,
+        origin_cm=(0.0, 0.0, 4.0),
+    )
+    entities.append(twin)
+    root.constructionPlanes.append(twin)
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(
+        core.WgLinkError,
+        match=r"'wg-a'.*2 datums in its component are named WG_THROAT_PLANE",
+    ):
+        send._source_contract(design, record)
+
+
+def test_a_recorded_token_naming_several_datums_is_refused(core, monkeypatch):
+    """Fusion may resolve one token to several entities; that is not an identity."""
+
+    send = _send_against(core, monkeypatch)
+    design, parts, entities = _root_links_document(
+        core, {"wg-a": (0.0, 0.0, 0.0)}, stamp_datums=False
+    )
+    root = design.rootComponent
+    twin = _Datum(
+        "ConstructionPlane", "Plane1", "tok-plane-twin", root, origin_cm=(0.0, 0.0, 4.0)
+    )
+    twin.tokens = {"tok-plane-twin", "tok-plane-wg-a"}
+    entities.append(twin)
+    root.constructionPlanes.append(twin)
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(
+        core.WgLinkError, match=r"'wg-a'.*its recorded WG_THROAT_PLANE names 2 datums"
+    ):
+        send._source_contract(design, record)
+
+    # Both stamped as wg-a's throat plane, and both answering to the token.
+    core._stamp_managed(parts["wg-a"]["plane"], "wg-a", "datum", "WG_THROAT_PLANE")
+    core._stamp_managed(twin, "wg-a", "datum", "WG_THROAT_PLANE")
+    (record,) = send._records_in_scope(design, {"selection": "root"})
+
+    with pytest.raises(
+        core.WgLinkError, match=r"'wg-a'.*2 datums answer to its recorded WG_THROAT_PLANE"
+    ):
+        send._source_contract(design, record)

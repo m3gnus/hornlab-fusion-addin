@@ -210,12 +210,22 @@ Commands and requests cross through WG's machine-local IPC folder,
   id beside the export identity, as their last write. A handoff whose operation
   id is already on a link is acknowledged without mutating, and before the
   baseline check, so a lost acknowledgement never reads as a conflict. Before
-  its first write that changes the model, a WG operation is marked as applying
-  on the root component; the mark is cleared after the evidence, and a refusal
-  before that first write leaves none. A mark with no evidence means the
-  change began and did not finish: **Update interrupted — recovery required**.
-  That operation is never run again, and the heartbeat publishes the mark as
-  `document.applyingOperation` so WG can say so too.
+  its first write that changes the model, Update saves the user's exact timeline
+  marker and journals `prepared`, `applying`, `applied`, then `verified`, with one
+  stable `startedAt`. The marker is restored to its saved position on every exit;
+  Update never moves it blindly to the end. Export identity and operation evidence
+  are stamped only after verification, then the journal is cleared. An apply
+  failure leaves `applying`; a verification failure leaves `applied` and reports
+  **Update applied but not verified — recovery required**. That operation is never
+  run again, and the heartbeat publishes `phase` and `startedAt` additively in
+  `document.applyingOperation` so WG can say where recovery stopped.
+- **Insert destination and expiry.** A new WG can bind an insert to the active
+  document with `destination: {kind: "document", value: <document id>}`, or to a
+  new document with `{kind: "new_document", value: <request id>}` when none is
+  active. WGLink consumes and refuses a different destination, and consumes an
+  insert more than 30 minutes after `requestedAt` as `expired`, without touching
+  the document. A request with no `destination` keeps the version-3 behaviour for
+  a pinned older WG.
 - **Supersession.** An update that has not started yet is dropped when a newer
   one for the same document and instance arrives; only the newest runs. WG
   withdraws the older file itself; WGLink covers a file WG could not remove.

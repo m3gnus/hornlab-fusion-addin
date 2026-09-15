@@ -2042,7 +2042,8 @@ def test_update_refuses_the_swap_before_it_touches_the_document(
         count = 9
 
         def __init__(self) -> None:
-            self._marker = 9
+            # Fusion's marker need not be at the end when Update starts.
+            self._marker = 7
 
         @property
         def markerPosition(self) -> int:
@@ -2357,7 +2358,8 @@ def _stub_rebuilding_update(core, monkeypatch, calls):
         count = 9
 
         def __init__(self) -> None:
-            self._marker = 9
+            # Fusion's marker need not be at the end when Update starts.
+            self._marker = 7
 
         @property
         def markerPosition(self) -> int:
@@ -2370,6 +2372,7 @@ def _stub_rebuilding_update(core, monkeypatch, calls):
 
         def moveToEnd(self) -> None:
             calls.append(("timeline", "end"))
+            self._marker = self.count
 
     class _RootAttributes:
         """The root component's attribute table, recording the applying marker."""
@@ -2504,7 +2507,8 @@ def test_update_stamps_the_operation_id_beside_the_export_identity_as_its_last_w
     else:
         # Marked as applying before the first write, cleared after the evidence.
         assert [kind for kind, _ in calls] == [
-            "marker", "timeline", "parameters", "timeline", "tag", "evidence", "clear",
+            "marker", "marker", "timeline", "parameters", "marker", "timeline",
+            "tag", "marker", "evidence", "clear",
         ]
     evidence = next(value for kind, value in calls if kind == "evidence")
     assert evidence["export_id"] == "wge_new"
@@ -2513,6 +2517,67 @@ def test_update_stamps_the_operation_id_beside_the_export_identity_as_its_last_w
     # One attribute is written at a time, in this order: the export identity
     # and then the operation id come last, after every other refreshed field.
     assert list(evidence)[-3:] == ["export_sequence", "export_id", "operation_id"]
+
+
+def test_update_journals_each_phase_and_restores_the_exact_timeline_marker(
+    core, monkeypatch, tmp_path: Path
+):
+    calls: list[tuple[str, object]] = []
+    design = _stub_rebuilding_update(core, monkeypatch, calls)
+
+    core.update(object(), None, {
+        "instance_id": "wgi_one",
+        "operation_id": "req-7",
+        "progress_path": str(tmp_path / "progress.json"),
+    })
+
+    phases = [
+        json.loads(value)["phase"]
+        for kind, value in calls
+        if kind == "marker"
+    ]
+    assert phases == ["prepared", "applying", "applied", "verified"]
+    started = {
+        json.loads(value)["startedAt"]
+        for kind, value in calls
+        if kind == "marker"
+    }
+    assert len(started) == 1
+    assert design.timeline.markerPosition == 7
+    assert ("timeline", "end") not in calls
+    evidence_index = next(i for i, (kind, _value) in enumerate(calls) if kind == "evidence")
+    verified_index = max(
+        i
+        for i, (kind, value) in enumerate(calls)
+        if kind == "marker" and json.loads(value)["phase"] == "verified"
+    )
+    assert verified_index < evidence_index
+
+
+def test_verify_failure_leaves_applied_journal_and_requires_recovery(
+    core, monkeypatch, tmp_path: Path
+):
+    calls: list[tuple[str, object]] = []
+    design = _stub_rebuilding_update(core, monkeypatch, calls)
+
+    def face_was_split(*_args, **_kwargs):
+        raise RuntimeError("face split")
+
+    monkeypatch.setattr(core, "_tag_report", face_was_split)
+
+    with pytest.raises(
+        core.WgLinkError,
+        match="Update applied but not verified — recovery required",
+    ):
+        core.update(object(), None, {
+            "instance_id": "wgi_one",
+            "operation_id": "req-7",
+            "progress_path": str(tmp_path / "progress.json"),
+        })
+
+    assert core.applying_operation(design)["phase"] == "applied"
+    assert "evidence" not in [kind for kind, _value in calls]
+    assert design.timeline.markerPosition == 7
 
 
 # --- The precondition and the applying marker ---------------------------------
@@ -2540,7 +2605,9 @@ def test_update_rechecks_its_precondition_after_the_last_read_and_before_any_wri
 
     core.update(object(), None, options)
 
-    assert [kind for kind, _ in calls][:3] == ["precondition", "marker", "timeline"]
+    assert [kind for kind, _ in calls][:4] == [
+        "precondition", "marker", "marker", "timeline"
+    ]
 
     calls.clear()
 
@@ -2576,12 +2643,19 @@ def test_an_update_interrupted_after_its_first_write_leaves_the_applying_marker(
         })
 
     assert "evidence" not in [kind for kind, _ in calls]
-    assert core.applying_operation(design) == {
+    applying = core.applying_operation(design)
+    assert applying is not None
+    assert {key: applying[key] for key in (
+        "operation_id", "kind", "instance_id", "export_id", "phase"
+    )} == {
         "operation_id": "req-7",
         "kind": "update",
         "instance_id": "wgi_one",
         "export_id": "wge_new",
+        "phase": "applying",
     }
+    assert applying["startedAt"].endswith("Z")
+    assert design.timeline.markerPosition == 7
 
 
 def test_a_later_completed_update_of_the_instance_clears_an_old_marker(

@@ -9,6 +9,7 @@ harness.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -286,7 +287,9 @@ def _set_attribute(entity: object, name: str, value: object) -> None:
 # mutations") calls that recovery_required, and the operation is never run
 # again. WGLink.py reads it and the heartbeat publishes it.
 APPLYING_ATTRIBUTE = "applying_operation"
-_APPLYING_FIELDS = ("operation_id", "kind", "instance_id", "export_id")
+_APPLYING_FIELDS = (
+    "operation_id", "kind", "instance_id", "export_id", "phase", "startedAt"
+)
 
 
 def applying_operation(design: object) -> dict[str, str] | None:
@@ -307,7 +310,14 @@ def applying_operation(design: object) -> dict[str, str] | None:
 
 
 def _mark_applying(
-    design: object, *, operation_id: str, kind: str, instance_id: str, export_id: str
+    design: object,
+    *,
+    operation_id: str,
+    kind: str,
+    instance_id: str,
+    export_id: str,
+    phase: str = "applying",
+    started_at: str | None = None,
 ) -> None:
     """Mark a WG operation as applying, before its first write.
 
@@ -330,9 +340,138 @@ def _mark_applying(
                 "kind": kind,
                 "instance_id": instance_id,
                 "export_id": export_id,
+                "phase": phase,
+                "startedAt": started_at
+                or datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
             }
         ),
     )
+
+
+def _prepare_update(
+    design: object, *, operation_id: str, instance_id: str, export_id: str
+) -> dict[str, object]:
+    """Finish preparation by saving the marker and opening the durable journal."""
+
+    prepared = {
+        "marker_position": design.timeline.markerPosition,
+        "operation_id": operation_id,
+        "instance_id": instance_id,
+        "export_id": export_id,
+        "started_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+    }
+    if operation_id:
+        _mark_applying(
+            design,
+            operation_id=operation_id,
+            kind="update",
+            instance_id=instance_id,
+            export_id=export_id,
+            phase="prepared",
+            started_at=str(prepared["started_at"]),
+        )
+    return prepared
+
+
+def _apply_update(design: object, prepared: Mapping[str, object], phase: str) -> None:
+    """Advance the journal around the model-writing part of Update."""
+
+    operation_id = str(prepared.get("operation_id") or "")
+    if operation_id:
+        _mark_applying(
+            design,
+            operation_id=operation_id,
+            kind="update",
+            instance_id=str(prepared["instance_id"]),
+            export_id=str(prepared["export_id"]),
+            phase=phase,
+            started_at=str(prepared["started_at"]),
+        )
+
+
+def _verify_update(
+    app: object,
+    design: object,
+    record: dict[str, Any],
+    bundle: object,
+    payload: dict[str, Any],
+    options: Mapping[str, Any],
+    before_health: list[dict[str, Any]],
+    local_state: str,
+    progress_path: Path,
+    report: dict[str, Any],
+    prepared: Mapping[str, object],
+) -> dict[str, Any]:
+    """Re-resolve and verify the applied model, then close its journal phase."""
+
+    body_record = _resolve_link(design, {"instance_id": record["instance_id"]})
+    _hide_link_helpers(body_record, report)
+    body = body_record["body"]
+    role = record["payload"].get("source_role", "HF")
+    throat_z = float(
+        payload.get("throat_z_mm", record["payload"].get("throat_z_mm", 0.0))
+    )
+    expected = throat_area_mm2(bundle)
+    tag = _tag_report(
+        app,
+        design,
+        body,
+        instance_id=record["instance_id"],
+        role=role,
+        throat_z_mm=throat_z,
+        expected_area_mm2=expected,
+        repair=True,
+    )
+    after_health, after_skipped = _feature_health(design)
+    regressions = health_regressions(before_health, after_health)
+    if after_skipped:
+        report["warnings"].append(
+            f"Post-update health diagnostics skipped {len(after_skipped)} unreadable entries."
+        )
+    assembly = _assembly_from_link(design, body_record)
+    report.update(
+        {
+            "assembly_from_link": assembly,
+            "body": _body_measurement(body, bundle.manifest),
+            "deviation": _deviation(
+                app,
+                body,
+                transform_points(list(payload.get("check_points") or []), assembly),
+                int(options.get("max_checks", 400)),
+            ),
+            "regressed": regressions,
+            "tag": tag,
+        }
+    )
+    if regressions:
+        names = ", ".join(
+            f"{row.get('name', '?')} ({row.get('health', '?')})"
+            for row in regressions
+        )
+        _write_progress(progress_path, report)
+        raise WgLinkError(
+            "WGLink update caused feature-health regressions: "
+            f"{names}. Freshness evidence was not committed; Undo the update or "
+            "repair every named feature before trying again."
+        )
+    evidence_state, evidence_fingerprint = refreshed_body_evidence(
+        local_state,
+        record["payload"].get("body_fingerprint"),
+        _json(_body_fingerprint(body)),
+    )
+    _apply_update(design, prepared, "verified")
+    return {
+        "assembly": assembly,
+        "body": body,
+        "expected": expected,
+        "throat_z": throat_z,
+        "evidence_state": evidence_state,
+        "evidence_fingerprint": evidence_fingerprint,
+    }
 
 
 def _clear_applying(design: object, *, instance_id: str) -> None:
@@ -3689,22 +3828,20 @@ def update(
             f"Health diagnostics skipped {len(before_skipped)} unreadable timeline entries."
         )
     local_state = _local_body_state(record)
-    # Immediately before the first write that changes the model. Every refusal
-    # above leaves the document as it was, so it must leave no mark either: a
-    # mark with no change behind it would read as an interrupted update.
-    if operation_id:
-        _mark_applying(
-            design,
-            operation_id=operation_id,
-            kind="update",
-            instance_id=record["instance_id"],
-            export_id=bundle.identity.export_id,
-        )
+    # Preparation above is read-only. Save the user's exact marker position,
+    # then journal the completed preparation before model writes begin.
+    prepared = _prepare_update(
+        design,
+        operation_id=operation_id,
+        instance_id=record["instance_id"],
+        export_id=bundle.identity.export_id,
+    )
     marker_moved = False
     failure: Exception | None = None
     try:
-        design.timeline.markerPosition = target_index
+        _apply_update(design, prepared, "applying")
         marker_moved = True
+        design.timeline.markerPosition = target_index
         report["parameters"] = _push_parameters(design, bundle, parameter_prefix)
         if incoming_mode == "enclosure":
             _mouth_overshoot_parameter, overshoot_parameter_report = (
@@ -3742,12 +3879,13 @@ def update(
         if fixed is not None:
             report["fit_points_moved"] += _move_fixed_enclosure(fixed, bundle)
         _write_progress(progress_path, report)
+        _apply_update(design, prepared, "applied")
     except Exception as exc:  # noqa: BLE001 - marker restoration happens below
         failure = exc
     finally:
         if marker_moved:
             try:
-                design.timeline.moveToEnd()
+                design.timeline.markerPosition = int(prepared["marker_position"])
                 timeline_report["restored"] = design.timeline.markerPosition
             except Exception as exc:  # noqa: BLE001
                 if failure is None:
@@ -3781,63 +3919,31 @@ def update(
             f"Fusion has no transaction for this operation; use Undo to recover.{tag_note}"
         ) from failure
 
-    body_record = _resolve_link(design, {"instance_id": record["instance_id"]})
-    # Re-resolved after the rebuild, so the helper bodies hidden here are the
-    # ones the document actually has now. Visibility is not a timeline
-    # property, so the rollback this rebuild performed neither undid an
-    # earlier hide nor requires this one to be repeated.
-    _hide_link_helpers(body_record, report)
-    body = body_record["body"]
-    role = record["payload"].get("source_role", "HF")
-    throat_z = float(payload.get("throat_z_mm", record["payload"].get("throat_z_mm", 0.0)))
-    expected = throat_area_mm2(bundle)
-    tag = _tag_report(
-        app,
-        design,
-        body,
-        instance_id=record["instance_id"],
-        role=role,
-        throat_z_mm=throat_z,
-        expected_area_mm2=expected,
-        repair=True,
-    )
-    after_health, after_skipped = _feature_health(design)
-    regressions = health_regressions(before_health, after_health)
-    if after_skipped:
-        report["warnings"].append(
-            f"Post-update health diagnostics skipped {len(after_skipped)} unreadable entries."
+    try:
+        verification = _verify_update(
+            app,
+            design,
+            record,
+            bundle,
+            payload,
+            opts,
+            before_health,
+            local_state,
+            progress_path,
+            report,
+            prepared,
         )
-    assembly = _assembly_from_link(design, body_record)
-    report.update(
-        {
-            "assembly_from_link": assembly,
-            "body": _body_measurement(body, bundle.manifest),
-            "deviation": _deviation(
-                app,
-                body,
-                transform_points(list(payload.get("check_points") or []), assembly),
-                int(opts.get("max_checks", 400)),
-            ),
-            "regressed": regressions,
-            "tag": tag,
-        }
-    )
-    if regressions:
-        names = ", ".join(
-            f"{row.get('name', '?')} ({row.get('health', '?')})"
-            for row in regressions
-        )
-        _write_progress(progress_path, report)
+    except Exception as exc:  # noqa: BLE001 - applied state must remain recoverable
         raise WgLinkError(
-            "WGLink update caused feature-health regressions: "
-            f"{names}. Freshness evidence was not committed; Undo the update or "
-            "repair every named feature before trying again."
-        )
-    evidence_state, evidence_fingerprint = refreshed_body_evidence(
-        local_state,
-        record["payload"].get("body_fingerprint"),
-        _json(_body_fingerprint(body)),
-    )
+            "Update applied but not verified — recovery required. Undo the update "
+            f"or repair the link before trying again. Verification failed: {exc}"
+        ) from exc
+    assembly = verification["assembly"]
+    body = verification["body"]
+    expected = verification["expected"]
+    throat_z = verification["throat_z"]
+    evidence_state = verification["evidence_state"]
+    evidence_fingerprint = verification["evidence_fingerprint"]
     refresh = {
         "assembly_from_link": _json(assembly),
         "bundle_id": str(bundle.manifest.get("bundle", {}).get("id", "")),

@@ -9,6 +9,7 @@ definitions were dead.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import importlib.util
 import json
 import math
@@ -3040,21 +3041,34 @@ def _per_request_handoff(
     request_id: str = "req-1",
     sequence: int = 1,
     export_id: str = "wge_5",
+    instance_id: str | None = "instance-b",
+    requested_at: str | None = None,
+    destination: dict[str, str] | None = None,
 ) -> Path:
     bundle = bundles / "horn.wglink"
     bundle.mkdir(exist_ok=True)
     (bundle / "wglink.json").write_text("{}")
-    _publish_like_wg(ipc, ".fusion-handoff.json", ".fusion-handoffs", request_id, sequence, {
+    body = {
         "target": "fusion360",
         "bundlePath": str(bundle),
         "bundleId": "wgb_5",
         "exportId": export_id,
         "sequence": 5,
         "designId": "wgd-shared",
-        "expectedDocumentId": "fusion:doc-a",
-        "expectedInstanceId": "instance-b",
-        "expectedReturnStateHash": "sha256:state-b",
-    })
+    }
+    if instance_id is not None:
+        body.update({
+            "expectedDocumentId": "fusion:doc-a",
+            "expectedInstanceId": instance_id,
+            "expectedReturnStateHash": "sha256:state-b",
+        })
+    if requested_at is not None:
+        body["requestedAt"] = requested_at
+    if destination is not None:
+        body["destination"] = destination
+    _publish_like_wg(
+        ipc, ".fusion-handoff.json", ".fusion-handoffs", request_id, sequence, body
+    )
     return bundle
 
 
@@ -3121,6 +3135,210 @@ def test_a_refused_per_request_handoff_is_consumed_and_says_how_to_retry(
     # The request is already spent: no file would help.
     assert ".json" not in ui.messages[0][1]
     assert "Send the model from WG again" in ui.messages[0][1]
+
+
+def test_an_expired_insert_is_consumed_without_touching_the_document(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_expired_insert")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2000-01-01T00:00:00Z",
+        destination={"kind": "document", "value": "fusion:doc-a"},
+    )
+    inserted: list[object] = []
+    monkeypatch.setattr(module.wglink_core, "insert", _recording(inserted))
+
+    snapshot = {**_shared_snapshot(), "links": []}
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert inserted == []
+    assert list((ipc / ".fusion-handoffs").iterdir()) == []
+    assert module._request_trace["outcome"] == "expired"
+    assert "expired" in ui.messages[0][1].lower()
+
+
+def test_an_insert_for_another_document_is_refused_without_mutation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_wrong_insert_destination")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2099-01-01T00:00:00Z",
+        destination={"kind": "document", "value": "fusion:doc-other"},
+    )
+    inserted: list[object] = []
+    monkeypatch.setattr(module.wglink_core, "insert", _recording(inserted))
+
+    assert module._apply_pending_handoff(_shared_snapshot()) == module.HANDLED
+
+    assert inserted == []
+    assert module._request_trace["outcome"] == "refused"
+    assert "destination" in ui.messages[0][1].lower()
+
+
+def test_insert_destination_is_rechecked_immediately_before_the_first_write(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_insert_destination_race")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2099-01-01T00:00:00Z",
+        destination={"kind": "document", "value": "fusion:doc-a"},
+    )
+    active = {"id": "fusion:doc-a"}
+    monkeypatch.setattr(module, "_active_document_id", lambda: active["id"])
+    monkeypatch.setattr(module, "_document_links", lambda: [])
+    writes: list[str] = []
+
+    def insert(_app, _path, options):
+        active["id"] = "fusion:doc-b"
+        options["precondition"]()
+        writes.append("model")
+
+    monkeypatch.setattr(module.wglink_core, "insert", insert)
+
+    snapshot = {**_shared_snapshot(), "links": []}
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert writes == []
+    assert module._request_trace["outcome"] == "refused"
+    assert "destination" in ui.messages[0][1].lower()
+
+
+def test_an_insert_for_the_active_destination_keeps_working(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_matching_insert_destination")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2099-01-01T00:00:00Z",
+        destination={"kind": "document", "value": "fusion:doc-a"},
+    )
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda: [])
+    writes: list[str] = []
+
+    def insert(_app, _path, options):
+        options["precondition"]()
+        writes.append("model")
+
+    monkeypatch.setattr(module.wglink_core, "insert", insert)
+    snapshot = {**_shared_snapshot(), "links": []}
+
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert writes == ["model"]
+    assert module._request_trace["outcome"] == "applied"
+    assert ui.messages == []
+
+
+def test_a_failed_claim_never_creates_the_new_destination_document(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_new_document_claim_race")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2099-01-01T00:00:00Z",
+        destination={"kind": "new_document", "value": "req-1"},
+    )
+    monkeypatch.setattr(module, "_active_document_id", lambda: None)
+    monkeypatch.setattr(module.wglink_watch, "claim_request", lambda _handoff: None)
+    created: list[str] = []
+    monkeypatch.setattr(
+        module, "_ensure_design_ready", lambda: created.append("document") or True
+    )
+
+    assert module._apply_pending_handoff({"document_id": None, "links": []}) == module.IDLE
+
+    assert created == []
+    assert ui.messages == []
+
+
+def test_a_claimed_new_document_destination_inserts_into_the_document_it_created(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_new_document_destination")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2099-01-01T00:00:00Z",
+        destination={"kind": "new_document", "value": "req-1"},
+    )
+    active = {"id": None}
+    monkeypatch.setattr(module, "_active_document_id", lambda: active["id"])
+    monkeypatch.setattr(module, "_document_links", lambda: [])
+
+    def create_document():
+        active["id"] = "fusion:new-doc"
+        return True
+
+    monkeypatch.setattr(module, "_ensure_design_ready", create_document)
+    writes: list[str] = []
+
+    def insert(_app, _path, options):
+        options["precondition"]()
+        writes.append("model")
+
+    monkeypatch.setattr(module.wglink_core, "insert", insert)
+
+    assert module._apply_pending_handoff({"document_id": None, "links": []}) == module.HANDLED
+
+    assert writes == ["model"]
+    assert module._request_trace["outcome"] == "applied"
+    assert ui.messages == []
+
+
+def test_an_insert_crossing_its_ttl_is_refused_at_the_first_write(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_insert_expiry_race")
+    ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _per_request_handoff(
+        ipc,
+        bundles,
+        instance_id=None,
+        requested_at="2026-09-15T09:00:00Z",
+        destination={"kind": "document", "value": "fusion:doc-a"},
+    )
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda: [])
+    clock = iter([
+        datetime(2026, 9, 15, 9, 29, 59, tzinfo=timezone.utc),
+        datetime(2026, 9, 15, 9, 30, 1, tzinfo=timezone.utc),
+    ])
+    monkeypatch.setattr(module, "_utc_now", lambda: next(clock))
+    writes: list[str] = []
+
+    def insert(_app, _path, options):
+        options["precondition"]()
+        writes.append("model")
+
+    monkeypatch.setattr(module.wglink_core, "insert", insert)
+    snapshot = {**_shared_snapshot(), "links": []}
+
+    assert module._apply_pending_handoff(snapshot) == module.HANDLED
+
+    assert writes == []
+    assert module._request_trace["outcome"] == "expired"
+    assert "expired" in ui.messages[0][1].lower()
 
 
 def test_a_per_request_return_request_runs_in_its_session_and_is_consumed(

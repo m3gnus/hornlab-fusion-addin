@@ -232,6 +232,8 @@ class PendingHandoff:
     expected_document_id: str
     expected_instance_id: str
     expected_return_state_hash: str
+    requested_at: str
+    destination: dict[str, str] | None
 
     @property
     def operation_id(self) -> str:
@@ -345,6 +347,13 @@ def read_pending_handoff(
     if bundle_path.is_symlink() or not bundle_path.is_dir():
         return None
     sequence = payload.get("sequence")
+    raw_destination = payload.get("destination")
+    destination = None
+    if isinstance(raw_destination, Mapping):
+        kind = raw_destination.get("kind")
+        value = raw_destination.get("value")
+        if isinstance(kind, str) and isinstance(value, str) and kind and value:
+            destination = {"kind": kind, "value": value}
     return PendingHandoff(
         marker_path=marker_path,
         request_id=identity[0],
@@ -357,6 +366,8 @@ def read_pending_handoff(
         expected_document_id=str(payload.get("expectedDocumentId") or ""),
         expected_instance_id=str(payload.get("expectedInstanceId") or ""),
         expected_return_state_hash=str(payload.get("expectedReturnStateHash") or ""),
+        requested_at=str(payload.get("requestedAt") or ""),
+        destination=destination,
     )
 
 
@@ -584,6 +595,20 @@ def claim_request(pending: _Pending) -> _Pending | None:
     return replace(pending, marker_path=claim)
 
 
+def release_claim(pending: _Pending) -> bool:
+    """Put back a claim whose prerequisites are not ready, without consuming it."""
+
+    claim = pending.marker_path
+    if not claim.name.startswith(CLAIM_PREFIX):
+        return False
+    source = claim.with_name(f"{pending.request_id}.json")
+    try:
+        os.rename(claim, source)
+    except OSError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class Announcement:
     """A link whose bundle on disk has moved past what the document holds."""
@@ -742,6 +767,10 @@ def write_fusion_status(
                 )
             },
         }
+        for name in ("phase", "startedAt"):
+            value = applying_operation.get(name)
+            if isinstance(value, str) and value:
+                payload["document"]["applyingOperation"][name] = value
     if diagnostics:
         payload["diagnostics"] = json.loads(json.dumps(diagnostics, default=str))
     marker = root / FUSION_STATUS_FILENAME

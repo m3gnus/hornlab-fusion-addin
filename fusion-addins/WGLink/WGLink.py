@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 import threading
@@ -221,6 +222,11 @@ _RETURN_RETRY_HINT = (
 )
 # How every WG round trip is delivered now: one file per request.
 DELIVERY = "perRequest"
+INSERT_HANDOFF_TTL_SECONDS = 30 * 60
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _refusal_text(reason: str, hint: str) -> str:
@@ -1915,14 +1921,40 @@ _ALREADY_LINKED_TEXT = (
 )
 
 
-def _require_insert_target(handoff: object) -> None:
+def _require_insert_target(
+    handoff: object, new_document_id: str | None = None
+) -> None:
     """Re-read the live document immediately before an insert's first write."""
 
-    if handoff.expected_document_id and handoff.expected_document_id != _active_document_id():
+    active_document_id = _active_document_id()
+    # A new-document destination was validated while no document existed. At
+    # this boundary validate its request identity and TTL again, then compare
+    # the document created for it below; do not reinterpret that new document
+    # as an unrelated active-document destination.
+    issue_document_id = None if new_document_id is not None else active_document_id
+    issue = _insert_handoff_issue(handoff, issue_document_id)
+    if issue is not None:
+        outcome, reason = issue
+        if outcome == "expired":
+            raise _ExpiredInsertError(reason)
+        raise wglink_core.WgLinkError(reason)
+    if handoff.expected_document_id and handoff.expected_document_id != active_document_id:
         raise wglink_core.WgLinkError(
             "The active Fusion document changed after WG prepared this insert. "
             "Refresh CAD Link and try again."
         )
+    destination = getattr(handoff, "destination", None)
+    if destination is not None:
+        expected = (
+            destination.get("value")
+            if destination.get("kind") == "document"
+            else new_document_id
+        )
+        if not expected or expected != active_document_id:
+            raise wglink_core.WgLinkError(
+                "The active Fusion document changed from this insert's destination. "
+                "Refresh CAD Link and try again."
+            )
     if _linked_to(handoff, _document_links()):
         raise wglink_core.WgLinkError(_ALREADY_LINKED_TEXT)
 
@@ -1938,6 +1970,10 @@ _RECOVERY_REQUIRED_TEXT = (
     "Fusion and it did not finish, so it will not run it again. Undo the partial "
     "change, or repair the link, then send the model from WG again."
 )
+
+
+class _ExpiredInsertError(wglink_core.WgLinkError):
+    """An insert crossed its TTL after it was claimed but before mutation."""
 
 
 def _design_ready() -> bool:
@@ -1961,6 +1997,46 @@ def _ensure_design_ready() -> bool:
             f"Could not create a Fusion Design document for this waveguide: {exc}"
         ) from exc
     return _design_ready()
+
+
+def _insert_handoff_issue(
+    handoff: object, document_id: object
+) -> tuple[str, str] | None:
+    """Return an insert's terminal outcome and reason before it can mutate."""
+
+    if getattr(handoff, "expected_instance_id", ""):
+        return None
+    requested_at = str(getattr(handoff, "requested_at", "") or "")
+    if requested_at:
+        try:
+            requested = datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+            age = (_utc_now() - requested.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            age = 0.0
+        if age > INSERT_HANDOFF_TTL_SECONDS:
+            return (
+                "expired",
+                "This insert request expired after 30 minutes and was not applied. "
+                "Send the model from WG again.",
+            )
+    destination = getattr(handoff, "destination", None)
+    if destination is None:
+        return None
+    kind = destination.get("kind")
+    value = destination.get("value")
+    if kind == "document" and value == document_id:
+        return None
+    if (
+        kind == "new_document"
+        and value == getattr(handoff, "request_id", None)
+        and document_id is None
+    ):
+        return None
+    return (
+        "refused",
+        "This insert names a destination other than the active Fusion document. "
+        "Refresh CAD Link and send the model from WG again.",
+    )
 
 
 def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
@@ -1989,15 +2065,24 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
     if _handoff_attempted_id == attempt_key:
         return SUPPRESSED
     correlation_id = handoff.operation_id
+    claimed = wglink_watch.claim_request(handoff)
+    if claimed is None:
+        return IDLE
+    handoff = claimed
+    # Destination is a live guard, not heartbeat-cached identity. The snapshot
+    # may already be stale if the user switched documents during this tick.
+    issue = _insert_handoff_issue(handoff, _active_document_id())
+    if issue is not None:
+        wglink_watch.acknowledge_handoff(handoff)
+        _handoff_attempted_id = attempt_key
+        outcome, reason = issue
+        _begin_request("handoff", correlation_id, DELIVERY)["outcome"] = outcome
+        _message(reason, "WGLink automatic insert refused")
+        return HANDLED
     try:
         ready = _ensure_design_ready()
     except wglink_core.WgLinkError as exc:
-        # Claimed first: a failed claim is retried on the next pass, so a
-        # refusal is shown and remembered only for a request it spent.
-        claimed = wglink_watch.claim_request(handoff)
-        if claimed is None:
-            return IDLE
-        wglink_watch.acknowledge_handoff(claimed)
+        wglink_watch.acknowledge_handoff(handoff)
         _handoff_attempted_id = attempt_key
         _begin_request("handoff", correlation_id, DELIVERY)["outcome"] = "refused"
         _message(
@@ -2006,13 +2091,16 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
         )
         return HANDLED
     if not ready:
+        wglink_watch.release_claim(handoff)
         return IDLE
-    claimed = wglink_watch.claim_request(handoff)
-    if claimed is None:
-        # Gone, or held open by WG on Windows: the next tick looks again.
-        return IDLE
-    handoff = claimed
-
+    new_document_id = None
+    destination = getattr(handoff, "destination", None)
+    if (
+        not getattr(handoff, "expected_instance_id", "")
+        and destination is not None
+        and destination.get("kind") == "new_document"
+    ):
+        new_document_id = _active_document_id()
     links = snapshot["links"] if snapshot is not None else _document_links()
     document_id = (
         snapshot["document_id"] if snapshot is not None else _active_document_id()
@@ -2102,7 +2190,9 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
                     "operation_id": handoff.operation_id,
                     # The document and "no link of this design yet", read live
                     # again immediately before the insert's first write.
-                    "precondition": lambda: _require_insert_target(handoff),
+                    "precondition": lambda: _require_insert_target(
+                        handoff, new_document_id
+                    ),
                 },
             )
             outcome = "applied"
@@ -2113,6 +2203,12 @@ def _apply_pending_handoff(snapshot: dict[str, object] | None = None) -> str:
         # root-fallback warning look like an error. Keep detailed reports for
         # the manual Insert command; automatic success stays silent. Genuine
         # refusals and unexpected failures below still demand attention.
+    except _ExpiredInsertError as exc:
+        outcome = "expired"
+        _message(
+            _refusal_text(str(exc), _HANDOFF_RETRY_HINT),
+            "WGLink automatic insert refused",
+        )
     except wglink_core.WgLinkError as exc:
         if outcome != "recoveryRequired":
             outcome = (

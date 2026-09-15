@@ -653,6 +653,43 @@ def test_a_handoff_outside_the_bundle_folder_is_never_offered(
     assert wglink_watch.next_pending_handoff(ipc, bundle_root=bundles) is None
 
 
+def test_an_insert_handoff_reads_its_additive_destination_and_requested_time(
+    ipc: Path, bundles: Path
+) -> None:
+    request_id = WG(ipc, bundles).publish(HANDOFFS, 1, instance=None)
+    path = ipc / KINDS[HANDOFFS][0] / f"{request_id}.json"
+    payload = _read(path)
+    payload.update({
+        "requestedAt": "2026-09-15T09:00:00Z",
+        "destination": {"kind": "document", "value": "fusion:doc-a"},
+    })
+    _write(path, payload)
+
+    handoff = wglink_watch.read_pending_handoff(path, bundle_root=bundles)
+
+    assert handoff.destination == {"kind": "document", "value": "fusion:doc-a"}
+    assert handoff.requested_at == "2026-09-15T09:00:00Z"
+
+
+def test_new_marker_fields_are_additive_to_the_v3_reader_contract(
+    ipc: Path, bundles: Path
+) -> None:
+    request_id = WG(ipc, bundles).publish(HANDOFFS, 1)
+    path = ipc / KINDS[HANDOFFS][0] / f"{request_id}.json"
+    payload = _read(path)
+    payload.update({
+        "destination": {"kind": "document", "value": "fusion:doc-a"},
+        "phase": "prepared",
+    })
+    _write(path, payload)
+
+    handoff = wglink_watch.read_pending_handoff(path, bundle_root=bundles)
+
+    assert handoff is not None
+    assert handoff.request_id == request_id
+    assert handoff.expected_instance_id == "instance-a"
+
+
 # -- the heartbeat ---------------------------------------------------------------
 
 
@@ -688,6 +725,7 @@ def test_the_heartbeat_states_its_delivery_version_and_an_interrupted_operation(
         applying_operation={
             "operation_id": "req-9", "kind": "update",
             "instance_id": "instance-a", "export_id": "wge_4",
+            "phase": "applied", "startedAt": "2026-09-15T09:00:00Z",
         },
     )
 
@@ -696,6 +734,7 @@ def test_the_heartbeat_states_its_delivery_version_and_an_interrupted_operation(
     assert status["document"]["applyingOperation"] == {
         "operationId": "req-9", "kind": "update",
         "instanceId": "instance-a", "exportId": "wge_4",
+        "phase": "applied", "startedAt": "2026-09-15T09:00:00Z",
     }
 
     quiet = json.loads(

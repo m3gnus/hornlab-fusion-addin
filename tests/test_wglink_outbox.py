@@ -213,11 +213,17 @@ def _items(ipc: Path) -> dict[str, dict[str, Any]]:
     folder = _outbox(ipc)
     if not folder.is_dir():
         return {}
-    return {
-        path.stem: json.loads(path.read_text(encoding="utf-8"))
-        for path in folder.iterdir()
-        if path.suffix == ".json" and not path.name.startswith(".")
-    }
+    items: dict[str, dict[str, Any]] = {}
+    for path in folder.iterdir():
+        if path.suffix != ".json" or path.name.startswith("."):
+            continue
+        try:
+            items[path.stem] = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            # The live worker may settle and delete an item after it appeared
+            # in the directory snapshot. That means it is no longer waiting.
+            continue
+    return items
 
 
 def _solve_files(ipc: Path) -> list[Path]:

@@ -28,6 +28,7 @@ import adsk.fusion
 if __package__:
     from . import wglink_author, wglink_core
     from .wglink_return import (
+        BASE_RETURN_FEATURES,
         DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
@@ -39,6 +40,7 @@ else:
     import wglink_author
     import wglink_core
     from wglink_return import (
+        BASE_RETURN_FEATURES,
         DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
@@ -1205,7 +1207,13 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
                 design, records, selected_occurrence=walk["selected_occurrence"]
             ),
         )
-        sources = _sources(records, included_bodies, fractions)
+        sources = _sources(
+            records,
+            included_bodies,
+            fractions,
+            source_identity=bool(opts.get("source_identity")),
+            design=design,
+        )
     except wglink_core.WgLinkError as exc:
         report["source_error"] = str(exc)
         sources = []
@@ -1302,6 +1310,8 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
                 selected_occurrence=walk["selected_occurrence"],
                 transforms=transforms,
             ),
+            source_identity=bool(opts.get("source_identity")),
+            design=design,
         )
     except wglink_core.WgLinkError as exc:
         return {"hash": None, "reason": str(exc)}
@@ -2137,6 +2147,266 @@ def _connected_components(faces: list[object]) -> int:
     return count
 
 
+# ------------------------------------------------------------ source identity
+#
+# ``source-identity-v1`` (WG ``docs/reference/MULTI-INSTANCE-CAD-IDENTITY.md``,
+# "Cross-export source identity"): when WG advertises it, every ``sources[].id``
+# is the CAD-authored identity of that logical source, the same in every later
+# export. It is resolved to faces here, and a missing, split, copied, removed or
+# ambiguous mapping is refused -- WG cannot tell from an opaque string which
+# face was meant, so neither side may guess. No Fusion entity token and no face
+# stamp ever enters the manifest.
+#
+# Two kinds of source, two kinds of identity:
+#
+# * A linked throat source is one-to-one with its link, whose ``instance_id``
+#   this add-in minted at Insert. Its identity is derived from that id, so it
+#   needs no document write and cannot be missing; ``_throat_faces`` already
+#   refuses a throat face that is removed or split.
+# * A painted source is every unclaimed face painted one role (WG selects those
+#   faces by appearance name, so one role is one source). Set WG Source... stamps
+#   each native face with ``source_identity``: the source id, the role it was
+#   painted, a nonce for that face, and how many faces the source was marked on.
+#   Fusion copies an attribute onto both halves of a split face and onto a pasted
+#   or patterned copy, which is what makes a split or copy visible here.
+
+SOURCE_IDENTITY_FEATURE = "source-identity-v1"
+SOURCE_IDENTITY_ATTRIBUTE = "source_identity"
+SOURCE_IDENTITY_SCHEMA = 1
+SOURCE_IDENTITY_PREFIX = "wgs-"
+# 20 Crockford base32 characters carry 100 bits; with the prefix an id is 24
+# ASCII bytes, inside WG's 25-byte ceiling.
+SOURCE_IDENTITY_CHARACTERS = 20
+# WG's bounds (``server/cadlink/wgreturn.py``): the id itself, and the whole gmsh
+# physical name ingestion writes for the source with the worst-case tag.
+SOURCE_IDENTITY_MAX_BYTES = 25
+GMSH_PHYSICAL_NAME_MAX_BYTES = 128
+WORST_CASE_SOURCE_TAG = 9999
+_THROAT_IDENTITY_NAMESPACE = "wglink-throat-source-v1|"
+
+
+def _base32_identity(value: int) -> str:
+    characters = []
+    for _index in range(SOURCE_IDENTITY_CHARACTERS):
+        characters.append(_CROCKFORD[value & 31])
+        value >>= 5
+    return SOURCE_IDENTITY_PREFIX + "".join(reversed(characters))
+
+
+def _mint_source_identity() -> str:
+    return _base32_identity(secrets.randbits(5 * SOURCE_IDENTITY_CHARACTERS))
+
+
+def _throat_source_identity(instance_id: str) -> str:
+    digest = hashlib.sha256(
+        (_THROAT_IDENTITY_NAMESPACE + str(instance_id)).encode("utf-8")
+    ).digest()
+    return _base32_identity(
+        int.from_bytes(digest, "big") >> (256 - 5 * SOURCE_IDENTITY_CHARACTERS)
+    )
+
+
+def source_physical_name(tag: int, source_id: str, instance_id: object, role: str) -> str:
+    """The mesh physical name WG's ingestion gives a source (WG ``_physical_name``)."""
+
+    instance = "null" if instance_id is None else str(instance_id)
+    return (
+        f"wg-import-v1|tag={tag}|source_id={source_id}|"
+        f"instance_id={instance}|role={role}"
+    )
+
+
+def _check_source_identities(sources: list[dict[str, Any]]) -> None:
+    """Refuse, before anything is written, what WG would refuse on reading."""
+
+    seen: set[str] = set()
+    for source in sources:
+        source_id = source.get("id")
+        role = str(source.get("role") or "")
+        if not isinstance(source_id, str) or not source_id:
+            raise wglink_core.WgLinkError(f"The {role} source has no source identity.")
+        if source_id != source_id.strip():
+            raise wglink_core.WgLinkError(
+                f"The {role} source identity {source_id!r} must be trimmed."
+            )
+        if len(source_id.encode("utf-8")) > SOURCE_IDENTITY_MAX_BYTES:
+            raise wglink_core.WgLinkError(
+                f"The {role} source identity {source_id!r} is longer than "
+                f"{SOURCE_IDENTITY_MAX_BYTES} UTF-8 bytes."
+            )
+        if source_id in seen:
+            raise wglink_core.WgLinkError(
+                f"Two sources claim the source identity {source_id!r}; identities must "
+                "be unique within a return, so WGLink will not choose between them. "
+                "A copied link or face carries its original's identity: remove the "
+                "copy, or insert a fresh link from WG."
+            )
+        seen.add(source_id)
+        name = source_physical_name(
+            WORST_CASE_SOURCE_TAG, source_id, source.get("instance_id"), role
+        )
+        size = len(name.encode("utf-8"))
+        if size > GMSH_PHYSICAL_NAME_MAX_BYTES:
+            raise wglink_core.WgLinkError(
+                f"The {role} source {source_id!r} would need a {size}-byte mesh name; "
+                f"WG keeps at most {GMSH_PHYSICAL_NAME_MAX_BYTES} bytes."
+            )
+
+
+def _native_face(face: object) -> object:
+    # An occurrence proxy carries no attributes of its own; the stamp lives on
+    # the native face, which is also what two placements of one component share.
+    return getattr(face, "nativeObject", None) or face
+
+
+def _parse_source_stamp(value: object) -> dict[str, Any] | None:
+    try:
+        stamp = json.loads(str(value))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(stamp, dict) or stamp.get("schema") != SOURCE_IDENTITY_SCHEMA:
+        return None
+    faces = stamp.get("faces")
+    if (
+        not all(isinstance(stamp.get(key), str) and stamp.get(key) for key in ("id", "role", "face"))
+        or isinstance(faces, bool)
+        or not isinstance(faces, int)
+        or faces < 1
+    ):
+        return None
+    return stamp
+
+
+def read_source_stamp(face: object) -> dict[str, Any] | None:
+    """The identity stamp a face carries, or None when it carries none that is readable."""
+
+    value = wglink_core._attribute_value(_native_face(face), SOURCE_IDENTITY_ATTRIBUTE)
+    return None if value is None else _parse_source_stamp(value)
+
+
+def _canonical_source_role(value: object) -> str | None:
+    """A painted or stamped role with the retired ``PORT_EXIT`` spelling resolved."""
+
+    literal = wglink_author._canonical_role(value)
+    if literal is None:
+        return None
+    return wglink_author.LEGACY_SOURCE_ROLE_ALIASES.get(literal, literal)
+
+
+def _painted_role(face: object) -> str | None:
+    return _canonical_source_role(_face_role(face))
+
+
+def _run_again(canonical: str) -> str:
+    return (
+        f"Select every face that should drive {canonical} and run Set WG Source… "
+        f"{canonical} again. Because this source no longer resolves, that gives it a "
+        "new source identity, and WG asks for its setup again."
+    )
+
+
+def _painted_source_identity(
+    role: str, faces: list[object], design: object | None = None
+) -> str:
+    """Resolve one painted role group to its single authored identity, or refuse.
+
+    ``faces`` are the faces this export sees painted ``role``. ``design``, when
+    given, lets a refusal tell a face that is gone from one that is only outside
+    what is being sent -- the remedies differ.
+    """
+
+    canonical = _canonical_source_role(role) or role
+    natives = _distinct_entities([_native_face(face) for face in faces])
+    stamps = [(native, read_source_stamp(native)) for native in natives]
+    missing = [
+        native
+        for native, stamp in stamps
+        if stamp is None or _canonical_source_role(stamp["role"]) != canonical
+    ]
+    if missing:
+        raise wglink_core.WgLinkError(
+            f"{len(missing)} of {len(natives)} face(s) painted {role} carry no WG source "
+            f"identity for {canonical} (painted by hand, repainted, or marked before "
+            f"source identities existed). Select them and run Set WG Source… "
+            f"{canonical}; a face added to a source that still resolves keeps that "
+            "source's identity."
+        )
+    identities = sorted({stamp["id"] for _native, stamp in stamps})
+    if len(identities) != 1:
+        raise wglink_core.WgLinkError(
+            f"The faces painted {role} carry {len(identities)} different WG source "
+            f"identities, so which source they are is ambiguous. {_run_again(canonical)}"
+        )
+    by_nonce: dict[str, list[object]] = {}
+    for native, stamp in stamps:
+        by_nonce.setdefault(stamp["face"], []).append(native)
+    copied = max(len(group) for group in by_nonce.values())
+    if copied > 1:
+        raise wglink_core.WgLinkError(
+            f"A face of the {canonical} source was split or copied: {copied} faces carry "
+            f"one face's identity. {_run_again(canonical)}"
+        )
+    counts = {stamp["faces"] for _native, stamp in stamps}
+    if counts == {len(natives)}:
+        return identities[0]
+    expected = max(counts)
+    if design is not None:
+        painted_members = [
+            member
+            for member, _attribute, _stamp in _identity_members(design, identities[0])
+            if _painted_role(member) == canonical
+        ]
+        outside = [
+            member
+            for member in _distinct_entities(painted_members)
+            if not any(_same_live_entity(member, native) for native in natives)
+        ]
+        if outside:
+            raise wglink_core.WgLinkError(
+                f"{len(outside)} face(s) of the {canonical} source are outside what is "
+                "being sent (in a hidden or excluded body, or another component), so "
+                "this export would carry only part of that source. Include them in the "
+                f"export, or select them and Clear their WG source."
+            )
+    raise wglink_core.WgLinkError(
+        f"The {canonical} source was marked on {expected} face(s), but only "
+        f"{len(natives)} still carry it: a face was removed or repainted. "
+        f"{_run_again(canonical)}"
+    )
+
+
+def _identity_members(design: object, identity: str) -> list[tuple[object, object, dict[str, Any]]]:
+    """Every (face, attribute, stamp) in the design carrying ``identity``."""
+
+    members = []
+    for attribute, stamp in _stamp_attributes(design):
+        if stamp["id"] == identity:
+            members.append((attribute.parent, attribute, stamp))
+    return members
+
+
+def _stamp_attributes(design: object) -> list[tuple[object, dict[str, Any]]]:
+    try:
+        found = wglink_core._items(
+            design.findAttributes(wglink_core.ATTRIBUTE_GROUP, SOURCE_IDENTITY_ATTRIBUTE)
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise wglink_core.WgLinkError(
+            f"Could not read the WG source identities in this design: {exc}"
+        ) from exc
+    result = []
+    for attribute in found:
+        try:
+            if str(attribute.name) != SOURCE_IDENTITY_ATTRIBUTE or attribute.parent is None:
+                continue
+            stamp = _parse_source_stamp(attribute.value)
+        except Exception:  # noqa: BLE001 - an unreadable stamp is no stamp
+            continue
+        if stamp is not None:
+            result.append((attribute, stamp))
+    return result
+
+
 def _source_ids(role: str, used: set[str]) -> tuple[str, str]:
     base = _slug(role)
     suffix = ""
@@ -2337,7 +2607,15 @@ def _sources(
     records: list[dict[str, Any]],
     included_bodies: list[object],
     retained_fractions: dict[str, float] | None = None,
+    *,
+    source_identity: bool = False,
+    design: object | None = None,
 ) -> list[dict[str, Any]]:
+    """Every drivable source the return carries.
+
+    ``source_identity`` is on only when WG advertises ``source-identity-v1``;
+    off, every id is the legacy role-derived one, byte for byte.
+    """
     sources: list[dict[str, Any]] = []
     claimed: set[tuple[str, object]] = set()
     used: set[str] = set()
@@ -2356,6 +2634,8 @@ def _sources(
             claimed.add(key)
             face_bodies.setdefault(key, str(getattr(record.get("body"), "name", "unnamed body")))
         source_id, drive_id = _source_ids(role, used)
+        if source_identity:
+            source_id = _throat_source_identity(str(record["instance_id"]))
         sources.append(
             {
                 "id": source_id,
@@ -2385,6 +2665,8 @@ def _sources(
         if not faces:
             continue
         source_id, drive_id = _source_ids(role, used)
+        if source_identity:
+            source_id = _painted_source_identity(role, faces, design)
         sources.append(
             {
                 "id": source_id,
@@ -2403,6 +2685,8 @@ def _sources(
         raise wglink_core.WgLinkError(
             "Return export has no drivable source. Paint an included face LF, MF, HF, or PASSIVE_CARDIOID and try again."
         )
+    if source_identity:
+        _check_source_identities(sources)
     return sources
 
 
@@ -2728,6 +3012,8 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(output_value, (str, os.PathLike)) or not str(output_value).strip():
         raise wglink_core.WgLinkError("options['output_folder'] must name the return output folder.")
     domain_planes = resolve_domain_planes(options.get("domain"))
+    # Declared only when WG advertises it (WGLink.py reads the capability file).
+    source_identity = bool(options.get("source_identity"))
     design = wglink_core._design(app)
     walk = _scope_walk(design, options.get("selection"))
     # First, and before anything is written: a FEM air body inside the exported
@@ -2816,6 +3102,8 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             selected_occurrence=walk["selected_occurrence"],
             transforms=transforms,
         ),
+        source_identity=source_identity,
+        design=design,
     )
     return_state_snapshot = return_state(app, options)
     return_state_hash = return_state_snapshot.get("hash")
@@ -2926,6 +3214,11 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
             scope=scope,
             instances=instance_records,
             sources=sources,
+            required_features=(
+                [*BASE_RETURN_FEATURES, SOURCE_IDENTITY_FEATURE]
+                if source_identity
+                else None
+            ),
         )
         (temp / "wgreturn.json").write_text(
             dumps_return_manifest(manifest), encoding="utf-8"

@@ -305,6 +305,56 @@ def test_send_writes_to_wgs_workspace_and_never_overwrites(monkeypatch, tmp_path
     assert options["overwrite"] is False
 
 
+@pytest.mark.parametrize(
+    "capabilities, declared",
+    [
+        (None, False),
+        ({"schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3}, False),
+        ({"schemaVersion": 1, "sourceIdentity": True}, False),
+        ({"schemaVersion": 1, "sourceIdentity": 1}, True),
+    ],
+)
+def test_every_source_path_declares_identity_only_when_wg_advertises_it(
+    monkeypatch, tmp_path: Path, capabilities, declared
+) -> None:
+    """Send, the heartbeat token and a return WG asked for must carry one set of
+    source ids, so all of them ask the same capability file."""
+
+    module = _load_instance(
+        monkeypatch,
+        f"WGLink_identity_gate_{declared}_{bool(capabilities)}",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    if capabilities is not None:
+        (tmp_path / "wg-capabilities.json").write_text(
+            json.dumps(capabilities), encoding="utf-8"
+        )
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+    seen: list[object] = []
+    monkeypatch.setattr(
+        module.wglink_send,
+        "return_state",
+        lambda _app, options: seen.append(options.get("source_identity")) or {"hash": "h"},
+    )
+
+    assert module._send_options(types.SimpleNamespace())["source_identity"] is declared
+    module._measure_geometry_state(object(), {})
+    assert seen == [declared]
+
+    previewed: list[object] = []
+
+    def preview(_app, options):
+        previewed.append(options.get("source_identity"))
+        raise module.wglink_core.WgLinkError("preview stops here")
+
+    monkeypatch.setattr(module.wglink_send, "preflight_scope", preview)
+    box = types.SimpleNamespace(formattedText="", text="")
+    module._sync_preflight(_dialog_inputs(preflight=box))
+    assert previewed == [declared]
+
+
 def test_send_refuses_when_wg_has_no_selected_workspace(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch,
@@ -2630,6 +2680,8 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
         "request_id": "request-a",
         "anchor_instance_id": "instance-a",
         "capture_document": True,
+        # No capability file advertises sourceIdentity here.
+        "source_identity": False,
     }]
     assert acknowledged == [request]
     assert ui.messages == []
@@ -3376,8 +3428,50 @@ def test_a_per_request_return_request_runs_in_its_session_and_is_consumed(
     assert module._apply_pending_return_request() == module.IDLE
 
     assert [options["request_id"] for options in sent] == ["req-r1"]
+    # This WG does not advertise sourceIdentity, so the return declares nothing.
+    assert sent[0]["source_identity"] is False
     assert list((ipc / ".fusion-return-requests").iterdir()) == []
     assert ui.messages == []
+
+
+def test_a_return_wg_asked_for_declares_source_identity_when_wg_reads_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, _ui = _design_module(monkeypatch, "WGLink_identity_return")
+    ipc, _bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    (ipc / "wg-capabilities.json").write_text(json.dumps({
+        "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3,
+        "sourceIdentity": 1,
+    }))
+    _publish_like_wg(
+        ipc,
+        ".fusion-return-request.json",
+        ".fusion-return-requests",
+        "req-identity",
+        1,
+        {
+            "target": "fusion360",
+            "sessionId": module._watch_session_id,
+            "designId": "wgd-a",
+            "documentId": "fusion:doc-a",
+            "instanceId": "instance-a",
+            "expectedReturnStateHash": "sha256:state-a",
+        },
+    )
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
+        "design_id": "wgd-a", "instance_id": "instance-a",
+        "document_signature_hash": "sha256:state-a",
+    }])
+    _unmoved_live_state(monkeypatch, module, "sha256:state-a")
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path / "wgreturn")
+    monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
+    sent: list[dict[str, object]] = []
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+
+    assert module._apply_pending_return_request() == module.HANDLED
+
+    assert [options["source_identity"] for options in sent] == [True]
 
 
 def test_a_redelivered_update_already_applied_is_reconciled_before_the_baseline_check(

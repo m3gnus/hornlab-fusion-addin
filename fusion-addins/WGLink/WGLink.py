@@ -566,6 +566,21 @@ def _send_domain(command_inputs: object) -> tuple[str, ...]:
         return ()
 
 
+def _source_identity_enabled() -> bool:
+    """Whether this return declares ``source-identity-v1``.
+
+    Only when WG advertises it: a WG that does not would refuse the bundle as an
+    unknown required feature. Every path that builds sources -- Send, Solve, a
+    return WG asked for, the preflight and the heartbeat's return-state token --
+    asks here, so they all carry the same source ids.
+    """
+
+    try:
+        return wglink_watch.wg_source_identity(wglink_workspace.ipc_folder())
+    except Exception:  # noqa: BLE001 - an unreadable capability declares nothing
+        return False
+
+
 def _send_options(command_inputs: object) -> dict[str, object]:
     # WG only ingests from its own workspace, so there is one correct
     # destination and the UI no longer asks. Collision-safe naming is kept:
@@ -583,6 +598,7 @@ def _send_options(command_inputs: object) -> dict[str, object]:
         "overwrite": False,
         "capture_document": wglink_workspace.capture_document(),
         "domain": list(_send_domain(command_inputs)),
+        "source_identity": _source_identity_enabled(),
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -633,6 +649,7 @@ def _sync_preflight(command_inputs: object) -> None:
         options: dict[str, object] = {
             "selection": _send_selection(command_inputs),
             "domain": list(_send_domain(command_inputs)),
+            "source_identity": _source_identity_enabled(),
         }
         anchor = _input(command_inputs, "anchor_instance_id")
         try:
@@ -1272,7 +1289,8 @@ def _geometry_change_key(design: object, records: dict) -> tuple:
     alone; the stored export id and edit version catch an Update.
     """
 
-    parts: list[object] = []
+    # Whether sources carry identities changes every source id the state hashes.
+    parts: list[object] = [_source_identity_enabled()]
     try:
         parts.append(int(design.timeline.count))
     except Exception:  # noqa: BLE001 - a product without a timeline still keys
@@ -1302,6 +1320,7 @@ def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
             {
                 "selection": "root",
                 **({"anchor_instance_id": first_instance} if first_instance else {}),
+                "source_identity": _source_identity_enabled(),
             },
         )
         document_signature_hash = str(return_state.get("hash") or "")
@@ -1865,6 +1884,7 @@ def _apply_pending_return_request(
             "request_id": request.request_id,
             "anchor_instance_id": request.instance_id,
             "capture_document": wglink_workspace.capture_document(),
+            "source_identity": _source_identity_enabled(),
         }
         wglink_send.send(_app(), options)
         outcome = "applied"

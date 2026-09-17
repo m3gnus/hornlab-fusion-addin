@@ -45,6 +45,10 @@ CAPABILITIES_FILENAME = "wg-capabilities.json"
 CAPABILITIES_SCHEMA_VERSION = 1
 SOLVE_COMMAND_DELIVERY = "solveCommandDelivery"
 FUSION_REQUEST_DELIVERY = "fusionRequestDelivery"
+# WG reads returns that require ``source-identity-v1`` when it advertises this
+# as an integer of at least 1. The add-in declares the feature only then: a WG
+# that does not advertise it refuses the bundle as an unknown required feature.
+SOURCE_IDENTITY = "sourceIdentity"
 # Every request file, in both directions, carries this schema version.
 REQUEST_SCHEMA_VERSION = 3
 # One file per solve command, one per WG request.
@@ -138,6 +142,30 @@ def wg_delivery_version(ipc_folder: Path, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 2:
         return 1
     return value
+
+
+def wg_source_identity(ipc_folder: Path | None) -> bool:
+    """Whether WG advertises that it reads ``source-identity-v1`` returns.
+
+    The same reading rules as the delivery versions: a missing or unreadable
+    file, a ``schemaVersion`` this add-in does not know, or a value that is not
+    an integer of at least 1 (a boolean is not one) all mean "do not declare it".
+    """
+
+    if ipc_folder is None:
+        return False
+    payload = _read_json(Path(ipc_folder) / CAPABILITIES_FILENAME)
+    if not isinstance(payload, Mapping):
+        return False
+    schema = payload.get("schemaVersion")
+    if (
+        isinstance(schema, bool)
+        or not isinstance(schema, int)
+        or schema != CAPABILITIES_SCHEMA_VERSION
+    ):
+        return False
+    value = payload.get(SOURCE_IDENTITY)
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
 
 
 def wg_speaks_delivery_version(ipc_folder: Path) -> bool:

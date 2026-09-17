@@ -25,8 +25,15 @@ SUPPORTED_RETURN_FEATURES = frozenset(
         "instance-records-v1",
         "fem-air-volume-v1",
         "reduced-domain-v1",
+        "source-identity-v1",
     }
 )
+# With this feature every ``sources[].id`` is a CAD-authored identity that WG
+# bounds: trimmed, at most 25 UTF-8 bytes, and the whole gmsh physical name WG
+# writes for the source (worst-case tag 9999) at most 128 bytes.
+SOURCE_IDENTITY_FEATURE = "source-identity-v1"
+SOURCE_IDENTITY_MAX_BYTES = 25
+GMSH_PHYSICAL_NAME_MAX_BYTES = 128
 BASE_RETURN_FEATURES = (
     "checksummed-files-v1",
     "assembly-frame-v1",
@@ -1316,6 +1323,26 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
     ]
     source_ids = [source_id for source_id, _channel in source_keys]
     channel_ids = [channel for _source_id, channel in source_keys]
+    if SOURCE_IDENTITY_FEATURE in features:
+        for index, source in enumerate(sources):
+            source_id = str(source["id"])
+            if source_id != source_id.strip():
+                raise WgReturnError(f"sources[{index}].id must be trimmed under {SOURCE_IDENTITY_FEATURE}")
+            if len(source_id.encode("utf-8")) > SOURCE_IDENTITY_MAX_BYTES:
+                raise WgReturnError(
+                    f"sources[{index}].id must be at most {SOURCE_IDENTITY_MAX_BYTES} UTF-8 bytes "
+                    f"under {SOURCE_IDENTITY_FEATURE}"
+                )
+            instance = source.get("instance_id")
+            name = (
+                f"wg-import-v1|tag=9999|source_id={source_id}|"
+                f"instance_id={'null' if instance is None else instance}|role={source['role']}"
+            )
+            if len(name.encode("utf-8")) > GMSH_PHYSICAL_NAME_MAX_BYTES:
+                raise WgReturnError(
+                    f"sources[{index}] would need a mesh physical name longer than "
+                    f"{GMSH_PHYSICAL_NAME_MAX_BYTES} UTF-8 bytes under {SOURCE_IDENTITY_FEATURE}"
+                )
     if len(source_ids) != len(set(source_ids)):
         raise WgReturnError("sources must have unique id values")
     if len(channel_ids) != len(set(channel_ids)):

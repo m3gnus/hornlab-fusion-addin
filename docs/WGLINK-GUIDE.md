@@ -83,6 +83,24 @@ refusal that only a new WG start can change (an add-in or protocol WG does not
 accept, or a registration proof that does not verify) waits for WG to restart;
 anything else is tried again within 30 seconds.
 
+With such a WG, **Solve in WG** and **Send to WG** also put the return in
+WGLink's outbox (`ipc/wglink/.wglink-outbox/`, one private file per return,
+which WG never reads). Each item keeps one operation id for good; WG accepts an
+id once, so delivering it again — after a lost answer, a WG restart or a Fusion
+restart — never makes a second operation. While the live session is healthy the
+background thread delivers the item over HTTP. Without one (WG closed, starting,
+or refusing the session), Solve in WG writes the v3 solve file under the same id
+at once, and a queued solve gets its file when the live session is lost;
+WG takes whichever arrives first and recovers the other. A Send to WG item never
+becomes a file: it waits for WG's next live session (the return itself is in the
+WGLink folder either way). WG's answer is final for the item: an accepted
+delivery is removed silently; a return WG rejected (for example one it could not
+read for 24 hours) or an id WG says names a different request is shown once in a
+message box and then removed. WGLink never resends either by itself: send the
+return again from Fusion, which is a new request. The outbox holds at most 100
+items; an item not delivered within 7 days is removed with a message. A WG
+without the live protocol gets exactly the v3 files, as before.
+
 ## 3. The linked round trip
 
 1. In WG, **Send to CAD** writes the bundle and raises Fusion; the add-in
@@ -296,6 +314,10 @@ occurrence where it already is and never moves it back to the origin.)
 - **Nothing arrives in WG after Solve in WG** — WG must be running; the
   request survives until it next runs, and the WG window still has to be
   brought forward by hand.
+- **"WGLink delivery to WG" message** — WG gave a final answer that needs you:
+  the return was rejected (the message carries WG's reason) or its id already
+  named a different request. Nothing is retried; send the return again from
+  Fusion if you still want it.
 - **Text Commands says "WGLink uses the files: …"** — nothing is broken:
   the live session is optional and the files carry everything. The line names
   why. On macOS and Linux WGLink refuses a `wg-endpoint.json` that other users

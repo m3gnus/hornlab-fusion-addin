@@ -20,8 +20,13 @@ the duration of one registration; the session token, proofs and nonces live
 only in memory. None of them is logged, written to a file, or reported by
 :meth:`LiveClient.status`.
 
-The session snapshot and :class:`Transport` are what the Fusion-bound request
-long poll and the outbox (later work) attach to; they are not implemented here.
+Section 8, WG-bound deliveries, is the outbox: :func:`produce_solve` and
+:func:`produce_snapshot` write an item on the main thread (files only, no
+network), and the worker delivers it over the session under its fixed
+operation id, writes a solve's v3 file when live delivery is not possible, and
+reports WG's final answer through :meth:`LiveClient.take_delivery_notices`.
+The Fusion-bound request long poll attaches to the same session later; it is
+not implemented here.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import stat
@@ -445,6 +451,8 @@ UNPARSEABLE = _Unparseable()
 class Answer:
     status: int
     body: Any = None
+    #: The response headers the client reads (only ``Retry-After``).
+    headers: dict = field(default_factory=dict)
 
     @property
     def code(self) -> str | None:
@@ -489,7 +497,9 @@ class Transport:
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 status, raw = response.status, response.read(MAX_RESPONSE_BYTES + 1)
+                kept = _kept_headers(response.headers)
         except urllib.error.HTTPError as error:
+            kept = _kept_headers(error.headers)
             try:
                 status, raw = error.code, error.read(MAX_RESPONSE_BYTES + 1)
             except (OSError, http.client.HTTPException):
@@ -499,13 +509,343 @@ class Transport:
         except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as error:
             raise NetworkFailure(type(error).__name__) from None
         if not raw:
-            return Answer(status, None)
+            return Answer(status, None, kept)
         if len(raw) > MAX_RESPONSE_BYTES:
-            return Answer(status, UNPARSEABLE)
+            return Answer(status, UNPARSEABLE, kept)
         try:
-            return Answer(status, json.loads(raw.decode("utf-8")))
+            return Answer(status, json.loads(raw.decode("utf-8")), kept)
         except (UnicodeError, ValueError):
-            return Answer(status, UNPARSEABLE)
+            return Answer(status, UNPARSEABLE, kept)
+
+
+def _kept_headers(headers: Any) -> dict[str, str]:
+    value = headers.get("Retry-After") if headers is not None else None
+    return {"Retry-After": value} if isinstance(value, str) else {}
+
+
+# -- the outbox (protocol section 8, "The add-in's outbox") ---------------------
+
+
+KIND_SOLVE = "prepare_and_solve"
+KIND_SNAPSHOT = "receive_snapshot"
+OUTBOX_DIRECTORY = ".wglink-outbox"
+OUTBOX_SCHEMA_VERSION = 1
+#: The outbox holds at most this many items, each for at most this long. A
+#: full outbox refuses new items (a solve still goes out as its v3 file); an
+#: item past its age is removed and the user told.
+OUTBOX_MAX_ITEMS = 100
+OUTBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
+#: Items the main thread adds are seen at once when it wakes the worker, and
+#: otherwise by a rescan this often.
+OUTBOX_RESCAN_SECONDS = 5.0
+#: WG retains the return into its own storage before it answers a delivery.
+DELIVERY_TIMEOUT_SECONDS = 30.0
+#: WG answers ``503 snapshot_not_readable`` for at most 30 s from the first
+#: such answer (``solve_command.LIVE_TRANSIENT_BOUND_S``), then 200. Past this
+#: client guard, measured against the same WG instance, WG is not keeping that
+#: bound: a solve goes out as its v3 file and the item slows down.
+TRANSIENT_GUARD_SECONDS = 60.0
+#: ``503 store_busy`` has no bound from WG: this many answers in a row, then a
+#: solve goes out as its v3 file and the item slows down.
+STORE_BUSY_DELIVERY_ANSWERS = 5
+#: The retryable 409s are retried quickly for this long, then slowly.
+RETRYABLE_REFUSAL_SECONDS = 60.0
+FAST_RETRY_MAX_SECONDS = 10.0
+#: The slow retry: 30 s, doubling, at most 5 minutes.
+SLOW_RETRY_START_SECONDS = 30.0
+SLOW_RETRY_MAX_SECONDS = 300.0
+_RETRYABLE_REFUSALS = {(409, "wglink_folder_not_selected"), (409, "update_restart_pending")}
+_KINDS = (KIND_SOLVE, KIND_SNAPSHOT)
+_OPERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+class OutboxFull(Exception):
+    """The outbox holds OUTBOX_MAX_ITEMS; nothing was queued.
+
+    ``solve_file`` is the v3 solve file written for a solve anyway, or None.
+    """
+
+    def __init__(self, operation_id: str, solve_file: Path | None = None) -> None:
+        super().__init__(f"WGLink's outbox already holds {OUTBOX_MAX_ITEMS} deliveries")
+        self.operation_id = operation_id
+        self.solve_file = solve_file
+
+
+def advertises_live(ipc_folder: Path | None) -> bool:
+    """Whether WG's capability file advertises the live protocol (rule 1)."""
+
+    return ipc_folder is not None and _advertises_live(Path(ipc_folder))
+
+
+def _utc_millis(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _utc_whole_seconds(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime(_UTC_SECONDS)
+
+
+def _parse_utc(text: object) -> float | None:
+    if not isinstance(text, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def delivery_item(
+    kind: str,
+    *,
+    operation_id: str,
+    bundle_path: str,
+    manifest_sha256: str,
+    requested_at: str,
+    created_at: str,
+    return_id: str | None = None,
+    file_written: bool = False,
+) -> dict[str, Any]:
+    """One outbox item. ``operationId`` is its identity for ever."""
+
+    item: dict[str, Any] = {
+        "schemaVersion": OUTBOX_SCHEMA_VERSION,
+        "operationId": str(operation_id),
+        "kind": kind,
+        "bundlePath": str(bundle_path),
+        "manifestSha256": str(manifest_sha256),
+        "requestedAt": str(requested_at),
+        "createdAt": str(created_at),
+        "answer": None,
+    }
+    if kind == KIND_SOLVE:
+        item["returnId"] = str(return_id or "")
+        item["fileWritten"] = bool(file_written)
+    return item
+
+
+def valid_item(item: object) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    kind = item.get("kind")
+    return (
+        _is_int(item.get("schemaVersion"))
+        and item.get("schemaVersion") == OUTBOX_SCHEMA_VERSION
+        and isinstance(item.get("operationId"), str)
+        and _OPERATION_ID.fullmatch(item["operationId"]) is not None
+        and kind in _KINDS
+        and all(
+            isinstance(item.get(name), str) and item.get(name)
+            for name in ("bundlePath", "manifestSha256", "requestedAt", "createdAt")
+        )
+        and (item.get("answer") is None or isinstance(item.get("answer"), Mapping))
+        and (
+            kind != KIND_SOLVE
+            or (isinstance(item.get("returnId"), str) and isinstance(item.get("fileWritten"), bool))
+        )
+    )
+
+
+def delivery_body(item: Mapping[str, Any]) -> dict[str, Any]:
+    """The protocol's delivery fields and nothing else (no client state, no transport)."""
+
+    body = {name: item[name] for name in ("operationId", "kind", "bundlePath", "manifestSha256", "requestedAt")}
+    if item["kind"] == KIND_SOLVE:
+        body["returnId"] = item["returnId"]
+    return body
+
+
+class Outbox:
+    """``<ipc>/.wglink-outbox/<operationId>.json``: one private file per item.
+
+    WG never reads this folder. Every write is atomic (a private temporary
+    file, fsync, replace), so a reader sees an item whole or not at all.
+    After an item is created only the IPC lease owner's live worker changes
+    or deletes it.
+    """
+
+    def __init__(self, ipc_folder: Path) -> None:
+        self.folder = Path(ipc_folder) / OUTBOX_DIRECTORY
+
+    def path(self, operation_id: str) -> Path:
+        return self.folder / f"{operation_id}.json"
+
+    def _names(self) -> list[Path]:
+        try:
+            return [
+                path for path in self.folder.iterdir()
+                if path.suffix == ".json" and not path.name.startswith(".")
+            ]
+        except OSError:
+            return []
+
+    def count(self) -> int:
+        return len(self._names())
+
+    def scan(self) -> tuple[list[dict[str, Any]], list[Path]]:
+        """Valid items oldest first (``createdAt``, then id), and files that are not items."""
+
+        items: list[dict[str, Any]] = []
+        foreign: list[Path] = []
+        for path in self._names()[: OUTBOX_MAX_ITEMS * 4]:
+            item = _read_json(path)
+            if valid_item(item) and path.stem == item["operationId"]:
+                items.append(dict(item))
+            else:
+                foreign.append(path)
+        items.sort(key=lambda item: (_parse_utc(item["createdAt"]) or 0.0, item["operationId"]))
+        return items, foreign
+
+    def read(self, operation_id: str) -> dict[str, Any] | None:
+        item = _read_json(self.path(operation_id))
+        return dict(item) if valid_item(item) and item["operationId"] == operation_id else None
+
+    def add(self, item: Mapping[str, Any]) -> None:
+        if self.count() >= OUTBOX_MAX_ITEMS:
+            raise OutboxFull(str(item["operationId"]))
+        self.write(item)
+
+    def write(self, item: Mapping[str, Any]) -> None:
+        if not valid_item(item):
+            raise ValueError("not an outbox item")
+        self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(self.folder, 0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{item['operationId']}.", suffix=".tmp", dir=self.folder
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(dict(item), stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path(item["operationId"]))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def delete(self, operation_id: str) -> None:
+        try:
+            self.path(operation_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def produce_solve(
+    ipc_folder: Path,
+    *,
+    bundle_path: Path,
+    workspace_root: Path,
+    return_id: str,
+    healthy: bool,
+    solve_files: Any,
+    operation_id: str | None = None,
+    wall: Callable[[], float] | None = None,
+) -> dict[str, Any] | None:
+    """"Solve in WG" on the main thread: queue the item, and the v3 file unless live.
+
+    No network. None when WG does not advertise the live protocol (the caller
+    writes the v3 file exactly as before). With a healthy live session the
+    item alone is written and the worker delivers it; otherwise the v3 solve
+    file is written first and the item records it, both under one operation
+    id and one return reference. ``OutboxFull`` still leaves the v3 file.
+    """
+
+    if not advertises_live(ipc_folder):
+        return None
+    solve_files.require_solve_delivery(ipc_folder)
+    relative, manifest = solve_files.return_reference(bundle_path, workspace_root)
+    now = (wall or time.time)()
+    operation_id = operation_id or str(uuid.uuid4())
+    outbox = Outbox(ipc_folder)
+    full = outbox.count() >= OUTBOX_MAX_ITEMS
+    item = delivery_item(
+        KIND_SOLVE,
+        operation_id=operation_id,
+        return_id=return_id,
+        bundle_path=relative,
+        manifest_sha256=manifest,
+        requested_at=_utc_whole_seconds(now),
+        created_at=_utc_millis(now),
+        file_written=not healthy or full,
+    )
+    written = _write_solve_file(solve_files, ipc_folder, item) if item["fileWritten"] else None
+    try:
+        if full:
+            raise OutboxFull(operation_id)
+        outbox.add(item)
+    except OutboxFull as exc:
+        exc.solve_file = written or _write_solve_file(solve_files, ipc_folder, item)
+        raise
+    return item
+
+
+def produce_snapshot(
+    ipc_folder: Path,
+    *,
+    bundle_path: Path,
+    workspace_root: Path,
+    solve_files: Any,
+    operation_id: str | None = None,
+    wall: Callable[[], float] | None = None,
+) -> dict[str, Any] | None:
+    """"Send to WG" on the main thread: queue a ``receive_snapshot`` (never a file)."""
+
+    if not advertises_live(ipc_folder):
+        return None
+    relative, manifest = solve_files.return_reference(bundle_path, workspace_root)
+    now = (wall or time.time)()
+    item = delivery_item(
+        KIND_SNAPSHOT,
+        operation_id=operation_id or str(uuid.uuid4()),
+        bundle_path=relative,
+        manifest_sha256=manifest,
+        requested_at=_utc_whole_seconds(now),
+        created_at=_utc_millis(now),
+    )
+    Outbox(ipc_folder).add(item)
+    return item
+
+
+def item_waiting_live(ipc_folder: Path, operation_id: str) -> bool:
+    """An unanswered solve item that only the live delivery carries (no v3 file)."""
+
+    item = Outbox(ipc_folder).read(operation_id)
+    return item is not None and item.get("answer") is None and not item.get("fileWritten")
+
+
+def _write_solve_file(solve_files: Any, ipc_folder: Path, item: Mapping[str, Any]) -> Path:
+    return solve_files.write_solve_request_fields(
+        ipc_folder,
+        command_id=item["operationId"],
+        return_id=item["returnId"],
+        bundle_relative=item["bundlePath"],
+        manifest_sha256=item["manifestSha256"],
+        requested_at=item["requestedAt"],
+    )
+
+
+@dataclass
+class _Retry:
+    """One item's retry state, in memory (a restart retries at once)."""
+
+    next_at: float = 0.0
+    transient: tuple[str, float] | None = None  # (WG instance, first 503 not readable)
+    busy: int = 0
+    refused_since: float | None = None
+    refusals: int = 0
+    slow: float = 0.0
+
+
+def _retry_after(answer: Answer) -> float:
+    value = (answer.headers or {}).get("Retry-After")
+    try:
+        return max(0.0, min(float(value), FAST_RETRY_MAX_SECONDS)) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # -- the client ----------------------------------------------------------------
@@ -547,6 +887,7 @@ class LiveClient:
         nonce: Callable[[int], bytes] = secrets.token_bytes,
         transport_factory: Callable[[str], Any] = Transport,
         posix: bool | None = None,
+        solve_files: Any = None,
     ) -> None:
         self._ipc_folder = ipc_folder
         self._adapter_session_id = str(adapter_session_id)
@@ -558,6 +899,9 @@ class LiveClient:
         self._nonce = nonce
         self._transport_factory = transport_factory
         self._posix = posix
+        #: ``wglink_watch``: writes a solve item's v3 file. Without it the
+        #: outbox is still delivered, and a solve never falls back to a file.
+        self._solve_files = solve_files
 
         self._lock = threading.Lock()
         self._session: _Session | None = None
@@ -575,6 +919,18 @@ class LiveClient:
         self._refreshes = 0
         self._last_cause: str | None = None
         self._log: deque[str] = deque(maxlen=LOG_LINES_KEPT)
+        # Outbox (worker only, except the two queues and the dirty flag).
+        #: Discovery or the session ended on the files: a solve item then goes
+        #: out as its v3 file. Not set while registering again after one 401.
+        self._offline = False
+        self._ipc: Path | None = None
+        self._items: list[dict[str, Any]] | None = None
+        self._scanned_at = float("-inf")
+        self._outbox_dirty = True
+        self._retries: dict[str, _Retry] = {}
+        self._noticed: set[str] = set()
+        self._notices: list[dict[str, Any]] = []
+        self._acknowledged: queue.SimpleQueue[str] = queue.SimpleQueue()
 
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -620,6 +976,30 @@ class LiveClient:
             self._heartbeat = (self._heartbeat_offers, text)
         self._wake.set()
 
+    def enqueue_delivery(self) -> None:
+        """The main thread added an outbox item: look at the outbox now."""
+
+        self._outbox_dirty = True
+        self._wake.set()
+
+    def take_delivery_notices(self) -> list[dict[str, Any]]:
+        """Final answers for the main thread to record and, where asked, show.
+
+        A notice with ``durable`` true (rejected, conflict, expired) keeps its
+        item on disk until :meth:`acknowledge_delivery_notice`, so it is shown
+        again after a restart if it never was.
+        """
+
+        with self._lock:
+            notices, self._notices = self._notices, []
+        return notices
+
+    def acknowledge_delivery_notice(self, operation_id: str) -> None:
+        """The user was told; the worker deletes the answered item."""
+
+        self._acknowledged.put(str(operation_id))
+        self._wake.set()
+
     def take_log_lines(self) -> list[str]:
         with self._lock:
             lines = list(self._log)
@@ -638,6 +1018,7 @@ class LiveClient:
                 "liveSessionId": session.live_session_id if session else None,
                 "refreshes": self._refreshes,
                 "lastCause": self._last_cause,
+                "outboxWaiting": sum(1 for item in self._items or () if item.get("answer") is None),
             }
 
     # -- worker ------------------------------------------------------------------
@@ -685,6 +1066,8 @@ class LiveClient:
             if self._session is not None:
                 self.end()
             return IDLE_STEP_SECONDS
+        self._ipc = ipc
+        self._keep_outbox(ipc, now)
         session = self._session
         if session is not None:
             if files_fingerprint(ipc) != session.fingerprint:
@@ -693,6 +1076,8 @@ class LiveClient:
                 self._recheck_at = now
             else:
                 return self._maintain(session, now)
+        if self._offline:
+            self._settle_offline(ipc)
         return self._discover(ipc, now)
 
     # -- discovery and registration ----------------------------------------------
@@ -812,6 +1197,8 @@ class LiveClient:
             return IDLE_STEP_SECONDS
         with self._lock:
             self._session = session
+        self._offline = False
+        self._outbox_dirty = True
         self._recover_next = False
         self._proof_reread = False
         self._busy_retries = 0
@@ -820,6 +1207,7 @@ class LiveClient:
         return 0.0
 
     def _stale(self, fingerprint: tuple, now: float, reason: str, delay: float) -> float:
+        self._offline = True
         self._stale_fingerprint = fingerprint
         self._recheck_at = now + delay
         self._busy_retries = 0
@@ -837,6 +1225,7 @@ class LiveClient:
     def _block(self, fingerprint: tuple, reason: str) -> float:
         """File mode until WG rewrites a discovery file."""
 
+        self._offline = True
         self._blocked = fingerprint
         self._busy_retries = 0
         self._note(reason, f"WGLink uses the files: {reason}.")
@@ -889,6 +1278,9 @@ class LiveClient:
             outcome = self._post_heartbeat(session, pending[1], now)
             if outcome is not None:
                 return outcome
+        outcome = self._deliver_next(session, now)
+        if outcome is not None:
+            return outcome
         return max(0.0, min(session.refresh_at - now, IDLE_STEP_SECONDS))
 
     def _refresh(self, session: _Session, now: float) -> float | None:
@@ -943,6 +1335,7 @@ class LiveClient:
 
         self._drop()
         if session.recovering and now - session.registered_at <= REREGISTER_WINDOW_SECONDS:
+            self._offline = True
             self._stale_fingerprint = self._current_fingerprint()
             self._recheck_at = now + STALE_RECHECK_SECONDS
             self._note("lost-again", f"WG refused the live session again ({code}); using the files.")
@@ -957,6 +1350,7 @@ class LiveClient:
             return self._session_lost(session, now, answer.code or "401")
         self._drop()
         self.__end_quietly(session)
+        self._offline = True
         self._stale_fingerprint = self._current_fingerprint()
         self._recheck_at = now + STALE_RECHECK_SECONDS
         reason = f"WG refused the live {what} ({answer.status} {answer.code or 'no code'})"
@@ -973,11 +1367,233 @@ class LiveClient:
 
     def _lost(self, now: float, reason: str) -> float:
         self._drop()
+        self._offline = True
         self._stale_fingerprint = self._current_fingerprint()
         self._network_backoff = 1.0
         self._recheck_at = now + self._network_backoff
         self._note("network", f"WGLink uses the files: {reason}.")
         return self._network_backoff
+
+    # -- the outbox (worker) ---------------------------------------------------------
+
+    def _keep_outbox(self, ipc: Path, now: float) -> None:
+        """Acknowledgements, rescans, notices of answered items, the age bound."""
+
+        outbox = Outbox(ipc)
+        while True:
+            try:
+                operation_id = self._acknowledged.get_nowait()
+            except queue.Empty:
+                break
+            stored = outbox.read(operation_id)
+            if stored is not None and stored.get("answer") is not None:
+                self._forget(outbox, operation_id)
+            self._noticed.discard(operation_id)
+        if self._items is None or self._outbox_dirty or now - self._scanned_at >= OUTBOX_RESCAN_SECONDS:
+            self._outbox_dirty = False
+            self._scanned_at = now
+            items, foreign = outbox.scan()
+            with self._lock:
+                self._items = items
+            present = {item["operationId"] for item in items}
+            for operation_id in set(self._retries) - present:
+                del self._retries[operation_id]
+            for path in foreign:
+                try:
+                    if self._wall() - path.stat().st_mtime > OUTBOX_MAX_AGE_SECONDS:
+                        path.unlink()
+                except OSError:
+                    pass
+        wall = self._wall()
+        for item in list(self._items or ()):
+            operation_id = item["operationId"]
+            if item.get("answer") is not None:
+                if operation_id not in self._noticed:
+                    self._notice(item, item["answer"], durable=True)
+                continue
+            created = _parse_utc(item["createdAt"])
+            if created is None or wall - created <= OUTBOX_MAX_AGE_SECONDS:
+                continue
+            if item["kind"] == KIND_SOLVE and item.get("fileWritten"):
+                # Its v3 file carries it; nothing is lost by forgetting the item.
+                self._forget(outbox, operation_id)
+            else:
+                self._answer(outbox, item, {"outcome": "expired", "state": None, "reason": None, "message": None})
+
+    def _settle_offline(self, ipc: Path) -> None:
+        """No session: a solve goes out as its v3 file; a taken file settles its item."""
+
+        if self._solve_files is None or self._halted():
+            return
+        outbox = Outbox(ipc)
+        for item in list(self._items or ()):
+            if item.get("answer") is not None or item["kind"] != KIND_SOLVE:
+                continue
+            if not item.get("fileWritten"):
+                self._write_file(outbox, item)
+            elif not self._solve_files.solve_request_path(ipc, item["operationId"]).exists():
+                # WG took the file: the file transport has it now.
+                self._forget(outbox, item["operationId"])
+
+    def _write_file(self, outbox: Outbox, item: dict[str, Any]) -> None:
+        if self._solve_files is None or item["kind"] != KIND_SOLVE or item.get("fileWritten"):
+            return
+        ipc = self._ipc
+        if ipc is None:
+            return
+        try:
+            _write_solve_file(self._solve_files, ipc, item)
+        except Exception as exc:  # noqa: BLE001 - WgOutdatedError, a vanished folder: retried later
+            self._note(f"outbox-file-{type(exc).__name__}",
+                       f"WGLink could not write a solve request as a file ({type(exc).__name__}); it stays queued.")
+            return
+        self._replace(outbox, {**item, "fileWritten": True})
+        self._note("outbox-file", "WGLink wrote a queued solve request as a file for WG to take.")
+
+    def _replace(self, outbox: Outbox, item: dict[str, Any]) -> None:
+        outbox.write(item)
+        with self._lock:
+            self._items = [item if other["operationId"] == item["operationId"] else other for other in self._items or ()]
+
+    def _forget(self, outbox: Outbox, operation_id: str) -> None:
+        outbox.delete(operation_id)
+        self._retries.pop(operation_id, None)
+        with self._lock:
+            self._items = [item for item in self._items or () if item["operationId"] != operation_id]
+
+    def _answer(self, outbox: Outbox, item: dict[str, Any], answer: dict[str, Any]) -> None:
+        """A final answer the user must see: kept on disk until acknowledged."""
+
+        self._replace(outbox, {**item, "answer": answer})
+        self._retries.pop(item["operationId"], None)
+        self._notice(item, answer, durable=True)
+
+    def _notice(self, item: Mapping[str, Any], answer: Mapping[str, Any], *, durable: bool) -> None:
+        notice = {
+            "operationId": item["operationId"],
+            "kind": item["kind"],
+            "createdAt": item["createdAt"],
+            "outcome": answer.get("outcome"),
+            "state": answer.get("state"),
+            "reason": answer.get("reason"),
+            "message": answer.get("message"),
+            "durable": durable,
+        }
+        with self._lock:
+            self._notices.append(notice)
+            if durable:
+                self._noticed.add(item["operationId"])
+
+    def _retry(self, operation_id: str) -> _Retry:
+        return self._retries.setdefault(operation_id, _Retry())
+
+    def _deliver_next(self, session: _Session, now: float) -> float | None:
+        """POST the oldest due item, at most one per step."""
+
+        if self._halted() or self._ipc is None:
+            return None
+        for item in list(self._items or ()):
+            if item.get("answer") is None and self._retry(item["operationId"]).next_at <= now:
+                return self._deliver(session, item, now)
+        return None
+
+    def _deliver(self, session: _Session, item: dict[str, Any], now: float) -> float | None:
+        headers = {"Content-Type": "application/json", **self._auth(session)}
+        try:
+            answer = session.transport.request(
+                "POST", "/deliveries", headers=headers, body=delivery_body(item),
+                timeout=END_TIMEOUT_SECONDS if self._stop.is_set() else DELIVERY_TIMEOUT_SECONDS,
+            )
+        except NetworkFailure:
+            # Maybe accepted, maybe not: the same id is delivered again, and a
+            # solve also goes out as its v3 file (_settle_offline).
+            return self._lost(now, "WG did not answer a delivery")
+        if answer.status in (401, 403):
+            return self._refused(session, answer, now, "delivery")
+        with self._lock:
+            session.last_ok = now
+        outbox = Outbox(self._ipc) if self._ipc is not None else None
+        if outbox is None:
+            return None
+        retry = self._retry(item["operationId"])
+        code = answer.code
+        if answer.status == 200:
+            self._accepted(outbox, item, answer.body)
+            return None
+        if (answer.status, code) == (409, "operation_conflict"):
+            self._note(f"conflict-{item['operationId']}",
+                       f"WG refused delivery {item['operationId']}: its id already names a different request.")
+            self._answer(outbox, item, {
+                "outcome": "conflict", "state": None, "reason": "operation_conflict", "message": None,
+            })
+            return None
+        hint = _retry_after(answer)
+        if (answer.status, code) == (503, "snapshot_not_readable"):
+            instance = session.endpoint.instance_id
+            if retry.transient is None or retry.transient[0] != instance:
+                retry.transient = (instance, now)
+            retry.busy, retry.refused_since, retry.slow = 0, None, 0.0
+            if now - retry.transient[1] >= TRANSIENT_GUARD_SECONDS:
+                self._note("transient-guard", "WG kept answering that a return is not readable past its 30 s bound.")
+                self._write_file(outbox, item)
+                self._slow(retry, now)
+            else:
+                retry.next_at = now + max(1.0, hint)
+            return None
+        if (answer.status, code) == (503, "store_busy"):
+            retry.busy += 1
+            retry.refused_since = None
+            if retry.busy >= STORE_BUSY_DELIVERY_ANSWERS:
+                self._note("delivery-store-busy", "WG's operation store stayed busy; the delivery is retried later.")
+                self._write_file(outbox, item)
+                self._slow(retry, now)
+            else:
+                retry.next_at = now + max(hint, min(2.0 ** (retry.busy - 1), 8.0))
+            return None
+        if (answer.status, code) in _RETRYABLE_REFUSALS:
+            retry.busy = 0
+            if retry.refused_since is None:
+                retry.refused_since, retry.refusals = now, 0
+            retry.refusals += 1
+            if now - retry.refused_since >= RETRYABLE_REFUSAL_SECONDS:
+                self._note(f"delivery-{code}", f"WG is not taking deliveries yet ({code}); retrying slowly.")
+                self._slow(retry, now)
+            else:
+                retry.next_at = now + max(hint, min(2.0 ** (retry.refusals - 1), FAST_RETRY_MAX_SECONDS))
+            return None
+        self._note(
+            f"delivery-{answer.status}-{code}",
+            f"WG answered a delivery unexpectedly ({answer.status} {code or 'no code'}); retrying later.",
+        )
+        retry.busy, retry.refused_since = 0, None
+        self._write_file(outbox, item)
+        self._slow(retry, now)
+        return None
+
+    def _accepted(self, outbox: Outbox, item: dict[str, Any], body: object) -> None:
+        """A 200: final for the item whatever the operation's state."""
+
+        operation = body.get("operation") if isinstance(body, Mapping) else None
+        if not isinstance(operation, Mapping) or body.get("result") not in {"created", "recovered"}:
+            self._note("delivery-body", "WG accepted a delivery with an answer WGLink does not recognise.")
+            operation = {}
+        state = operation.get("state") if isinstance(operation.get("state"), str) else None
+        answer = {
+            "outcome": "rejected" if state == "rejected" else "delivered",
+            "state": state,
+            "reason": operation.get("reason") if isinstance(operation.get("reason"), str) else None,
+            "message": operation.get("message") if isinstance(operation.get("message"), str) else None,
+        }
+        if answer["outcome"] == "rejected":
+            self._answer(outbox, item, answer)
+            return
+        self._forget(outbox, item["operationId"])
+        self._notice(item, answer, durable=False)
+
+    @staticmethod
+    def _slow(retry: _Retry, now: float) -> None:
+        retry.slow = SLOW_RETRY_START_SECONDS if retry.slow <= 0 else min(retry.slow * 2, SLOW_RETRY_MAX_SECONDS)
+        retry.next_at = now + retry.slow
 
     def _current_fingerprint(self) -> tuple | None:
         ipc = self._ipc_folder()
@@ -1005,17 +1621,27 @@ class LiveClient:
 __all__ = [
     "Answer",
     "Endpoint",
+    "KIND_SNAPSHOT",
+    "KIND_SOLVE",
     "LiveClient",
     "NetworkFailure",
+    "Outbox",
+    "OutboxFull",
     "Stale",
     "Transport",
     "UNPARSEABLE",
+    "advertises_live",
     "client_proof",
     "decode_32",
+    "delivery_body",
+    "delivery_item",
     "encode",
     "files_fingerprint",
     "installation_id",
+    "item_waiting_live",
     "loaded_identity",
+    "produce_snapshot",
+    "produce_solve",
     "read_endpoint",
     "server_proof",
     "server_proof_matches",

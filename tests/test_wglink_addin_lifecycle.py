@@ -4106,6 +4106,9 @@ class _LiveRecorder:
         lines, self.lines = self.lines, []
         return lines
 
+    def take_delivery_notices(self) -> list[dict]:
+        return []
+
 
 def test_the_heartbeat_file_and_the_live_offer_are_the_same_object(monkeypatch, tmp_path: Path) -> None:
     module = _load_instance(monkeypatch, "WGLink_live_offer", _UI(_Panels(), _Definitions(reserve_ids=False)))
@@ -4233,3 +4236,188 @@ def test_the_main_thread_never_does_network_io_while_live(monkeypatch, tmp_path:
     assert main not in connecting
     assert ("DELETE", LIVE + "/sessions/current") in [(m, p) for m, p, _h, _b in stub.requests]
     assert not client.is_running()
+
+
+# -- the outbox, main-thread half (wglink_live producers and notices) ----------------------
+
+
+class _OutboxClient:
+    """Stands in for the live client where only the main thread's half matters."""
+
+    def __init__(self, *, healthy: bool, notices: list[dict] | None = None) -> None:
+        self._healthy = healthy
+        self.enqueued = 0
+        self.notices = list(notices or [])
+        self.acknowledged: list[str] = []
+
+    def healthy(self) -> bool:
+        return self._healthy
+
+    def enqueue_delivery(self) -> None:
+        self.enqueued += 1
+
+    def take_delivery_notices(self) -> list[dict]:
+        notices, self.notices = self.notices, []
+        return notices
+
+    def acknowledge_delivery_notice(self, operation_id: str) -> None:
+        self.acknowledged.append(operation_id)
+
+    def offer_heartbeat(self, _payload: dict) -> None:
+        pass
+
+    def take_log_lines(self) -> list[str]:
+        return []
+
+
+_LIVE_CAPABILITIES = {
+    "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3, "liveProtocol": 1,
+}
+
+
+def _outbox_setup(monkeypatch, tmp_path: Path, name: str, *, live: bool = True):
+    module, ui = _design_module(monkeypatch, name)
+    ipc, _bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    if live:
+        (ipc / "wg-capabilities.json").write_text(json.dumps(_LIVE_CAPABILITIES))
+    bundle = tmp_path / "workspace" / "wgreturn" / "speaker.wgreturn"
+    bundle.mkdir(parents=True)
+    (bundle / "wgreturn.json").write_bytes(b'{"return": "speaker"}')
+    monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: True)
+    return module, ui, ipc, bundle
+
+
+def _outbox_items(ipc: Path) -> dict[str, dict]:
+    folder = ipc / ".wglink-outbox"
+    if not folder.is_dir():
+        return {}
+    return {p.stem: json.loads(p.read_text()) for p in folder.iterdir() if not p.name.startswith(".")}
+
+
+def _v3_solve_files(ipc: Path) -> list[Path]:
+    folder = ipc / ".wg-solve-requests"
+    return sorted(p for p in folder.iterdir() if not p.name.startswith(".")) if folder.is_dir() else []
+
+
+def test_solve_in_wg_with_a_healthy_live_session_queues_the_item_and_writes_no_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, _ui, ipc, bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_live_solve")
+    client = _OutboxClient(healthy=True)
+    monkeypatch.setattr(module, "_live_client", client)
+
+    assert module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)}) is True
+
+    [(operation_id, item)] = _outbox_items(ipc).items()
+    assert (item["kind"], item["returnId"], item["bundlePath"], item["fileWritten"]) == (
+        "prepare_and_solve", "wgr_1", "wgreturn/speaker.wgreturn", False,
+    )
+    assert _v3_solve_files(ipc) == []
+    assert client.enqueued == 1
+    assert module._request_trace["correlationId"] == operation_id
+
+
+def test_solve_in_wg_without_a_healthy_session_writes_the_file_and_the_item_under_one_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, _ui, ipc, bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_offline_solve")
+    client = _OutboxClient(healthy=False)
+    monkeypatch.setattr(module, "_live_client", client)
+
+    module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)})
+
+    [path] = _v3_solve_files(ipc)
+    payload = json.loads(path.read_text())
+    [(operation_id, item)] = _outbox_items(ipc).items()
+    assert path.stem == payload["commandId"] == operation_id
+    assert item["fileWritten"] is True
+    for key in ("returnId", "bundlePath", "manifestSha256", "requestedAt"):
+        assert payload[key] == item[key]
+
+
+def test_solve_in_wg_for_a_wg_without_the_live_protocol_writes_only_the_v3_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, _ui, ipc, bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_no_live", live=False)
+    monkeypatch.setattr(module, "_live_client", _OutboxClient(healthy=True))
+
+    module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)})
+
+    assert len(_v3_solve_files(ipc)) == 1
+    assert not (ipc / ".wglink-outbox").exists()
+
+
+def test_a_plain_send_queues_a_snapshot_only_for_a_wg_that_speaks_live(monkeypatch, tmp_path: Path) -> None:
+    module, _ui, ipc, bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_send", live=False)
+    client = _OutboxClient(healthy=False)
+    monkeypatch.setattr(module, "_live_client", client)
+    report = {"return_id": "wgr_1", "bundle_path": str(bundle)}
+
+    module._queue_snapshot(report)
+    assert _outbox_items(ipc) == {} and client.enqueued == 0
+
+    (ipc / "wg-capabilities.json").write_text(json.dumps(_LIVE_CAPABILITIES))
+    module._queue_snapshot(report)
+    [item] = _outbox_items(ipc).values()
+    assert (item["kind"], item["bundlePath"]) == ("receive_snapshot", "wgreturn/speaker.wgreturn")
+    assert "returnId" not in item and _v3_solve_files(ipc) == []
+    assert client.enqueued == 1
+    assert "delivery_note" not in report
+
+
+def test_final_delivery_answers_are_recorded_and_the_ones_that_need_the_user_shown_then_acknowledged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui, ipc, _bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_notices")
+    notices = [
+        {"operationId": "op-ok", "kind": "prepare_and_solve", "createdAt": "2026-09-17T10:00:00.000Z",
+         "outcome": "delivered", "state": "received", "reason": None, "message": None, "durable": False},
+        {"operationId": "op-gone", "kind": "receive_snapshot", "createdAt": "2026-09-16T10:00:00.000Z",
+         "outcome": "rejected", "state": "rejected", "reason": "snapshot_unavailable",
+         "message": "WG could not read this snapshot in the WGLink folder for 24 hours. Send it again from Fusion.",
+         "durable": True},
+    ]
+    client = _OutboxClient(healthy=True, notices=notices)
+    monkeypatch.setattr(module, "_live_client", client)
+    monkeypatch.setattr(module, "_fusion_snapshot", _shared_snapshot)
+    monkeypatch.setattr(module, "_apply_pending_handoff", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module, "_apply_pending_return_request", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module._watcher, "survey", lambda _links: [])
+    monkeypatch.setattr(module, "_claims_swept", True)
+
+    module._on_watch_tick()
+
+    [(title, text)] = ui.messages
+    assert title == "WGLink delivery to WG"
+    assert "for 24 hours" in text and "snapshot_unavailable" in text and "op-gone" in text
+    assert "Send to WG" in text
+    assert client.acknowledged == ["op-gone"]
+    status = json.loads((ipc / ".fusion-status.json").read_text())
+    outcomes = status["diagnostics"]["recentOutcomes"]
+    assert {"channel": "solveCommand", "requestId": "op-ok", "outcome": "delivered"} in outcomes
+    assert {"channel": "snapshot", "requestId": "op-gone", "outcome": "rejected"} in outcomes
+
+
+def test_a_solve_waiting_only_for_its_live_delivery_counts_as_untaken(monkeypatch, tmp_path: Path) -> None:
+    module, ui, ipc, bundle = _outbox_setup(monkeypatch, tmp_path, "WGLink_outbox_untaken")
+    monkeypatch.setattr(module, "_live_client", _OutboxClient(healthy=True))
+    clock = types.SimpleNamespace(value=1000.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
+    monkeypatch.setattr(module, "_fusion_snapshot", _shared_snapshot)
+    monkeypatch.setattr(module, "_apply_pending_handoff", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module, "_apply_pending_return_request", lambda _snapshot: module.IDLE)
+    monkeypatch.setattr(module._watcher, "survey", lambda _links: [])
+    monkeypatch.setattr(module, "_claims_swept", True)
+
+    module._request_wg_solve({"return_id": "wgr_1", "bundle_path": str(bundle)})
+    assert _v3_solve_files(ipc) == []
+    clock.value += 61.0
+    module._on_watch_tick()
+    assert [title for title, _text in ui.messages] == ["WGLink solve request waiting"]
+
+    # Delivered: the item is gone and nothing more is said.
+    [operation_id] = _outbox_items(ipc)
+    (ipc / ".wglink-outbox" / f"{operation_id}.json").unlink()
+    clock.value += 120.0
+    module._on_watch_tick()
+    assert len(ui.messages) == 1

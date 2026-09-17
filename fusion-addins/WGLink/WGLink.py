@@ -927,6 +927,8 @@ def _summary(operation: str, report: dict[str, object]) -> str:
                         str(record.get("path") or record.get("name") or record.get("object_id") or "unnamed body")
                     )
             message += "\n\nDEGRADED EXPORT — skipped bodies:\n- " + "\n- ".join(names or ["none reported"])
+        if report.get("delivery_note"):
+            message += f"\n\n{report['delivery_note']}"
         return message
     return (
         f"Detached WGLink instance {report.get('instance_id', '?')}.\n"
@@ -951,19 +953,119 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
             "Waveguide Generator has no selected CAD Link workspace, so it cannot be asked to solve."
         )
     command_id = str(uuid.uuid4())
+    return_id = str(report.get("return_id") or "")
+    bundle = Path(str(report.get("bundle_path") or ""))
+    client = _live_client
     try:
-        written = wglink_watch.write_solve_request(
+        # A WG that speaks the live protocol gets an outbox item: delivered
+        # over HTTP while the session is healthy, and written as the v3 file
+        # (same operation id) right away when it is not. Any other WG gets the
+        # v3 file exactly as before. No network here either way.
+        item = wglink_live.produce_solve(
             ipc,
-            command_id=command_id,
-            return_id=str(report.get("return_id") or ""),
-            bundle_path=Path(str(report.get("bundle_path") or "")),
+            bundle_path=bundle,
             workspace_root=workspace,
+            return_id=return_id,
+            healthy=client is not None and client.healthy(),
+            solve_files=wglink_watch,
+            operation_id=command_id,
         )
+        if item is None:
+            wglink_watch.write_solve_request(
+                ipc,
+                command_id=command_id,
+                return_id=return_id,
+                bundle_path=bundle,
+                workspace_root=workspace,
+            )
     except wglink_watch.WgOutdatedError as exc:
         raise wglink_core.WgLinkError(str(exc)) from exc
-    _untaken_solves[Path(written)] = time.monotonic()
+    except wglink_live.OutboxFull:
+        report["delivery_note"] = OUTBOX_FULL_NOTE + " The solve request was written as a file for WG to take."
+    if client is not None:
+        client.enqueue_delivery()
+    _untaken_solves[wglink_watch.solve_request_path(ipc, command_id)] = time.monotonic()
     _begin_request("solveCommand", command_id, DELIVERY)["outcome"] = "requested"
     return True
+
+
+def _queue_snapshot(report: dict[str, object]) -> None:
+    """After a plain Send: queue the return for WG's live ``receive_snapshot``.
+
+    Only for a WG that advertises the live protocol; the return is already
+    published in the WGLink folder, so nothing here can fail the Send.
+    """
+
+    ipc = wglink_workspace.ipc_folder()
+    workspace = wglink_workspace.workspace_root()
+    if ipc is None or workspace is None or not report.get("bundle_path"):
+        return
+    try:
+        item = wglink_live.produce_snapshot(
+            ipc,
+            bundle_path=Path(str(report["bundle_path"])),
+            workspace_root=workspace,
+            solve_files=wglink_watch,
+        )
+    except wglink_live.OutboxFull:
+        report["delivery_note"] = OUTBOX_FULL_NOTE
+        return
+    except Exception as exc:  # noqa: BLE001 - the return is published whatever happens here
+        _log(f"WGLink could not queue the return for Waveguide Generator: {exc}")
+        return
+    client = _live_client
+    if item is not None and client is not None:
+        client.enqueue_delivery()
+
+
+OUTBOX_FULL_NOTE = (
+    "WGLink's queue of deliveries waiting for Waveguide Generator is full, so this one "
+    "was not queued. The return itself is in the WGLink folder."
+)
+
+
+def _delivery_notice_text(notice: dict[str, object]) -> str:
+    """What the user is told about a final delivery answer that needs them."""
+
+    what = "Solve in WG" if notice.get("kind") == wglink_live.KIND_SOLVE else "Send to WG"
+    sent = str(notice.get("createdAt") or "earlier")
+    operation = str(notice.get("operationId") or "?")
+    outcome = notice.get("outcome")
+    if outcome == "rejected":
+        reason = str(notice.get("reason") or "")
+        detail = str(notice.get("message") or "") or "WG gave no message"
+        return (
+            f"Waveguide Generator did not accept the return from {what} (sent {sent}, "
+            f"operation {operation}): {detail}"
+            f"{f' [{reason}]' if reason else ''}\n\n"
+            "WGLink does not send it again by itself. Send it again from Fusion if you "
+            "still want it; that is a new request."
+        )
+    if outcome == "conflict":
+        return (
+            f"Waveguide Generator refused the return from {what} (sent {sent}): its "
+            f"operation id {operation} already names a different request, so nothing "
+            "changed in WG. Send it again from Fusion."
+        )
+    return (
+        f"The return from {what} (sent {sent}, operation {operation}) could not be "
+        "delivered to Waveguide Generator within 7 days and was removed from WGLink's "
+        "queue. Send it again from Fusion if you still want it."
+    )
+
+
+def _notice_deliveries() -> None:
+    """Record final delivery answers and show the ones that need the user."""
+
+    client = _live_client
+    if client is None:
+        return
+    for notice in client.take_delivery_notices():
+        channel = "solveCommand" if notice.get("kind") == wglink_live.KIND_SOLVE else "snapshot"
+        _note_outcome(channel, str(notice.get("operationId")), str(notice.get("outcome")))
+        if notice.get("durable"):
+            _modal(_delivery_notice_text(notice), f"{PANEL_NAME} delivery to WG")
+            client.acknowledge_delivery_notice(str(notice.get("operationId")))
 
 
 def _notice_untaken_solves() -> None:
@@ -976,7 +1078,9 @@ def _notice_untaken_solves() -> None:
 
     now = time.monotonic()
     for path, written_at in list(_untaken_solves.items()):
-        if not path.exists():
+        # Waiting: its v3 file is there, or its outbox item waits for the live
+        # delivery alone.
+        if not path.exists() and not wglink_live.item_waiting_live(path.parent.parent, path.stem):
             _untaken_solves.pop(path, None)
             _untaken_noticed.discard(path)
             continue
@@ -1070,6 +1174,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     )
                     report = dict(report)
                     report["solve_requested"] = _request_wg_solve(report)
+                else:
+                    report = dict(report)
+                    _queue_snapshot(report)
                 _update_export_progress(progress, 3, "Return ready in Waveguide Generator.")
             elif self.operation == "source":
                 report = _apply_source_role(inputs)
@@ -2390,6 +2497,7 @@ def _on_watch_tick() -> None:
             _sweep_leftover_claims(snapshot)
         _notice_outdated_wg()
         _notice_untaken_solves()
+        _notice_deliveries()
         # Only a channel that actually did something claims the tick. A
         # suppressed refusal did nothing, so the channels behind it are still
         # owed this tick -- otherwise one refused handoff silently swallows
@@ -2520,6 +2628,8 @@ def _start_live() -> None:
         loaded_identity=_loaded_identity,
         # Reads the lease broker only; no Fusion call.
         lease_ok=lambda: _owns_active_ipc_lease(),
+        # Writes a queued solve's v3 file when live delivery is not possible.
+        solve_files=wglink_watch,
     )
     client.start()
     _live_client = client

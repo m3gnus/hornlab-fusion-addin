@@ -11,7 +11,17 @@ ids, secrets and tokens are made deterministic by replacing the clock and the
 random sources of ``server.cadlink.live.registry`` (and the heartbeat clock of
 ``server.cadlink.fusion_status``), so the same WG commit records the same file.
 Machine-specific values are normalized: the port in ``baseUrl`` becomes
-``{port}`` and the endpoint file's ``pid`` becomes 12345.
+``{port}``, the endpoint file's ``pid`` becomes 12345, and the wall-clock
+``createdAt``/``updatedAt`` of an operation in a delivery answer become
+``{time}``.
+
+Deliveries (protocol section 8) are recorded against a selected WGLink folder
+holding real ``.wgreturn`` bundles written by WG's own test helper, retained
+into WG's own storage. WG's transient-bound clock and its snapshot wall clock
+are replaced so the 30 s bound and the 24 h bound are reached deterministically;
+``store_busy`` is produced by making WG's live acceptance raise SQLite's
+"database is locked", and ``update_restart_pending`` by an approved restart,
+both answered by WG's real route.
 
 ``--check`` regenerates in memory and fails if ``exchanges.json`` differs.
 """
@@ -118,8 +128,13 @@ class _Wire:
         try:
             with self.opener.open(request, timeout=10) as response:
                 status, raw = response.status, response.read()
+                retry_after = response.headers.get("Retry-After")
         except urllib.error.HTTPError as error:
             status, raw = error.code, error.read()
+            retry_after = error.headers.get("Retry-After")
+        answer = {"status": status, "body": json.loads(raw) if raw else None}
+        if retry_after is not None:
+            answer["headers"] = {"Retry-After": retry_after}
         return {
             "request": {
                 "method": method,
@@ -127,7 +142,7 @@ class _Wire:
                 "headers": {name: headers[name] for name in RECORDED_HEADERS if name in headers},
                 "body": body,
             },
-            "response": {"status": status, "body": json.loads(raw) if raw else None},
+            "response": answer,
         }
 
 
@@ -262,7 +277,19 @@ def record(checkout: Path) -> dict:
             application.state.live_registry = registry
 
         first_endpoint = endpoint
-        with _wg_live_app.serving(data_dir) as application:
+        workspace = Path(temporary) / "workspace"
+        workspace.mkdir()
+        bound_clock = {"now": 5_000.0}
+        wall_clock = {"now": datetime(2026, 9, 17, 10, 0, 0, tzinfo=timezone.utc)}
+        from server.cadlink import preparation, solve_command
+
+        solve_command._now = lambda: bound_clock["now"]
+        preparation._wall_now = lambda: wall_clock["now"]
+
+        def select(application) -> None:
+            application.state.cad_workspace.select(workspace)
+
+        with _wg_live_app.serving(data_dir, configure=select) as application:
             port = application.state.test_port
             wire = _Wire(port)
             restarted_raw = json.loads(
@@ -283,6 +310,11 @@ def record(checkout: Path) -> dict:
             exchanges["restart_register"] = wire.send(
                 "POST", "/sessions", install, _registration(restarted_raw, CLIENT_NONCE_BYTES)
             )
+            session = {
+                "Authorization": f"Bearer {exchanges['restart_register']['response']['body']['sessionToken']}",
+                **install,
+            }
+            _record_deliveries(exchanges, wire, application, session, workspace, bound_clock, wall_clock, third)
 
     return {
         "schemaVersion": 1,
@@ -301,6 +333,97 @@ def record(checkout: Path) -> dict:
         "heartbeat": exchanges["heartbeat"]["request"]["body"],
         "exchanges": exchanges,
     }
+
+
+SOLVE_ID = "0b5a1c7e-5d2f-4c3a-8e1b-000000000001"
+SNAPSHOT_ID = "0b5a1c7e-5d2f-4c3a-8e1b-000000000002"
+UNREADABLE_ID = "0b5a1c7e-5d2f-4c3a-8e1b-000000000003"
+BUSY_ID = "0b5a1c7e-5d2f-4c3a-8e1b-000000000004"
+REFUSED_ID = "0b5a1c7e-5d2f-4c3a-8e1b-000000000005"
+REQUESTED_AT = "2026-09-17T10:00:00Z"
+
+
+def _delivery(operation_id: str, kind: str, bundle_path: str, manifest: str, **extra) -> dict:
+    body = {
+        "operationId": operation_id,
+        "kind": kind,
+        "bundlePath": bundle_path,
+        "manifestSha256": manifest,
+        "requestedAt": REQUESTED_AT,
+    }
+    if kind == "prepare_and_solve":
+        body["returnId"] = "wgr_1"
+    body.update(extra)
+    return body
+
+
+def _normalized_delivery(exchange: dict) -> dict:
+    operation = (exchange["response"]["body"] or {}).get("operation")
+    if isinstance(operation, dict):
+        for key in ("createdAt", "updatedAt"):
+            if operation.get(key) is not None:
+                operation[key] = "{time}"
+    return exchange
+
+
+def _record_deliveries(exchanges, wire, application, session, workspace, bound_clock, wall_clock, old_token) -> None:
+    """Section 8 answers from WG's real route, in an order that needs no reset."""
+
+    import sqlite3
+    from datetime import timedelta
+
+    from server.cadlink import solve_command
+    from server.tests.test_cad_preparation import _write_return
+
+    first_path, first_manifest = _write_return(workspace, "first.wgreturn", step=b"STEP first")
+    second_path, second_manifest = _write_return(workspace, "second.wgreturn", step=b"STEP second")
+    missing_path, missing_manifest = "wgreturn/missing.wgreturn", "sha256:" + "4" * 64
+
+    def deliver(name: str, body: dict, headers: dict | None = None) -> None:
+        exchanges[name] = _normalized_delivery(wire.send("POST", "/deliveries", headers or session, body))
+
+    solve = _delivery(SOLVE_ID, "prepare_and_solve", first_path, first_manifest)
+    deliver("deliver_solve_created", solve)
+    deliver("deliver_solve_recovered", solve)
+    deliver("deliver_conflict", _delivery(SOLVE_ID, "prepare_and_solve", second_path, second_manifest))
+    deliver("deliver_snapshot_created", _delivery(SNAPSHOT_ID, "receive_snapshot", second_path, second_manifest))
+    unreadable = _delivery(UNREADABLE_ID, "receive_snapshot", missing_path, missing_manifest)
+    deliver("deliver_snapshot_not_readable", unreadable)
+    bound_clock["now"] += solve_command.LIVE_TRANSIENT_BOUND_S
+    deliver("deliver_snapshot_not_readable_at_bound", unreadable)
+
+    real = solve_command.deliver_live
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    solve_command.deliver_live = locked
+    try:
+        deliver("deliver_store_busy", _delivery(BUSY_ID, "prepare_and_solve", first_path, first_manifest))
+    finally:
+        solve_command.deliver_live = real
+
+    refused = _delivery(REFUSED_ID, "prepare_and_solve", first_path, first_manifest)
+    cad_workspace = application.state.cad_workspace
+    selected = cad_workspace._selected
+    cad_workspace._selected = None
+    try:
+        deliver("deliver_folder_not_selected", refused)
+    finally:
+        cad_workspace._selected = selected
+    restart = application.state.update_restart
+    restart.refusal = lambda: "An update restart is pending."
+    try:
+        deliver("deliver_update_restart_pending", refused)
+    finally:
+        del restart.refusal
+    deliver("deliver_invalid_request", {**refused, "attemptGeneration": 1})
+    deliver("deliver_with_an_old_token", refused, {**session, "Authorization": f"Bearer {old_token}"})
+
+    # The unreadable snapshot, 24 hours later: rejected, and still a 200.
+    wall_clock["now"] += timedelta(hours=24)
+    bound_clock["now"] += solve_command.LIVE_TRANSIENT_BOUND_S + solve_command.LIVE_DEADLINE_MEMORY_S
+    deliver("deliver_snapshot_unavailable", unreadable)
 
 
 def _head(checkout: Path) -> str:

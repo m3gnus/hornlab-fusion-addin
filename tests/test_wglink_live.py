@@ -37,7 +37,7 @@ import wglink_watch  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "live-protocol-v1" / "exchanges.json"
 #: sha256 of the recorded exchanges; a re-recording must update this on purpose.
-EXCHANGES_SHA256 = "c0f1b8db5c309589f28d5a9fa6f5e8e697580262ab5d38b134d98a116d6d3713"
+EXCHANGES_SHA256 = "fd60989925560dd0b53da9231dabf73938e1ebdfff545eadedf5d8cdd7a01f96"
 LIVE = "/api/cadlink/live"
 INSTALLATION_HEADER = "X-WGLink-Installation"
 ADAPTER_SESSION = "fusion-session-under-test"
@@ -241,7 +241,7 @@ class FakeTransport:
     def request(self, method: str, path: str, *, headers: dict[str, str] | None = None,
                 body: object = None, timeout: float = 5.0) -> "wglink_live.Answer":
         assert self.base_url == f"http://127.0.0.1:{self.wg.port}", "the client left the endpoint's baseUrl"
-        assert 0 < timeout <= 10
+        assert 0 < timeout <= wglink_live.DELIVERY_TIMEOUT_SECONDS
         assert not path.startswith(LIVE), "paths are relative to the live prefix"
         request = Request(method, LIVE + path, dict(headers or {}), body, threading.current_thread().name)
         self.wg.requests.append(request)
@@ -1311,7 +1311,9 @@ class Replay:
         self.served.append(name)
         response = exchange["response"]
         payload = json.dumps(response["body"]).encode() if response["body"] is not None else b""
-        return response["status"], {"Content-Type": "application/json"} if payload else {}, payload
+        headers = {"Content-Type": "application/json"} if payload else {}
+        headers.update(response.get("headers") or {})
+        return response["status"], headers, payload
 
 
 def _replay_client(tmp_path: Path, fixture: dict[str, Any], port: int, clock: Clock, endpoint_key: str = "endpoint"):

@@ -204,15 +204,46 @@ def write_solve_request(
     updated instead.
     """
 
-    folder = ipc_folder.expanduser().resolve()
+    require_solve_delivery(ipc_folder)
+    relative, manifest_sha256 = return_reference(bundle_path, workspace_root)
+    return write_solve_request_fields(
+        ipc_folder,
+        command_id=command_id,
+        return_id=return_id,
+        bundle_relative=relative,
+        manifest_sha256=manifest_sha256,
+        requested_at=utc_timestamp(requested_at),
+    )
+
+
+def require_solve_delivery(ipc_folder: Path) -> None:
+    """``WgOutdatedError`` unless WG reads this add-in's solve-command version."""
+
+    folder = Path(ipc_folder).expanduser().resolve()
     if wg_delivery_version(folder, SOLVE_COMMAND_DELIVERY) < DELIVERY_VERSION:
         raise WgOutdatedError(WG_OUTDATED_MESSAGE)
-    if not _PLAIN_ID.fullmatch(str(command_id)):
-        raise ValueError(
-            f"A solve command id must be a plain file name, got {command_id!r}."
-        )
-    bundle = bundle_path.expanduser().resolve()
-    root = workspace_root.expanduser().resolve()
+
+
+def utc_timestamp(moment: datetime | None = None) -> str:
+    """A request's ``requestedAt``: UTC, whole seconds, ``Z``."""
+
+    return (
+        (moment or datetime.now(timezone.utc))
+        .astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def return_reference(bundle_path: Path, workspace_root: Path) -> tuple[str, str]:
+    """How a delivery names a published return: workspace-relative path, manifest hash.
+
+    One spelling for both carriers -- the v3 solve file and the live delivery
+    -- because WG's operation digest is made of exactly these two strings.
+    """
+
+    bundle = Path(bundle_path).expanduser().resolve()
+    root = Path(workspace_root).expanduser().resolve()
     try:
         relative = bundle.relative_to(root)
     except ValueError as exc:
@@ -220,22 +251,48 @@ def write_solve_request(
             f"Return bundle {bundle} is not inside the WGLink workspace {root}."
         ) from exc
     digest = hashlib.sha256((bundle / "wgreturn.json").read_bytes()).hexdigest()
+    return relative.as_posix(), f"sha256:{digest}"
+
+
+def solve_request_path(ipc_folder: Path, command_id: str) -> Path:
+    """Where the v3 solve file for ``command_id`` is written (and taken from by WG)."""
+
+    return Path(ipc_folder).expanduser().resolve() / SOLVE_REQUESTS_DIRECTORY / f"{command_id}.json"
+
+
+def write_solve_request_fields(
+    ipc_folder: Path,
+    *,
+    command_id: str,
+    return_id: str,
+    bundle_relative: str,
+    manifest_sha256: str,
+    requested_at: str,
+) -> Path:
+    """Write the v3 solve file from a return reference already taken.
+
+    The live outbox writes an item's file with this, so the file and the live
+    delivery name the same operation with the same strings.
+    """
+
+    require_solve_delivery(ipc_folder)
+    if not _PLAIN_ID.fullmatch(str(command_id)):
+        raise ValueError(
+            f"A solve command id must be a plain file name, got {command_id!r}."
+        )
     payload = {
         "schemaVersion": REQUEST_SCHEMA_VERSION,
         "target": "waveguide-generator",
         "commandId": str(command_id),
         "operationId": str(command_id),
         "returnId": str(return_id),
-        "bundlePath": relative.as_posix(),
-        "manifestSha256": f"sha256:{digest}",
-        "requestedAt": (requested_at or datetime.now(timezone.utc))
-        .astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z"),
+        "bundlePath": str(bundle_relative),
+        "manifestSha256": str(manifest_sha256),
+        "requestedAt": str(requested_at),
     }
-    directory = folder / SOLVE_REQUESTS_DIRECTORY
-    directory.mkdir(parents=True, exist_ok=True)
-    return _write_json_atomically(directory / f"{payload['commandId']}.json", payload)
+    path = solve_request_path(ipc_folder, payload["commandId"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _write_json_atomically(path, payload)
 
 
 @dataclass(frozen=True)

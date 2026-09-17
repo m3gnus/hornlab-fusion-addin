@@ -20,6 +20,473 @@
     "startedAt": "2026-09-10T00:26:40Z"
   },
   "exchanges": {
+    "deliver_conflict": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/second.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:fa667fa0d6d20480f193fb77166b5d35e543cee1775e8d9c782bf22bd59c676a",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000001",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "This operation id already names a different request; it is left as it is.",
+          "error": {
+            "client_request_id": null,
+            "code": "operation_conflict",
+            "details": {},
+            "message": "This operation id already names a different request; it is left as it is.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "deliver_folder_not_selected": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000005",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "No WGLink folder is selected in WG, so it cannot read the return; retry once one is.",
+          "error": {
+            "client_request_id": null,
+            "code": "wglink_folder_not_selected",
+            "details": {},
+            "message": "No WGLink folder is selected in WG, so it cannot read the return; retry once one is.",
+            "retryable": true,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "deliver_invalid_request": {
+      "request": {
+        "body": {
+          "attemptGeneration": 1,
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000005",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "The request is not valid.",
+          "error": {
+            "client_request_id": null,
+            "code": "invalid_request",
+            "details": {
+              "errors": [
+                {
+                  "loc": [
+                    "body"
+                  ],
+                  "type": "extra_forbidden"
+                }
+              ]
+            },
+            "message": "The request is not valid.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 400
+      }
+    },
+    "deliver_snapshot_created": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/second.wgreturn",
+          "kind": "receive_snapshot",
+          "manifestSha256": "sha256:fa667fa0d6d20480f193fb77166b5d35e543cee1775e8d9c782bf22bd59c676a",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000002",
+          "requestedAt": "2026-09-17T10:00:00Z"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "operation": {
+            "attemptGeneration": 1,
+            "createdAt": "{time}",
+            "jobId": null,
+            "kind": "receive_snapshot",
+            "legacy": false,
+            "message": "WG verified and kept this snapshot.",
+            "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000002",
+            "preparationId": null,
+            "reason": null,
+            "setupRevisionId": null,
+            "snapshot": {
+              "documentName": "Tritonia speaker",
+              "manifestSha256": "sha256:fa667fa0d6d20480f193fb77166b5d35e543cee1775e8d9c782bf22bd59c676a",
+              "projectLineageId": null
+            },
+            "stage": "received",
+            "state": "accepted",
+            "updatedAt": "{time}"
+          },
+          "result": "created"
+        },
+        "status": 200
+      }
+    },
+    "deliver_snapshot_not_readable": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/missing.wgreturn",
+          "kind": "receive_snapshot",
+          "manifestSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000003",
+          "requestedAt": "2026-09-17T10:00:00Z"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "WG cannot read the return in the WGLink folder yet; retry shortly.",
+          "error": {
+            "client_request_id": null,
+            "code": "snapshot_not_readable",
+            "details": {},
+            "message": "WG cannot read the return in the WGLink folder yet; retry shortly.",
+            "retryable": true,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "headers": {
+          "Retry-After": "1"
+        },
+        "status": 503
+      }
+    },
+    "deliver_snapshot_not_readable_at_bound": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/missing.wgreturn",
+          "kind": "receive_snapshot",
+          "manifestSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000003",
+          "requestedAt": "2026-09-17T10:00:00Z"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "operation": {
+            "attemptGeneration": 0,
+            "createdAt": "{time}",
+            "jobId": null,
+            "kind": "receive_snapshot",
+            "legacy": false,
+            "message": null,
+            "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000003",
+            "preparationId": null,
+            "reason": null,
+            "setupRevisionId": null,
+            "snapshot": null,
+            "stage": "received",
+            "state": "received",
+            "updatedAt": "{time}"
+          },
+          "result": "recovered"
+        },
+        "status": 200
+      }
+    },
+    "deliver_snapshot_unavailable": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/missing.wgreturn",
+          "kind": "receive_snapshot",
+          "manifestSha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000003",
+          "requestedAt": "2026-09-17T10:00:00Z"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "operation": {
+            "attemptGeneration": 1,
+            "createdAt": "{time}",
+            "jobId": null,
+            "kind": "receive_snapshot",
+            "legacy": false,
+            "message": "WG could not read this snapshot in the WGLink folder for 24 hours. Send it again from Fusion.",
+            "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000003",
+            "preparationId": null,
+            "reason": "snapshot_unavailable",
+            "setupRevisionId": null,
+            "snapshot": null,
+            "stage": "received",
+            "state": "rejected",
+            "updatedAt": "{time}"
+          },
+          "result": "recovered"
+        },
+        "status": 200
+      }
+    },
+    "deliver_solve_created": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000001",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "operation": {
+            "attemptGeneration": 0,
+            "createdAt": "{time}",
+            "jobId": null,
+            "kind": "prepare_and_solve",
+            "legacy": false,
+            "message": null,
+            "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000001",
+            "preparationId": null,
+            "reason": null,
+            "setupRevisionId": null,
+            "snapshot": {
+              "documentName": "Tritonia speaker",
+              "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+              "projectLineageId": null
+            },
+            "stage": "received",
+            "state": "received",
+            "updatedAt": "{time}"
+          },
+          "result": "created"
+        },
+        "status": 200
+      }
+    },
+    "deliver_solve_recovered": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000001",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "operation": {
+            "attemptGeneration": 0,
+            "createdAt": "{time}",
+            "jobId": null,
+            "kind": "prepare_and_solve",
+            "legacy": false,
+            "message": null,
+            "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000001",
+            "preparationId": null,
+            "reason": null,
+            "setupRevisionId": null,
+            "snapshot": {
+              "documentName": "Tritonia speaker",
+              "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+              "projectLineageId": null
+            },
+            "stage": "received",
+            "state": "received",
+            "updatedAt": "{time}"
+          },
+          "result": "recovered"
+        },
+        "status": 200
+      }
+    },
+    "deliver_store_busy": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000004",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "WG's operation store is busy; retry shortly.",
+          "error": {
+            "client_request_id": null,
+            "code": "store_busy",
+            "details": {},
+            "message": "WG's operation store is busy; retry shortly.",
+            "retryable": true,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "headers": {
+          "Retry-After": "1"
+        },
+        "status": 503
+      }
+    },
+    "deliver_update_restart_pending": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000005",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "Waveguide Generator is about to restart for an update; deliver this again after it.",
+          "error": {
+            "client_request_id": null,
+            "code": "update_restart_pending",
+            "details": {},
+            "message": "Waveguide Generator is about to restart for an update; deliver this again after it.",
+            "retryable": true,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "deliver_with_an_old_token": {
+      "request": {
+        "body": {
+          "bundlePath": "wgreturn/first.wgreturn",
+          "kind": "prepare_and_solve",
+          "manifestSha256": "sha256:7f630befb4d61f95ff81dab72d6abfadf0889ff435769703ac401c3e40cac046",
+          "operationId": "0b5a1c7e-5d2f-4c3a-8e1b-000000000005",
+          "requestedAt": "2026-09-17T10:00:00Z",
+          "returnId": "wgr_1"
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0005-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/deliveries"
+      },
+      "response": {
+        "body": {
+          "detail": "No live CAD Link session has this token; register again.",
+          "error": {
+            "client_request_id": null,
+            "code": "session_unknown",
+            "details": {},
+            "message": "No live CAD Link session has this token; register again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
     "end": {
       "request": {
         "body": null,

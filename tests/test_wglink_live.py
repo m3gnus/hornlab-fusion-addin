@@ -1021,6 +1021,10 @@ def test_no_token_secret_or_proof_reaches_logs_status_or_files(tmp_path: Path) -
 # -- transport (real loopback HTTP) --------------------------------------------
 
 
+class DropConnection(Exception):
+    """Tell the loopback stub to close without writing an HTTP response."""
+
+
 class StubServer:
     """A loopback HTTP server whose answers a test chooses."""
 
@@ -1041,6 +1045,9 @@ class StubServer:
                 stub.requests.append((self.command, self.path, headers, body))
                 try:
                     status, extra, payload = stub.handle(stub, self.command, self.path, headers, body)
+                except DropConnection:
+                    self.close_connection = True
+                    return
                 except Exception as exc:  # noqa: BLE001 - surfaced by the test
                     stub.errors.append(exc)
                     status, extra, payload = 599, {}, b""
@@ -1130,7 +1137,10 @@ def test_a_closed_port_or_a_timeout_is_a_network_failure(stub_factory) -> None:
 
     def slow(_stub, *_args):
         time.sleep(1.5)
-        return 200, {}, b"{}"
+        # The caller has timed out and closed its socket by now. Model that
+        # network failure without making the background handler write to the
+        # closed connection after this test has already finished.
+        raise DropConnection
 
     stub = stub_factory(slow)
     started = time.monotonic()

@@ -2407,6 +2407,210 @@ def _stamp_attributes(design: object) -> list[tuple[object, dict[str, Any]]]:
     return result
 
 
+class _StampEdit:
+    """Every stamp write of one command, undone together if any of them fails.
+
+    A face in an externally referenced (read-only) component refuses the write;
+    without this, the faces written before it would keep a half-applied source.
+    """
+
+    def __init__(self) -> None:
+        self._originals: list[tuple[object, str | None]] = []
+
+    def _remember(self, face: object) -> None:
+        if any(face is seen for seen, _value in self._originals):
+            return
+        self._originals.append(
+            (face, wglink_core._attribute_value(face, SOURCE_IDENTITY_ATTRIBUTE))
+        )
+
+    def write(self, face: object, stamp: dict[str, Any]) -> None:
+        self._remember(face)
+        wglink_core._set_attribute(face, SOURCE_IDENTITY_ATTRIBUTE, wglink_core._json(stamp))
+
+    def delete(self, face: object) -> None:
+        attribute = wglink_core._attribute(face, SOURCE_IDENTITY_ATTRIBUTE)
+        if attribute is None:
+            return
+        self._remember(face)
+        if attribute.deleteMe() is False:
+            raise wglink_core.WgLinkError("Fusion refused to remove a WG source identity.")
+
+    def rollback(self) -> list[str]:
+        problems: list[str] = []
+        for face, value in reversed(self._originals):
+            try:
+                if value is None:
+                    attribute = wglink_core._attribute(face, SOURCE_IDENTITY_ATTRIBUTE)
+                    if attribute is not None:
+                        attribute.deleteMe()
+                else:
+                    wglink_core._set_attribute(face, SOURCE_IDENTITY_ATTRIBUTE, value)
+            except Exception as exc:  # noqa: BLE001 - report every face we could not restore
+                problems.append(str(exc))
+        return problems
+
+
+def _run_edit(action: str, body) -> Any:
+    edit = _StampEdit()
+    try:
+        return body(edit)
+    except Exception as exc:  # noqa: BLE001 - roll back, then refuse with the cause
+        problems = edit.rollback()
+        detail = str(exc)
+        if problems:
+            detail += (
+                f"; {len(problems)} face(s) could not be restored, so undo this "
+                "command in Fusion"
+            )
+        raise wglink_core.WgLinkError(
+            f"Could not {action}: {detail}. No source identity was changed."
+            if not problems
+            else f"Could not {action}: {detail}."
+        ) from exc
+
+
+def _is_managed_throat(face: object) -> bool:
+    return wglink_core._attribute_value(face, "face_role") is not None
+
+
+def _detach_from_identity(edit: _StampEdit, design: object, face: object) -> None:
+    """Take ``face`` out of the source it was stamped into.
+
+    The others keep their identity and their count drops by one. A decrement,
+    never a recount: a source that had already lost a face must still read as
+    short afterwards, not be made to add up by this edit.
+    """
+
+    stamp = read_source_stamp(face)
+    edit.delete(face)
+    if stamp is None:
+        return
+    for member, _attribute, member_stamp in _identity_members(design, stamp["id"]):
+        if _same_live_entity(member, face):
+            continue
+        edit.write(member, dict(member_stamp, faces=max(1, member_stamp["faces"] - 1)))
+
+
+def _valid_group(
+    members: list[tuple[object, object, dict[str, Any]]],
+    canonical: str,
+    selected: list[object],
+) -> bool:
+    """Whether a role's existing stamps still form exactly the source they record.
+
+    Every member must still be painted that role -- a face whose paint was
+    removed or changed by hand is a stale member, which makes the source one
+    that no longer resolves. The faces just painted by this command count as
+    painted whatever their proxy/native appearance reads back.
+    """
+
+    natives = _distinct_entities([member for member, _attribute, _stamp in members])
+    if not natives or len(natives) != len(members):
+        return False
+    for member in natives:
+        just_painted = any(_same_live_entity(member, native) for native in selected)
+        if not just_painted and _painted_role(member) != canonical:
+            return False
+    counts = {stamp["faces"] for _member, _attribute, stamp in members}
+    nonces = [stamp["face"] for _member, _attribute, stamp in members]
+    return counts == {len(natives)} and len(set(nonces)) == len(nonces)
+
+
+def assign_source_identity(design: object, faces: list[object], role: str) -> dict[str, Any]:
+    """Stamp the selected faces, just painted ``role``, with that source's identity.
+
+    Adding faces to a source that still resolves keeps its identity, so WG keeps
+    the setup it recorded for it. When the design's existing ``role`` stamps do
+    not resolve -- a member's paint removed or changed, a face removed, split or
+    copied, or two identities -- this is the reassignment WGLink asked for: a new
+    identity is minted for the selected faces and the stale stamps are removed
+    from every other face, so WG does not carry a setup across a remapping nobody
+    confirmed. All writes succeed together or none remain.
+
+    A managed throat face is left alone; its identity comes from its link.
+    """
+
+    canonical = _canonical_source_role(role) or role
+    selected = [
+        native
+        for native in _distinct_entities([_native_face(face) for face in faces])
+        if not _is_managed_throat(native)
+    ]
+    if not selected:
+        return {"identity": None, "stamped": 0, "kept": False}
+
+    def body(edit: _StampEdit) -> dict[str, Any]:
+        for native in selected:
+            stamp = read_source_stamp(native)
+            if stamp is not None and _canonical_source_role(stamp["role"]) != canonical:
+                _detach_from_identity(edit, design, native)
+
+        groups: dict[str, list[tuple[object, object, dict[str, Any]]]] = {}
+        for attribute, stamp in _stamp_attributes(design):
+            if _canonical_source_role(stamp["role"]) == canonical:
+                groups.setdefault(stamp["id"], []).append((attribute.parent, attribute, stamp))
+        if len(groups) == 1:
+            identity, members = next(iter(groups.items()))
+            if _valid_group(members, canonical, selected):
+                joining = [
+                    native
+                    for native in selected
+                    if not any(_same_live_entity(native, member) for member, _a, _s in members)
+                ]
+                total = len(members) + len(joining)
+                for member, _attribute, stamp in members:
+                    if stamp["faces"] != total:
+                        edit.write(member, dict(stamp, faces=total))
+                for native in joining:
+                    edit.write(native, _new_stamp(identity, canonical, total))
+                return {"identity": identity, "stamped": len(joining), "kept": True}
+
+        identity = _mint_source_identity()
+        for group in groups.values():
+            for member, _attribute, _stamp in group:
+                if not any(_same_live_entity(member, native) for native in selected):
+                    edit.delete(member)
+        for native in selected:
+            edit.write(native, _new_stamp(identity, canonical, len(selected)))
+        return {"identity": identity, "stamped": len(selected), "kept": False}
+
+    return _run_edit(f"stamp the {canonical} source identity", body)
+
+
+def _new_stamp(identity: str, role: str, faces: int) -> dict[str, Any]:
+    return {
+        "schema": SOURCE_IDENTITY_SCHEMA,
+        "id": identity,
+        "role": role,
+        "face": uuid.uuid4().hex,
+        "faces": faces,
+    }
+
+
+def clear_source_identity(design: object, faces: list[object]) -> int:
+    """Remove the source identity from every selected face, painted or not.
+
+    A face whose paint was already removed by hand still carries its stamp;
+    Clear is how that stale member is taken out of its source.
+    """
+
+    targets = [
+        native
+        for native in _distinct_entities([_native_face(face) for face in faces])
+        if wglink_core._attribute(native, SOURCE_IDENTITY_ATTRIBUTE) is not None
+    ]
+    if not targets:
+        return 0
+
+    def body(edit: _StampEdit) -> int:
+        for native in targets:
+            _detach_from_identity(edit, design, native)
+        return len(targets)
+
+    return _run_edit("clear the WG source identity", body)
+
+
 def _source_ids(role: str, used: set[str]) -> tuple[str, str]:
     base = _slug(role)
     suffix = ""

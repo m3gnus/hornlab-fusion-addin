@@ -540,7 +540,41 @@ def _fake_face(role: str | None, area: float = 5.0) -> object:
     return types.SimpleNamespace(
         area=area,
         appearance=None if role is None else types.SimpleNamespace(name=role),
+        attributes=_Attributes(),
     )
+
+
+class _FoundAttribute:
+    def __init__(self, parent: object, key: tuple[str, str]) -> None:
+        self.parent, self.groupName, self.name = parent, key[0], key[1]
+        self._key = key
+
+    @property
+    def value(self) -> object:
+        return self.parent.attributes.values.get(self._key)
+
+    def deleteMe(self) -> bool:
+        self.parent.attributes.values.pop(self._key, None)
+        return True
+
+
+def _face_design(faces: list[object]) -> object:
+    """A design whose attribute search sees exactly these faces' stamps."""
+
+    def find(group: str, name: str) -> list[object]:
+        return [
+            _FoundAttribute(face, key)
+            for face in faces
+            for key in list(face.attributes.values)
+            if key == (group, name)
+        ]
+
+    return types.SimpleNamespace(findAttributes=find)
+
+
+def _identity_stamp(face: object) -> dict[str, object] | None:
+    raw = face.attributes.values.get(("WGLink", "source_identity"))
+    return None if raw is None else json.loads(raw)
 
 
 def _fake_body(name: str, *, solid: bool = True) -> object:
@@ -735,7 +769,6 @@ def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
     module = _load_instance(
         monkeypatch, "WGLink_apply_source", _UI(_Panels(), _Definitions(reserve_ids=False))
     )
-    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: "design")
     minted: list[str] = []
     monkeypatch.setattr(
         module.wglink_core,
@@ -743,6 +776,8 @@ def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
         lambda _app, _design, name: (minted.append(name), types.SimpleNamespace(name=name))[1],
     )
     blank, wrong, already = _fake_face(None), _fake_face("MF"), _fake_face("HF")
+    design = _face_design([blank, wrong, already])
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
     inputs = _dialog_inputs(
         source_faces=_SelectionInput([blank, wrong, already]),
         source_role=_chosen("HF"),
@@ -756,6 +791,43 @@ def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
     assert "3 faces now drive the HF source" in report["summary"]
     # Fusion reports square centimetres; the summary states square millimetres.
     assert "1500.0 mm²" in report["summary"]
+    # Every selected face -- the one that already carried HF too -- is stamped
+    # with one source identity, which is what a later Send resolves.
+    stamps = [_identity_stamp(face) for face in (blank, wrong, already)]
+    assert all(stamp is not None for stamp in stamps)
+    assert {stamp["id"] for stamp in stamps} == {stamps[0]["id"]}
+    assert {stamp["faces"] for stamp in stamps} == {3}
+    assert {stamp["role"] for stamp in stamps} == {"HF"}
+
+
+def test_setting_a_source_again_on_a_refused_source_reassigns_a_new_identity(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_reassign_source", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_named_appearance",
+        lambda _app, _design, name: types.SimpleNamespace(name=name),
+    )
+    first, second = _fake_face("HF"), _fake_face("HF")
+    design = _face_design([first, second])
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
+    module._apply_source_role(_dialog_inputs(
+        source_faces=_SelectionInput([first]), source_role=_chosen("HF")
+    ))
+    original = _identity_stamp(first)
+    # A split: Fusion copied the face's stamp onto the other half.
+    second.attributes.values = dict(first.attributes.values)
+    with pytest.raises(module.wglink_core.WgLinkError, match="split or copied"):
+        module.wglink_send._painted_source_identity("HF", [first, second])
+
+    module._apply_source_role(_dialog_inputs(
+        source_faces=_SelectionInput([first, second]), source_role=_chosen("HF")
+    ))
+
+    assert module.wglink_send._painted_source_identity("HF", [first, second]) != original["id"]
 
 
 def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
@@ -764,7 +836,6 @@ def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
     module = _load_instance(
         monkeypatch, "WGLink_clear_source", _UI(_Panels(), _Definitions(reserve_ids=False))
     )
-    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: "design")
     minted: list[str] = []
     monkeypatch.setattr(
         module.wglink_core,
@@ -774,6 +845,12 @@ def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
     # PORT_EXIT is the retired spelling of PASSIVE_CARDIOID; Clear still has
     # to recognise -- and strip -- a face painted under the old name.
     role, painted = _fake_face("PORT_EXIT"), _fake_face("Steel - Satin")
+    kept = _fake_face("PORT_EXIT")
+    design = _face_design([role, painted, kept])
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
+    stamp = {"schema": 1, "id": "wgs-00000000000000000001", "role": "PORT_EXIT", "faces": 2}
+    role.attributes.values[("WGLink", "source_identity")] = json.dumps(dict(stamp, face="a"))
+    kept.attributes.values[("WGLink", "source_identity")] = json.dumps(dict(stamp, face="b"))
     inputs = _dialog_inputs(
         source_faces=_SelectionInput([role, painted]),
         source_role=_chosen(module.wglink_author.CLEAR_SOURCE_LABEL),
@@ -786,6 +863,35 @@ def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
     assert role.appearance is None
     assert painted.appearance.name == "Steel - Satin"
     assert "Cleared the WG source role from 1 face" in report["summary"]
+    # Its identity goes with the role, and the face that stays is one short.
+    assert _identity_stamp(role) is None
+    assert _identity_stamp(kept)["faces"] == 1
+
+
+def test_clear_takes_the_identity_off_a_face_whose_paint_was_removed_by_hand(
+    monkeypatch,
+) -> None:
+    """The face carries no role any more, so the appearance plan leaves it alone;
+    its stale stamp still has to go, or its source stays refused for good."""
+
+    module = _load_instance(
+        monkeypatch, "WGLink_clear_stale_stamp", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    stripped, kept = _fake_face(None), _fake_face("HF")
+    design = _face_design([stripped, kept])
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
+    stamp = {"schema": 1, "id": "wgs-00000000000000000002", "role": "HF", "faces": 2}
+    stripped.attributes.values[("WGLink", "source_identity")] = json.dumps(dict(stamp, face="a"))
+    kept.attributes.values[("WGLink", "source_identity")] = json.dumps(dict(stamp, face="b"))
+
+    report = module._apply_source_role(_dialog_inputs(
+        source_faces=_SelectionInput([stripped]),
+        source_role=_chosen(module.wglink_author.CLEAR_SOURCE_LABEL),
+    ))
+
+    assert _identity_stamp(stripped) is None
+    assert _identity_stamp(kept)["faces"] == 1
+    assert "stale WG source identity from 1 face" in report["summary"]
 
 
 def test_declaring_bodies_writes_the_attribute_the_export_scope_reads(

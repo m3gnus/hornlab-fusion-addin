@@ -93,6 +93,40 @@ Relink remain full head-less APIs but are not panel commands.
   a Fusion appearance by hand. The same dialog clears a role, which strips only
   faces that actually carry one of the four roles — a face painted with your own
   material is left alone.
+
+  The command also stamps each selected face with the source's identity (a
+  `source_identity` attribute on the native face: the id, the role, a per-face
+  nonce and the number of faces the source was marked on). When WG advertises
+  `"sourceIdentity": 1` in `wg-capabilities.json`, Send, Solve, a return WG
+  asks for, the pre-flight and the heartbeat all declare `source-identity-v1`,
+  and each `sources[].id` becomes that stable identity (`wgs-` and 20 base32
+  characters) instead of the role-derived `source-hf`. A linked throat's identity
+  is derived from its link's `instance_id` and needs no stamp. A WG that does not
+  advertise the capability gets the legacy manifest, byte for byte, stamps or
+  not. Fusion entity tokens and stamps never enter the manifest.
+
+  Export refuses a painted role, never guessing, when a face carries no stamp,
+  the faces carry two identities, a face was split or copied, or the source no
+  longer adds up to the faces it was marked on. What re-running
+  **Set WG Source…** does depends on the source:
+
+  - **The source no longer resolves** — a member face's paint was removed or
+    changed by hand, a face was removed, split or copied, or two identities
+    share the role. Selecting every face that should drive the role and running
+    the command gives it a **new** identity, removes the stale stamps from every
+    other face, and WG asks for that source's setup again.
+  - **The source still resolves** — the selected faces are added to it and it
+    **keeps** its identity; this is also the remedy for faces painted by hand or
+    before identities existed.
+  - **Part of the source is outside what is being sent** (another component, or
+    a body the selection leaves out) — the refusal says so. Include those faces
+    in the export, or select them and **Clear** their WG source; running the
+    command again on the faces in scope changes nothing.
+
+  Clear removes the stamp from every selected face, including one whose paint
+  was already removed by hand. A source whose faces were all deleted is simply
+  absent from the next return. The command's stamp writes succeed together or
+  are rolled back together (a read-only referenced component refuses a write).
 - **Solve in WG** writes the same validated `.wgreturn` bundle as Send to WG,
   then asks Waveguide Generator to prepare that exact bundle and start the
   solve, so WG is already solving when you switch to it. The request is a
@@ -275,6 +309,30 @@ three-registration promotion, orderly owner-first stop, expired-owner takeover,
 and realistic occurrence-proxy attribute behavior. The same cases still need
 verification in a live Fusion process before this recovery path is considered
 field-validated.
+
+### Source identity: live-Fusion verification still owed
+
+Fake-backed tests cover the resolution, refusal, reassignment, rollback and
+capability gating above. These depend on Fusion behaviour a fake cannot prove,
+and need a live check on macOS and Windows before the feature is field-validated:
+
+- A face split, copied, pasted or patterned carries its original's attribute
+  onto every result (the split/copy refusal relies on it).
+- Stamps survive an upstream timeline edit and recompute. A lost stamp on a
+  face that kept its paint reads as "carries no identity" — a false refusal.
+- Painting a face through an occurrence proxy, and whether the native face then
+  reads that paint; decision 4 (one face placed twice is one source) assumes the
+  proxies of one native face share its stamp.
+- `Design.findAttributes` reaches faces in externally referenced components, and
+  a read-only referenced component refuses the write so the rollback runs.
+- Fusion `==` identifies an attribute's `parent` with the same face reached from
+  a body's `faces` (the fakes use object identity or the token fallback).
+- Undo of Set WG Source… restores the stamps. Undo moves nothing the heartbeat's
+  change key watches, so the published token can stay stale for up to the 60 s
+  age ceiling, then reads "cannot tell" until the next measurement (at most the
+  120 s duty-cycle wait).
+- The plan's exit rows: a source face removed, split or made ambiguous triggers
+  reassignment, not a silent remap.
 
 ## The Send and Solve pre-flight
 

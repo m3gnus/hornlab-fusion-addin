@@ -49,7 +49,7 @@ contains only **Declare Body…**, **Insert**, **Update**, and **Detach**.
 
 | Command | What it does |
 |---|---|
-| **Set WG Source…** | Mark the selected faces as the `LF`, `MF`, `HF`, or `PASSIVE_CARDIOID` drive source (applies an appearance with that exact name; Clear removes it). A face already painted `PORT_EXIT`, the role's old name, is still recognised. |
+| **Set WG Source…** | Mark the selected faces as the `LF`, `MF`, `HF`, or `PASSIVE_CARDIOID` drive source (applies an appearance with that exact name and stamps the source's identity; Clear removes both). A face already painted `PORT_EXIT`, the role's old name, is still recognised. |
 | **Solve in WG** | Export the assembly and ask WG to prepare and solve it, so WG is already solving when you switch windows. |
 | **Send to WG** | Export the assembly as a validated `.wgreturn` bundle without asking for a solve. |
 | Declare Body… | Classify a body for the return: `exterior-shell` includes an open surface body, `exclude` leaves a body out, Clear restores automatic scoping. |
@@ -139,6 +139,32 @@ requirements:
 
 In WG the return arrives marked `unlinked`; acknowledge that one finding, set
 mesh sizing and drive channels in the CAD Link panel, and solve.
+
+### Source identity
+
+A Waveguide Generator that reads source identities keeps a painted source's
+settings from one return to the next by the identity **Set WG Source…** stamped
+on its faces. Once WG reads them, Send and Solve refuse a painted role, and the
+message names it, when:
+
+- faces were painted by hand or before identities existed — select them and run
+  **Set WG Source…** with that role; faces added to a source that still resolves
+  keep its identity;
+- a face's paint was removed or changed by hand, a face was removed, split or
+  copied, or the role carries two identities — select **every** face that should
+  drive the role and run **Set WG Source…** again. That gives the source a new
+  identity, and WG asks for its setup once;
+- some of the source's faces are outside what you are sending — include them,
+  or select them and **Clear** their WG source. Clear also takes the identity off
+  a face whose paint you already removed by hand.
+
+A linked waveguide's throat needs nothing: its identity follows the link.
+
+**Upgrade note.** The first time WG advertises source identities, every
+document's status token changes once, because source ids are part of it. WG
+therefore shows models it imported earlier as changed; send them again. Painted
+sources marked before this release are refused until you re-run
+**Set WG Source…** on them.
 
 ## 5. Returning a model you already cut in half
 

@@ -780,7 +780,28 @@ def _apply_source_role(command_inputs: object) -> dict[str, object]:
             raise wglink_core.WgLinkError(
                 f"Could not clear the WG source appearance from a selected face: {exc}."
             ) from exc
-    return {"summary": plan.summary}
+    # The source identity is authored here and nowhere else -- never by Send, the
+    # preflight or the heartbeat -- and whatever WG advertises, so a document is
+    # ready when WG starts reading identities. Every selected face is stamped,
+    # including one that already carried the role: re-running this command on a
+    # source WGLink refused is how that source is reassigned. Clear takes the
+    # identity off every selected face, including one whose paint was already
+    # removed by hand, which is the only way to take such a stale face out.
+    global _source_authoring_generation
+    _source_authoring_generation += 1
+    summary = plan.summary
+    if plan.role is not None:
+        wglink_send.assign_source_identity(
+            design, [faces[index] for index in (*plan.paint, *plan.unchanged)], plan.role
+        )
+    else:
+        removed = wglink_send.clear_source_identity(design, faces)
+        if removed and not plan.clear:
+            summary = (
+                f"Removed a stale WG source identity from {removed} face(s) that no "
+                "longer carried a WG source role."
+            )
+    return {"summary": summary}
 
 
 def _apply_body_declaration(command_inputs: object) -> dict[str, object]:
@@ -1277,6 +1298,11 @@ GEOMETRY_STATE_DUTY_CYCLE = 12.0
 GEOMETRY_STATE_MAX_WAIT_SECONDS = 120.0
 
 
+# Bumped by Set WG Source...: a stamp is an attribute write, which moves neither
+# the timeline nor a body revision, and the heartbeat's source ids depend on it.
+_source_authoring_generation = 0
+
+
 def _geometry_change_key(design: object, records: dict) -> tuple:
     """A key that moves when the geometry the heartbeat measures moves.
 
@@ -1289,8 +1315,7 @@ def _geometry_change_key(design: object, records: dict) -> tuple:
     alone; the stored export id and edit version catch an Update.
     """
 
-    # Whether sources carry identities changes every source id the state hashes.
-    parts: list[object] = [_source_identity_enabled()]
+    parts: list[object] = [_source_authoring_generation, _source_identity_enabled()]
     try:
         parts.append(int(design.timeline.count))
     except Exception:  # noqa: BLE001 - a product without a timeline still keys

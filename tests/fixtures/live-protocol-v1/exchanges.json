@@ -1,0 +1,1007 @@
+{
+  "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+  "capabilities": {
+    "fusionRequestDelivery": 3,
+    "liveProtocol": 1,
+    "producer": "waveguide-generator",
+    "schemaVersion": 1,
+    "solveCommandDelivery": 3,
+    "sourceIdentity": 1
+  },
+  "clientNonceHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "endpoint": {
+    "baseUrl": "http://127.0.0.1:{port}",
+    "instanceId": "a1000000000000000000000000000001",
+    "liveProtocol": 1,
+    "pid": 12345,
+    "producer": "waveguide-generator",
+    "registrationSecret": "recorded-token-0001-xxxxxxxxxxxxxxxxxxxxxxxx",
+    "schemaVersion": 1,
+    "startedAt": "2026-09-10T00:26:40Z"
+  },
+  "exchanges": {
+    "end": {
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer recorded-token-0003-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "DELETE",
+        "path": "/api/cadlink/live/sessions/current"
+      },
+      "response": {
+        "body": null,
+        "status": 204
+      }
+    },
+    "heartbeat": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:26:40Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": null,
+        "status": 204
+      }
+    },
+    "heartbeat_after_end": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:27:10Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0003-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "No live CAD Link session has this token; register again.",
+          "error": {
+            "client_request_id": null,
+            "code": "session_unknown",
+            "details": {},
+            "message": "No live CAD Link session has this token; register again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "heartbeat_after_idle": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:28:11Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0005-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "The live CAD Link session token has expired; register again.",
+          "error": {
+            "client_request_id": null,
+            "code": "token_expired",
+            "details": {},
+            "message": "The live CAD Link session token has expired; register again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "heartbeat_after_refresh": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:27:10Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0003-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": null,
+        "status": 204
+      }
+    },
+    "heartbeat_session_mismatch": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "another-fusion-session",
+          "updatedAt": "2026-09-10T00:26:40Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "The heartbeat's sessionId is not the one this live session registered.",
+          "error": {
+            "client_request_id": null,
+            "code": "session_mismatch",
+            "details": {},
+            "message": "The heartbeat's sessionId is not the one this live session registered.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "heartbeat_stale": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-09T23:26:40Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "The heartbeat's updatedAt is outside the freshness window; send a current one.",
+          "error": {
+            "client_request_id": null,
+            "code": "heartbeat_stale",
+            "details": {},
+            "message": "The heartbeat's updatedAt is outside the freshness window; send a current one.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "heartbeat_without_installation": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:26:40Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "Live CAD Link requests carry a valid X-WGLink-Installation header.",
+          "error": {
+            "client_request_id": null,
+            "code": "installation_mismatch",
+            "details": {},
+            "message": "Live CAD Link requests carry a valid X-WGLink-Installation header.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "hello": {
+      "request": {
+        "body": null,
+        "headers": {},
+        "method": "GET",
+        "path": "/api/cadlink/live/endpoint"
+      },
+      "response": {
+        "body": {
+          "deliveryVersion": 3,
+          "instanceId": "a1000000000000000000000000000001",
+          "liveProtocol": 1,
+          "producer": "waveguide-generator",
+          "schemaVersion": 1
+        },
+        "status": 200
+      }
+    },
+    "hello_store_busy": {
+      "request": {
+        "body": null,
+        "headers": {},
+        "method": "GET",
+        "path": "/api/cadlink/live/endpoint"
+      },
+      "response": {
+        "body": {
+          "detail": "The live CAD Link session service is not running.",
+          "error": {
+            "client_request_id": null,
+            "code": "store_busy",
+            "details": {},
+            "message": "The live CAD Link session service is not running.",
+            "retryable": true,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 503
+      }
+    },
+    "hello_with_origin": {
+      "request": {
+        "body": null,
+        "headers": {
+          "Origin": "http://127.0.0.1:{port}"
+        },
+        "method": "GET",
+        "path": "/api/cadlink/live/endpoint"
+      },
+      "response": {
+        "body": {
+          "detail": "Live CAD Link routes refuse browser requests.",
+          "error": {
+            "client_request_id": null,
+            "code": "origin_not_allowed",
+            "details": {},
+            "message": "Live CAD Link routes refuse browser requests.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 403
+      }
+    },
+    "refresh": {
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions/refresh"
+      },
+      "response": {
+        "body": {
+          "expiresAt": "2026-09-10T00:42:10Z",
+          "liveSessionId": "a1000000000000000000000000000002",
+          "refreshAfter": "2026-09-10T00:37:10Z",
+          "sessionToken": "recorded-token-0003-xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "status": 200
+      }
+    },
+    "refresh_with_replaced_token": {
+      "request": {
+        "body": null,
+        "headers": {
+          "Authorization": "Bearer recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions/refresh"
+      },
+      "response": {
+        "body": {
+          "detail": "The live CAD Link session token has expired; register again.",
+          "error": {
+            "client_request_id": null,
+            "code": "token_expired",
+            "details": {},
+            "message": "The live CAD Link session token has expired; register again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "register": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "clientProof": "DefW4ARsOV6NjsGKY-Evcr7meNeGycFQQHPHnfgEHyY",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "capabilities": {
+            "fusionRequestDelivery": 3,
+            "liveProtocol": 1,
+            "producer": "waveguide-generator",
+            "schemaVersion": 1,
+            "solveCommandDelivery": 3,
+            "sourceIdentity": 1
+          },
+          "expiresAt": "2026-09-10T00:41:40Z",
+          "heartbeatIntervalSeconds": 4,
+          "idleTimeoutSeconds": 60,
+          "instanceId": "a1000000000000000000000000000001",
+          "liveProtocol": 1,
+          "liveSessionId": "a1000000000000000000000000000002",
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "matchesPin": false,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          },
+          "longPollSeconds": 25,
+          "refreshAfter": "2026-09-10T00:36:40Z",
+          "serverProof": "iMpbT8zdfoTb7YMZc8J4E960R6eFo6MgT3OjZKZ_FiY",
+          "sessionToken": "recorded-token-0002-xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "status": 201
+      }
+    },
+    "register_addin_outdated": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+          "clientProof": "-MvFoxNW3IY0lynrSxsamXuuc39HWLRuEEhlOQVMoCg",
+          "deliveryVersion": 2,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "This add-in is older than delivery version 3; update WGLink.",
+          "error": {
+            "client_request_id": null,
+            "code": "addin_outdated",
+            "details": {},
+            "message": "This add-in is older than delivery version 3; update WGLink.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "register_again": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8",
+          "clientProof": "n4sHq4vW_ZniqgDnGTagBSKzbzg9-AwUs3HoojGODw4",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "capabilities": {
+            "fusionRequestDelivery": 3,
+            "liveProtocol": 1,
+            "producer": "waveguide-generator",
+            "schemaVersion": 1,
+            "solveCommandDelivery": 3,
+            "sourceIdentity": 1
+          },
+          "expiresAt": "2026-09-10T00:42:10Z",
+          "heartbeatIntervalSeconds": 4,
+          "idleTimeoutSeconds": 60,
+          "instanceId": "a1000000000000000000000000000001",
+          "liveProtocol": 1,
+          "liveSessionId": "a1000000000000000000000000000003",
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "matchesPin": false,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          },
+          "longPollSeconds": 25,
+          "refreshAfter": "2026-09-10T00:37:10Z",
+          "serverProof": "iKZ6H-vdZrAhuSOYRdaOal8w9fG8Sg2SPLszRrYyIMU",
+          "sessionToken": "recorded-token-0005-xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "status": 201
+      }
+    },
+    "register_bad_proof": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+          "clientProof": "nzIaSLJQKbttepeTpcqVP0YhJNowAh8sHVPqTZq87Uo",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "The registration proof does not verify; read the endpoint file again.",
+          "error": {
+            "client_request_id": null,
+            "code": "registration_proof_invalid",
+            "details": {},
+            "message": "The registration proof does not verify; read the endpoint file again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "register_protocol_unsupported": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+          "clientProof": "-MvFoxNW3IY0lynrSxsamXuuc39HWLRuEEhlOQVMoCg",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 2,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "This WG serves live protocol 1 only; use file delivery.",
+          "error": {
+            "client_request_id": null,
+            "code": "protocol_unsupported",
+            "details": {},
+            "message": "This WG serves live protocol 1 only; use file delivery.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 409
+      }
+    },
+    "register_reused_nonce": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "clientProof": "DefW4ARsOV6NjsGKY-Evcr7meNeGycFQQHPHnfgEHyY",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "The registration proof does not verify; read the endpoint file again.",
+          "error": {
+            "client_request_id": null,
+            "code": "registration_proof_invalid",
+            "details": {},
+            "message": "The registration proof does not verify; read the endpoint file again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "register_unknown_field": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+          "clientProof": "-MvFoxNW3IY0lynrSxsamXuuc39HWLRuEEhlOQVMoCg",
+          "deliveryVersion": 3,
+          "extra": 1,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "The request is not valid.",
+          "error": {
+            "client_request_id": null,
+            "code": "invalid_request",
+            "details": {
+              "errors": [
+                {
+                  "loc": [
+                    "body"
+                  ],
+                  "type": "extra_forbidden"
+                }
+              ]
+            },
+            "message": "The request is not valid.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 400
+      }
+    },
+    "restart_hello": {
+      "request": {
+        "body": null,
+        "headers": {},
+        "method": "GET",
+        "path": "/api/cadlink/live/endpoint"
+      },
+      "response": {
+        "body": {
+          "deliveryVersion": 3,
+          "instanceId": "a1000000000000000000000000000004",
+          "liveProtocol": 1,
+          "producer": "waveguide-generator",
+          "schemaVersion": 1
+        },
+        "status": 200
+      }
+    },
+    "restart_old_token": {
+      "request": {
+        "body": {
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "deliveryVersion": 3,
+          "diagnostics": {
+            "lastTickMs": {
+              "snapshot_ms": 0.1
+            },
+            "watchIntervalSeconds": 4.0
+          },
+          "document": {
+            "id": null,
+            "links": [],
+            "name": "Untitled"
+          },
+          "schemaVersion": 1,
+          "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "updatedAt": "2026-09-10T00:28:11Z",
+          "workspaceRoot": null
+        },
+        "headers": {
+          "Authorization": "Bearer recorded-token-0005-xxxxxxxxxxxxxxxxxxxxxxxx",
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/heartbeat"
+      },
+      "response": {
+        "body": {
+          "detail": "No live CAD Link session has this token; register again.",
+          "error": {
+            "client_request_id": null,
+            "code": "session_unknown",
+            "details": {},
+            "message": "No live CAD Link session has this token; register again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    },
+    "restart_register": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+          "clientProof": "vUAcfkZzb8ydOIM9HUs56P9uO4PEoA5A4AAKWXSum0Q",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "capabilities": {
+            "fusionRequestDelivery": 3,
+            "liveProtocol": 1,
+            "producer": "waveguide-generator",
+            "schemaVersion": 1,
+            "solveCommandDelivery": 3,
+            "sourceIdentity": 1
+          },
+          "expiresAt": "2026-09-10T00:43:11Z",
+          "heartbeatIntervalSeconds": 4,
+          "idleTimeoutSeconds": 60,
+          "instanceId": "a1000000000000000000000000000004",
+          "liveProtocol": 1,
+          "liveSessionId": "a1000000000000000000000000000005",
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "matchesPin": false,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          },
+          "longPollSeconds": 25,
+          "refreshAfter": "2026-09-10T00:38:11Z",
+          "serverProof": "m-pzoPBC_TSLupt5rmSGvNa5gbxBoUxXvLpU7esGTAU",
+          "sessionToken": "recorded-token-0007-xxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "status": 201
+      }
+    },
+    "restart_register_old_secret": {
+      "request": {
+        "body": {
+          "adapterSessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+          "adapterVersion": "0.1.1",
+          "cadApplication": "fusion360",
+          "clientNonce": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+          "clientProof": "ZJsciactqjYkQ7var3ynNUump_l_HXm-UJlTm5TSStk",
+          "deliveryVersion": 3,
+          "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+          "liveProtocol": 1,
+          "loadedIdentity": {
+            "addinVersion": "0.1.1",
+            "loadedAt": "2026-09-10T00:25:40Z",
+            "managedBy": null,
+            "source": "unmanaged",
+            "sourceCommit": null,
+            "waveguideGeneratorRoot": null
+          }
+        },
+        "headers": {
+          "Content-Type": "application/json",
+          "X-WGLink-Installation": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f"
+        },
+        "method": "POST",
+        "path": "/api/cadlink/live/sessions"
+      },
+      "response": {
+        "body": {
+          "detail": "The registration proof does not verify; read the endpoint file again.",
+          "error": {
+            "client_request_id": null,
+            "code": "registration_proof_invalid",
+            "details": {},
+            "message": "The registration proof does not verify; read the endpoint file again.",
+            "retryable": false,
+            "schema_version": 1,
+            "stage": "cadlink-live"
+          }
+        },
+        "status": 401
+      }
+    }
+  },
+  "heartbeat": {
+    "adapterVersion": "0.1.1",
+    "cadApplication": "fusion360",
+    "deliveryVersion": 3,
+    "diagnostics": {
+      "lastTickMs": {
+        "snapshot_ms": 0.1
+      },
+      "watchIntervalSeconds": 4.0
+    },
+    "document": {
+      "id": null,
+      "links": [],
+      "name": "Untitled"
+    },
+    "schemaVersion": 1,
+    "sessionId": "9d7e5c3a-1b2f-4a6e-8d0c-2e4f6a8b0c1d",
+    "updatedAt": "2026-09-10T00:26:40Z",
+    "workspaceRoot": null
+  },
+  "installationId": "5b0c2f7e-3d1a-4e8b-9c6f-0a1b2c3d4e5f",
+  "loadedIdentity": {
+    "addinVersion": "0.1.1",
+    "loadedAt": "2026-09-10T00:25:40Z",
+    "managedBy": null,
+    "source": "unmanaged",
+    "sourceCommit": null,
+    "waveguideGeneratorRoot": null
+  },
+  "recordedFrom": {
+    "commit": "a3328f40324bc7348a1eecae44135d274447e05d",
+    "recorder": "tests/fixtures/live-protocol-v1/record_exchanges.py",
+    "repository": "waveguide-generator"
+  },
+  "restartedEndpoint": {
+    "baseUrl": "http://127.0.0.1:{port}",
+    "instanceId": "a1000000000000000000000000000004",
+    "liveProtocol": 1,
+    "pid": 12345,
+    "producer": "waveguide-generator",
+    "registrationSecret": "recorded-token-0006-xxxxxxxxxxxxxxxxxxxxxxxx",
+    "schemaVersion": 1,
+    "startedAt": "2026-09-10T00:28:11Z"
+  },
+  "schemaVersion": 1
+}

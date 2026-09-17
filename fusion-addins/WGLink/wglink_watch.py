@@ -668,6 +668,44 @@ def write_fusion_status(
 ) -> Path:
     """Atomically publish the active Fusion document as inert JSON.
 
+    The payload is :func:`fusion_status_payload`; the writer is
+    :func:`write_fusion_status_payload`.
+    """
+
+    root = bundle_root.expanduser().resolve()
+    if not root.is_dir():
+        raise OSError(f"WGLink bundle folder is unavailable: {root}")
+    payload = fusion_status_payload(
+        session_id=session_id,
+        document_name=document_name,
+        document_id=document_id,
+        adapter_version=adapter_version,
+        workspace_root=workspace_root,
+        links=links,
+        updated_at=updated_at,
+        diagnostics=diagnostics,
+        applying_operation=applying_operation,
+    )
+    return write_fusion_status_payload(root, payload)
+
+
+def fusion_status_payload(
+    *,
+    session_id: str,
+    document_name: str | None,
+    document_id: str | None = None,
+    adapter_version: str | None = None,
+    workspace_root: Path | None = None,
+    links: Iterable[Mapping[str, Any]],
+    updated_at: datetime | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
+    applying_operation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The heartbeat object: the active Fusion document as inert JSON.
+
+    The same object is written to ``.fusion-status.json`` and, while a live
+    session is healthy, posted to WG over HTTP (``wglink_live``).
+
     ``deliveryVersion`` tells WG which delivery version this add-in speaks; WG
     refuses an add-in that reports less than its own. ``applying_operation``
     is the WG operation the document is marked as applying, from
@@ -681,9 +719,6 @@ def write_fusion_status(
     WG client ignores the key, exactly as it ignores ``linkName``.
     """
 
-    root = bundle_root.expanduser().resolve()
-    if not root.is_dir():
-        raise OSError(f"WGLink bundle folder is unavailable: {root}")
     allowed = {
         "instance_id": "instanceId",
         "bundle_path": "bundlePath",
@@ -801,6 +836,15 @@ def write_fusion_status(
                 payload["document"]["applyingOperation"][name] = value
     if diagnostics:
         payload["diagnostics"] = json.loads(json.dumps(diagnostics, default=str))
+    return payload
+
+
+def write_fusion_status_payload(bundle_root: Path, payload: Mapping[str, Any]) -> Path:
+    """Atomically write a :func:`fusion_status_payload` object as the heartbeat file."""
+
+    root = bundle_root.expanduser().resolve()
+    if not root.is_dir():
+        raise OSError(f"WGLink bundle folder is unavailable: {root}")
     marker = root / FUSION_STATUS_FILENAME
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f"{FUSION_STATUS_FILENAME}.", dir=root

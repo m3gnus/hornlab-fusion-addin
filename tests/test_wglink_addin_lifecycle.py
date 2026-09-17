@@ -4087,3 +4087,149 @@ def test_leftover_claims_wait_for_an_active_document(monkeypatch, tmp_path: Path
 
     module._sweep_leftover_claims({**_shared_snapshot(), "applying_operation": None})
     assert not left.marker_path.exists() and module._claims_swept is True
+
+
+# -- the live CAD Link session (wglink_live) -----------------------------------
+
+
+class _LiveRecorder:
+    """Stands in for ``wglink_live.LiveClient`` where only the hand-over matters."""
+
+    def __init__(self, lines: list[str] | None = None) -> None:
+        self.offered: list[dict] = []
+        self.lines = list(lines or [])
+
+    def offer_heartbeat(self, payload: dict) -> None:
+        self.offered.append(json.loads(json.dumps(payload)))
+
+    def take_log_lines(self) -> list[str]:
+        lines, self.lines = self.lines, []
+        return lines
+
+
+def test_the_heartbeat_file_and_the_live_offer_are_the_same_object(monkeypatch, tmp_path: Path) -> None:
+    module = _load_instance(monkeypatch, "WGLink_live_offer", _UI(_Panels(), _Definitions(reserve_ids=False)))
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: True)
+    recorder = _LiveRecorder()
+    monkeypatch.setattr(module, "_live_client", recorder)
+
+    module._publish_fusion_status({
+        "document_name": "Speaker", "document_id": "fusion:doc", "links": [],
+        "diagnostics": {"watchIntervalSeconds": 4.0},
+    })
+
+    written = json.loads((tmp_path / module.wglink_watch.FUSION_STATUS_FILENAME).read_text())
+    assert recorder.offered == [written]
+    assert written["sessionId"] == module._watch_session_id
+
+    # Without a live client the file is written exactly as before.
+    monkeypatch.setattr(module, "_live_client", None)
+    (tmp_path / module.wglink_watch.FUSION_STATUS_FILENAME).unlink()
+    module._publish_fusion_status({"document_name": None, "document_id": None, "links": [], "diagnostics": {}})
+    assert (tmp_path / module.wglink_watch.FUSION_STATUS_FILENAME).exists()
+
+
+def test_the_live_client_log_is_printed_on_the_main_thread_tick(monkeypatch) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_live_log", ui)
+    monkeypatch.setattr(module, "_live_client", _LiveRecorder(["WGLink is live with WG."]))
+    monkeypatch.setattr(module, "_fusion_snapshot", lambda: {
+        "document_name": None, "document_id": None, "links": [], "diagnostics": {},
+    })
+    monkeypatch.setattr(module, "_claims_swept", True)
+
+    module._on_watch_tick()
+
+    assert "WGLink is live with WG." in ui.text_palette.written
+
+
+def test_only_the_lease_owner_runs_a_live_client_and_stop_joins_it(monkeypatch) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    owner = _load_instance(monkeypatch, "WGLink_live_owner", ui, app)
+    standby = _load_instance(monkeypatch, "WGLink_live_standby", ui, app)
+
+    owner.run(None)
+    standby.run(None)
+    client = owner._live_client
+    assert client is not None and client.is_running()
+    assert standby._live_client is None
+
+    standby.stop(None)
+    assert owner._live_client is client and client.is_running()
+    owner.stop(None)
+    assert owner._live_client is None
+    assert not client.is_running()
+
+
+def test_the_main_thread_never_does_network_io_while_live(monkeypatch, tmp_path: Path) -> None:
+    """Start, tick, publish and stop on this (the "main") thread against a loopback WG stand-in."""
+
+    import socket
+    import threading
+
+    from test_wglink_live import LIVE, StubServer, _capabilities, _endpoint, _mac, _write_private
+
+    ipc = tmp_path / "ipc" / "wglink"
+    ipc.mkdir(parents=True)
+    os.chmod(ipc, 0o755)
+    secret, instance = "lifecycle-secret", "e" * 32
+    heartbeats: list[dict] = []
+    arrived = threading.Event()
+
+    def handle(_stub, method, path, headers, body):
+        if (method, path) == ("GET", LIVE + "/endpoint"):
+            return 200, {}, json.dumps({"schemaVersion": 1, "producer": "waveguide-generator",
+                                        "instanceId": instance, "liveProtocol": 1, "deliveryVersion": 3}).encode()
+        if (method, path) == ("POST", LIVE + "/sessions"):
+            sent = json.loads(body)
+            proof = _mac(secret, "wglink-server", sent["clientNonce"], instance, headers["x-wglink-installation"])
+            return 201, {}, json.dumps({"liveSessionId": "s", "sessionToken": "lifecycle-token",
+                                        "serverProof": proof, "instanceId": instance, "liveProtocol": 1}).encode()
+        if (method, path) == ("POST", LIVE + "/heartbeat"):
+            heartbeats.append(json.loads(body))
+            if (heartbeats[-1].get("document") or {}).get("name") == "Speaker":
+                arrived.set()
+        return 204, {}, b""
+
+    stub = StubServer(handle)
+    try:
+        _write_private(ipc / "wg-capabilities.json", _capabilities())
+        _write_private(ipc / "wg-endpoint.json", _endpoint(instance, secret, stub.port))
+        main = threading.current_thread()
+        connecting: list[threading.Thread] = []
+        original = socket.socket.connect
+
+        def recording_connect(self, address):
+            connecting.append(threading.current_thread())
+            return original(self, address)
+
+        monkeypatch.setattr(socket.socket, "connect", recording_connect)
+        ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+        module = _load_instance(monkeypatch, "WGLink_live_main_thread", ui)
+        monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: ipc)
+
+        module.run(None)
+        client = module._live_client
+        deadline = time.monotonic() + 10
+        while not client.healthy() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert client.healthy(), client.take_log_lines()
+        module._publish_fusion_status({"document_name": "Speaker", "document_id": None, "links": [],
+                                       "diagnostics": {"watchIntervalSeconds": 4.0}})
+        assert arrived.wait(10)
+        module.stop(None)
+    finally:
+        stub.close()
+
+    file_heartbeat = ipc / module.wglink_watch.FUSION_STATUS_FILENAME
+    assert not file_heartbeat.exists()  # removed at stop, as before
+    speaker = [h for h in heartbeats if (h.get("document") or {}).get("name") == "Speaker"]
+    assert len(speaker) == 1
+    assert speaker[0] == json.loads(json.dumps(speaker[0]))
+    assert all(h["sessionId"] == module._watch_session_id for h in heartbeats)
+    assert len(connecting) >= 4  # hello, register, heartbeat, end
+    assert main not in connecting
+    assert ("DELETE", LIVE + "/sessions/current") in [(m, p) for m, p, _h, _b in stub.requests]
+    assert not client.is_running()

@@ -47,6 +47,7 @@ def _load_registration_package() -> dict[str, types.ModuleType]:
         "wglink_return",
         "wglink_send",
         "wglink_watch",
+        "wglink_live",
     ):
         loaded[name] = importlib.import_module(f"{_registration_package_name}.{name}")
     return loaded
@@ -58,6 +59,7 @@ wglink_author = _registration_modules["wglink_author"]
 wglink_core = _registration_modules["wglink_core"]
 wglink_send = _registration_modules["wglink_send"]
 wglink_watch = _registration_modules["wglink_watch"]
+wglink_live = _registration_modules["wglink_live"]
 format_measurement_mm = _registration_modules["wglink_bundle"].format_measurement_mm
 
 
@@ -186,6 +188,15 @@ _untaken_noticed: set[Path] = set()
 # ``diagnostics.recentOutcomes``, newest last.
 _recent_outcomes: list[dict[str, str]] = []
 _RECENT_OUTCOMES_LIMIT = 16
+# The live CAD Link session (``wglink_live``), run only by the IPC lease owner.
+# It is additive: the file heartbeat and every v3 request file keep working
+# whatever it does. Its worker thread owns every network exchange; this thread
+# only hands it the heartbeat and prints what it logged.
+_live_client = None
+# What this registration loaded, captured once (protocol "loadedIdentity").
+_loaded_identity = wglink_live.loaded_identity(
+    ADDIN_DIR, addin_version=wglink_send.ADAPTER_VERSION
+)
 
 
 def _note_outcome(channel: str, request_id: str, outcome: str) -> None:
@@ -1793,8 +1804,7 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
     if _recent_outcomes:
         diagnostics["recentOutcomes"] = [dict(item) for item in _recent_outcomes]
     try:
-        wglink_watch.write_fusion_status(
-            folder,
+        payload = wglink_watch.fusion_status_payload(
             session_id=_watch_session_id,
             document_name=current["document_name"],
             document_id=current["document_id"],
@@ -1805,7 +1815,20 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
             applying_operation=current.get("applying_operation"),
         )
     except Exception:  # noqa: BLE001 - presence must never block CAD commands
+        return
+    try:
+        # The file heartbeat is always written: WG reads it whenever no live
+        # session is current, including right after WG itself restarts.
+        wglink_watch.write_fusion_status_payload(folder, payload)
+    except Exception:  # noqa: BLE001 - presence must never block CAD commands
         pass
+    client = _live_client
+    if client is not None:
+        try:
+            # Never blocks: the worker thread posts it.
+            client.offer_heartbeat(payload)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _apply_announced_updates(announcements: list) -> None:
@@ -2397,6 +2420,7 @@ def _on_watch_tick() -> None:
             _command_busy = False
     finally:
         _publish_fusion_status(snapshot)
+        _print_live_log()
 
 
 class WatchEventHandler(adsk.core.CustomEventHandler):
@@ -2483,6 +2507,47 @@ def _stop_candidate(app: object) -> None:
     _candidate_event = _candidate_handler = _candidate_stop = _candidate_thread = None
 
 
+def _start_live() -> None:
+    """Start the live session worker; only the active lease owner calls this."""
+
+    global _live_client
+    if _live_client is not None:
+        return
+    client = wglink_live.LiveClient(
+        ipc_folder=lambda: wglink_workspace.ipc_folder(),
+        adapter_session_id=_watch_session_id,
+        adapter_version=wglink_send.ADAPTER_VERSION,
+        loaded_identity=_loaded_identity,
+        # Reads the lease broker only; no Fusion call.
+        lease_ok=lambda: _owns_active_ipc_lease(),
+    )
+    client.start()
+    _live_client = client
+
+
+def _stop_live() -> None:
+    """End the live session (from its worker) and wait a bounded time for it."""
+
+    global _live_client
+    client, _live_client = _live_client, None
+    if client is None:
+        return
+    try:
+        client.stop(timeout=WATCH_INTERVAL_SECONDS + 1)
+    except Exception:  # noqa: BLE001 - shutdown is best effort
+        pass
+    for line in client.take_log_lines():
+        _log(line)
+
+
+def _print_live_log() -> None:
+    client = _live_client
+    if client is None:
+        return
+    for line in client.take_log_lines():
+        _log(line)
+
+
 def _start_watch(app: object) -> bool:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
     global _handoff_attempted_id, _return_request_attempted_id, _request_trace
@@ -2516,6 +2581,7 @@ def _stop_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
     global _handoff_attempted_id, _return_request_attempted_id, _request_trace
     global _claims_swept, _wg_outdated_noticed
+    _stop_live()
     if _watch_stop is not None:
         _watch_stop.set()
     if _watch_thread is not None and _watch_thread.is_alive():
@@ -2669,6 +2735,7 @@ def _build_owner(app: object, ui: object) -> None:
         if not _activate_ipc_lease():
             raise RuntimeError("WGLink's IPC owner lease was lost during startup")
         _owned = True
+        _start_live()
         _publish_fusion_status()
     except Exception:
         _stop_watch(app)

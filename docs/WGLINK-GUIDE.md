@@ -68,6 +68,21 @@ the same strict observation used by Send to WG; an unavailable or fallback
 identity is omitted, while older WG clients can continue ignoring the added
 members under heartbeat schema 1.
 
+When WG advertises the live protocol (`liveProtocol` in `wg-capabilities.json`
+and a `wg-endpoint.json` beside it), the active WGLink also registers a live
+session with WG over loopback HTTP and posts the same heartbeat object there.
+This is additive: `.fusion-status.json` is still written on every tick, and
+every request still travels as the v3 files, so WG started later, a WG without
+live support, or any refusal simply leaves WGLink on the files. The session
+runs on its own background thread, never through a proxy, and only in the
+WGLink registration that owns the panel. When its state changes, it writes a
+line to Fusion's Text Commands palette (for example "WGLink is live with WG."
+or "WGLink uses the files: …"); a state that persists is not repeated, but
+each new change, including a return to an earlier state, is written again. A
+refusal that only a new WG start can change (an add-in or protocol WG does not
+accept, or a registration proof that does not verify) waits for WG to restart;
+anything else is tried again within 30 seconds.
+
 ## 3. The linked round trip
 
 1. In WG, **Send to CAD** writes the bundle and raises Fusion; the add-in
@@ -281,6 +296,17 @@ occurrence where it already is and never moves it back to the origin.)
 - **Nothing arrives in WG after Solve in WG** — WG must be running; the
   request survives until it next runs, and the WG window still has to be
   brought forward by hand.
+- **Text Commands says "WGLink uses the files: …"** — nothing is broken:
+  the live session is optional and the files carry everything. The line names
+  why. On macOS and Linux WGLink refuses a `wg-endpoint.json` that other users
+  could read or change, an `ipc/wglink` folder that group or other can write
+  to, and an `ipc/wglink` folder or endpoint file that is a symlink; a
+  `WG2_DATA_DIR` on a shared location therefore stays on the files.
+- **Text Commands alternates between "live" and "ended the live session"** —
+  two Fusion processes are running against the same WG data folder. They share
+  one WGLink installation id, so each registration replaces the other's. WGLink
+  bounds this: a second loss within 30 seconds of registering again keeps that
+  process on the files for 30 seconds. Close one of the Fusion processes.
 - **Duplicate WGLink installations** — remove the extra registration and
   restart Fusion. Current copies elect one active panel/watcher and promote a
   surviving standby if the owner stops, but a mixed-version duplicate remains

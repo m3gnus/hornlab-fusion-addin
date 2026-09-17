@@ -2442,8 +2442,8 @@ class _StampEdit:
             try:
                 if value is None:
                     attribute = wglink_core._attribute(face, SOURCE_IDENTITY_ATTRIBUTE)
-                    if attribute is not None:
-                        attribute.deleteMe()
+                    if attribute is not None and attribute.deleteMe() is False:
+                        problems.append("Fusion refused to remove a stamp this command wrote")
                 else:
                     wglink_core._set_attribute(face, SOURCE_IDENTITY_ATTRIBUTE, value)
             except Exception as exc:  # noqa: BLE001 - report every face we could not restore
@@ -2464,7 +2464,7 @@ def _run_edit(action: str, body) -> Any:
                 "command in Fusion"
             )
         raise wglink_core.WgLinkError(
-            f"Could not {action}: {detail}. No source identity was changed."
+            f"Could not {action}: {detail}. Every source identity stamp was restored."
             if not problems
             else f"Could not {action}: {detail}."
         ) from exc

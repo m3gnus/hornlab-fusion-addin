@@ -209,7 +209,7 @@ def test_a_refused_write_leaves_every_stamp_as_it_was(send_module, monkeypatch):
     send_module.assign_source_identity(design, [a, b], "HF")
     before = {name: dict(face.attributes.values) for name, face in (("a", a), ("b", b))}
 
-    with pytest.raises(send_module.wglink_core.WgLinkError, match="No source identity was changed"):
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="Every source identity stamp was restored"):
         send_module.assign_source_identity(design, [a, locked], "HF")
 
     assert {name: dict(face.attributes.values) for name, face in (("a", a), ("b", b))} == before
@@ -233,3 +233,29 @@ def test_clearing_the_faces_outside_the_export_is_the_remedy_the_refusal_names(
 
     report = send_module.send(_app(), _outside_options(tmp_path, occurrence, "after"))
     assert [source["id"] for source in report["sources"]] == [kept]
+
+
+class _UndeletableAttributes(Attributes):
+    """Writes succeed, but Fusion answers False when asked to delete."""
+
+    def itemByName(self, group, name):
+        handle = super().itemByName(group, name)
+        if handle is not None:
+            handle.deleteMe = lambda: False
+        return handle
+
+
+def test_a_rollback_that_fusion_refuses_is_reported_not_called_restored(
+    send_module, monkeypatch
+):
+    fresh, locked = stamped_face("HF"), stamped_face("HF")
+    fresh.attributes = _UndeletableAttributes()
+    locked.attributes = _ReadOnlyAttributes()
+    design = _painted_document(send_module, monkeypatch, [fresh, locked])
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
+        send_module.assign_source_identity(design, [fresh, locked], "HF")
+
+    text = str(refusal.value)
+    assert "1 face(s) could not be restored" in text
+    assert "restored." not in text.replace("could not be restored", "")

@@ -868,6 +868,36 @@ def test_clearing_a_source_returns_only_role_faces_to_their_body_appearance(
     assert _identity_stamp(kept)["faces"] == 1
 
 
+def test_a_failed_stamp_says_the_paint_it_applied_was_kept(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch, "WGLink_stamp_failure", _UI(_Panels(), _Definitions(reserve_ids=False))
+    )
+    monkeypatch.setattr(
+        module.wglink_core,
+        "_named_appearance",
+        lambda _app, _design, name: types.SimpleNamespace(name=name),
+    )
+    blank = _fake_face(None)
+
+    class _Locked(_Attributes):
+        def add(self, group: str, name: str, value: object) -> None:
+            raise RuntimeError("the component is read-only")
+
+    blank.attributes = _Locked()
+    design = _face_design([blank])
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
+
+    with pytest.raises(module.wglink_core.WgLinkError) as refusal:
+        module._apply_source_role(_dialog_inputs(
+            source_faces=_SelectionInput([blank]), source_role=_chosen("HF")
+        ))
+
+    text = str(refusal.value)
+    assert "Every source identity stamp was restored" in text
+    assert "HF paint applied to 1 face(s) was kept" in text
+    assert blank.appearance.name == "HF"
+
+
 def test_clear_takes_the_identity_off_a_face_whose_paint_was_removed_by_hand(
     monkeypatch,
 ) -> None:

@@ -790,12 +790,30 @@ def _apply_source_role(command_inputs: object) -> dict[str, object]:
     global _source_authoring_generation
     _source_authoring_generation += 1
     summary = plan.summary
-    if plan.role is not None:
-        wglink_send.assign_source_identity(
-            design, [faces[index] for index in (*plan.paint, *plan.unchanged)], plan.role
+    try:
+        if plan.role is not None:
+            wglink_send.assign_source_identity(
+                design, [faces[index] for index in (*plan.paint, *plan.unchanged)], plan.role
+            )
+            removed = 0
+        else:
+            removed = wglink_send.clear_source_identity(design, faces)
+    except wglink_core.WgLinkError as exc:
+        # The appearance change above is not undone: say so, rather than let
+        # "restored" read as "nothing changed". Send names what to do next.
+        changed = len(plan.paint) if plan.role is not None else len(plan.clear)
+        if not changed:
+            raise
+        done = (
+            f"the {plan.role} paint applied to {changed} face(s)"
+            if plan.role is not None
+            else f"clearing the WG source role from {changed} face(s)"
         )
-    else:
-        removed = wglink_send.clear_source_identity(design, faces)
+        raise wglink_core.WgLinkError(
+            f"{exc} However, {done} was kept; Send to WG names what to do next, "
+            "or undo this command in Fusion."
+        ) from exc
+    if plan.role is None:
         if removed and not plan.clear:
             summary = (
                 f"Removed a stale WG source identity from {removed} face(s) that no "

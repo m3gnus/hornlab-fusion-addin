@@ -126,7 +126,10 @@ Relink remain full head-less APIs but are not panel commands.
   Clear removes the stamp from every selected face, including one whose paint
   was already removed by hand. A source whose faces were all deleted is simply
   absent from the next return. The command's stamp writes succeed together or
-  are rolled back together (a read-only referenced component refuses a write).
+  are rolled back together (a read-only referenced component refuses a write);
+  the appearance it already painted or cleared is kept, and the error says so —
+  Send then names the remedy, or undo the command. A face whose stamp Fusion
+  would not restore is reported, never called restored.
 - **Solve in WG** writes the same validated `.wgreturn` bundle as Send to WG,
   then asks Waveguide Generator to prepare that exact bundle and start the
   solve, so WG is already solving when you switch to it. The request is a

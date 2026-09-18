@@ -219,9 +219,10 @@ def _items(ipc: Path) -> dict[str, dict[str, Any]]:
             continue
         try:
             items[path.stem] = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            # The live worker may settle and delete an item after it appeared
-            # in the directory snapshot. That means it is no longer waiting.
+        except (FileNotFoundError, PermissionError):
+            # The live worker may settle an item after it appeared in the
+            # directory snapshot. Deletion races on POSIX; on Windows, its
+            # final open/replace can briefly make that same path unreadable.
             continue
     return items
 

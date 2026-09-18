@@ -1669,6 +1669,16 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
         _record("resolve_links_ms", resolve_started)
         return []
     _record("resolve_links_ms", resolve_started)
+    if not records:
+        # A heartbeat has no link state or optimistic-concurrency token to
+        # publish for an unrelated document.  Calling ``return_state`` here
+        # walks the root export scope and evaluates every included face and
+        # body on Fusion's main thread, so merely enabling WGLink could stall
+        # any complex model even though WGLink had never touched it.
+        if timings is not None:
+            timings["geometry_state"] = "not-linked"
+            timings["geometry_state_ms"] = 0.0
+        return []
     state, verdict = _geometry_state(
         app, design, records, _active_document_id(), timings
     )

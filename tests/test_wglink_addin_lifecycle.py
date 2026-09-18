@@ -1693,6 +1693,45 @@ def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> N
     assert "snapshot_ms" in diagnostics["lastTickMs"]
 
 
+def test_an_unlinked_document_heartbeat_never_measures_geometry(monkeypatch) -> None:
+    """Enabling WGLink must not inspect an unrelated Fusion model.
+
+    The root-scope return-state walk evaluates every included face and body on
+    Fusion's main thread.  There is no link identity or update token to report
+    when the document has no WGLink records, so paying that cost can only make
+    an unrelated modelling session stall.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_unlinked_tick", ui, app)
+    app.activeProduct = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        findAttributes=lambda _group, _name: _Collection(),
+    )
+    monkeypatch.setattr(
+        module,
+        "_measure_geometry_state",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an unlinked heartbeat traversed the root assembly"
+        ),
+    )
+
+    timings: dict[str, float] = {}
+    assert module._document_links(timings) == []
+    assert timings["geometry_state"] == "not-linked"
+    assert timings["geometry_state_ms"] == 0.0
+
+    # There is no cache age at which an unrelated model becomes WGLink's
+    # geometry to inspect.  A later heartbeat stays on the same cheap path.
+    later_timings: dict[str, float] = {}
+    assert module._document_links(later_timings) == []
+    assert later_timings["geometry_state"] == "not-linked"
+    assert later_timings["geometry_state_ms"] == 0.0
+
+
 def test_the_heartbeat_does_not_re_measure_a_document_that_has_not_moved(
     monkeypatch,
 ) -> None:

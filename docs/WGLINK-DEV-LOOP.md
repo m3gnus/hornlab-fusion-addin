@@ -65,6 +65,7 @@ things the tick did:
 | `cached` | nothing moved — the tick was free |
 | `deferred` | it moved, but the last measurement was expensive enough that another one is not due yet |
 | `unavailable` | a measurement is not due yet *and* the cached one does not describe this document, or is older than the sixty-second ceiling — so the tick publishes no signature and no fingerprints rather than another document's, or a stale one |
+| `not-linked` | the active document contains no WGLink records, so the tick deliberately does no export-scope walk or geometry measurement |
 
 A healthy idle document reads `cached` with `geometry_state_ms` near zero. A
 run of `measured` ticks at hundreds of milliseconds on a document nobody is

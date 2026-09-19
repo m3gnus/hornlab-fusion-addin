@@ -277,6 +277,74 @@ Commands and requests cross through WG's machine-local IPC folder,
   round trip (`channel`, `correlationId`, `attemptId`, `delivery`, `outcome`),
   and each link publishes the `operationId` stamped on it.
 
+### The heartbeat reads cached state only
+
+The four-second heartbeat inspects no geometry. Measuring a link's state means
+walking the root export scope and evaluating every included face and body on
+Fusion's main thread, which on a dense linked document is a permanent load on
+the application the user is modelling in. So the tick publishes identity —
+stored attributes, which cost nothing — and, for the measured half, whatever a
+previous measurement left in the cache.
+
+Each link therefore carries two extra tokens beside its measured state, both
+property reads and both additive under heartbeat schema 1:
+
+- `geometryRevisionToken` — the revision the document is at **now**. It moves
+  with the timeline count, each managed body's revision and visibility, the
+  stored export id and edit version, and the source-identity stamping
+  generation.
+- `measuredRevisionToken` — the revision the published measurement was taken
+  at, or `null` when there is no measurement to offer.
+
+Equal tokens mean `documentSignatureHash`, `documentBodyCount`,
+`sourceStateHash`, `bodyFingerprintHash` and `localBodyState` describe the
+document as it stands. Anything else — unequal tokens, or a null
+`geometryRevisionToken` meaning the revision could not be computed at all — means
+they are an observation of an earlier revision and must not be read as current.
+Read the hashes, not the tokens, for whether there is an observation to use: an
+empty `documentSignatureHash` with `localBodyState: "unknown"` is "cannot tell",
+which is what a restart or a switch to a document nothing has measured yet
+publishes. It is never another document's measurement and never a claim of a
+fresh one.
+
+**An observation is never withdrawn for being old.** There is no age ceiling on
+what the heartbeat publishes, because nothing renews a cache the tick may not
+measure into: a ceiling would only decide how long a linked idle document took
+to lose its baseline for good, and WG refuses to publish a return request or an
+exact-target handoff without one. The tokens are what an age ceiling used to
+approximate, and they are exact.
+
+A measurement is asked for only when a linked document has no observation worth
+publishing, or when a WGLink command the user completed may have moved one —
+and by every guarded operation WG asks for, which measures inline. "Has no
+observation" rather than "has just changed" is deliberate: a request can be
+spent without answering anything (the document stopped being nameable, its
+links went, the measurement threw), and a rule that asks once per change never
+learns the answer never arrived. `GEOMETRY_REFRESH_RETRY_SECONDS` is the rate
+at which such a document may be asked about again, so this is a rate rather
+than a retry loop — and rather than a fixed allowance, which would give up on a
+document that was merely still loading and leave it with no baseline for the
+rest of the session. An observation stops the asking entirely. A document whose
+observation is merely *stale* asks for nothing.
+
+Each request names the document it is about, and is dropped without measuring
+if that document is no longer active, cannot be named, or has no WGLink links.
+At most one refresh is pending per add-in instance — a second request for the
+same document is dropped, and one for a different document replaces it, so the
+live question is never stuck behind a dead one. It is paid for on the next
+tick, the only main thread the Fusion API allows.
+
+A guarded update or return measures inline and refuses a document that has
+moved or that WGLink cannot read, so a stale published token can cost a refusal
+but never an overwrite; that refusal refreshes the cache, so the next heartbeat
+carries the current state.
+
+An unsaved document is identified by its root component's `entityToken`, not by
+any Python-side identity: Fusion's bindings mint a fresh proxy per property
+read, so neither `id(document)` nor holding the object says anything durable
+about the document. A document that cannot be named at all is cached under
+nothing and reports "cannot tell".
+
 ## Duplicate-registration ownership and recovery
 
 Fusion may load several registered WGLink paths into one Python process. Each

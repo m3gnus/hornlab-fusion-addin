@@ -129,6 +129,8 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
             "document_signature_hash": "sha256:return-state",
             "document_body_count": "3",
             "source_state_hash": "sha256:sources",
+            "geometry_revision_token": "sha256:revision-now",
+            "measured_revision_token": "sha256:revision-measured",
             "body_object_ids": ["body-b", "body-a", "body-a"],
             "transform_hash": "sha256:transform",
             "source_ids": ["source-hf"],
@@ -163,6 +165,11 @@ def test_fusion_status_publishes_document_config_and_parameters_atomically(
         "documentSignatureHash": "sha256:return-state",
         "documentBodyCount": 3,
         "sourceStateHash": "sha256:sources",
+        # A cache-only heartbeat says which revision the document is at and
+        # which revision its published measurement came from, so a consumer
+        # can tell a current observation from an older one for free.
+        "geometryRevisionToken": "sha256:revision-now",
+        "measuredRevisionToken": "sha256:revision-measured",
         "bodyObjectIds": ["body-a", "body-b"],
         "transformHash": "sha256:transform",
         "sourceIds": ["source-hf"],

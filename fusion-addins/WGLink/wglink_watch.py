@@ -797,6 +797,17 @@ def fusion_status_payload(
         "document_signature_hash": "documentSignatureHash",
         "document_body_count": "documentBodyCount",
         "source_state_hash": "sourceStateHash",
+        # The cheap revision token the document is at now, and the token the
+        # published measurement was taken at. The periodic heartbeat reads
+        # cached state only, so these two are how a consumer tells a current
+        # measurement from an older observation of the same document without
+        # anyone inspecting geometry: equal means current, unequal means
+        # cached-and-moved, and a null measured token means there is no
+        # measurement to offer. Both are property reads. Additive under
+        # heartbeat schema 1: an older WG client ignores them, exactly as it
+        # ignores linkName.
+        "geometry_revision_token": "geometryRevisionToken",
+        "measured_revision_token": "measuredRevisionToken",
         "export_id": "exportId",
         "export_sequence": "exportSequence",
     }

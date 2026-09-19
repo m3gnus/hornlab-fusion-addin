@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import types
 
@@ -75,6 +76,72 @@ class _Application:
     def fireCustomEvent(self, event_id: str, _payload: str = "") -> bool:
         self.fired.append(event_id)
         return True
+
+
+class _Proxy:
+    """A fresh wrapper over one underlying object, forwarding every access.
+
+    Fusion's Python bindings mint one of these on every property read, which is
+    why this repository identifies entities by ``entityToken`` rather than by
+    Python identity: ``a is b`` and ``id(a)`` answer about the wrapper, not
+    about the thing. A fake that hands back the identical object every time
+    cannot see a design that depends on either.
+    """
+
+    def __init__(self, target: object) -> None:
+        object.__setattr__(self, "_target", target)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        setattr(object.__getattribute__(self, "_target"), name, value)
+
+
+class _ProxyingApplication(_Application):
+    """An application whose ``activeDocument`` is a property, as Fusion's is."""
+
+    def __init__(self, ui: "_UI") -> None:
+        super().__init__(ui)
+        object.__setattr__(self, "_document", None)
+
+    @property
+    def activeDocument(self) -> object | None:
+        document = object.__getattribute__(self, "_document")
+        return None if document is None else _Proxy(document)
+
+    @activeDocument.setter
+    def activeDocument(self, value: object | None) -> None:
+        object.__setattr__(self, "_document", value)
+
+
+def _proxying_root(design: object) -> object:
+    """``design`` with a ``rootComponent`` that is freshly wrapped per read."""
+
+    root = design.rootComponent
+    proxied = types.SimpleNamespace(
+        **{
+            name: value
+            for name, value in vars(design).items()
+            if name != "rootComponent"
+        }
+    )
+    return _RootProxying(proxied, root)
+
+
+class _RootProxying:
+    """A design whose ``rootComponent`` mints a wrapper on every access."""
+
+    def __init__(self, design: object, root: object) -> None:
+        object.__setattr__(self, "_design", design)
+        object.__setattr__(self, "_root", root)
+
+    @property
+    def rootComponent(self) -> object:
+        return _Proxy(object.__getattribute__(self, "_root"))
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(object.__getattribute__(self, "_design"), name)
 
 
 class _Control:
@@ -1518,6 +1585,10 @@ def _linked_document(
     root = types.SimpleNamespace(
         name="Doc",
         objectType="adsk::fusion::Component",
+        # A real root component has one, and it is how this add-in names an
+        # unsaved document. ``instance_id`` keeps two fixture documents apart
+        # exactly as two real documents are kept apart.
+        entityToken=f"component-token-{instance_id}",
         bRepBodies=_Collection([body]),
         meshBodies=_Collection(),
         constructionPlanes=_Collection([
@@ -1630,6 +1701,9 @@ def _tick_module(monkeypatch, name: str):
     module = _load_instance(monkeypatch, name, ui, app)
     design, body = _linked_document(module)
     app.activeProduct = design
+    # Unsaved: no dataFile, so the identity comes from the root component's
+    # entity token, which is what production reads.
+    app.activeDocument = types.SimpleNamespace(name="Horn")
     body.revisionId = "revision-1"
     return module, design, body
 
@@ -1655,6 +1729,31 @@ def _unmoved_live_state(monkeypatch, module, signature_hash: str) -> None:
     )
 
 
+def _ask_for_refresh(module, reason: str = "test") -> None:
+    """Request a refresh for the document that is active right now.
+
+    Every production caller names the document it is asking about, so a test
+    that leaves it out would exercise a request shape that cannot occur.
+    """
+
+    module._request_geometry_refresh(reason, module._active_document_id())
+
+
+def _prime_measured_state(module) -> None:
+    """Run what the first two ticks do: see the document, then measure it once.
+
+    The periodic heartbeat measures nothing at all, so a fixture that needs a
+    published measured state has to arrive at one the way production does: a
+    tick notices a linked document and asks for one look, and the next tick
+    pays for it. Asking by hand instead would leave the sighting unrecorded,
+    and the request it makes would still be outstanding.
+    """
+
+    module._document_links()
+    module._service_geometry_refresh()
+    assert module._geometry_refresh_pending is None
+
+
 def _count_measurements(monkeypatch, module) -> list[int]:
     calls: list[int] = []
     real = module.wglink_send.return_state
@@ -1671,8 +1770,9 @@ def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> N
     """Which phase costs the four-second tick, measured where it runs.
 
     The measured half walks the whole export scope and fingerprints every
-    included face; it happens on Fusion's main thread, and until it is timed
-    there, "Fusion is slow" and "the heartbeat is slow" are the same
+    included face. The tick no longer pays for it -- it reads the cache, and a
+    cache miss answers "cannot tell" -- but the phases are still timed, because
+    until they are, "Fusion is slow" and "the heartbeat is slow" are the same
     unfalsifiable sentence.
     """
 
@@ -1681,7 +1781,7 @@ def test_document_links_time_each_phase_of_the_tick_it_runs_on(monkeypatch) -> N
     timings: dict[str, float] = {}
     module._document_links(timings)
 
-    assert timings["geometry_state"] == "measured"
+    assert timings["geometry_state"] == "unavailable"
     assert {"resolve_links_ms", "geometry_state_ms", "per_link_ms"} <= set(timings)
     assert all(
         value >= 0.0 for value in timings.values() if isinstance(value, float)
@@ -1744,30 +1844,31 @@ def test_the_heartbeat_does_not_re_measure_a_document_that_has_not_moved(
     """
 
     module, _design, _body = _tick_module(monkeypatch, "WGLink_tick_cached")
+    _prime_measured_state(module)
     calls = _count_measurements(monkeypatch, module)
 
     first = module._document_links()
     second_timings: dict[str, float] = {}
     second = module._document_links(second_timings)
 
-    assert len(calls) == 1
+    assert calls == []
     assert second_timings["geometry_state"] == "cached"
     assert second[0]["document_signature_hash"] == first[0]["document_signature_hash"]
     assert second[0]["local_body_state"] == first[0]["local_body_state"]
 
 
-def test_the_heartbeat_re_measures_when_the_managed_body_moves(monkeypatch) -> None:
-    """The cache may not outlive the geometry it describes.
+def test_the_heartbeat_reports_a_moved_body_without_re_measuring(monkeypatch) -> None:
+    """The cache may not outlive the geometry it describes -- and may not renew itself.
 
     ``revisionId`` is a property read, so asking it every tick is free; the
-    measurement it guards is not.
+    measurement it guards is not. The tick therefore says the published
+    observation is no longer current and leaves it at that. Only an explicit
+    refresh pays for a new one.
     """
 
     module, _design, body = _tick_module(monkeypatch, "WGLink_tick_revision")
+    _prime_measured_state(module)
     calls = _count_measurements(monkeypatch, module)
-    # The duty cycle is a separate guard with its own test. Two calls a
-    # microsecond apart would otherwise be deferred by it, and this test would
-    # pass whether or not the key noticed the body at all.
     monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
 
     module._document_links()
@@ -1775,17 +1876,26 @@ def test_the_heartbeat_re_measures_when_the_managed_body_moves(monkeypatch) -> N
     timings: dict[str, float] = {}
     module._document_links(timings)
 
-    assert len(calls) == 2
-    assert timings["geometry_state"] == "measured"
+    assert calls == []
+    assert timings["geometry_state"] == "stale"
+
+    _ask_for_refresh(module, "explicit")
+    module._service_geometry_refresh()
+    refreshed: dict[str, float] = {}
+    module._document_links(refreshed)
+
+    assert len(calls) == 1
+    assert refreshed["geometry_state"] == "cached"
 
 
-def test_a_costly_measurement_defers_the_next_one(monkeypatch) -> None:
-    """The duty cycle is the guard the change key cannot be.
+def test_a_costly_measurement_throttles_the_next_explicit_refresh(monkeypatch) -> None:
+    """The duty cycle now bounds explicit refreshes, which is all that is left.
 
-    A key that moves on every tick -- a document genuinely being edited -- would
-    otherwise reinstate exactly the load this fixes. Waiting a multiple of what
-    the last measurement cost bounds the share of the main thread this can take
-    on any document, at the price of an advisory token a few seconds behind.
+    Nothing periodic can ask for a measurement any more, so the cycle no longer
+    defers a heartbeat's own recompute. What it still does is bound a stream of
+    explicit causes -- a burst of commands, repeated document switches -- to a
+    small share of Fusion's main thread on a document where one measurement is
+    expensive. The request stays pending while it waits, so nothing is lost.
     """
 
     module, _design, body = _tick_module(monkeypatch, "WGLink_tick_duty")
@@ -1796,13 +1906,18 @@ def test_a_costly_measurement_defers_the_next_one(monkeypatch) -> None:
         return real(app, options)
 
     monkeypatch.setattr(module.wglink_send, "return_state", slow)
+    _prime_measured_state(module)
+    calls = _count_measurements(monkeypatch, module)
 
-    module._document_links()
     body.revisionId = "revision-2"
+    _ask_for_refresh(module, "command")
+    module._service_geometry_refresh()
+
+    assert calls == []
+    assert module._geometry_refresh_pending is not None
     timings: dict[str, float] = {}
     module._document_links(timings)
-
-    assert timings["geometry_state"] == "deferred"
+    assert timings["geometry_state"] == "stale"
     assert timings["geometry_state_ms"] < 20.0
 
 
@@ -1882,6 +1997,7 @@ def _guarded_document(monkeypatch, name: str):
     monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
     active = {"document_id": "fusion:doc-a"}
     monkeypatch.setattr(module, "_active_document_id", lambda: active["document_id"])
+    _prime_measured_state(module)
     published = module._document_links()
     assert published[0]["document_signature_hash"]
     module._geometry_state_cache["cost_ms"] = 1000.0
@@ -1995,9 +2111,11 @@ def test_a_cached_token_does_not_authorize_an_edited_managed_body(
     module = fixture.module
     fixture.body.revisionId = "revision-2"
     snapshot = _heartbeat_snapshot(fixture)
-    # The stale republication is the precondition, not the thing under test:
-    # the duty cycle is a deliberate performance guard and stays.
-    assert snapshot["timings"]["geometry_state"] == "deferred"
+    # The stale republication is the precondition, not the thing under test: a
+    # cache-only heartbeat publishes the observation it has, labelled stale,
+    # because refusing to publish anything would leave WG unable to ask for
+    # the model at all.
+    assert snapshot["timings"]["geometry_state"] == "stale"
     assert (
         snapshot["links"][0]["document_signature_hash"]
         == fixture.published[0]["document_signature_hash"]
@@ -2083,35 +2201,782 @@ def test_the_heartbeat_never_publishes_another_documents_measured_state(
     assert snapshot["links"][0]["body_fingerprint_hash"] == ""
 
 
-def test_the_duty_cycle_may_delay_a_measurement_but_not_the_age_ceiling(
+def test_an_idle_linked_document_keeps_its_baseline_indefinitely(
     monkeypatch,
 ) -> None:
-    """Sixty seconds is a promise about what is published, not only about the key.
+    """There is no age at which an idle document loses the state WG needs.
 
-    The two caps are independent: the duty cycle waits up to
-    ``GEOMETRY_STATE_MAX_WAIT_SECONDS`` and the ceiling is
-    ``GEOMETRY_STATE_MAX_AGE_SECONDS``, so a document expensive enough to reach
-    the longer wait published a two-minute-old token under a one-minute
-    promise. The wait still holds -- nothing here forces a measurement onto
-    Fusion's main thread -- but past the ceiling the answer is "cannot tell".
+    Withdrawing the cached observation after a minute made sense while the wire
+    could not say how old it was. It cannot survive a cache-only heartbeat:
+    nothing renews a cache the tick may not measure into, so the ceiling only
+    decided how long it took for the published ``documentSignatureHash`` to go
+    empty and stay empty. WG refuses to publish a return request or an
+    exact-target handoff without one, and nothing in its UI can cause a
+    measurement, so a user who left Fusion alone for a minute could no longer
+    ask for their own model.
+
+    What the tokens buy is the honest version: the observation is still there,
+    still labelled with the revision it was taken at, and still free.
     """
 
-    fixture = _guarded_document(monkeypatch, "WGLink_guard_age_ceiling")
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_idle_baseline")
     module = fixture.module
     calls = _count_measurements(monkeypatch, module)
-    # Twenty seconds a measurement: the duty cycle would wait its full cap.
+    # Twenty seconds a measurement: expensive enough to reach every cap there
+    # is, on a document nobody is touching.
     module._geometry_state_cache["cost_ms"] = 20_000.0
-    fixture.clock.value += module.GEOMETRY_STATE_MAX_AGE_SECONDS + 10.0
+    measured = fixture.published[0]
 
-    snapshot = _heartbeat_snapshot(fixture)
+    for _tick in range(50):
+        fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+        snapshot = _heartbeat_snapshot(fixture)
+        link = snapshot["links"][0]
+        assert snapshot["timings"]["geometry_state"] == "cached"
+        assert link["document_signature_hash"] == measured["document_signature_hash"]
+        assert link["measured_revision_token"] == measured["geometry_revision_token"]
 
-    assert snapshot["timings"]["geometry_state"] == "unavailable"
     assert (
         snapshot["timings"]["geometry_state_age_s"]
         > module.GEOMETRY_STATE_MAX_AGE_SECONDS
     )
-    assert snapshot["links"][0]["document_signature_hash"] == ""
     assert calls == []
+
+
+def test_an_edited_document_keeps_its_older_baseline_past_the_old_ceiling(
+    monkeypatch,
+) -> None:
+    """The same promise for a document that moved: labelled, not withdrawn.
+
+    ``stale`` is the honest answer, at four seconds and at four minutes. The
+    tokens differ, so nothing can read the published observation as current,
+    and WG still has a baseline it can name -- which the guard measures against
+    for real and refuses if the model has moved.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_stale_forever")
+    module = fixture.module
+    calls = _count_measurements(monkeypatch, module)
+    measured = fixture.published[0]
+    fixture.body.revisionId = "revision-2"
+    fixture.clock.value += module.GEOMETRY_STATE_MAX_AGE_SECONDS * 4
+
+    snapshot = _heartbeat_snapshot(fixture)
+    link = snapshot["links"][0]
+
+    assert snapshot["timings"]["geometry_state"] == "stale"
+    assert link["document_signature_hash"] == measured["document_signature_hash"]
+    assert link["measured_revision_token"] == measured["geometry_revision_token"]
+    assert link["geometry_revision_token"] != link["measured_revision_token"]
+    assert calls == []
+
+
+def test_a_startup_refresh_never_walks_an_unlinked_document(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Loading the add-in must not inspect a model WGLink has never touched.
+
+    Startup asks for one refresh because a restart has no cached state. On a
+    document with no WGLink records there is nothing for that measurement to
+    report -- ``_document_links`` returns ``[]`` either way -- and
+    ``return_state`` still walks the root export scope to produce it. The
+    request is spent without measuring instead.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_startup_unlinked", ui, app)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_k: tmp_path)
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    app.activeProduct = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        findAttributes=lambda _group, _name: _Collection(),
+    )
+    app.activeDocument = types.SimpleNamespace(name="Somebody else's model")
+    calls = _count_measurements(monkeypatch, module)
+
+    module.run(None)
+    try:
+        handler = module._watch_handler
+        assert handler is not None
+        for _tick in range(5):
+            handler.notify(None)
+
+        assert calls == []
+        assert module._document_links() == []
+        assert module._geometry_refresh_pending is None
+    finally:
+        module.stop(None)
+
+
+def test_a_refresh_is_dropped_when_the_document_it_named_is_no_longer_active(
+    monkeypatch,
+) -> None:
+    """A request is about one document, and only that one can answer it.
+
+    A slot carrying only a reason is serviced against whatever document the
+    tick happens to land on, so asking about a linked document and switching
+    away bought a walk of the document the user moved to.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_refresh_wrong_document")
+    module = fixture.module
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _count_measurements(monkeypatch, module)
+    fixture.body.revisionId = "revision-2"
+    _ask_for_refresh(module, "command")
+
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    fixture.app.activeProduct = other_design
+    fixture.active["document_id"] = "fusion:doc-b"
+    module._service_geometry_refresh()
+
+    assert calls == []
+    assert module._geometry_refresh_pending is None
+
+
+def test_the_refresh_throttle_never_outlives_the_observation_it_protects(
+    monkeypatch,
+) -> None:
+    """A wait longer than the state it defends is a wait that defends nothing.
+
+    While the cap was two minutes and the observation's own ceiling one, an
+    expensive document postponed the measurement past the point where the state
+    it was waiting to replace had already been withdrawn.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_throttle_cap")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    calls = _count_measurements(monkeypatch, module)
+    module._geometry_state_cache["cost_ms"] = 20_000.0
+    fixture.body.revisionId = "revision-2"
+    _ask_for_refresh(module, "command")
+
+    assert module.GEOMETRY_STATE_MAX_WAIT_SECONDS <= (
+        module.GEOMETRY_STATE_MAX_AGE_SECONDS
+    )
+    for _tick in range(20):
+        fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+        module._on_watch_tick()
+
+    assert len(calls) == 1
+    assert module._geometry_refresh_pending is None
+
+
+def test_a_switch_is_not_throttled_by_the_previous_documents_cost(
+    monkeypatch,
+) -> None:
+    """One document's expense is not a reason to withhold another's state.
+
+    The throttle reads the cache's cost and age. Applied to a cache entry
+    belonging to the document just switched away from, a dense model would
+    silently delay the new document's first measurement by up to the full cap.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_throttle_other_document")
+    module = fixture.module
+    calls = _count_measurements(monkeypatch, module)
+    module._geometry_state_cache["cost_ms"] = 20_000.0
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    fixture.app.activeProduct = other_design
+    fixture.active["document_id"] = "fusion:doc-b"
+
+    _ask_for_refresh(module, "document-changed")
+    module._service_geometry_refresh()
+
+    assert len(calls) == 1
+    assert module._geometry_refresh_pending is None
+
+
+@pytest.mark.parametrize("channel", ["return", "update"])
+def test_a_guard_that_cannot_measure_refuses_the_operation(
+    monkeypatch, tmp_path: Path, channel: str
+) -> None:
+    """"Cannot confirm" is a refusal, not a pass.
+
+    The guard has two halves and only one was covered: a measurement that
+    disagrees with WG's baseline refuses, and a measurement that produces no
+    token at all must refuse too. A document WGLink cannot read is exactly the
+    case where a permissive guard would let a rebuild run over an unknown
+    model, and a cache-only heartbeat makes an empty token an ordinary state
+    rather than an exotic one.
+    """
+
+    fixture = _guarded_document(monkeypatch, f"WGLink_guard_unmeasurable_{channel}")
+    module = fixture.module
+    snapshot = _heartbeat_snapshot(fixture)
+    monkeypatch.setattr(
+        module,
+        "_fresh_geometry_state",
+        lambda: {
+            "document_signature_hash": "",
+            "document_body_count": "",
+            "source_state_hash": "",
+            "instance_identities": {},
+            "bodies": {},
+        },
+    )
+
+    if channel == "return":
+        effects = _pending_return(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_return_request(snapshot) == module.HANDLED
+        expected_title = "WGLink return to WG refused"
+    else:
+        effects = _pending_update(fixture, monkeypatch, tmp_path)
+        assert module._apply_pending_handoff(snapshot) == module.HANDLED
+        expected_title = "WGLink automatic update refused"
+
+    assert effects == []
+    assert [title for title, _text in fixture.ui.messages] == [expected_title]
+    assert "could not measure this Fusion document" in fixture.ui.messages[0][1]
+
+
+def test_a_forced_measurement_is_published_as_current(monkeypatch) -> None:
+    """A fresh measurement is current by definition, and says so.
+
+    Both tokens name the revision it was taken at, so a consumer handed a
+    forced measurement never has to guess whether the labels apply to it.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_forced_tokens")
+    app = module._app()
+    records = module.wglink_core._resolved_link_records(app.activeProduct)
+
+    state, verdict = module._geometry_state(
+        app, app.activeProduct, records, "fusion:doc-a", force=True
+    )
+
+    assert verdict == "measured"
+    assert state["geometry_revision_token"]
+    assert state["measured_revision_token"] == state["geometry_revision_token"]
+
+
+def _proxying_module(monkeypatch, name: str):
+    """A registration whose application behaves the way Fusion's does.
+
+    ``activeDocument`` is a property that mints a new wrapper on every read,
+    and the design's ``rootComponent`` does the same. Any identity derived from
+    Python object identity is unstable under this and stable under the
+    plain-attribute fake, which is precisely why the plain fake could not see
+    the defect.
+    """
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False))
+    app = _ProxyingApplication(ui)
+    module = _load_instance(monkeypatch, name, ui, app)
+    design, body = _linked_document(module)
+    app.activeProduct = _proxying_root(design)
+    app.activeDocument = types.SimpleNamespace(name="Untitled")
+    body.revisionId = "revision-1"
+    return module, app, design, body
+
+
+def test_an_unsaved_documents_identity_is_stable_under_fusions_proxies(
+    monkeypatch,
+) -> None:
+    """The identity must come from Fusion, not from a Python object.
+
+    Fusion's bindings construct a fresh proxy for every property read, so
+    ``id(document)`` and ``document is held`` describe a temporary wrapper. An
+    identity built on either changes on every read: the document id in the
+    snapshot and the one the links were cached under disagree inside a single
+    tick, every tick is a cache miss, and a refresh requested for the active
+    document is dropped for naming the wrong one -- a linked unsaved document
+    that can never report a state.
+    """
+
+    module, app, _design, _body = _proxying_module(
+        monkeypatch, "WGLink_proxy_identity"
+    )
+
+    reads = {module._active_document_id() for _ in range(5)}
+
+    assert len(reads) == 1
+    only = reads.pop()
+    assert only and only.startswith("local:")
+
+    # A second document: a different root component, so a different handle.
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    app.activeProduct = _proxying_root(other_design)
+    app.activeDocument = types.SimpleNamespace(name="Untitled")
+
+    assert module._active_document_id() != only
+
+
+def test_a_linked_unsaved_document_reports_its_state_under_fusions_proxies(
+    monkeypatch,
+) -> None:
+    """The end-to-end consequence, on the application shape Fusion presents.
+
+    One measurement, then a published baseline: an unstable identity turned
+    this into zero measurements and an empty hash for ever.
+    """
+
+    module, _app, _design, _body = _proxying_module(
+        monkeypatch, "WGLink_proxy_heartbeat"
+    )
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    calls = _count_measurements(monkeypatch, module)
+
+    for _tick in range(5):
+        module._on_watch_tick()
+
+    timings: dict[str, float] = {}
+    links = module._document_links(timings)
+
+    assert len(calls) == 1
+    assert timings["geometry_state"] == "cached"
+    assert links[0]["document_signature_hash"]
+
+
+def test_an_uncomputable_revision_key_is_never_reported_as_current(
+    monkeypatch,
+) -> None:
+    """Two blanks matching is not evidence that nothing moved.
+
+    An empty revision token means the key could not be computed. Comparing it
+    with the equally empty token of the cached measurement reported ``cached``,
+    so a full ``documentSignatureHash`` was published as current on the
+    strength of two absences agreeing -- and with no age ceiling left to cap
+    it, for as long as the key stayed uncomputable.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_blank_revision")
+    monkeypatch.setattr(module, "_geometry_revision_token", lambda *_a, **_k: "")
+    _prime_measured_state(module)
+    calls = _count_measurements(monkeypatch, module)
+
+    timings: dict[str, float] = {}
+    links = module._document_links(timings)
+
+    assert calls == []
+    assert timings["geometry_state"] != "cached"
+    assert links[0]["geometry_revision_token"] == ""
+
+
+def test_a_linked_document_opened_after_the_add_in_loaded_reports_its_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """WGLink loads before the user opens a model. That is the ordinary order.
+
+    Nothing was active at load, so nothing could be asked about then; the
+    linked design the user opens next is the first document this registration
+    has ever seen, and a first sighting used to be exempt from asking. Between
+    them, no cause ever fired, and the document reported an empty hash for
+    ever -- which WG cannot publish a return request or an exact-target handoff
+    from.
+    """
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_open_after_load", ui, app)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_k: tmp_path)
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    calls = _count_measurements(monkeypatch, module)
+
+    module.run(None)
+    try:
+        handler = module._watch_handler
+        assert handler is not None
+        handler.notify(None)
+        assert calls == []  # nothing is open; there is nothing to look at
+
+        design, body = _linked_document(module)
+        body.revisionId = "revision-1"
+        app.activeProduct = design
+        app.activeDocument = types.SimpleNamespace(name="Horn")
+        for _tick in range(5):
+            handler.notify(None)
+
+        assert len(calls) == 1
+        timings: dict[str, float] = {}
+        links = module._document_links(timings)
+        assert timings["geometry_state"] == "cached"
+        assert links[0]["document_signature_hash"]
+    finally:
+        module.stop(None)
+
+
+def test_a_linked_document_opened_after_a_drawing_reports_its_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The same hole reached through a product that is not a Design.
+
+    A Drawing active at load never reached the part of the tick that records
+    what is active, so the linked model opened next was still a first sighting.
+    """
+
+    panels = _Panels()
+    ui = _UI(panels, _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_open_after_drawing", ui, app)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_k: tmp_path)
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::drawing::Drawing")
+    app.activeDocument = types.SimpleNamespace(name="Sheet 1")
+    calls = _count_measurements(monkeypatch, module)
+
+    module.run(None)
+    try:
+        handler = module._watch_handler
+        assert handler is not None
+        for _tick in range(3):
+            handler.notify(None)
+        assert calls == []
+
+        design, body = _linked_document(module)
+        body.revisionId = "revision-1"
+        app.activeProduct = design
+        app.activeDocument = types.SimpleNamespace(name="Horn")
+        for _tick in range(5):
+            handler.notify(None)
+
+        assert len(calls) == 1
+        assert module._document_links()[0]["document_signature_hash"]
+    finally:
+        module.stop(None)
+
+
+def test_a_request_lost_before_it_is_answered_is_asked_again(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Asking once is not the same as being answered.
+
+    A request is spent without answering anything whenever the document stops
+    being nameable between the tick that asked and the tick that would have
+    paid. A rule that asks only when the document *changes* never learns that
+    the answer never came, so the document publishes an empty hash for the rest
+    of the session -- the same dead end as an expired observation, reached from
+    a different direction.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_lost_request")
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _count_measurements(monkeypatch, module)
+    real_id = module._active_document_id
+
+    # One tick sees the document and asks about it.
+    module._document_links()
+    assert module._geometry_refresh_pending is not None
+
+    # The next tick cannot name the active document, so the request it was
+    # holding is about nothing it can measure, and is spent.
+    monkeypatch.setattr(module, "_active_document_id", lambda: None)
+    module._service_geometry_refresh()
+    assert module._geometry_refresh_pending is None
+    assert calls == []
+
+    # The document is nameable again from here, and still has no observation.
+    # Asking only when the document *changes* never asks a second time.
+    monkeypatch.setattr(module, "_active_document_id", real_id)
+    for _tick in range(4):
+        module._on_watch_tick()
+
+    assert len(calls) == 1
+    assert module._document_links()[0]["document_signature_hash"]
+
+
+def test_a_refresh_for_a_document_whose_links_went_is_spent_without_walking_it(
+    monkeypatch,
+) -> None:
+    """Links can go between the tick that asks and the tick that would pay.
+
+    ``_measure_geometry_state`` walks the root export scope whatever the
+    document holds, so a request that arrives at a document with no WGLink
+    records must not be answered -- that is the cost the unlinked fast path
+    exists to avoid, reached through the refresh instead of the heartbeat. And
+    it must be *spent*, not left pending, or every later tick tries the same
+    walk again.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_links_vanished")
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    _ask_for_refresh(module, "document-seen")
+    assert module._geometry_refresh_pending is not None
+    calls = _count_measurements(monkeypatch, module)
+    # Detached while the request was in flight.
+    monkeypatch.setattr(
+        module.wglink_core, "_resolved_link_records", lambda _design: {}
+    )
+
+    for _tick in range(5):
+        module._on_watch_tick()
+
+    assert calls == []
+    assert module._geometry_refresh_pending is None
+
+
+def _unmeasurable(monkeypatch, module) -> list[int]:
+    """Make every measurement fail the way a real one fails: silently.
+
+    ``_measure_geometry_state`` swallows the exception and returns empty
+    hashes, so a document that is still loading or regenerating is
+    indistinguishable from one that can never be measured.
+    """
+
+    calls: list[int] = []
+
+    def refuses(_app, _options=None):
+        calls.append(1)
+        raise RuntimeError("this document cannot be measured")
+
+    monkeypatch.setattr(module.wglink_send, "return_state", refuses)
+    return calls
+
+
+def test_a_document_that_cannot_be_measured_is_not_retried_every_tick(
+    monkeypatch,
+) -> None:
+    """Re-asking is a rate, not a loop.
+
+    Asking again whenever a linked document has no observation is what stops
+    one lost request from silencing the document. Left ungoverned it would be a
+    measurement attempt every four seconds on a document that cannot be
+    measured at all -- the load this whole item removes, rebuilt out of
+    recovery logic.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_retry_rate")
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _unmeasurable(monkeypatch, module)
+
+    for _tick in range(20):
+        module._on_watch_tick()
+
+    assert len(calls) == 1
+    assert module._document_links()[0]["document_signature_hash"] == ""
+
+
+def test_a_document_that_becomes_measurable_recovers_by_itself(
+    monkeypatch,
+) -> None:
+    """Giving up is D1's dead end behind a counter.
+
+    A measurement fails for ordinary, temporary reasons -- the document is
+    still loading, or regenerating -- and a failure is indistinguishable from
+    permanent, because ``_measure_geometry_state`` swallows it and returns
+    empty hashes. A fixed allowance is spent in a few fast ticks, and the
+    document then publishes an empty ``documentSignatureHash`` for the rest of
+    the session however measurable it becomes: WG refuses every return request
+    and every exact-target handoff, and nothing in WG can cause a measurement.
+    So the retry never stops; it only slows down.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_retry_recovery")
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    clock = types.SimpleNamespace(value=1000.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
+    real_state = module.wglink_send.return_state
+    failing = _unmeasurable(monkeypatch, module)
+
+    for _tick in range(20):
+        clock.value += module.WATCH_INTERVAL_SECONDS
+        module._on_watch_tick()
+    assert len(failing) == 2  # once, then once a minute
+
+    # Whatever it was, it passed.
+    monkeypatch.setattr(module.wglink_send, "return_state", real_state)
+    calls = _count_measurements(monkeypatch, module)
+    clock.value += module.GEOMETRY_REFRESH_RETRY_SECONDS
+    for _tick in range(3):
+        clock.value += module.WATCH_INTERVAL_SECONDS
+        module._on_watch_tick()
+
+    assert len(calls) == 1
+    timings: dict[str, float] = {}
+    links = module._document_links(timings)
+    assert timings["geometry_state"] == "cached"
+    assert links[0]["document_signature_hash"]
+
+
+def test_a_failed_measurement_is_never_published_as_a_measurement(
+    monkeypatch,
+) -> None:
+    """A measurement that produced no document baseline is not a baseline.
+
+    Publishing it as ``cached``, with a revision token beside an empty
+    signature hash, said "this measurement is current" while carrying no
+    measurement for anything to be current about -- and WG cannot publish a
+    return request or an exact-target handoff from it either way.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_failed_measurement")
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    _unmeasurable(monkeypatch, module)
+
+    _ask_for_refresh(module, "document-seen")
+    module._service_geometry_refresh()
+
+    timings: dict[str, float] = {}
+    link = module._document_links(timings)[0]
+    assert timings["geometry_state"] != "cached"
+    assert link["document_signature_hash"] == ""
+    assert link["measured_revision_token"] == ""
+
+
+def test_a_failed_measurement_does_not_evict_the_last_real_observation(
+    monkeypatch,
+) -> None:
+    """The observation WG is working from outlives a measurement that failed."""
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_failed_keeps_cache")
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    _prime_measured_state(module)
+    measured = module._document_links()[0]
+    assert measured["document_signature_hash"]
+
+    _unmeasurable(monkeypatch, module)
+    body.revisionId = "revision-2"
+    _ask_for_refresh(module, "document-seen")
+    module._service_geometry_refresh()
+
+    timings: dict[str, float] = {}
+    link = module._document_links(timings)[0]
+    assert timings["geometry_state"] == "stale"
+    assert link["document_signature_hash"] == measured["document_signature_hash"]
+
+
+def test_two_documents_this_add_in_cannot_name_never_share_one_observation(
+    monkeypatch,
+) -> None:
+    """``None`` is "cannot name this document", and it is not a name.
+
+    A saved document has a data file id and an unsaved one has its root
+    component's entity token. A document with neither cannot be told apart from
+    any other document with neither, so giving them all one identity -- any
+    constant, however obviously a placeholder -- files every one of them under
+    a single cache entry, and the next one reads back the last one's
+    fingerprint. That is exactly the substitution A1 forbids, and it is why
+    nothing is cached under ``None`` and nothing is read back from it.
+    """
+
+    module, design, _body = _tick_module(monkeypatch, "WGLink_unnameable_pair")
+    app = module._app()
+    design.rootComponent.entityToken = ""
+
+    assert module._active_document_id() is None
+    assert module._fresh_geometry_state() is not None
+    assert module._geometry_state_cache is None  # nowhere to file it
+
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    other_design.rootComponent.entityToken = ""
+    app.activeProduct = other_design
+
+    timings: dict[str, float] = {}
+    link = module._document_links(timings)[0]
+
+    assert link["instance_id"] == "wgi-other"
+    assert timings["geometry_state"] == "unavailable"
+    assert link["document_signature_hash"] == ""
+    assert link["measured_revision_token"] == ""
+
+
+def test_an_observation_filed_under_no_document_is_never_read_back(
+    monkeypatch,
+) -> None:
+    """The read guard is what makes "nothing is cached under None" a property.
+
+    Nothing writes such an entry today. The guard is what stops that being a
+    fact about the current code rather than about the design: one entry keyed
+    on "unknown" is read back by every other document that cannot be named.
+    """
+
+    module, design, _body = _tick_module(monkeypatch, "WGLink_none_keyed_cache")
+    design.rootComponent.entityToken = ""
+    assert module._active_document_id() is None
+    records = module.wglink_core._resolved_link_records(design)
+    module._geometry_state_cache = {
+        "key": (None, module._geometry_revision_token(design, records)),
+        "at": module.time.monotonic(),
+        "cost_ms": 1.0,
+        "state": {
+            "document_signature_hash": "sha256:another-documents-model",
+            "document_body_count": "1",
+            "source_state_hash": "",
+            "instance_identities": {},
+            "bodies": {},
+        },
+    }
+
+    timings: dict[str, float] = {}
+    link = module._document_links(timings)[0]
+
+    assert timings["geometry_state"] == "unavailable"
+    assert link["document_signature_hash"] == ""
+
+
+def test_a_measurement_that_arrives_stops_the_add_in_asking(monkeypatch) -> None:
+    """The budget is about documents with no answer, not about documents.
+
+    Once an observation exists, no number of ticks asks for another -- which is
+    the property the whole item is about, restated for the recovery path.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_budget_cleared")
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _count_measurements(monkeypatch, module)
+
+    for index in range(30):
+        # Edited on every tick: stale, which is not the same as unobserved.
+        body.revisionId = f"revision-{index}"
+        module._on_watch_tick()
+
+    assert len(calls) == 1
+    assert module._geometry_refresh_attempts == {}
+    assert module._document_links()[0]["document_signature_hash"]
+
+
+def test_a_stale_stamped_request_never_blocks_the_active_documents_own(
+    monkeypatch,
+) -> None:
+    """One slot, and the live question owns it.
+
+    Coalescing keeps one pending request, not the first one ever made. A
+    request stamped for a document nobody is asking about any more would
+    otherwise sit in the slot, drop out on the next tick for mismatch, and
+    leave the document actually on screen with nothing asked about it.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_stale_stamp")
+    module = fixture.module
+    module._geometry_refresh_pending = None
+    module._request_geometry_refresh("startup", None)
+
+    _ask_for_refresh(module, "document-seen")
+
+    pending = module._geometry_refresh_pending
+    assert pending is not None
+    assert pending["document_id"] == module._active_document_id()
+    # Still one slot, not a queue.
+    _ask_for_refresh(module, "command")
+    assert module._geometry_refresh_pending is pending
 
 
 @pytest.mark.parametrize("channel", ["return", "update"])
@@ -2213,6 +3078,449 @@ def test_an_idle_tick_still_costs_the_document_no_measurement(monkeypatch) -> No
     assert module._geometry_state_cache is not None
 
 
+# --- the periodic heartbeat is cache-only ---------------------------------
+#
+# The four-second tick may read what a previous measurement left behind. It may
+# never take one. Every measurement below is caused by something a user or WG
+# did, and the tick is only the main thread it is allowed to run on.
+
+
+def test_a_linked_heartbeat_never_measures_geometry_on_a_cache_miss(
+    monkeypatch,
+) -> None:
+    """A first tick on a linked document is still a tick.
+
+    The unlinked fast path saved documents WGLink had never touched. A linked
+    one still paid a full root-scope evaluation on the first tick after load,
+    after a document switch and after a restart -- on Fusion's main thread, in
+    the middle of whatever the user was doing. There is nothing to publish that
+    a cache miss can honestly answer, so it answers "cannot tell".
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_cache_miss")
+    calls = _count_measurements(monkeypatch, module)
+
+    timings: dict[str, float] = {}
+    links = module._document_links(timings)
+
+    assert calls == []
+    assert timings["geometry_state"] == "unavailable"
+    assert links[0]["document_signature_hash"] == ""
+    assert links[0]["local_body_state"] == "unknown"
+    assert links[0]["body_fingerprint_hash"] == ""
+    # Identity is stored attributes and stays free, so it is still published.
+    assert links[0]["instance_id"]
+    assert links[0]["design_id"]
+
+
+def test_a_stale_cache_is_published_as_stale_without_measuring(monkeypatch) -> None:
+    """A moved document does not buy the heartbeat a new measurement.
+
+    The cheap revision token says the measurement is no longer current, which
+    is a property read. Acting on that by measuring is exactly the four-second
+    load this item removes, so the heartbeat publishes the measurement it has
+    and labels it. Nothing here claims a newly measured state.
+    """
+
+    module, _design, body = _tick_module(monkeypatch, "WGLink_stale_cache")
+    # Rule the duty cycle out: with it in play the base heartbeat would defer
+    # rather than measure, and this test would pass without saying anything.
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    _prime_measured_state(module)
+    first = module._document_links()
+    assert first[0]["document_signature_hash"]
+
+    calls = _count_measurements(monkeypatch, module)
+    body.revisionId = "revision-2"
+    timings: dict[str, float] = {}
+    second = module._document_links(timings)
+
+    assert calls == []
+    assert timings["geometry_state"] == "stale"
+    assert (
+        second[0]["document_signature_hash"] == first[0]["document_signature_hash"]
+    )
+    # The token the measurement was taken at, beside the token the document is
+    # at now: unequal, so no consumer can mistake the one for the other.
+    assert second[0]["measured_revision_token"] == first[0]["geometry_revision_token"]
+    assert second[0]["geometry_revision_token"] != second[0]["measured_revision_token"]
+
+
+def test_only_an_explicit_refresh_measures_and_it_measures_once(monkeypatch) -> None:
+    """Ticks are the carrier, never the cause.
+
+    With nothing asked for, any number of ticks on a document that keeps moving
+    measure nothing at all. One explicit request measures exactly once, however
+    many ticks follow it.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_explicit_refresh")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    fixture.body.revisionId = "revision-2"
+    calls = _count_measurements(monkeypatch, module)
+
+    for _tick in range(4):
+        module._on_watch_tick()
+        fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+    assert calls == []
+
+    _ask_for_refresh(module, "explicit")
+    for _tick in range(4):
+        module._on_watch_tick()
+        fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+
+    assert len(calls) == 1
+    assert module._geometry_refresh_pending is None
+    timings: dict[str, float] = {}
+    module._document_links(timings)
+    assert timings["geometry_state"] == "cached"
+
+
+def test_a_geometry_refresh_is_coalesced_to_one_pending_request(monkeypatch) -> None:
+    """One add-in instance, at most one pending refresh.
+
+    Every explicit cause -- startup, a document switch, a finished command --
+    may ask. A queue of them would reinstate the load this removes on the first
+    busy minute, so the second request onwards is dropped, not stacked.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_refresh_coalescing")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    fixture.body.revisionId = "revision-2"
+    calls = _count_measurements(monkeypatch, module)
+
+    _ask_for_refresh(module, "startup")
+    pending = module._geometry_refresh_pending
+    for reason in ("document-switch", "command", "command", "command"):
+        _ask_for_refresh(module, reason)
+    assert module._geometry_refresh_pending is pending
+
+    module._on_watch_tick()
+    fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+    module._on_watch_tick()
+
+    assert len(calls) == 1
+    assert module._geometry_refresh_pending is None
+
+
+def test_a_refresh_on_an_unmeasurable_document_is_not_retried_forever(
+    monkeypatch,
+) -> None:
+    """A request that cannot be answered is spent, not left on the timer.
+
+    The document has links, so the request is serviced; the measurement then
+    comes back with nothing -- an inventory that stopped being readable between
+    the two reads. If that left the request standing, every later tick would
+    try again, which is a periodic inspection attempt by another name.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_unmeasurable_refresh")
+    _prime_measured_state(module)
+    # Rule the refresh throttle out: a request it is merely waiting on is
+    # still outstanding, which is a different thing from one it has spent.
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _count_measurements(monkeypatch, module)
+    monkeypatch.setattr(module, "_fresh_geometry_state", lambda: None)
+
+    _ask_for_refresh(module, "document-changed")
+    module._service_geometry_refresh()
+
+    assert calls == []
+    assert module._geometry_refresh_pending is None
+
+
+def test_a_guarded_operation_settles_a_pending_refresh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """One explicit measurement answers every request outstanding for it.
+
+    A guarded return measures the live document for real. A refresh asked for
+    a moment earlier wants exactly that measurement, so it is answered by it;
+    leaving the request pending would buy a second walk of the same document
+    on the next tick.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_guard_settles_refresh")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    snapshot = _heartbeat_snapshot(fixture)
+    sent = _pending_return(fixture, monkeypatch, tmp_path)
+    calls = _count_measurements(monkeypatch, module)
+    _ask_for_refresh(module, "document-changed")
+
+    assert module._apply_pending_return_request(snapshot) == module.HANDLED
+
+    assert sent and fixture.ui.messages == []
+    assert len(calls) == 1
+    assert module._geometry_refresh_pending is None
+
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+    module._on_watch_tick()
+    assert len(calls) == 1
+
+
+def test_a_document_switch_schedules_one_refresh_and_publishes_no_foreign_state(
+    monkeypatch,
+) -> None:
+    """Switching documents is a change notification, not a scan.
+
+    The switch invalidates the cached measurement -- the previous document's
+    fingerprint is never this document's evidence -- and schedules one bounded
+    refresh. It does not walk the new document on the tick that noticed it, and
+    a second tick on the same document does not ask again.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_switch_refresh")
+    module = fixture.module
+    calls = _count_measurements(monkeypatch, module)
+    other_design, _other_body = _linked_document(
+        module, instance_id="wgi-other", export_id="wge_9"
+    )
+    fixture.app.activeProduct = other_design
+    fixture.active["document_id"] = "fusion:doc-b"
+
+    snapshot = _heartbeat_snapshot(fixture)
+
+    assert calls == []
+    assert snapshot["timings"]["geometry_state"] == "unavailable"
+    assert snapshot["links"][0]["instance_id"] == "wgi-other"
+    assert snapshot["links"][0]["document_signature_hash"] == ""
+    assert snapshot["links"][0]["measured_revision_token"] == ""
+    pending = module._geometry_refresh_pending
+    assert pending is not None
+
+    _heartbeat_snapshot(fixture)
+    assert module._geometry_refresh_pending is pending
+    assert calls == []
+
+
+def test_neither_a_linked_nor_an_unlinked_design_is_inspected_by_a_tick(
+    monkeypatch,
+) -> None:
+    """The instrumented count for periodic activity alone is zero, both ways.
+
+    The unlinked path returns before it resolves anything; the linked path
+    reads stored attributes and the cache. Neither reaches ``return_state``.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_linked_and_unlinked")
+    module = fixture.module
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    monkeypatch.setattr(module, "GEOMETRY_STATE_DUTY_CYCLE", 0.0)
+    calls = _count_measurements(monkeypatch, module)
+    linked = fixture.app.activeProduct
+    unlinked = types.SimpleNamespace(
+        objectType="adsk::fusion::Design",
+        findAttributes=lambda _group, _name: _Collection(),
+    )
+
+    for index in range(6):
+        fixture.app.activeProduct = linked if index % 2 == 0 else unlinked
+        fixture.body.revisionId = f"revision-{index}"
+        module._on_watch_tick()
+        fixture.clock.value += module.WATCH_INTERVAL_SECONDS
+
+    assert calls == []
+
+
+def test_a_second_add_in_instance_measures_nothing_while_it_is_not_the_owner(
+    monkeypatch,
+) -> None:
+    """Two Fusion processes, one data directory, one measuring instance.
+
+    A standby registration keeps its own cache and its own pending refresh, and
+    its watch handler refuses the tick because it does not hold the active IPC
+    lease. Nothing it does reaches the document.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    owner = _load_instance(monkeypatch, "WGLink_multi_owner", ui, app)
+    standby = _load_instance(monkeypatch, "WGLink_multi_standby", ui, app)
+    design, body = _linked_document(owner)
+    body.revisionId = "revision-1"
+    app.activeProduct = design
+    assert owner._claim_ipc_lease() and owner._activate_ipc_lease()
+    try:
+        assert standby._owns_active_ipc_lease() is False
+        calls = _count_measurements(monkeypatch, standby)
+        _ask_for_refresh(standby, "document-switch")
+
+        handler = standby.WatchEventHandler()
+        for _tick in range(3):
+            handler.notify(None)
+
+        assert calls == []
+        # Its own slot, untouched: the owner never services another instance's
+        # refresh, and the standby never services its own.
+        assert standby._geometry_refresh_pending is not None
+        assert owner._geometry_refresh_pending is None
+    finally:
+        owner._release_ipc_lease()
+
+
+def test_a_restart_recovers_its_measured_state_from_one_startup_refresh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A restart is an explicit cause, and it converges in one measurement.
+
+    Otherwise a reloaded add-in would publish "cannot tell" for a linked
+    document until the user happened to run a command, and WG cannot ask for a
+    model whose state was never reported.
+    """
+
+    panels = _Panels()
+    definitions = _Definitions(reserve_ids=False)
+    ui = _UI(panels, definitions)
+    app = _Application(ui)
+    module = _load_instance(monkeypatch, "WGLink_restart_refresh", ui, app)
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_k: tmp_path)
+    monkeypatch.setattr(module, "_pending_handoff", lambda: None)
+    monkeypatch.setattr(module, "_pending_return_request", lambda: None)
+    design, body = _linked_document(module)
+    body.revisionId = "revision-1"
+    app.activeProduct = design
+    app.activeDocument = types.SimpleNamespace(name="Horn")
+    calls = _count_measurements(monkeypatch, module)
+
+    module.run(None)
+    try:
+        assert module._owned is True
+        # Startup publishes what it has, which after a restart is nothing.
+        assert calls == []
+        assert module._geometry_refresh_pending is not None
+
+        handler = module._watch_handler
+        assert handler is not None
+        for _tick in range(3):
+            handler.notify(None)
+
+        assert len(calls) == 1
+        timings: dict[str, float] = {}
+        links = module._document_links(timings)
+        assert timings["geometry_state"] == "cached"
+        assert links[0]["document_signature_hash"]
+        assert (
+            links[0]["measured_revision_token"] == links[0]["geometry_revision_token"]
+        )
+    finally:
+        module.stop(None)
+
+
+def test_a_finished_command_is_an_explicit_cause_of_one_refresh(monkeypatch) -> None:
+    """A command the user ran may have moved the model, so it asks for a look.
+
+    This is the ordinary way a linked document's published state becomes
+    current again without a timer ever measuring anything.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_command_refresh")
+    module = fixture.module
+    module._geometry_refresh_pending = None
+    monkeypatch.setattr(module, "_command_options", lambda _inputs: {})
+    monkeypatch.setattr(module, "_summary", lambda _operation, _report: "done")
+    monkeypatch.setattr(module.wglink_core, "update", lambda *_a, **_k: {"ok": True})
+
+    handler = module.CommandExecuteHandler("update")
+    handler.notify(
+        types.SimpleNamespace(command=types.SimpleNamespace(commandInputs=None))
+    )
+
+    pending = module._geometry_refresh_pending
+    assert pending is not None
+    assert pending["document_id"] == module._active_document_id()
+    assert module._command_busy is False
+
+
+def test_a_cancelled_command_asks_for_no_measurement(monkeypatch) -> None:
+    """A command the user backed out of changed nothing to look at.
+
+    Detach asks for confirmation and Insert asks for a bundle; answering "no"
+    to either returns before anything is written. Asking for a measurement
+    there buys a root-scope walk for a decision not to act.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_command_cancelled")
+    module = fixture.module
+    module._geometry_refresh_pending = None
+    detached: list[int] = []
+    monkeypatch.setattr(module, "_command_options", lambda _inputs: {})
+    monkeypatch.setattr(module, "_confirm_detach", lambda: False)
+    monkeypatch.setattr(
+        module.wglink_core, "detach", lambda *_a, **_k: detached.append(1)
+    )
+
+    handler = module.CommandExecuteHandler("detach")
+    handler.notify(
+        types.SimpleNamespace(command=types.SimpleNamespace(commandInputs=None))
+    )
+
+    assert detached == []
+    assert module._geometry_refresh_pending is None
+    assert module._command_busy is False
+
+
+def test_a_blocked_delivery_does_not_starve_heartbeat_scheduling(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A long poll belongs to the worker; the tick carrier keeps its cadence.
+
+    The scheduling thread renews the lease and raises the owner's event without
+    calling the Fusion API or the live client, so a delivery stuck in a long
+    poll cannot delay a tick -- and nothing it does measures geometry.
+    """
+
+    module, _design, _body = _tick_module(monkeypatch, "WGLink_fair_scheduling")
+    calls = _count_measurements(monkeypatch, module)
+    app = module._app()
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_k: tmp_path)
+    monkeypatch.setattr(module, "WATCH_INTERVAL_SECONDS", 0.01)
+    assert module._claim_ipc_lease() and module._activate_ipc_lease()
+    entered, release = threading.Event(), threading.Event()
+
+    class _StuckDelivery:
+        """A live client whose worker is inside a long poll."""
+
+        def offer_heartbeat(self, _payload: object) -> None:
+            entered.set()
+            release.wait(5.0)
+
+    module._live_client = _StuckDelivery()
+    stop = threading.Event()
+    publisher = threading.Thread(target=module._publish_fusion_status, daemon=True)
+    carrier = threading.Thread(
+        target=module._watch_loop, args=(app, stop), daemon=True
+    )
+    try:
+        publisher.start()
+        assert entered.wait(5.0)
+        carrier.start()
+        deadline = time.monotonic() + 5.0
+        while len(app.fired) < 5 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        # Still blocked in delivery, and the carrier has ticked regardless.
+        assert publisher.is_alive()
+        assert len(app.fired) >= 5
+        assert calls == []
+    finally:
+        stop.set()
+        release.set()
+        carrier.join(timeout=5)
+        publisher.join(timeout=5)
+        module._live_client = None
+        module._release_ipc_lease()
+
+
 def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None:
     """The heartbeat and Audit read one inventory, so they cannot disagree.
 
@@ -2230,7 +3538,9 @@ def test_document_links_report_an_intact_body_as_audit_does(monkeypatch) -> None
     module = _load_instance(monkeypatch, "WGLink_body_state", ui, app)
     design, body = _linked_document(module)
     app.activeProduct = design
+    app.activeDocument = types.SimpleNamespace(name="Horn")
 
+    _prime_measured_state(module)
     link = module._document_links()[0]
 
     audited = module.wglink_core._resolve_link(design, {"instance_id": "wgi-heartbeat"})
@@ -2255,7 +3565,9 @@ def test_document_links_report_a_deleted_body_as_missing(monkeypatch) -> None:
     body.attributes.values.clear()
     design.rootComponent.bRepBodies = _Collection()
     app.activeProduct = design
+    app.activeDocument = types.SimpleNamespace(name="Horn")
 
+    _prime_measured_state(module)
     link = module._document_links()[0]
 
     assert link["local_body_state"] == "missing"
@@ -2270,7 +3582,9 @@ def test_document_links_attach_exact_live_return_identities(monkeypatch) -> None
     module = _load_instance(monkeypatch, "WGLink_live_identities", ui, app)
     design, body = _linked_document(module)
     app.activeProduct = design
+    app.activeDocument = types.SimpleNamespace(name="Horn")
 
+    _prime_measured_state(module)
     link = module._document_links()[0]
 
     state = module.wglink_send.return_state(

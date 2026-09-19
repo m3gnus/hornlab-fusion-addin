@@ -130,6 +130,31 @@ _owned = False
 WATCH_INTERVAL_SECONDS = 4.0
 _installed_source_cache: dict[str, object] | None = None
 _geometry_state_cache: dict[str, object] | None = None
+# At most one pending geometry refresh per add-in instance. A refresh is asked
+# for by something a user or WG did -- startup, a document switch, a finished
+# command -- and is paid for once on the next tick that may run it. The
+# periodic heartbeat never asks: a queue of requests, or a timer that requested
+# its own, would reinstate exactly the four-second main-thread load this
+# design removes.
+_geometry_refresh_pending: dict[str, str | None] | None = None
+# When a document with no usable observation may be asked about again, and
+# when each was last attempted. A request can be spent without answering
+# anything -- the document stopped being nameable between the tick that asked
+# and the tick that would have paid, the measurement threw -- and a request
+# asked once and lost is a document that reports no state for the rest of the
+# session. This is the retry.
+#
+# **A rate, not a budget.** A fixed number of attempts is D1's symptom behind a
+# counter: ``_measure_geometry_state`` swallows every exception and returns
+# empty hashes, so a document that is still loading or regenerating looks
+# exactly like one that can never be measured, spends the allowance in a few
+# fast ticks, and then publishes an empty ``documentSignatureHash`` for ever
+# however measurable it becomes. A rate costs an unmeasurable document about
+# one attempt a minute and never gives up. A measurement that produces a
+# signature hash clears the entry, and the add-in stops asking entirely.
+GEOMETRY_REFRESH_RETRY_SECONDS = 60.0
+_GEOMETRY_REFRESH_ATTEMPTS_TRACKED = 64
+_geometry_refresh_attempts: dict[str, float] = {}
 OWNER_LEASE_SECONDS = WATCH_INTERVAL_SECONDS * 3
 WATCH_EVENT_ID = f"hornlab_wglink_export_available_{_watch_session_id}"
 _candidate_event_id = f"hornlab_wglink_owner_candidate_{_watch_session_id}"
@@ -1142,6 +1167,10 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
     def notify(self, args: object) -> None:
         global _command_busy
         progress = None
+        # Whether this command got as far as producing a report. A user who
+        # cancelled the bundle picker or the detach confirmation changed
+        # nothing, so there is nothing for the next tick to look at.
+        ran = False
         # Hold the watcher off: it must not open a prompt over a running
         # command, and an operation that rewrites a link's stored export id
         # would otherwise be surveyed halfway through.
@@ -1188,6 +1217,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 report = wglink_core.detach(_app(), options)
             else:
                 raise RuntimeError(f"Unknown WGLink operation: {self.operation}")
+            ran = True
             _message(_summary(self.operation, report))
         except (wglink_core.WgLinkError, wglink_author.AuthorError) as exc:
             _message(str(exc), "WGLink refused")
@@ -1199,6 +1229,13 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             # This command may have moved the link on; re-survey from scratch so
             # a stale announcement cannot re-offer what was just applied.
             _watcher.reset()
+            # It may also have moved the geometry, and a command the user ran
+            # is an explicit cause. One coalesced refresh, paid for on the next
+            # tick, is how a linked document's published state becomes current
+            # again without a timer measuring anything. A cancelled command
+            # asks for nothing.
+            if ran:
+                _request_geometry_refresh("command", _active_document_id())
 
 
 class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
@@ -1429,9 +1466,20 @@ def _workspace(ui: object) -> object:
     return workspace
 
 
+# How old a cached observation may get before a refresh that is waiting on the
+# throttle must be allowed through. It is no longer a ceiling on what may be
+# *published*: a cache-only heartbeat that refused to publish anything past a
+# minute left a linked idle document with no baseline at all, and WG cannot ask
+# for a model whose state it was never told. What may be published is governed
+# by the revision tokens instead, which say exactly how current an observation
+# is without anyone inspecting geometry.
 GEOMETRY_STATE_MAX_AGE_SECONDS = 60.0
 GEOMETRY_STATE_DUTY_CYCLE = 12.0
-GEOMETRY_STATE_MAX_WAIT_SECONDS = 120.0
+# The throttle may never outlive the observation it is protecting. While these
+# two disagreed -- 120 against 60 -- an expensive document postponed its
+# refresh for two minutes, and the state that refresh was waiting to replace
+# had aged out one minute earlier.
+GEOMETRY_STATE_MAX_WAIT_SECONDS = GEOMETRY_STATE_MAX_AGE_SECONDS
 
 
 # Bumped by Set WG Source...: a stamp is an attribute write, which moves neither
@@ -1531,6 +1579,211 @@ def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
     }
 
 
+def _geometry_revision_token(design: object, records: dict) -> str:
+    """The cheap revision token: a hash of property reads, and nothing else.
+
+    :func:`_geometry_change_key` evaluates no surface -- it reads the timeline
+    count, each managed body's ``revisionId`` and visibility, the stored export
+    id and edit version, and the source-authoring generation. Hashing it gives
+    one short string that moves when the geometry the measurement describes may
+    have moved, at no cost to Fusion's main thread.
+
+    It is published beside the measurement's own token so a consumer can tell,
+    without anyone inspecting anything, whether the measured state it holds is
+    still current. That is what lets the periodic heartbeat be cache-only.
+    """
+
+    try:
+        return _fingerprint_hash(_geometry_change_key(design, records))
+    except Exception:  # noqa: BLE001 - a document we cannot key has no token
+        return ""
+
+
+def _with_revision_tokens(
+    state: dict[str, object], current: str, measured: str
+) -> dict[str, object]:
+    """Label a measured state with when it was taken, and where we are now."""
+
+    return {
+        **state,
+        "geometry_revision_token": current,
+        "measured_revision_token": measured,
+    }
+
+
+def _request_geometry_refresh(reason: str, document_id: str | None) -> None:
+    """Ask for one geometry inspection of one document, from an explicit cause.
+
+    Coalescing is the whole point: the slot holds at most one request per
+    add-in instance and a second is dropped, not queued. Startup, a document
+    switch and a burst of finished commands therefore cost one measurement
+    between them, not one each.
+
+    The request names the document it was asked for. A slot carrying only a
+    reason is serviced against whatever document happens to be active when the
+    tick lands, so asking about a linked document and then switching away paid
+    for a walk of the document the user moved to -- which is neither what was
+    asked for nor something WGLink has any business inspecting.
+
+    Coalescing means one slot, not "the first request wins". A pending request
+    for a *different* document is replaced: it is about a document nobody is
+    asking about any more, and leaving it there would block the live question
+    behind a dead one until a tick dropped it for mismatch -- after which
+    nothing would ask again, and the document would never report a state.
+    """
+
+    global _geometry_refresh_pending
+    pending = _geometry_refresh_pending
+    if pending is not None and pending.get("document_id") == document_id:
+        return
+    _geometry_refresh_pending = {"reason": str(reason), "document_id": document_id}
+
+
+def _linked_records_now() -> dict | None:
+    """The active document's resolved WGLink records, or ``None`` for no links.
+
+    Stored-attribute reads and inventory resolution -- the same call the tick
+    already makes in :func:`_document_links`, and nothing that evaluates a
+    surface. It exists so a refresh can be refused *before* it costs anything.
+    """
+
+    app = _app()
+    design = app.activeProduct if app else None
+    if design is None or not isinstance(getattr(design, "objectType", ""), str):
+        return None
+    if "Design" not in str(design.objectType):
+        return None
+    try:
+        records = wglink_core._resolved_link_records(design)
+    except Exception:  # noqa: BLE001 - a document we cannot read has no links
+        return None
+    return records or None
+
+
+def _service_geometry_refresh() -> None:
+    """Pay for a requested inspection on the main thread, at most once.
+
+    The tick is the only place a Fusion API call may run, so it is where a
+    refresh is carried out -- but it is the carrier, never the cause. With
+    nothing pending this returns immediately, which is what makes the
+    heartbeat-caused inspection count zero.
+
+    Three things can spend a request without measuring, and all three matter:
+
+    * the active document is not the one the request named. The answer would
+      be about the wrong document, so there is nothing to measure.
+    * the active document has no WGLink records. ``_measure_geometry_state``
+      walks the root export scope whatever the document is, so servicing a
+      request here would walk a model WGLink has never touched -- the exact
+      cost the unlinked fast path exists to avoid, arriving by another door.
+    * the measurement ran. That is the ordinary case.
+
+    The duty cycle survives here, and only here: it no longer defers a
+    measurement the heartbeat wanted (the heartbeat wants none), it bounds what
+    a stream of explicit causes may cost on a document where one measurement is
+    expensive. It is capped at ``GEOMETRY_STATE_MAX_AGE_SECONDS`` so it can
+    never outlive the observation it is protecting, and it is never applied
+    against a cache entry belonging to a different document -- switching away
+    from an expensive model must not throttle the one switched to.
+    """
+
+    global _geometry_refresh_pending
+    pending = _geometry_refresh_pending
+    if pending is None:
+        return
+    document_id = _active_document_id()
+    if document_id is None or pending.get("document_id") != document_id:
+        _geometry_refresh_pending = None
+        return
+    cached = _geometry_state_cache
+    if cached is not None and cached["key"][0] == document_id:
+        wait = min(
+            float(cached["cost_ms"]) / 1000.0 * GEOMETRY_STATE_DUTY_CYCLE,
+            GEOMETRY_STATE_MAX_WAIT_SECONDS,
+        )
+        if time.monotonic() - float(cached["at"]) < wait:
+            return
+    # Spent here, once, for every outcome that is not "still waiting": a
+    # request left standing after the tick decided not to answer it is
+    # retried on the next tick and the next, which is a periodic inspection
+    # attempt wearing an explicit cause's clothes.
+    _geometry_refresh_pending = None
+    if _linked_records_now() is None:
+        return
+    if len(_geometry_refresh_attempts) >= _GEOMETRY_REFRESH_ATTEMPTS_TRACKED:
+        # A session's worth of documents, not a leak. The oldest entries are
+        # for documents nothing is asking about any more.
+        _geometry_refresh_attempts.clear()
+    _geometry_refresh_attempts[document_id] = time.monotonic()
+    _fresh_geometry_state()
+
+
+def _has_usable_observation(document_id: str) -> bool:
+    """Whether the cache holds a measurement of this document worth publishing.
+
+    "Worth publishing" means it carries a signature hash. A measurement that
+    produced none is an answer in the same sense that silence is: WG cannot
+    publish a return request or an exact-target handoff from it, so the
+    document is no better off than if nothing had ever been measured.
+    """
+
+    cached = _geometry_state_cache
+    return bool(
+        cached is not None
+        and cached["key"][0] == document_id
+        and str(cached["state"].get("document_signature_hash") or "")
+    )
+
+
+def _note_active_document(document_id: str | None, *, linked: bool) -> None:
+    """The document-change notification: bounded work, never a scan.
+
+    The cached measurement is keyed by document id, so a switch cannot publish
+    the previous document's fingerprint whatever happens here. What this adds
+    is the bounded half: one coalesced refresh so the active document reports a
+    measured state, without a timer ever deciding to walk anything.
+
+    The condition is deliberately **"this document has no usable observation"**
+    rather than "the document changed". Both fire on a switch -- a switch
+    leaves the single cache slot holding the other document -- but only the
+    first survives a request that is spent without answering, and requests are
+    spent without answering in more ways than are comfortable: the add-in
+    loaded before the user opened a model, a Drawing was active at load, the
+    document stopped being nameable between the tick that asked and the tick
+    that would have paid, the measurement threw. Every one of those leaves a
+    linked document publishing an empty ``documentSignatureHash``, which WG
+    cannot act on and no WG-side action can repair. A rule keyed on change
+    asks once and never learns that the answer never arrived.
+
+    It is not a retry loop either. ``GEOMETRY_REFRESH_RETRY_SECONDS`` is the
+    rate at which a document with no observation may be asked about again, so
+    one that cannot be measured costs about one attempt a minute rather than
+    one every four seconds -- and, unlike a fixed allowance, never stops being
+    asked about, because a document that is still loading is indistinguishable
+    from one that can never be measured and both recover. A measurement that
+    yields a hash clears the entry and this stops asking for good. An idle
+    document with an observation, or one whose observation is merely stale,
+    asks for nothing.
+
+    An unlinked document schedules nothing: there is no link state to publish
+    for it, and ``return_state`` on the root scope is the cost that merely
+    enabling WGLink must not impose on an unrelated model. A document this
+    add-in cannot name schedules nothing either -- there is nowhere to cache
+    the answer, and two unnameable documents would share the entry.
+    """
+
+    if not linked or document_id is None:
+        return
+    if _geometry_refresh_pending is not None or _has_usable_observation(document_id):
+        return
+    attempted = _geometry_refresh_attempts.get(document_id)
+    if attempted is not None and (
+        time.monotonic() - attempted < GEOMETRY_REFRESH_RETRY_SECONDS
+    ):
+        return
+    _request_geometry_refresh("document-seen", document_id)
+
+
 def _unavailable_geometry_state() -> dict[str, object]:
     """The shape of "this add-in cannot say", in the measured state's own keys.
 
@@ -1558,77 +1811,131 @@ def _geometry_state(
     *,
     force: bool = False,
 ) -> tuple[dict[str, object], str]:
-    """The measured state, recomputed only when it can have moved.
+    """Cached state for a heartbeat; a measurement only when asked explicitly.
 
-    Two guards, because they fail in different directions. The **key** skips
-    the measurement when nothing changed, which is the ordinary case and the
-    one that was costing the user a modelling session. The **duty cycle** caps
-    what the measurement may cost even when the key does move: a recompute
-    waits until the time since the last one is ``GEOMETRY_STATE_DUTY_CYCLE``
-    times what that one took, so this can never own more than a small slice of
-    Fusion's main thread whatever the document costs. An advisory token that is
-    a few seconds behind is a far smaller problem than a CAD application that
-    stops responding.
+    **The periodic heartbeat reads the cache and nothing else.** Every verdict
+    it can produce -- ``cached``, ``stale``, ``unavailable`` -- is a statement
+    about a measurement somebody already paid for. It never returns
+    ``measured``, because ``force`` is the only path that measures, and no
+    timer sets it. ``_measure_geometry_state`` walks the root export scope and
+    evaluates every included face and body on Fusion's main thread, so a
+    four-second timer that can reach it is a permanent load on a linked dense
+    document however cleverly it is throttled. Change detection made that load
+    rarer; it did not make the tick cache-only, and on a first tick, a document
+    switch or a restart it did not help at all.
 
-    The age ceiling is the third, and it is a ceiling on what may be
-    *published*, not only on what the key may excuse: past
-    ``GEOMETRY_STATE_MAX_AGE_SECONDS`` the cached state is no longer offered at
-    all. The duty cycle owns a separate, longer cap
-    (``GEOMETRY_STATE_MAX_WAIT_SECONDS``), and while the two disagreed the
-    heartbeat could publish a two-minute-old token under a sixty-second
-    promise. The wait still holds -- no measurement is forced by the ceiling --
-    but the answer becomes "cannot tell" instead of a stale fingerprint.
+    ``stale`` publishes the measurement it has rather than nothing, and says so
+    through the revision tokens. This is deliberate: the cached token is a real
+    measurement of *this* document that is no longer current, and refusing to
+    publish anything would leave WG unable to ask for a model at all -- its
+    return request requires a baseline. Publishing it is safe because the
+    guard that matters re-measures: :func:`_require_live_state` forces a
+    measurement before any mutation, so a moved model is refused, never
+    overwritten, and that refusal refreshes this cache for the next tick.
+
+    **There is no age at which a cached observation is withdrawn.** There used
+    to be: past ``GEOMETRY_STATE_MAX_AGE_SECONDS`` this returned "cannot tell",
+    because the old wire had no way to say how old an observation was, so a
+    minute was the point past which publishing one was misleading. The revision
+    tokens say it exactly, and withdrawing the observation instead is strictly
+    worse: a linked document left idle for a minute published an empty
+    ``document_signature_hash`` for ever, WG refuses to publish a return
+    request or an exact-target handoff without one, and nothing in WG's UI can
+    cause a measurement -- so the user could not ask for the model at all.
+    Nothing renews a cache the heartbeat may not measure into; the age ceiling
+    only decided how long an unusable state took to arrive.
 
     Cached state belongs to the document it was measured in. The key carries
-    ``document_id`` so the *unchanged* branch already refuses a switch; the
-    duty-cycle branch is time-only and did not, so a document switch inside the
-    wait returned the previous document's fingerprint, which
-    :func:`_document_links` then combined with the new document's identity.
-    Another document's measurement is never evidence for the active one.
+    ``document_id``, so a switch is ``unavailable`` -- empty tokens, empty
+    hashes, ``unknown`` body state -- and never the previous document's
+    measurement wearing the new document's identity.
 
-    ``force`` bypasses the cache entirely. It is for an explicit, guarded
-    operation -- an update or a return WG asked for -- which happens once and
-    can pay for one measurement; never for a heartbeat tick.
+    ``force`` is for an explicit cause -- a guarded update or return WG asked
+    for, or a refresh :func:`_service_geometry_refresh` was asked for -- which
+    happens once and can pay for one measurement. It also settles a pending
+    refresh: the request has been answered.
     """
 
-    global _geometry_state_cache
+    global _geometry_state_cache, _geometry_refresh_pending
     started = time.perf_counter()
-    key = (document_id, _geometry_change_key(design, records))
-    now = time.monotonic()
-    cached = None if force else _geometry_state_cache
-    verdict = "measured"
-    if cached is not None:
-        age = now - float(cached["at"])
-        within_ceiling = age < GEOMETRY_STATE_MAX_AGE_SECONDS
-        unchanged = cached["key"] == key and within_ceiling
-        wait = min(
-            float(cached["cost_ms"]) / 1000.0 * GEOMETRY_STATE_DUTY_CYCLE,
-            GEOMETRY_STATE_MAX_WAIT_SECONDS,
-        )
-        deferred = age < wait
-        if unchanged or deferred:
-            if timings is not None:
-                timings["geometry_state_ms"] = round(
-                    (time.perf_counter() - started) * 1000.0, 1
-                )
+    revision_token = _geometry_revision_token(design, records)
+    key = (document_id, revision_token)
+    if not force:
+        cached = _geometry_state_cache
+        state = _unavailable_geometry_state()
+        verdict = "unavailable"
+        measured_token = ""
+        age = None
+        if cached is not None:
+            age = time.monotonic() - float(cached["at"])
+            # ``None`` is "cannot name this document", not a name. Two
+            # documents this add-in cannot name would otherwise share one
+            # cache entry, which is how one document's measurement reaches
+            # another document's links. Nothing writes such an entry; this is
+            # what makes that a property rather than a coincidence.
+            if document_id is not None and cached["key"][0] == document_id:
+                state = dict(cached["state"])
+                if str(state.get("document_signature_hash") or ""):
+                    measured_token = str(cached["key"][1])
+                    # An empty revision token means the key could not be
+                    # computed, not that nothing moved. Comparing one unknown
+                    # with another reported ``cached`` -- a full measurement
+                    # presented as current, on the strength of two blanks
+                    # matching.
+                    verdict = (
+                        "cached"
+                        if revision_token and cached["key"] == key
+                        else "stale"
+                    )
+                else:
+                    # A measurement that produced no document-level baseline.
+                    # What it does carry -- each managed body's state, which is
+                    # how a deleted body still reads ``missing`` -- is real and
+                    # is published. The currency claim is not: reporting
+                    # ``cached`` with a token beside an empty signature hash
+                    # said "this measurement is current" while carrying no
+                    # measurement for anything to be current about.
+                    measured_token = ""
+                    verdict = "stale"
+        if timings is not None:
+            timings["geometry_state_ms"] = round(
+                (time.perf_counter() - started) * 1000.0, 1
+            )
+            # No cache, no age. A sentinel would be a number nobody can read.
+            if age is not None:
                 timings["geometry_state_age_s"] = round(age, 1)
-            if unchanged:
-                return dict(cached["state"]), "cached"
-            if cached["key"][0] != document_id or not within_ceiling:
-                return _unavailable_geometry_state(), "unavailable"
-            return dict(cached["state"]), "deferred"
+        return _with_revision_tokens(state, revision_token, measured_token), verdict
     state = _measure_geometry_state(app, records)
     cost_ms = (time.perf_counter() - started) * 1000.0
-    _geometry_state_cache = {
-        "key": key,
-        "at": time.monotonic(),
-        "cost_ms": cost_ms,
-        "state": state,
-    }
+    measured = str(state.get("document_signature_hash") or "")
+    # A document that cannot be named has no key to file this under. Every
+    # unnameable document would read back the same entry, which is the
+    # substitution this whole design exists to prevent -- and the read path
+    # refuses such an entry anyway, so writing one only evicted the last
+    # usable observation.
+    if document_id is not None and (
+        measured or not _has_usable_observation(document_id)
+    ):
+        # A measurement that produced no document-level baseline is still worth
+        # keeping when there is nothing better: it carries each managed body's
+        # state, which is how a deleted body reads ``missing``. It must not
+        # replace *this document's* own baseline -- across documents it still
+        # can, because the cache is one slot and the active document owns it.
+        _geometry_state_cache = {
+            "key": key,
+            "at": time.monotonic(),
+            "cost_ms": cost_ms,
+            "state": state,
+        }
+    if document_id is not None and measured:
+        # A baseline arrived. Whatever went wrong before it, this document is
+        # no longer one that needs asking about.
+        _geometry_refresh_attempts.pop(document_id, None)
+    _geometry_refresh_pending = None
     if timings is not None:
         timings["geometry_state_ms"] = round(cost_ms, 1)
         timings["geometry_state_age_s"] = 0.0
-    return state, verdict
+    return _with_revision_tokens(state, revision_token, revision_token), "measured"
 
 
 def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, object]]:
@@ -1640,8 +1947,9 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
 
     Identity comes from stored attributes and costs nothing, so it is read on
     every tick. The measured half -- the export fingerprint and the body
-    fingerprints -- goes through :func:`_geometry_state`, which is what keeps
-    this off Fusion's main thread when the document has not moved.
+    fingerprints -- goes through :func:`_geometry_state`, which on this path
+    reads the cache and never measures. Called on a timer, this function
+    inspects no geometry at all.
 
     ``timings`` collects the wall clock of each phase in milliseconds, which is
     the only way to say what this costs on a real document without attaching a
@@ -1654,6 +1962,9 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
 
     app = _app()
     design = app.activeProduct if app else None
+    # A document with nothing to report needs no notification and no document
+    # id: :func:`_note_active_document` acts only on a linked document, so
+    # asking here would cost a Fusion round trip to reach an immediate return.
     if design is None or not isinstance(getattr(design, "objectType", ""), str):
         return []
     if "Design" not in str(design.objectType):
@@ -1679,11 +1990,12 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
             timings["geometry_state"] = "not-linked"
             timings["geometry_state_ms"] = 0.0
         return []
-    state, verdict = _geometry_state(
-        app, design, records, _active_document_id(), timings
-    )
+    document_id = _active_document_id()
+    _note_active_document(document_id, linked=True)
+    state, verdict = _geometry_state(app, design, records, document_id, timings)
     if timings is not None:
         timings["geometry_state"] = verdict
+        timings["geometry_refresh_pending"] = _geometry_refresh_pending is not None
     instance_identities = state["instance_identities"]
     body_states = state["bodies"]
     links: list[dict[str, object]] = []
@@ -1736,6 +2048,18 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
             "document_signature_hash": state["document_signature_hash"],
             "document_body_count": state["document_body_count"],
             "source_state_hash": state["source_state_hash"],
+            # The cheap revision token the document is at now, and the one the
+            # published measurement was taken at. Equal means the measured
+            # state is current; unequal means it is a cached observation of an
+            # earlier revision; an empty measured token means there is no
+            # measurement to offer. Neither costs a geometry evaluation, and
+            # neither is ever presented as a fresh measurement.
+            "geometry_revision_token": str(
+                state.get("geometry_revision_token") or ""
+            ),
+            "measured_revision_token": str(
+                state.get("measured_revision_token") or ""
+            ),
             "export_id": str(payload.get("export_id") or ""),
             "export_sequence": str(payload.get("export_sequence") or ""),
             "operation_id": str(payload.get("operation_id") or ""),
@@ -1755,6 +2079,26 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
 
 
 def _active_document_id() -> str | None:
+    """A durable identity for the active document, saved or not.
+
+    A saved document has one: its data file id. An unsaved one has no data
+    file, and neither Python's identity for the ``Document`` object nor its
+    address is a substitute. Fusion's bindings construct a fresh proxy for a
+    property read, so ``document is other`` and ``id(document)`` answer about a
+    temporary wrapper rather than about the document -- a stable answer and an
+    unstable one are both accidents of when that wrapper was collected. This
+    repository already identifies Fusion entities by ``entityToken`` for
+    exactly that reason (``wglink_core._entity_token``), and the root
+    component's token is that same handle for the document holding it. It is
+    hashed because a raw token is long and belongs to Fusion, not to the wire.
+
+    ``None`` means this add-in cannot name the active document. It is not an
+    identity and is never treated as one: nothing is cached under it, nothing
+    is refreshed for it, and the heartbeat answers "cannot tell" -- because two
+    documents that cannot be named would otherwise share one cache entry, which
+    is how one document's measurement reaches another's links.
+    """
+
     app = _app()
     document = getattr(app, "activeDocument", None) if app else None
     if document is None:
@@ -1765,7 +2109,13 @@ def _active_document_id() -> str | None:
             return f"fusion:{native_id}"
     except Exception:  # noqa: BLE001 - unsaved local document
         pass
-    return f"local:{_watch_session_id}:{id(document)}"
+    try:
+        token = str(app.activeProduct.rootComponent.entityToken or "").strip()
+    except Exception:  # noqa: BLE001 - a product with no root component
+        token = ""
+    if not token:
+        return None
+    return "local:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def _fresh_geometry_state() -> dict[str, object] | None:
@@ -2501,6 +2851,11 @@ def _on_watch_tick() -> None:
     global _command_busy
     if _command_busy:
         return
+    # The one place a requested inspection may run: Fusion's API needs the main
+    # thread, and this event is the only main thread WGLink has. The tick is
+    # the carrier, not the cause -- with nothing pending it returns at once,
+    # which is why periodic activity alone inspects no geometry.
+    _service_geometry_refresh()
     snapshot = _fusion_snapshot()
     try:
         if not _claims_swept:
@@ -2856,6 +3211,12 @@ def _build_owner(app: object, ui: object) -> None:
             raise RuntimeError("WGLink's IPC owner lease was lost during startup")
         _owned = True
         _start_live()
+        # No separate startup refresh. Loading the add-in is not the event that
+        # matters -- seeing a linked document is, and a document stamped at
+        # load time is routinely the wrong one or none at all, because WGLink
+        # loads before the user opens a model. :func:`_note_active_document`
+        # asks when the document is actually seen, on this very publish when
+        # one is already open and on the first tick that finds one otherwise.
         _publish_fusion_status()
     except Exception:
         _stop_watch(app)

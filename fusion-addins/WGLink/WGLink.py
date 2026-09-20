@@ -444,6 +444,53 @@ def _confirm_detach() -> bool:
     return answer == accepted
 
 
+def _confirm_source_adoption(role: str, faces: int) -> bool:
+    """Ask before adopting paint that predates WG source identities.
+
+    Asked once per painted role group, because that is the only unit the
+    question is answerable in: a document can be unambiguous in one role and
+    ambiguous in another, and only the unambiguous one may be adopted at all.
+    One question covering the whole document would put a single answer over
+    several different situations.
+
+    Fails closed, exactly as ``_confirm_detach`` does. A shell without Fusion's
+    modal API cannot ask, so it refuses -- which is what it did before adoption
+    existed.
+    """
+
+    ui = _ui()
+    message_box = getattr(ui, "messageBox", None) if ui is not None else None
+    try:
+        yes_no = adsk.core.MessageBoxButtonTypes.YesNoButtonType
+        question = adsk.core.MessageBoxIconTypes.QuestionIconType
+        accepted = adsk.core.DialogResults.DialogYes
+    except AttributeError:
+        return False
+    if not callable(message_box):
+        return False
+    answer = message_box(
+        f"{faces} face(s) painted {role} were marked before WG source "
+        "identities existed, so they carry none.\n\n"
+        f"Adopt them as this document's {role} source?\n\n"
+        f"This gives {role} a new source identity. Waveguide Generator treats "
+        "it as a new source and asks for its setup once; the setup an earlier "
+        "export had cannot be carried across, because the identity it was "
+        "recorded against did not exist yet.",
+        f"{PANEL_NAME} — adopt {role} source",
+        yes_no,
+        question,
+    )
+    if answer != accepted:
+        return False
+    # The heartbeat's cached source ids are about to change. Bumping on the
+    # answer rather than on the write over-invalidates when the write then
+    # rolls back, which is the safe direction: a key that moves too often costs
+    # one measurement, one that moves too rarely serves a stale identity.
+    global _source_authoring_generation
+    _source_authoring_generation += 1
+    return True
+
+
 def _log(text: str) -> None:
     """Put diagnostics where diagnostics belong: Fusion's Text Commands palette."""
 
@@ -839,9 +886,12 @@ def _apply_source_role(command_inputs: object) -> dict[str, object]:
             raise wglink_core.WgLinkError(
                 f"Could not clear the WG source appearance from a selected face: {exc}."
             ) from exc
-    # The source identity is authored here and nowhere else -- never by Send, the
-    # preflight or the heartbeat -- and whatever WG advertises, so a document is
-    # ready when WG starts reading identities. Every selected face is stamped,
+    # The source identity is authored here, and whatever WG advertises, so a
+    # document is ready when WG starts reading identities. The preflight and the
+    # heartbeat never author one. Send authors one in exactly one case: a role
+    # group painted before source identities existed, where no face carries the
+    # attribute at all, and only after ``_confirm_source_adoption`` has asked --
+    # see ``wglink_send._adopt_painted_source``. Every selected face is stamped,
     # including one that already carried the role: re-running this command on a
     # source WGLink refused is how that source is reassigned. Clear takes the
     # identity off every selected face, including one whose paint was already
@@ -1219,7 +1269,11 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 _update_export_progress(
                     progress, 1, "Exporting STEP and validating the return bundle…"
                 )
-                report = wglink_send.send(_app(), _send_options(inputs))
+                report = wglink_send.send(
+                    _app(),
+                    _send_options(inputs),
+                    confirm_adoption=_confirm_source_adoption,
+                )
                 if self.operation == "solve":
                     _update_export_progress(
                         progress, 2, "Return written. Asking Waveguide Generator to solve…"
@@ -2483,7 +2537,9 @@ def _execute_return_request(
         _stop_if_cancelled(cancelled)
         if started is not None:
             started()
-        wglink_send.send(_app(), options)
+        # This path holds ``_command_busy`` (above), so the adoption question
+        # cannot have the watcher's prompt stacked over it.
+        wglink_send.send(_app(), options, confirm_adoption=_confirm_source_adoption)
         outcome = "applied"
     except _CancelledRequest:
         outcome = "cancelled"

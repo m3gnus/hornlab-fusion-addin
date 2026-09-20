@@ -8,6 +8,7 @@ editing the open design.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -2305,14 +2306,39 @@ def _run_again(canonical: str) -> str:
     )
 
 
+def _unresolved_paint(role: str, canonical: str, missing: int, total: int) -> str:
+    """The refusal for a role group WGLink cannot resolve to one source.
+
+    Held in one place so the ambiguous case and the pre-stamp case cannot drift
+    apart: the ambiguous one must keep saying exactly this.
+    """
+
+    return (
+        f"{missing} of {total} face(s) painted {role} carry no WG source "
+        f"identity for {canonical} (painted by hand, repainted, or marked before "
+        f"source identities existed). Select them and run Set WG Source… "
+        f"{canonical}; a face added to a source that still resolves keeps that "
+        "source's identity."
+    )
+
+
 def _painted_source_identity(
-    role: str, faces: list[object], design: object | None = None
+    role: str,
+    faces: list[object],
+    design: object | None = None,
+    *,
+    adopt: Callable[[str, int], bool] | None = None,
 ) -> str:
     """Resolve one painted role group to its single authored identity, or refuse.
 
     ``faces`` are the faces this export sees painted ``role``. ``design``, when
     given, lets a refusal tell a face that is gone from one that is only outside
     what is being sent -- the remedies differ.
+
+    ``adopt`` is the caller's way of asking the user one question, and only the
+    export supplies one. Without it nothing here writes to the document, which
+    is what keeps the preview and the fingerprint read-only by construction
+    rather than by convention.
     """
 
     canonical = _canonical_source_role(role) or role
@@ -2324,13 +2350,37 @@ def _painted_source_identity(
         if stamp is None or _canonical_source_role(stamp["role"]) != canonical
     ]
     if missing:
-        raise wglink_core.WgLinkError(
-            f"{len(missing)} of {len(natives)} face(s) painted {role} carry no WG source "
-            f"identity for {canonical} (painted by hand, repainted, or marked before "
-            f"source identities existed). Select them and run Set WG Source… "
-            f"{canonical}; a face added to a source that still resolves keeps that "
-            "source's identity."
+        # One condition covered two different situations, and only one of them
+        # is ambiguous.
+        #
+        # When *some* face of the group already carries an identity, nothing
+        # here can tell whether the unidentified faces belong to that source or
+        # were painted separately; binding them would silently solve the wrong
+        # thing. That refusal is unchanged, and no question is put, because no
+        # answer to it would be safe.
+        #
+        # When *no* face carries the attribute at all, the group is paint that
+        # predates source identities. There is no competing identity to
+        # mis-bind to and the paint is the only evidence and is unanimous, so
+        # the user is asked once and the group is adopted. "Carries the
+        # attribute" is deliberately stricter than "parses": a value that will
+        # not parse is a corruption, and it establishes nothing about whether
+        # the face is already claimed.
+        refusal = _unresolved_paint(role, canonical, len(missing), len(natives))
+        pre_stamp = bool(natives) and all(
+            wglink_core._attribute(native, SOURCE_IDENTITY_ATTRIBUTE) is None
+            for native in natives
         )
+        if pre_stamp and adopt is not None and design is not None:
+            if adopt(canonical, len(natives)):
+                return _adopt_painted_source(design, natives, canonical)
+            # Declined: nothing was written, and the refusal stands as before.
+        elif pre_stamp:
+            refusal = (
+                f"{refusal} These faces predate WG source identities, so Send "
+                f"offers to adopt them as this document's {canonical} source."
+            )
+        raise wglink_core.WgLinkError(refusal)
     identities = sorted({stamp["id"] for _native, stamp in stamps})
     if len(identities) != 1:
         raise wglink_core.WgLinkError(
@@ -2588,6 +2638,35 @@ def _new_stamp(identity: str, role: str, faces: int) -> dict[str, Any]:
     }
 
 
+def _adopt_painted_source(design: object, natives: list[object], canonical: str) -> str:
+    """Give paint that predates source identities one identity, once, together.
+
+    Minted and stamped exactly as ``assign_source_identity`` mints and stamps --
+    one identity, one nonce per face, and the same transaction -- so there is
+    one identity scheme and one stamp shape, not two. A face in an externally
+    referenced (read-only) component refuses the write, and ``_StampEdit`` puts
+    back every face written before it, so a document is never left with half a
+    source.
+
+    ``faces`` records the number adopted, which is what this group *is*: a later
+    export that sees fewer faces then reads as short, exactly as it does for a
+    source marked by hand. Adoption binds the faces this export carries and goes
+    looking for no others; paint of the same role outside the export is not
+    adopted, and a wider export later says so.
+
+    The caller has already established that no face here carries the attribute,
+    and has already asked.
+    """
+
+    def body(edit: _StampEdit) -> str:
+        identity = _mint_source_identity()
+        for native in natives:
+            edit.write(native, _new_stamp(identity, canonical, len(natives)))
+        return identity
+
+    return _run_edit(f"adopt the {canonical} source identity", body)
+
+
 def clear_source_identity(design: object, faces: list[object]) -> int:
     """Remove the source identity from every selected face, painted or not.
 
@@ -2814,11 +2893,15 @@ def _sources(
     *,
     source_identity: bool = False,
     design: object | None = None,
+    adopt: Callable[[str, int], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Every drivable source the return carries.
 
     ``source_identity`` is on only when WG advertises ``source-identity-v1``;
     off, every id is the legacy role-derived one, byte for byte.
+
+    ``adopt`` is passed only by the export. The preview and the fingerprint call
+    this to read, so they leave it out and cannot write a stamp.
     """
     sources: list[dict[str, Any]] = []
     claimed: set[tuple[str, object]] = set()
@@ -2870,7 +2953,7 @@ def _sources(
             continue
         source_id, drive_id = _source_ids(role, used)
         if source_identity:
-            source_id = _painted_source_identity(role, faces, design)
+            source_id = _painted_source_identity(role, faces, design, adopt=adopt)
         sources.append(
             {
                 "id": source_id,
@@ -3207,8 +3290,22 @@ def _publish(temp: Path, target: Path, overwrite: bool) -> None:
     shutil.rmtree(backup)
 
 
-def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
-    """Write one return bundle and return a JSON-serialisable export report."""
+def send(
+    app: object,
+    options: dict[str, Any],
+    *,
+    confirm_adoption: Callable[[str, int], bool] | None = None,
+) -> dict[str, Any]:
+    """Write one return bundle and return a JSON-serialisable export report.
+
+    ``confirm_adoption(role, faces)`` is how the add-in's UI asks the one
+    question this export may put to the user: whether a role group painted
+    before WG source identities existed should be adopted as this document's
+    source for that role. It is a callback rather than a dialog raised here
+    because this module stays head-less; a caller that supplies none -- a
+    script, a test, a shell without Fusion's modal API -- gets the refusal it
+    always got.
+    """
 
     if not isinstance(options, dict):
         raise wglink_core.WgLinkError("options must be an object")
@@ -3308,7 +3405,11 @@ def send(app: object, options: dict[str, Any]) -> dict[str, Any]:
         ),
         source_identity=source_identity,
         design=design,
+        adopt=confirm_adoption,
     )
+    # After ``_sources``, deliberately: an adoption above has already written
+    # its stamps, so the fingerprint is taken of the document as it now is
+    # rather than of one that could not be fingerprinted at all.
     return_state_snapshot = return_state(app, options)
     return_state_hash = return_state_snapshot.get("hash")
     if not return_state_hash:

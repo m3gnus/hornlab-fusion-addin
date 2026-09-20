@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import importlib.util
 import json
+import inspect
 import math
 import os
 from pathlib import Path
@@ -791,7 +792,13 @@ def test_send_shows_and_closes_progress_around_the_slow_export(
     monkeypatch.setattr(module, "_send_options", lambda _inputs: {"selection": "root"})
     observed: list[tuple[int, str]] = []
 
-    def send(_app: object, _options: dict[str, object]) -> dict[str, object]:
+    # ``**_kwargs`` here, and in the other doubles of ``send`` below, absorbs
+    # the ``confirm_adoption`` callback the command now hands the export. The
+    # doubles assert on what they were called with, not on how tightly they were
+    # declared, so nothing they check is relaxed by accepting it.
+    def send(
+        _app: object, _options: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
         dialog = ui.progress_dialogs[0]
         observed.append((dialog.progressValue, dialog.message))
         return {
@@ -1160,6 +1167,88 @@ def test_an_unexpected_failure_shows_one_line_and_logs_the_traceback(
     assert "Text Commands" in text
     logged, = ui.text_palette.written
     assert "Traceback" in logged and "RuntimeError" in logged
+
+
+def test_adopting_pre_stamp_paint_is_asked_for_and_says_what_is_not_carried(
+    monkeypatch,
+) -> None:
+    """The one question Send may put, and the one thing it must not overstate.
+
+    Adoption mints a *new* identity, so WG has no setup recorded against it.
+    Saying the source is restored would claim a continuity that does not exist.
+    """
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False), dialog_result="yes")
+    module = _load_instance(monkeypatch, "WGLink_adopt_yes", ui)
+    before = module._source_authoring_generation
+
+    assert module._confirm_source_adoption("LF", 2) is True
+
+    (title, text), = ui.messages
+    assert "adopt LF source" in title
+    assert "2 face(s) painted LF" in text
+    assert "before WG source identities existed" in text
+    assert "asks for its setup once" in text
+    assert "cannot be carried across" in text
+    # The heartbeat's cached source ids are about to change.
+    assert module._source_authoring_generation == before + 1
+
+
+def test_declining_the_adoption_question_changes_nothing(monkeypatch) -> None:
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False), dialog_result="no")
+    module = _load_instance(monkeypatch, "WGLink_adopt_no", ui)
+    before = module._source_authoring_generation
+
+    assert module._confirm_source_adoption("HF", 1) is False
+    assert module._source_authoring_generation == before
+
+
+def test_the_adoption_question_fails_closed_without_a_modal_api(monkeypatch) -> None:
+    """No way to ask is not permission. A shell without Fusion's modal API
+    refuses exactly as it did before adoption existed."""
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False), dialog_result="yes")
+    module = _load_instance(monkeypatch, "WGLink_adopt_headless", ui)
+
+    monkeypatch.setattr(module, "_ui", lambda: None)
+    assert module._confirm_source_adoption("LF", 2) is False
+
+    monkeypatch.setattr(module, "_ui", lambda: types.SimpleNamespace())
+    assert module._confirm_source_adoption("LF", 2) is False
+
+    monkeypatch.delattr(module.adsk.core.MessageBoxButtonTypes, "YesNoButtonType")
+    monkeypatch.setattr(module, "_ui", lambda: ui)
+    assert module._confirm_source_adoption("LF", 2) is False
+
+
+def test_the_send_command_offers_adoption_and_the_preview_never_does(
+    monkeypatch,
+) -> None:
+    """The export is the only caller that may write a stamp.
+
+    ``preflight_scope`` predicts the export for the dialog; handing it the
+    question would make a preview change the document it is previewing.
+    """
+
+    fixture = _guarded_document(monkeypatch, "WGLink_send_adoption")
+    module = fixture.module
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(module, "_command_options", lambda _inputs: {})
+    monkeypatch.setattr(module, "_send_options", lambda _inputs: {})
+    monkeypatch.setattr(module, "_queue_snapshot", lambda _report: None)
+    monkeypatch.setattr(
+        module.wglink_send,
+        "send",
+        lambda _app, _options, **kwargs: seen.update(kwargs) or {"sources": []},
+    )
+
+    handler = module.CommandExecuteHandler("send")
+    handler.notify(
+        types.SimpleNamespace(command=types.SimpleNamespace(commandInputs=None))
+    )
+
+    assert seen["confirm_adoption"] is module._confirm_source_adoption
+    assert "adopt" not in inspect.signature(module.wglink_send.preflight_scope).parameters
 
 
 def test_the_link_chooser_appears_only_with_several_links(monkeypatch) -> None:
@@ -2052,7 +2141,7 @@ def _pending_return(fixture, monkeypatch, tmp_path, **overrides):
     monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(
-        module.wglink_send, "send", lambda _app, options: sent.append(options)
+        module.wglink_send, "send", lambda _app, options, **_k: sent.append(options)
     )
     monkeypatch.setattr(
         module.wglink_watch, "acknowledge_return_request", lambda _request: True
@@ -4069,7 +4158,7 @@ def test_a_targeted_return_refuses_if_the_active_document_changed(
     monkeypatch.setattr(module, "_pending_return_request", lambda: request)
     monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:other")
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options, **_k: sent.append(options))
 
     assert module._apply_pending_return_request() == module.HANDLED
 
@@ -4162,7 +4251,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
     _unmoved_live_state(monkeypatch, module, "sha256:state-a")
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options, **_k: sent.append(options))
     acknowledged: list[object] = []
     monkeypatch.setattr(module.wglink_watch, "acknowledge_return_request", acknowledged.append)
 
@@ -4304,7 +4393,7 @@ def test_a_refused_handoff_does_not_starve_a_pending_return_request(
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(
-        module.wglink_send, "send", lambda _app, options: sent.append(options)
+        module.wglink_send, "send", lambda _app, options, **_k: sent.append(options)
     )
     acknowledged: list[object] = []
     monkeypatch.setattr(
@@ -4401,7 +4490,7 @@ def test_a_refused_return_request_does_not_starve_a_newer_export_offer(
     }])
     sent: list[dict[str, object]] = []
     monkeypatch.setattr(
-        module.wglink_send, "send", lambda _app, options: sent.append(options)
+        module.wglink_send, "send", lambda _app, options, **_k: sent.append(options)
     )
 
     module._on_watch_tick()
@@ -4917,7 +5006,7 @@ def test_a_per_request_return_request_runs_in_its_session_and_is_consumed(
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path / "wgreturn")
     monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options, **_k: sent.append(options))
 
     assert module._apply_pending_return_request() == module.HANDLED
     assert module._apply_pending_return_request() == module.IDLE
@@ -4962,7 +5051,7 @@ def test_a_return_wg_asked_for_declares_source_identity_when_wg_reads_it(
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path / "wgreturn")
     monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
     sent: list[dict[str, object]] = []
-    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(options))
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options, **_k: sent.append(options))
 
     assert module._apply_pending_return_request() == module.HANDLED
 
@@ -6259,7 +6348,7 @@ def test_a_live_return_request_exports_once_and_reports_applied(
     client = _Dispatcher()
     monkeypatch.setattr(module, "_live_client", client)
     sent: list[dict] = []
-    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options: sent.append(dict(options)))
+    monkeypatch.setattr(module.wglink_send, "send", lambda _app, options, **_k: sent.append(dict(options)))
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path / "workspace")
     request = {
         "schemaVersion": 3, "target": "fusion360", "requestId": "op-ret",

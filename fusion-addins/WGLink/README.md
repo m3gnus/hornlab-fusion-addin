@@ -303,12 +303,21 @@ parser, one run, one set of rules.
   waits in the kernel. It has a thread of its own because a 25 s wait on the
   sender would push the four-second heartbeat past WG's 20 s freshness window.
   A poll that answers instantly is not a wait, and the next one is delayed.
-  The same holds for a request WGLink may not take yet — a Fusion command is
-  running, no design is ready, no WG workspace is selected. WG answers a long
-  poll the instant an offerable request exists, so only a *change* in what WG
-  is offering shortens the next wait or raises the custom event; a standing
-  offer is re-examined by the four-second tick instead. The request waits and
-  the heartbeat says why, which is the point — but it waits quietly.
+  The same holds for a request WGLink may not take yet — a **WGLink** command
+  is running, no design is ready, no WG workspace is selected. WG answers a
+  long poll the instant an offerable request exists, so only a *change* in what
+  WG is offering shortens the next wait or raises the custom event; a standing
+  offer is re-examined by the four-second tick instead. The request waits
+  quietly with its reason in the heartbeat — except while a WGLink command is
+  running, where the reason is recorded but not published until the command
+  ends, because the tick that publishes returns before it gets there.
+- **What this does *not* do.** Nothing here observes the *user's* active Fusion
+  command: there is no `commandStarting` or `commandTerminated` hook in the
+  add-in, and `_command_busy` is set only by WGLink's own commands. WGLink does
+  not terminate anything, so it cannot interrupt a user command — but neither
+  does it deliberately wait behind one. That behaviour, and the timing of live
+  dispatch while a modal or a user command is open, is owed to the real-Fusion
+  responsiveness pass and is not claimed here.
 - **The durable claim comes first.** Before WGLink asks WG for a request it
   writes `ipc/wglink/.wglink-live-claims/<operationId>.json` with a fresh claim
   id. Nothing is acknowledged to WG before that file exists, and nothing

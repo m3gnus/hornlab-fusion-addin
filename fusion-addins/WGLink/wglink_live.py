@@ -1581,9 +1581,11 @@ class LiveClient:
                 return 0.0
             if wanted:
                 # The same offers, still unclaimed. That is the state the
-                # contract mandates while a Fusion command is running, while no
+                # contract mandates while a WGLink command is running, while no
                 # design is ready and while no WG workspace is selected: the
-                # request waits and the heartbeat says why. WG answers a long
+                # request waits quietly. (The heartbeat carries the reason for
+                # the latter two; for a running WGLink command it does not --
+                # see WGLink.py's note at _on_live_dispatch.) WG answers a long
                 # poll the instant an offerable request exists, so asking again
                 # at once would be a continuous round trip against WG and an
                 # unbounded custom-event queue onto Fusion's main thread --

@@ -5942,10 +5942,27 @@ def test_a_live_update_runs_on_the_main_thread_and_reports_what_happened(
     assert ui.messages == []
 
 
-def test_a_live_request_never_interrupts_a_running_fusion_command(
+def test_a_live_request_waits_behind_a_running_wglink_command(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """The request waits and the heartbeat says why; nothing is claimed."""
+    """Nothing is claimed and the document is not read while WGLink's own command runs.
+
+    Two things this test does **not** prove, recorded here so the name cannot
+    be read as more than it is:
+
+    * ``_command_busy`` is WGLink's *own* command, never the user's. Nothing in
+      the add-in observes the user's active Fusion command -- there is no
+      ``commandStarting``/``commandTerminated`` hook anywhere in
+      ``fusion-addins/WGLink``. Waiting behind a user command is owed to the
+      real-Fusion responsiveness pass, not shown here.
+    * The ``_publish_fusion_status`` call below is **hand-made**. Production
+      never reaches it in this state: ``_on_watch_tick`` returns on
+      ``_command_busy`` before the ``finally`` that publishes, and
+      ``LiveEventHandler`` does not publish at all. So the assertion that
+      follows it shows that the reason is *recorded correctly*, not that WG
+      ever sees it while the wait lasts. A test that closed that gap would
+      assert the production path instead of hand-calling the publish.
+    """
 
     module, _ui, ipc, bundle = _live_module(monkeypatch, tmp_path, "WGLink_live_busy")
     client = _Dispatcher()
@@ -5965,6 +5982,11 @@ def test_a_live_request_never_interrupts_a_running_fusion_command(
     # Nor is the document read: a command is running, and this thread is the
     # one running it.
     assert reads == []
+    # Production does not publish in this state; see the docstring. This
+    # hand-call checks the recorded reason, not its delivery.
+    assert not (ipc / ".fusion-status.json").exists(), (
+        "the status file appeared without a publish; the docstring's note is stale"
+    )
     module._publish_fusion_status(_shared_snapshot())
     status = json.loads((ipc / ".fusion-status.json").read_text())
     assert status["diagnostics"]["liveDispatch"]["reason"] == "commandBusy"

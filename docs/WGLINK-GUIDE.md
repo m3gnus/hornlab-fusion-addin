@@ -325,9 +325,11 @@ occurrence where it already is and never moves it back to the origin.)
   to, and an `ipc/wglink` folder or endpoint file that is a symlink; a
   `WG2_DATA_DIR` on a shared location therefore stays on the files.
 - **WG says a request is running and nothing happens in Fusion** — a WGLink
-  command is open, or no design is. WGLink never interrupts the command you are
-  running to service WG: the request waits and the reason travels in the
-  heartbeat. Finish or cancel the command, and it runs on the next pass.
+  command is open, or no design is. WGLink starts nothing over its own command:
+  the request waits. Finish or cancel the WGLink command, and it runs on the
+  next pass. If no design is ready, or no WG workspace is selected, the reason
+  travels to WG in the heartbeat; while a WGLink command is open it does not,
+  so WG shows the request as simply still running.
 - **WG shows an update as still running after Fusion restarted** — WGLink
   settles what it can against the open document, read-only, and never runs an
   interrupted update again. If the update was for a document you do not have

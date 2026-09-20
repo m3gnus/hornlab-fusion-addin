@@ -225,8 +225,11 @@ _live_client = None
 _live_event = None
 _live_handler = None
 # Requests WG handed this add-in that have not run yet. A dispatch stays here
-# while a Fusion command is running or no design is open: WGLink never
-# interrupts the user's command to service WG, it waits and says why.
+# while a WGLink command is running or no design is open. WGLink starts nothing
+# of its own over its own command; the request waits instead. Note that
+# ``_command_busy`` tracks WGLink's commands only -- nothing here observes the
+# user's active Fusion command (there is no ``commandStarting`` hook anywhere in
+# this add-in), so waiting behind a *user* command is not implemented.
 _live_pending: list[object] = []
 # Claims an interrupted session left ``claimed`` in the live journal, and the
 # file claims it left in WG's request folders, that this session could not
@@ -3131,8 +3134,15 @@ def _on_live_dispatch(snapshot: dict[str, object] | None = None) -> bool:
         _live_waiting = None
         return False
     if _command_busy:
-        # A WGLink command is running: WG's work waits behind the user, and the
-        # heartbeat says why. WGLink never interrupts a Fusion command.
+        # A WGLink command is running -- its own, not the user's: nothing in
+        # this add-in observes the user's active Fusion command. WG's work
+        # waits behind it rather than racing it. The reason is recorded here,
+        # but it does NOT reach WG while this state lasts: _on_watch_tick
+        # returns on _command_busy before the finally that publishes, and the
+        # live event handler does not publish. Closing that gap means
+        # publishing from the live event handler off the CACHED snapshot, never
+        # a fresh one -- a fresh read here would put geometry back on a
+        # periodic path. Deliberately not done in this change.
         _live_waiting = {"reason": "commandBusy", "waiting": len(_live_pending) + len(offers)}
         return False
     current = snapshot if snapshot is not None else _fusion_snapshot()

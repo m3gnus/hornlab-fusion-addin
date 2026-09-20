@@ -538,6 +538,13 @@ OUTBOX_MAX_AGE_SECONDS = 7 * 24 * 3600
 #: Items the main thread adds are seen at once when it wakes the worker, and
 #: otherwise by a rescan this often.
 OUTBOX_RESCAN_SECONDS = 5.0
+#: Windows refuses to unlink a file any reader still holds open, and the
+#: readers of an outbox item are all momentary: a virus scanner, a backup
+#: agent, an indexer, this suite's own inspection. Held is not lost: a settled
+#: item's removal is retried for this long inline, and on every later step
+#: after that, so it is never left on disk to be delivered a second time.
+DELETE_RETRY_SECONDS = 0.5
+DELETE_RETRY_STEP_SECONDS = 0.01
 #: WG retains the return into its own storage before it answers a delivery.
 DELIVERY_TIMEOUT_SECONDS = 30.0
 #: WG answers ``503 snapshot_not_readable`` for at most 30 s from the first
@@ -727,11 +734,26 @@ class Outbox:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def delete(self, operation_id: str) -> None:
-        try:
-            self.path(operation_id).unlink(missing_ok=True)
-        except OSError:
-            pass
+    def delete(self, operation_id: str) -> bool:
+        """Remove an item; ``False`` means it is still on disk, so retry later.
+
+        A refusal is never reported as success. On Windows an open reader is
+        enough to refuse the unlink, so the bounded retry here settles the
+        momentary holders; :meth:`LiveClient._forget` carries the rest.
+        """
+
+        path = self.path(operation_id)
+        deadline = time.monotonic() + DELETE_RETRY_SECONDS
+        while True:
+            try:
+                path.unlink(missing_ok=True)
+                return True
+            except OSError:
+                if not path.exists():
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(DELETE_RETRY_STEP_SECONDS)
 
 
 def produce_solve(
@@ -928,6 +950,7 @@ class LiveClient:
         self._scanned_at = float("-inf")
         self._outbox_dirty = True
         self._retries: dict[str, _Retry] = {}
+        self._settled: set[str] = set()
         self._noticed: set[str] = set()
         self._notices: list[dict[str, Any]] = []
         self._acknowledged: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -1389,10 +1412,16 @@ class LiveClient:
             if stored is not None and stored.get("answer") is not None:
                 self._forget(outbox, operation_id)
             self._noticed.discard(operation_id)
+        for operation_id in sorted(self._settled):
+            if outbox.delete(operation_id):
+                self._settled.discard(operation_id)
         if self._items is None or self._outbox_dirty or now - self._scanned_at >= OUTBOX_RESCAN_SECONDS:
             self._outbox_dirty = False
             self._scanned_at = now
             items, foreign = outbox.scan()
+            # An item whose file this session has already settled is not work,
+            # however often it is still readable.
+            items = [item for item in items if item["operationId"] not in self._settled]
             with self._lock:
                 self._items = items
             present = {item["operationId"] for item in items}
@@ -1456,7 +1485,13 @@ class LiveClient:
             self._items = [item if other["operationId"] == item["operationId"] else other for other in self._items or ()]
 
     def _forget(self, outbox: Outbox, operation_id: str) -> None:
-        outbox.delete(operation_id)
+        if outbox.delete(operation_id):
+            self._settled.discard(operation_id)
+        else:
+            # The item is settled with WG but its file is held (Windows). Keep
+            # the id: the next step deletes it, and until then the rescan must
+            # not read it back as unanswered work and deliver it again.
+            self._settled.add(operation_id)
         self._retries.pop(operation_id, None)
         with self._lock:
             self._items = [item for item in self._items or () if item["operationId"] != operation_id]

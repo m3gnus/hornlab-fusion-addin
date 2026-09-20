@@ -835,6 +835,76 @@ def test_recorded_delivery_answers_are_classified(tmp_path: Path, stub_factory, 
         assert exchange["response"]["headers"]["Retry-After"] == "1"
 
 
+def test_delete_answers_truthfully_while_a_reader_holds_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The premise behind the retry, asserted on whichever platform is running.
+
+    POSIX unlinks a file out from under an open reader; Windows refuses with a
+    sharing violation, and any momentary reader will do -- a scanner, a backup
+    agent, this suite's own inspection. ``Outbox.delete`` must never report
+    success while the file is still there: that swallowed refusal is what left
+    a delivered item on disk.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path, live=False)
+    monkeypatch.setattr(wglink_live, "DELETE_RETRY_SECONDS", 0.0)
+    item = _snapshot_item(ipc, workspace, _bundle(workspace))
+    outbox = wglink_live.Outbox(ipc)
+    path = outbox.path(item["operationId"])
+    with path.open("rb"):
+        removed = outbox.delete(item["operationId"])
+        assert removed == (not path.exists())
+        assert removed is POSIX
+    assert outbox.delete(item["operationId"]) is True and not path.exists()
+
+
+def test_a_settled_item_whose_file_is_held_is_removed_later_and_never_sent_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused unlink must not turn a settled item back into work.
+
+    The refusal is forced because it is a Windows behaviour, but what it
+    exposes is not platform-specific: the swallowed error left the item on
+    disk with ``answer: None``, and the next rescan read it back as waiting
+    work and delivered it to WG a second time under the same operation id.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path)
+    monkeypatch.setattr(wglink_live, "DELETE_RETRY_SECONDS", 0.0)
+    item = _snapshot_item(ipc, workspace, _bundle(workspace))
+    held = wglink_live.Outbox(ipc).path(item["operationId"])
+    refusing = True
+    unlink = Path.unlink
+
+    def refuse(self: Path, *args: Any, **kwargs: Any) -> None:
+        if refusing and self == held:
+            raise PermissionError(32, "The process cannot access the file")
+        return unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    client.enqueue_delivery()
+    client.step()
+    # WG has it and the worker is done with it, but the file is still there.
+    assert len(_deliveries(wg)) == 1 and wg.created == [item["operationId"]]
+    assert client.status()["outboxWaiting"] == 0
+    assert list(_items(ipc)) == [item["operationId"]]
+
+    # A rescan reads the held file back. It must not become work again: WG
+    # answers a repeat under the same id `recovered`, so a second POST leaves
+    # `created` unchanged and is invisible to anything but the request count.
+    clock.now += wglink_live.OUTBOX_RESCAN_SECONDS + 1
+    _steps(client, 3)
+    assert len(_deliveries(wg)) == 1
+    assert client.status()["outboxWaiting"] == 0
+    assert list(_items(ipc)) == [item["operationId"]]
+
+    refusing = False
+    client.step()
+    assert _items(ipc) == {} and len(_deliveries(wg)) == 1
+
+
 def test_the_live_worker_delivers_off_the_producing_thread(tmp_path: Path, stub_factory) -> None:  # noqa: F811
     """Real loopback HTTP and the real worker thread."""
 
@@ -874,6 +944,7 @@ def test_the_live_worker_delivers_off_the_producing_thread(tmp_path: Path, stub_
                          "managedBy": None, "waveguideGeneratorRoot": None, "loadedAt": "2026-09-17T10:00:00Z"},
         lease_ok=lambda: True, solve_files=wglink_watch,
     )
+    notices: list[dict[str, Any]] = []
     client.start()
     try:
         deadline = time.monotonic() + 10
@@ -883,10 +954,20 @@ def test_the_live_worker_delivers_off_the_producing_thread(tmp_path: Path, stub_
         _snapshot_item(ipc, workspace, _bundle(workspace))
         client.enqueue_delivery()
         assert delivered.wait(10)
-        deadline = time.monotonic() + 5
-        while _items(ipc) and time.monotonic() < deadline:
-            time.sleep(0.02)
+        # Then wait for the worker's own answer, not for a wall clock, and do
+        # not read the outbox while waiting. ``delivered`` is set inside the
+        # stub's handler, before WG has answered at all; the worker removes
+        # the item only after it has read that answer, and emits the notice
+        # after the file is gone. Polling ``_items`` here instead both timed
+        # the drain from the wrong event and held the very file the worker was
+        # unlinking -- which Windows refuses (see ``Outbox.delete``).
+        deadline = time.monotonic() + 10
+        while not notices and time.monotonic() < deadline:
+            notices = client.take_delivery_notices()
+            if not notices:
+                time.sleep(0.02)
     finally:
         client.stop(timeout=5)
+    assert [(notice["kind"], notice["outcome"]) for notice in notices] == [(SNAPSHOT, "delivered")]
     assert _items(ipc) == {}
     assert len(threads) == 1

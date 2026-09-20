@@ -545,6 +545,13 @@ OUTBOX_RESCAN_SECONDS = 5.0
 #: after that, so it is never left on disk to be delivered a second time.
 DELETE_RETRY_SECONDS = 0.5
 DELETE_RETRY_STEP_SECONDS = 0.01
+#: `os.replace` over an item that already exists is refused by exactly the
+#: same sharing behaviour, by exactly the same momentary readers. Same budget
+#: as the unlink, named apart so one side can be tuned without moving the
+#: other. A refusal here loses nothing: the replace is atomic, so the item on
+#: disk stays whole and unchanged, and the write is re-attempted.
+REPLACE_RETRY_SECONDS = 0.5
+REPLACE_RETRY_STEP_SECONDS = 0.01
 #: WG retains the return into its own storage before it answers a delivery.
 DELIVERY_TIMEOUT_SECONDS = 30.0
 #: WG answers ``503 snapshot_not_readable`` for at most 30 s from the first
@@ -576,6 +583,23 @@ class OutboxFull(Exception):
         super().__init__(f"WGLink's outbox already holds {OUTBOX_MAX_ITEMS} deliveries")
         self.operation_id = operation_id
         self.solve_file = solve_file
+
+
+class OutboxHeld(OSError):
+    """An item could not be written: another process holds its file open.
+
+    Nothing was written and whatever was on disk is unchanged. Raised only
+    where silence would lose the caller's work -- :meth:`Outbox.add`, on the
+    main thread, where a queued item that was never queued would strand a
+    user's request. The worker never sees it: :meth:`Outbox.write` returns
+    ``False`` there and :meth:`LiveClient._replace` re-attempts the write on
+    every later step. ``OSError`` remains the base, so existing handlers of a
+    failed write behave as they did.
+    """
+
+    def __init__(self, operation_id: str) -> None:
+        super().__init__(f"WGLink could not write delivery {operation_id}: another program holds its file")
+        self.operation_id = operation_id
 
 
 def advertises_live(ipc_folder: Path | None) -> bool:
@@ -712,9 +736,24 @@ class Outbox:
     def add(self, item: Mapping[str, Any]) -> None:
         if self.count() >= OUTBOX_MAX_ITEMS:
             raise OutboxFull(str(item["operationId"]))
-        self.write(item)
+        if not self.write(item):
+            raise OutboxHeld(str(item["operationId"]))
 
-    def write(self, item: Mapping[str, Any]) -> None:
+    def write(self, item: Mapping[str, Any]) -> bool:
+        """Write an item atomically; ``False`` means its file is held, so retry later.
+
+        On Windows an open reader is enough to refuse the replace, and every
+        reader of an outbox item is momentary -- a virus scanner, a backup
+        agent, an indexer, this suite's own inspection. The bounded retry
+        here settles those; :meth:`LiveClient._replace` carries the rest.
+
+        A refusal costs nothing and is never reported as a write: the replace
+        is atomic, so the item on disk is exactly what it was, the temporary
+        is removed either way, and the caller decides what an unwritten item
+        means. Only :meth:`add` treats it as an error, because a new item that
+        was never written has nowhere else to live.
+        """
+
         if not valid_item(item):
             raise ValueError("not an outbox item")
         self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -730,7 +769,16 @@ class Outbox:
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path(item["operationId"]))
+            destination = self.path(item["operationId"])
+            deadline = time.monotonic() + REPLACE_RETRY_SECONDS
+            while True:
+                try:
+                    os.replace(temporary, destination)
+                    return True
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(REPLACE_RETRY_STEP_SECONDS)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -951,6 +999,7 @@ class LiveClient:
         self._outbox_dirty = True
         self._retries: dict[str, _Retry] = {}
         self._settled: set[str] = set()
+        self._pending: dict[str, dict[str, Any]] = {}
         self._noticed: set[str] = set()
         self._notices: list[dict[str, Any]] = []
         self._acknowledged: queue.SimpleQueue[str] = queue.SimpleQueue()
@@ -1408,13 +1457,16 @@ class LiveClient:
                 operation_id = self._acknowledged.get_nowait()
             except queue.Empty:
                 break
-            stored = outbox.read(operation_id)
+            stored = self._pending.get(operation_id) or outbox.read(operation_id)
             if stored is not None and stored.get("answer") is not None:
                 self._forget(outbox, operation_id)
             self._noticed.discard(operation_id)
         for operation_id in sorted(self._settled):
             if outbox.delete(operation_id):
                 self._settled.discard(operation_id)
+        for operation_id, owed in sorted(self._pending.items()):
+            if outbox.write(owed):
+                self._pending.pop(operation_id, None)
         if self._items is None or self._outbox_dirty or now - self._scanned_at >= OUTBOX_RESCAN_SECONDS:
             self._outbox_dirty = False
             self._scanned_at = now
@@ -1422,6 +1474,9 @@ class LiveClient:
             # An item whose file this session has already settled is not work,
             # however often it is still readable.
             items = [item for item in items if item["operationId"] not in self._settled]
+            # ...nor is the file of an item whose write was refused the item:
+            # on disk it is still the version before the answer.
+            items = [self._pending.get(item["operationId"], item) for item in items]
             with self._lock:
                 self._items = items
             present = {item["operationId"] for item in items}
@@ -1480,9 +1535,29 @@ class LiveClient:
         self._note("outbox-file", "WGLink wrote a queued solve request as a file for WG to take.")
 
     def _replace(self, outbox: Outbox, item: dict[str, Any]) -> None:
-        outbox.write(item)
+        """Update an item in place; a held file is retried, never raised.
+
+        Before this returned nothing and let a refused ``os.replace`` out --
+        through :meth:`_answer` into :meth:`_run`'s blanket handler, which
+        drops the live session. A momentary reader on Windows was enough, and
+        the path it hit is the one carrying the terminal outcomes a user must
+        see. The item in memory is the true one from here on: it is kept, the
+        write is re-attempted on every later step, and the rescan is not
+        allowed to read the stale file back over it (:meth:`_keep_outbox`).
+        Nothing downstream records a write that did not happen.
+        """
+
+        operation_id = item["operationId"]
+        if outbox.write(item):
+            self._pending.pop(operation_id, None)
+        else:
+            self._pending[operation_id] = dict(item)
+            self._note(
+                "outbox-held",
+                "WGLink could not update a queued delivery; another program holds its file. It will retry.",
+            )
         with self._lock:
-            self._items = [item if other["operationId"] == item["operationId"] else other for other in self._items or ()]
+            self._items = [item if other["operationId"] == operation_id else other for other in self._items or ()]
 
     def _forget(self, outbox: Outbox, operation_id: str) -> None:
         if outbox.delete(operation_id):
@@ -1492,6 +1567,7 @@ class LiveClient:
             # the id: the next step deletes it, and until then the rescan must
             # not read it back as unanswered work and deliver it again.
             self._settled.add(operation_id)
+        self._pending.pop(operation_id, None)
         self._retries.pop(operation_id, None)
         with self._lock:
             self._items = [item for item in self._items or () if item["operationId"] != operation_id]

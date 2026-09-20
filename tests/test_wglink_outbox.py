@@ -905,6 +905,181 @@ def test_a_settled_item_whose_file_is_held_is_removed_later_and_never_sent_again
     assert _items(ipc) == {} and len(_deliveries(wg)) == 1
 
 
+class _HeldItemFile:
+    """Forces the refusal: ``os.replace`` onto ``path`` is denied until released.
+
+    Windows refuses to replace a file any reader still holds open, exactly as
+    it refuses to unlink one, and a real holder would be a virus scanner or a
+    backup agent rather than anything the suite can arrange. Denying the call
+    is the same collision without the platform.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+        self.path, self.refusing = path, True
+        replace = os.replace
+
+        def refuse(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+            if self.refusing and Path(destination) == self.path:
+                raise PermissionError(32, "The process cannot access the file")
+            return replace(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(wglink_live, "REPLACE_RETRY_SECONDS", 0.0)
+        monkeypatch.setattr(os, "replace", refuse)
+
+    def release(self) -> None:
+        self.refusing = False
+
+
+def _rejection(operation_id: str, message: str) -> "wglink_live.Answer":
+    return wglink_live.Answer(200, {"result": "created", "operation": {
+        "operationId": operation_id, "kind": SNAPSHOT, "state": "rejected", "stage": None,
+        "reason": "snapshot_unavailable", "message": message,
+    }})
+
+
+def test_write_answers_truthfully_while_a_reader_holds_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The premise behind the write retry, asserted on whichever platform is running.
+
+    ``os.replace`` over an open destination is the same sharing question as
+    the unlink one test above: POSIX replaces it out from under the reader,
+    Windows refuses, and any momentary reader will do. ``Outbox.write`` must
+    report that refusal rather than raise it -- the raise is what reached
+    ``_run``'s blanket handler and dropped the live session -- and a refused
+    write must leave the item exactly as it was, since ``os.replace`` is
+    atomic and publishes all of the new item or none of it.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path, live=False)
+    monkeypatch.setattr(wglink_live, "REPLACE_RETRY_SECONDS", 0.0)
+    item = _snapshot_item(ipc, workspace, _bundle(workspace))
+    outbox = wglink_live.Outbox(ipc)
+    path = outbox.path(item["operationId"])
+    answered = {**item, "answer": {"outcome": "rejected", "state": "rejected",
+                                   "reason": "snapshot_unavailable", "message": None}}
+    with path.open("rb"):
+        written = outbox.write(answered)
+        assert written == (outbox.read(item["operationId"])["answer"] is not None)
+        assert written is POSIX
+    # Held or not, the item on disk is whole, and no temporary was left behind.
+    assert wglink_live.valid_item(outbox.read(item["operationId"]))
+    assert [stray.name for stray in _outbox(ipc).iterdir() if stray.name.startswith(".")] == []
+    assert outbox.write(answered) is True
+    assert outbox.read(item["operationId"])["answer"]["reason"] == "snapshot_unavailable"
+
+
+def test_a_final_answer_whose_file_is_held_is_kept_never_resent_and_written_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused write must not cost the user the live session, or resend the item.
+
+    ``_answer`` -> ``_replace`` -> ``Outbox.write`` -> ``os.replace`` had
+    nothing catching it, so a momentary reader raised straight out of
+    ``step()`` into ``_run``'s blanket handler, which drops the session and
+    falls back to files -- and it did so on the path carrying ``rejected``,
+    ``conflict`` and ``expired``, the terminal outcomes a user must see. What
+    the forced refusal exposes is not platform-specific: the answer is only
+    in memory until the write lands, so the stale file must not read back
+    over it and become work again. WG answers a repeat under one id
+    ``recovered``, so only the request count at the boundary can see that.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path)
+    item = _snapshot_item(ipc, workspace, _bundle(workspace), clock)
+    held = _HeldItemFile(monkeypatch, wglink_live.Outbox(ipc).path(item["operationId"]))
+    message = "WG could not read this snapshot in the WGLink folder for 24 hours. Send it again from Fusion."
+    wg.script[("POST", "/deliveries")] = [_rejection(item["operationId"], message)]
+
+    client.enqueue_delivery()
+    client.step()
+    assert client.healthy(), "a held item file must never end the live session"
+    [notice] = client.take_delivery_notices()
+    assert (notice["outcome"], notice["reason"], notice["durable"]) == ("rejected", "snapshot_unavailable", True)
+    # The answer is still only in memory: that divergence is the whole hazard.
+    assert _items(ipc)[item["operationId"]]["answer"] is None
+    assert client.status()["outboxWaiting"] == 0
+
+    # A rescan reads that stale file back. It must not become work again.
+    clock.now += wglink_live.OUTBOX_RESCAN_SECONDS + 1
+    _steps(client, 3)
+    assert len(_deliveries(wg)) == 1
+    assert client.status()["outboxWaiting"] == 0
+    assert client.take_delivery_notices() == []
+
+    held.release()
+    client.step()
+    assert _items(ipc)[item["operationId"]]["answer"] == {
+        "outcome": "rejected", "state": "rejected", "reason": "snapshot_unavailable", "message": message,
+    }
+    client.acknowledge_delivery_notice(item["operationId"])
+    client.step()
+    assert _items(ipc) == {} and len(_deliveries(wg)) == 1
+
+
+def test_acknowledging_an_answer_whose_write_is_still_owed_removes_the_item_for_good(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user may dismiss a final answer before it has reached the disk.
+
+    What the acknowledgement settles is the answer the item really has, which
+    is the one in memory while the file still says none. Once the item is
+    forgotten the owed write goes with it: otherwise the retry writes the
+    file back after the delete, and the notice the user just dismissed
+    returns on the next rescan, for ever.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path)
+    item = _snapshot_item(ipc, workspace, _bundle(workspace), clock)
+    held = _HeldItemFile(monkeypatch, wglink_live.Outbox(ipc).path(item["operationId"]))
+    wg.script[("POST", "/deliveries")] = [_rejection(item["operationId"], "unreadable")]
+
+    client.enqueue_delivery()
+    client.step()
+    assert [n["outcome"] for n in client.take_delivery_notices()] == ["rejected"]
+    assert _items(ipc)[item["operationId"]]["answer"] is None, "the write is still owed"
+
+    client.acknowledge_delivery_notice(item["operationId"])
+    client.step()
+    assert _items(ipc) == {}, "an acknowledged item goes, whether or not its answer reached disk"
+
+    held.release()
+    clock.now += wglink_live.OUTBOX_RESCAN_SECONDS + 1
+    _steps(client, 3)
+    assert _items(ipc) == {}, "the owed write must never resurrect a forgotten item"
+    assert client.take_delivery_notices() == []
+    assert len(_deliveries(wg)) == 1
+
+
+def test_a_new_item_that_could_not_be_written_is_never_reported_as_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``add`` is the one caller for which an unwritten item is an error.
+
+    The worker can carry a refused write forward and re-attempt it; the main
+    thread cannot. ``produce_snapshot`` returning normally means the item is
+    queued, so a refusal reported as a write would strand the user's request
+    with nothing left to retry it.
+    """
+
+    ipc, wg, client, clock, workspace = _setup(tmp_path, live=False)
+    bundle = _bundle(workspace)
+    outbox = _outbox(ipc)
+    monkeypatch.setattr(wglink_live, "REPLACE_RETRY_SECONDS", 0.0)
+    replace = os.replace
+
+    def refuse(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if Path(destination).parent == outbox:
+            raise PermissionError(32, "The process cannot access the file")
+        return replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(wglink_live.OutboxHeld):
+        _snapshot_item(ipc, workspace, bundle)
+    assert _items(ipc) == {}
+    assert list(outbox.iterdir()) == [], "the temporary is removed whether or not the replace happened"
+
+
 def test_the_live_worker_delivers_off_the_producing_thread(tmp_path: Path, stub_factory) -> None:  # noqa: F811
     """Real loopback HTTP and the real worker thread."""
 

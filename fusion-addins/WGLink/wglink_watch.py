@@ -392,7 +392,23 @@ def read_return_request(
 ) -> PendingReturnRequest | None:
     """Read one return request. It runs only in the add-in session it names."""
 
-    payload = _read_json(marker_path)
+    return return_request_from_document(
+        _read_json(marker_path), session_id=session_id, marker_path=marker_path
+    )
+
+
+def return_request_from_document(
+    payload: Any, *, session_id: str, marker_path: Path
+) -> PendingReturnRequest | None:
+    """One return request from its v3 document, whichever transport carried it.
+
+    The file transport reads the document from ``marker_path``; the live
+    transport receives the same document in WG's claim answer and passes the
+    claim journal's path, which is not a request file and is never deleted as
+    one. Both go through this one parser, so a request cannot mean two things
+    depending on how it arrived.
+    """
+
     identity = _request_identity(payload)
     if identity is None or payload.get("sessionId") != session_id:
         return None
@@ -413,7 +429,21 @@ def read_pending_handoff(
 ) -> PendingHandoff | None:
     """Read one handoff without trusting an arbitrary bundle path."""
 
-    payload = _read_json(marker_path)
+    return handoff_from_document(
+        _read_json(marker_path), bundle_root=bundle_root, marker_path=marker_path
+    )
+
+
+def handoff_from_document(
+    payload: Any, *, bundle_root: Path | None, marker_path: Path
+) -> PendingHandoff | None:
+    """One handoff from its v3 document, whichever transport carried it.
+
+    The bundle path is validated against ``bundle_root`` here and not by the
+    caller, so a request that arrived over HTTP is trusted exactly as little as
+    one read from a file.
+    """
+
     identity = _request_identity(payload)
     if identity is None:
         return None

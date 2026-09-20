@@ -921,6 +921,242 @@ def _retry_after(answer: Answer) -> float:
 # -- the client ----------------------------------------------------------------
 
 
+# -- Fusion-bound requests (protocol section 7) ---------------------------------
+
+
+KIND_REQUEST_RETURN = "request_return"
+KIND_INSERT_LINK = "insert_link"
+KIND_UPDATE_LINK = "update_link"
+#: The kinds WG offers over ``GET /requests`` (``fusion_outcomes.FUSION_KINDS``).
+FUSION_KINDS = (KIND_REQUEST_RETURN, KIND_INSERT_LINK, KIND_UPDATE_LINK)
+#: The two stages the add-in reports, one step at a time (section 7.3).
+STAGE_QUEUED_FOR_FUSION = "queuedForFusion"
+STAGE_EXECUTING = "executing"
+#: The seven outcomes WG accepts (section 7.4). No other name is ever sent.
+OUTCOMES = (
+    "applied", "reconciled", "refused", "superseded", "discarded", "recoveryRequired", "failed",
+)
+#: WG's operation state that means the user dismissed the request while it ran.
+CANCEL_REQUESTED = "cancel_requested"
+
+CLAIM_DIRECTORY = ".wglink-live-claims"
+CLAIM_SCHEMA_VERSION = 1
+CLAIM_STATE_CLAIMING = "claiming"
+CLAIM_STATE_CLAIMED = "claimed"
+CLAIM_STATE_OUTCOME = "outcome"
+_CLAIM_STATES = (CLAIM_STATE_CLAIMING, CLAIM_STATE_CLAIMED, CLAIM_STATE_OUTCOME)
+#: WG's ``claimId`` grammar (``server/cadlink/live/requests.py``); a uuid4 hex fits.
+_CLAIM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+#: WG's long poll window (``registry.LONG_POLL_SECONDS``); it refuses more.
+LONG_POLL_SECONDS = 25
+#: The socket timeout for a long poll: WG's window plus a margin for the answer.
+POLL_TIMEOUT_MARGIN_SECONDS = 5.0
+#: How long the poll thread waits before trying again after a failure, and how
+#: long it sleeps while there is no healthy session. The poll itself blocks in
+#: WG's wait, so an idle add-in spends no CPU between answers.
+POLL_RETRY_SECONDS = 1.0
+#: A long poll that answers nothing faster than this is not holding the request
+#: open, so the next one waits instead of asking again at once. Without it a WG
+#: that answers immediately -- one that advertises a zero window, or that
+#: returns early -- would turn the poll into a busy loop.
+POLL_MIN_INTERVAL_SECONDS = 0.25
+#: At most this many claim/progress/completion exchanges in one worker step, so
+#: one busy operation cannot hold the heartbeat back indefinitely.
+MAX_REQUEST_STEPS = 8
+#: How long a settled journal entry that could not be deleted is held back
+#: before its record is offered to WG again, doubling on each further failure
+#: up to the ceiling. Without it the surviving entry is picked up by every
+#: scan and re-sent ``MAX_REQUEST_STEPS`` times per worker turn, for as long as
+#: the file is held.
+JOURNAL_HELD_RETRY_SECONDS = 5.0
+JOURNAL_HELD_MAX_RETRY_SECONDS = 300.0
+#: A completion's ``message`` is at most this long (section 7.4).
+MAX_MESSAGE_CHARS = 2000
+_CANCELLED_BEFORE_START = (
+    "Cancelled in WG before WGLink began the request; the Fusion model was not changed."
+)
+
+
+@dataclass(frozen=True)
+class Offer:
+    """One request WG is offering this session, exactly as the poll answered."""
+
+    operation_id: str
+    kind: str
+    attempt_generation: int
+    request: dict[str, Any]
+    epoch: int
+
+
+@dataclass(frozen=True)
+class Dispatch:
+    """A claimed request for the main thread to run, at its claimed generation."""
+
+    operation_id: str
+    kind: str
+    attempt_generation: int
+    request: dict[str, Any]
+    epoch: int
+
+
+@dataclass(frozen=True)
+class _ClaimRequest:
+    operation_id: str
+    kind: str
+    attempt_generation: int
+    request: dict[str, Any]
+    epoch: int
+
+
+@dataclass(frozen=True)
+class _Report:
+    operation_id: str
+    attempt_generation: int
+    epoch: int
+    #: Exactly one of these: a progress stage, or a terminal outcome.
+    stage: str | None = None
+    outcome: str | None = None
+    message: str | None = None
+    evidence: dict[str, str] | None = None
+
+
+def valid_claim(entry: object) -> bool:
+    """Whether ``entry`` is a claim journal document this version wrote."""
+
+    if not isinstance(entry, Mapping):
+        return False
+    generation = entry.get("attemptGeneration")
+    if (
+        entry.get("schemaVersion") != CLAIM_SCHEMA_VERSION
+        or entry.get("state") not in _CLAIM_STATES
+        or entry.get("kind") not in FUSION_KINDS
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or not isinstance(entry.get("request"), Mapping)
+    ):
+        return False
+    for name, pattern in (("operationId", _OPERATION_ID), ("claimId", _CLAIM_ID)):
+        value = entry.get(name)
+        if not isinstance(value, str) or pattern.fullmatch(value) is None:
+            return False
+    if entry["state"] == CLAIM_STATE_OUTCOME:
+        outcome = entry.get("outcome")
+        if not isinstance(outcome, Mapping) or outcome.get("outcome") not in OUTCOMES:
+            return False
+    return True
+
+
+class ClaimJournal:
+    """``<ipc>/.wglink-live-claims/<operationId>.json``: the durable claim.
+
+    The add-in writes ``claiming`` **before** it sends a claim, so nothing is
+    ever acknowledged to WG before a durable record of it exists, and it writes
+    ``claimed`` before the request reaches Fusion's main thread. A ``claiming``
+    entry therefore proves the work never ran; a ``claimed`` one is settled
+    read-only after an interruption and never re-run (protocol section 9).
+
+    Written only by the live worker, with the same atomic write as the outbox.
+    WG never reads this folder.
+    """
+
+    def __init__(self, ipc_folder: Path) -> None:
+        self.folder = Path(ipc_folder) / CLAIM_DIRECTORY
+
+    def path(self, operation_id: str) -> Path:
+        return self.folder / f"{operation_id}.json"
+
+    def scan(self) -> list[dict[str, Any]]:
+        """Every valid entry, oldest claim first, then by operation id."""
+
+        entries: list[dict[str, Any]] = []
+        try:
+            names = sorted(self.folder.iterdir())
+        except OSError:
+            return []
+        for path in names:
+            if path.suffix != ".json" or path.name.startswith("."):
+                continue
+            entry = _read_json(path)
+            if valid_claim(entry) and path.stem == entry["operationId"]:
+                entries.append(dict(entry))
+        entries.sort(key=lambda entry: (str(entry.get("claimedAt") or ""), entry["operationId"]))
+        return entries
+
+    def read(self, operation_id: str) -> dict[str, Any] | None:
+        entry = _read_json(self.path(operation_id))
+        if valid_claim(entry) and entry["operationId"] == operation_id:
+            return dict(entry)
+        return None
+
+    def write(self, entry: Mapping[str, Any]) -> None:
+        if not valid_claim(entry):
+            raise ValueError("not a claim journal entry")
+        self.folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(self.folder, 0o700)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{entry['operationId']}.", suffix=".tmp", dir=self.folder
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(dict(entry), stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path(str(entry["operationId"])))
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def delete(self, operation_id: str) -> bool:
+        """Remove a settled entry; ``False`` when it is still on disk.
+
+        An entry that survives its delete is found again by the very next
+        scan and sent again, so the caller must know. Reporting success for a
+        file that is still there -- a Windows reader holding it open for a
+        moment -- turns one settled operation into a silent re-POST every
+        worker turn, which WG deduplicates into one result and nobody sees.
+        """
+
+        try:
+            self.path(operation_id).unlink(missing_ok=True)
+        except OSError:
+            return False
+        return True
+
+
+def offers_from(body: object, epoch: int) -> list[Offer]:
+    """The offers in a long-poll answer; anything malformed is left out."""
+
+    if not isinstance(body, Mapping):
+        return []
+    requests = body.get("requests")
+    if not isinstance(requests, list):
+        return []
+    found: list[Offer] = []
+    for value in requests[: OUTBOX_MAX_ITEMS]:
+        if not isinstance(value, Mapping):
+            continue
+        operation_id = value.get("operationId")
+        kind = value.get("kind")
+        generation = value.get("attemptGeneration")
+        request = value.get("request")
+        if (
+            not isinstance(operation_id, str)
+            or _OPERATION_ID.fullmatch(operation_id) is None
+            or kind not in FUSION_KINDS
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+            or not isinstance(request, Mapping)
+        ):
+            continue
+        found.append(Offer(operation_id, str(kind), generation, dict(request), epoch))
+    return found
+
+
 @dataclass
 class _Session:
     endpoint: Endpoint = field(repr=False)
@@ -935,6 +1171,8 @@ class _Session:
     last_ok: float = 0.0
     #: Registered to recover from a 401; a second 401 soon after ends live use.
     recovering: bool = False
+    #: WG's advertised long-poll window, clamped to what WG accepts.
+    long_poll: int = LONG_POLL_SECONDS
 
 
 class LiveClient:
@@ -958,6 +1196,7 @@ class LiveClient:
         transport_factory: Callable[[str], Any] = Transport,
         posix: bool | None = None,
         solve_files: Any = None,
+        notify: Callable[[], None] | None = None,
     ) -> None:
         self._ipc_folder = ipc_folder
         self._adapter_session_id = str(adapter_session_id)
@@ -1004,9 +1243,47 @@ class LiveClient:
         self._notices: list[dict[str, Any]] = []
         self._acknowledged: queue.SimpleQueue[str] = queue.SimpleQueue()
 
+        # Fusion-bound requests (protocol section 7).
+        #: Raised on the poll thread so the main thread services a dispatch at
+        #: once; Fusion documents ``fireCustomEvent`` as thread-safe, and it is
+        #: the only call a worker makes towards ``WGLink.py``.
+        self._notify = notify
+        #: Bumped when this instance stops owning the connection (the IPC lease
+        #: or ``stop``). Never by a token refresh or a new registration: an
+        #: operation is bound to the installation and attempt generation.
+        self._epoch = 1
+        self._lease_held = True
+        self._offers: list[Offer] = []
+        #: What the last answered poll left unclaimed. ``None`` means the last
+        #: poll told us nothing, so the next answer counts as a change. Only a
+        #: change wakes Fusion's main thread and shortens the next wait.
+        self._offered: frozenset[str] | None = None
+        #: Operations the main thread asked for; not offered again meanwhile.
+        self._taken: set[str] = set()
+        self._cancelled: set[str] = set()
+        self._claim_requests: queue.SimpleQueue[_ClaimRequest] = queue.SimpleQueue()
+        self._reports: queue.SimpleQueue[_Report] = queue.SimpleQueue()
+        self._dispatch: queue.SimpleQueue[Dispatch] = queue.SimpleQueue()
+        self._adoptions: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
+        self._progress_due: deque[_Report] = deque()
+        self._progress_hold = float("-inf")
+        self._claim_retry: dict[str, float] = {}
+        self._outcome_retry: dict[str, float] = {}
+        #: Consecutive failed deletes per operation, for the backoff above.
+        self._journal_held: dict[str, int] = {}
+        #: Journal entries this life created, so only an earlier life's
+        #: ``claimed`` entry is offered to the main thread for settlement.
+        self._own: set[str] = set()
+        self._adopted: set[str] = set()
+        self._claims_scanned = False
+        self._poll_answers: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
+        self._polls = 0
+
         self._stop = threading.Event()
         self._wake = threading.Event()
+        self._poll_wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._poll_thread: threading.Thread | None = None
 
     def __repr__(self) -> str:
         return f"<LiveClient mode={self.status()['mode']}>"
@@ -1019,20 +1296,35 @@ class LiveClient:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="WGLinkLiveSend", daemon=True)
         self._thread.start()
+        # The long poll parks in WG's wait for up to 25 s. On the sender thread
+        # that would push the four-second heartbeat past WG's 20 s freshness
+        # window, so it gets a thread of its own and never touches session state.
+        self._poll_thread = threading.Thread(target=self._poll_run, name="WGLinkLivePoll", daemon=True)
+        self._poll_thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """End the session from the worker and wait for it to finish."""
+        """End the session from the workers and wait a bounded time for them."""
 
-        thread = self._thread
+        deadline = time.monotonic() + max(0.0, timeout)
         self._stop.set()
         self._wake.set()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-        if thread is None or not thread.is_alive():
-            self._thread = None
+        self._poll_wake.set()
+        # The ownership generation is deliberately not moved here. Stopping does
+        # not hand the connection to another instance, and an outcome this
+        # instance already decided must still reach the claim journal in the
+        # worker's shutdown flush. ``_halted`` is what stops new work.
+        for name in ("_thread", "_poll_thread"):
+            thread = getattr(self, name)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread is None or not thread.is_alive():
+                setattr(self, name, None)
 
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return any(
+            thread is not None and thread.is_alive()
+            for thread in (self._thread, self._poll_thread)
+        )
 
     def healthy(self) -> bool:
         with self._lock:
@@ -1072,6 +1364,96 @@ class LiveClient:
         self._acknowledged.put(str(operation_id))
         self._wake.set()
 
+    # -- Fusion-bound requests, main-thread side (never blocks) -----------------
+
+    @property
+    def epoch(self) -> int:
+        """Which ownership of the connection the current work belongs to."""
+
+        with self._lock:
+            return self._epoch
+
+    def offers(self) -> list[Offer]:
+        """What WG is offering now, minus anything already asked for."""
+
+        with self._lock:
+            return [offer for offer in self._offers if offer.operation_id not in self._taken]
+
+    def claim(self, offer: Offer) -> None:
+        """Ask the worker to claim ``offer``. Nothing is acknowledged here."""
+
+        with self._lock:
+            if offer.epoch != self._epoch or offer.operation_id in self._taken:
+                return
+            self._taken.add(offer.operation_id)
+        self._claim_requests.put(
+            _ClaimRequest(
+                offer.operation_id, offer.kind, offer.attempt_generation, dict(offer.request), offer.epoch
+            )
+        )
+        self._wake.set()
+
+    def take_dispatch(self) -> Dispatch | None:
+        """One claimed request to run on Fusion's main thread, or None."""
+
+        while True:
+            try:
+                dispatch = self._dispatch.get_nowait()
+            except queue.Empty:
+                return None
+            if dispatch.epoch == self.epoch:
+                return dispatch
+
+    def take_adoption(self) -> dict[str, Any] | None:
+        """A claim an earlier session left ``claimed``, to settle read-only."""
+
+        try:
+            return self._adoptions.get_nowait()
+        except queue.Empty:
+            return None
+
+    def cancel_pending(self, operation_id: str) -> bool:
+        """Whether WG has reported this operation dismissed while it runs."""
+
+        with self._lock:
+            return str(operation_id) in self._cancelled
+
+    def report_progress(self, operation_id: str, generation: int, stage: str, *, epoch: int | None = None) -> None:
+        if stage not in (STAGE_QUEUED_FOR_FUSION, STAGE_EXECUTING):
+            raise ValueError(f"unknown live progress stage {stage!r}")
+        self._reports.put(
+            _Report(
+                str(operation_id), int(generation), self.epoch if epoch is None else int(epoch), stage=stage
+            )
+        )
+        self._wake.set()
+
+    def report_outcome(
+        self,
+        operation_id: str,
+        generation: int,
+        outcome: str,
+        *,
+        message: str | None = None,
+        evidence: Mapping[str, str] | None = None,
+        epoch: int | None = None,
+    ) -> None:
+        """Record this operation's one terminal outcome and send it."""
+
+        if outcome not in OUTCOMES:
+            raise ValueError(f"unknown live outcome {outcome!r}")
+        self._reports.put(
+            _Report(
+                str(operation_id),
+                int(generation),
+                self.epoch if epoch is None else int(epoch),
+                outcome=outcome,
+                message=(str(message)[:MAX_MESSAGE_CHARS] or None) if message else None,
+                evidence={str(k): str(v) for k, v in dict(evidence).items()} if evidence else None,
+            )
+        )
+        self._wake.set()
+
     def take_log_lines(self) -> list[str]:
         with self._lock:
             lines = list(self._log)
@@ -1091,6 +1473,11 @@ class LiveClient:
                 "refreshes": self._refreshes,
                 "lastCause": self._last_cause,
                 "outboxWaiting": sum(1 for item in self._items or () if item.get("answer") is None),
+                "epoch": self._epoch,
+                "polls": self._polls,
+                "offered": len(self._offers),
+                "claiming": len(self._taken),
+                "cancelRequested": sorted(self._cancelled),
             }
 
     # -- worker ------------------------------------------------------------------
@@ -1109,7 +1496,142 @@ class LiveClient:
                     break
                 self._wake.wait(max(0.0, min(delay, IDLE_STEP_SECONDS)))
         finally:
+            # An outcome reported just before shutdown is journaled here, so a
+            # terminal result is durable even when its POST never went out.
+            ipc = self._ipc
+            if ipc is not None:
+                try:
+                    self._keep_claims(ClaimJournal(ipc))
+                except Exception:  # noqa: BLE001 - shutdown is best effort
+                    pass
             self.end()
+
+    def _poll_run(self) -> None:
+        """The long poll, and nothing else: it never changes session state."""
+
+        while not self._stop.is_set():
+            self._poll_wake.clear()
+            try:
+                delay = self.poll_step()
+            except Exception:  # noqa: BLE001 - never let the poll thread die silently
+                self._note("poll", "WGLink's live request poll hit an unexpected error.")
+                delay = POLL_RETRY_SECONDS
+            if self._stop.is_set():
+                break
+            if delay > 0:
+                self._poll_wake.wait(min(delay, IDLE_STEP_SECONDS))
+
+    def poll_step(self) -> float:
+        """One ``GET /requests``; returns seconds to wait before the next.
+
+        WG holds the request open for up to its long-poll window, so an idle
+        add-in waits in the kernel rather than asking again in a loop. The
+        answer only fills the offer slot; every refusal is handed to the sender,
+        which owns registration and session state.
+        """
+
+        if self._halted():
+            self._forget_offered()
+            return POLL_RETRY_SECONDS
+        with self._lock:
+            session = self._session
+            if session is None or self._clock() - session.last_ok > HEALTHY_WINDOW_SECONDS:
+                self._offered = None
+                return POLL_RETRY_SECONDS
+            headers = self._auth(session)
+            wait = max(0, min(int(session.long_poll), LONG_POLL_SECONDS))
+            transport = session.transport
+            epoch = self._epoch
+        began = self._clock()
+        try:
+            answer = transport.request(
+                "GET",
+                f"/requests?waitSeconds={wait}",
+                headers=headers,
+                timeout=wait + POLL_TIMEOUT_MARGIN_SECONDS,
+            )
+        except NetworkFailure:
+            self._forget_offered()
+            self._poll_answers.put(("network", None))
+            self._wake.set()
+            return POLL_RETRY_SECONDS
+        if self._halted():
+            self._forget_offered()
+            return POLL_RETRY_SECONDS
+        with self._lock:
+            self._polls += 1
+        if answer.status == 200:
+            offers = offers_from(answer.body, epoch)
+            with self._lock:
+                if epoch != self._epoch:
+                    return POLL_RETRY_SECONDS
+                # Latest wins: the slot is replaced, never appended to, so a
+                # quiet WG and a busy one cost the same memory.
+                self._offers = offers
+                wanted = frozenset(
+                    offer.operation_id for offer in offers if offer.operation_id not in self._taken
+                )
+                changed = wanted != self._offered
+                self._offered = wanted
+            self._poll_answers.put(("ok", None))
+            if wanted and changed:
+                # Something new to take: wake the main thread, and ask again at
+                # once in case WG is holding more behind it.
+                self._raise_event()
+                return 0.0
+            if wanted:
+                # The same offers, still unclaimed. That is the state the
+                # contract mandates while a Fusion command is running, while no
+                # design is ready and while no WG workspace is selected: the
+                # request waits and the heartbeat says why. WG answers a long
+                # poll the instant an offerable request exists, so asking again
+                # at once would be a continuous round trip against WG and an
+                # unbounded custom-event queue onto Fusion's main thread --
+                # exactly while the user has a command open. The main thread
+                # re-examines the offer on its own watch tick, so nothing is
+                # lost by waiting, and a change is still prompt.
+                return POLL_RETRY_SECONDS
+            # Nothing offered: ask again at once only if WG actually held the
+            # request open. A poll that answers instantly is not a wait.
+            return 0.0 if self._clock() - began >= POLL_MIN_INTERVAL_SECONDS else POLL_RETRY_SECONDS
+        self._forget_offered()
+        self._poll_answers.put(("refused", answer))
+        self._wake.set()
+        return POLL_RETRY_SECONDS
+
+    def _forget_offered(self) -> None:
+        """A poll that did not answer proves nothing about what WG still holds.
+
+        The next answer is therefore a change, and it reaches the main thread.
+        """
+
+        with self._lock:
+            self._offered = None
+
+    def _raise_event(self) -> None:
+        if self._notify is None:
+            return
+        try:
+            self._notify()
+        except Exception:  # noqa: BLE001 - a torn-down custom event is not fatal
+            pass
+
+    def _bump_epoch(self, reason: str) -> None:
+        """This instance no longer owns the connection: refuse its late work."""
+
+        with self._lock:
+            self._epoch += 1
+            self._offers = []
+            self._offered = None
+            self._taken.clear()
+            self._cancelled.clear()
+        self._progress_due.clear()
+        for channel in (self._dispatch, self._claim_requests, self._reports, self._adoptions):
+            while True:
+                try:
+                    channel.get_nowait()
+                except queue.Empty:
+                    break
 
     def end(self) -> None:
         """End the session with WG (best effort) and forget it."""
@@ -1129,10 +1651,16 @@ class LiveClient:
 
         now = self._clock()
         if not self._lease_ok():
+            if self._lease_held:
+                self._lease_held = False
+                # Another add-in instance owns the connection now: nothing this
+                # one claimed, dispatched or is about to report may still land.
+                self._bump_epoch("lease")
             if self._session is not None:
                 self._note("lease", "WGLink no longer owns the IPC lease; live session ended.")
                 self.end()
             return IDLE_STEP_SECONDS
+        self._lease_held = True
         ipc = self._ipc_folder()
         if ipc is None:
             if self._session is not None:
@@ -1140,6 +1668,12 @@ class LiveClient:
             return IDLE_STEP_SECONDS
         self._ipc = ipc
         self._keep_outbox(ipc, now)
+        journal = ClaimJournal(ipc)
+        self._keep_claims(journal)
+        self._adopt_claims(journal)
+        answered = self._read_poll_answers(now)
+        if answered is not None:
+            return answered
         session = self._session
         if session is not None:
             if files_fingerprint(ipc) != session.fingerprint:
@@ -1262,6 +1796,7 @@ class LiveClient:
             registered_at=now,
             last_ok=now,
             recovering=self._recover_next,
+            long_poll=self._long_poll(reply),
         )
         if self._halted():
             # Never keep a session registered after stop or lease loss.
@@ -1350,6 +1885,11 @@ class LiveClient:
             outcome = self._post_heartbeat(session, pending[1], now)
             if outcome is not None:
                 return outcome
+        # Claims and reports come before deliveries: a bundle delivery may take
+        # WG up to 30 s to retain, and Fusion should not wait behind it.
+        outcome = self._work_requests(session, now)
+        if outcome is not None:
+            return outcome
         outcome = self._deliver_next(session, now)
         if outcome is not None:
             return outcome
@@ -1445,6 +1985,467 @@ class LiveClient:
         self._recheck_at = now + self._network_backoff
         self._note("network", f"WGLink uses the files: {reason}.")
         return self._network_backoff
+
+    # -- Fusion-bound requests (worker) ----------------------------------------------
+
+    @staticmethod
+    def _long_poll(reply: Mapping[str, Any]) -> int:
+        value = reply.get("longPollSeconds")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return LONG_POLL_SECONDS
+        return min(value, LONG_POLL_SECONDS)
+
+    def _read_poll_answers(self, now: float) -> float | None:
+        """Apply what the poll thread saw. Only this thread ends a session."""
+
+        while True:
+            try:
+                kind, answer = self._poll_answers.get_nowait()
+            except queue.Empty:
+                return None
+            session = self._session
+            if session is None:
+                continue
+            if kind == "ok":
+                with self._lock:
+                    session.last_ok = now
+                continue
+            if kind == "network":
+                return self._lost(now, "WG did not answer the request poll")
+            if answer.status == 401:
+                return self._session_lost(session, now, answer.code or "401")
+            if answer.status == 503 and answer.code == "store_busy":
+                # WG is starting or stopping: the poll backs off by itself.
+                continue
+            return self._refused(session, answer, now, "request poll")
+
+    def _keep_claims(self, journal: ClaimJournal) -> None:
+        """Turn the main thread's asks into durable journal entries.
+
+        A claim is journaled here, before anything is sent; an outcome is
+        journaled here, before its completion is sent. Both are what makes a
+        repeat harmless: the claim replays by its id, and the outcome is the
+        operation's one authoritative terminal record.
+        """
+
+        while True:
+            try:
+                item = self._claim_requests.get_nowait()
+            except queue.Empty:
+                break
+            if item.epoch != self.epoch or self._halted():
+                continue
+            if journal.read(item.operation_id) is not None:
+                continue
+            try:
+                journal.write(
+                    {
+                        "schemaVersion": CLAIM_SCHEMA_VERSION,
+                        "operationId": item.operation_id,
+                        "claimId": uuid.uuid4().hex,
+                        "kind": item.kind,
+                        "attemptGeneration": item.attempt_generation,
+                        "state": CLAIM_STATE_CLAIMING,
+                        "request": item.request,
+                        "claimedAt": _utc_whole_seconds(self._wall()),
+                    }
+                )
+            except (OSError, ValueError):
+                self._note("journal", "WGLink could not record a live claim; using the files for it.")
+                with self._lock:
+                    self._taken.discard(item.operation_id)
+                continue
+            self._own.add(item.operation_id)
+        while True:
+            try:
+                report = self._reports.get_nowait()
+            except queue.Empty:
+                return
+            if report.epoch != self.epoch:
+                continue
+            if report.stage is not None:
+                self._progress_due.append(report)
+                continue
+            entry = journal.read(report.operation_id)
+            if entry is None:
+                # The attempt is gone: another owner settled it, or WG refused
+                # the claim. A terminal report without a claim is never sent.
+                continue
+            outcome: dict[str, Any] = {"outcome": report.outcome}
+            if report.message:
+                outcome["message"] = report.message
+            if report.evidence:
+                outcome["evidence"] = report.evidence
+            try:
+                journal.write(
+                    {
+                        **entry,
+                        "state": CLAIM_STATE_OUTCOME,
+                        "attemptGeneration": report.attempt_generation,
+                        "outcome": outcome,
+                    }
+                )
+            except (OSError, ValueError):
+                self._note("journal", "WGLink could not record a live outcome; it will be reported again.")
+
+    def _adopt_claims(self, journal: ClaimJournal) -> None:
+        """Offer an earlier session's ``claimed`` entries for settlement.
+
+        Once per load, and read-only: an interrupted claim is reconciled
+        against the document by the main thread and never run again. A
+        ``claiming`` entry is not adopted -- it was written before its claim
+        was ever sent, so its work provably never reached Fusion, and it
+        replays through the ordinary claim path.
+        """
+
+        if self._claims_scanned:
+            return
+        self._claims_scanned = True
+        for entry in journal.scan():
+            operation_id = entry["operationId"]
+            if operation_id in self._own or operation_id in self._adopted:
+                continue
+            if entry["state"] != CLAIM_STATE_CLAIMED:
+                continue
+            self._adopted.add(operation_id)
+            self._adoptions.put(dict(entry))
+            self._raise_event()
+
+    def _forget_claim(
+        self, journal: ClaimJournal, operation_id: str, now: float | None = None
+    ) -> bool:
+        """Drop a settled operation. ``False`` when its entry is still on disk.
+
+        A journal file that refuses to be deleted is found by the next scan and
+        its claim or outcome is sent again. It is held back here, doubling,
+        with one diagnostic -- rather than re-sent silently and for ever.
+        """
+
+        removed = journal.delete(operation_id)
+        self._own.discard(operation_id)
+        self._adopted.discard(operation_id)
+        self._claim_retry.pop(operation_id, None)
+        self._outcome_retry.pop(operation_id, None)
+        with self._lock:
+            self._taken.discard(operation_id)
+            self._cancelled.discard(operation_id)
+        if removed:
+            self._journal_held.pop(operation_id, None)
+            return True
+        failures = self._journal_held.get(operation_id, 0) + 1
+        self._journal_held[operation_id] = failures
+        wait = min(
+            JOURNAL_HELD_RETRY_SECONDS * (2 ** (failures - 1)),
+            JOURNAL_HELD_MAX_RETRY_SECONDS,
+        )
+        when = (self._clock() if now is None else now) + wait
+        # Whichever state the surviving file holds, the scan that finds it is
+        # gated by one of these two.
+        self._claim_retry[operation_id] = when
+        self._outcome_retry[operation_id] = when
+        self._note(
+            "journal-held",
+            "WGLink could not clear a settled live claim; it waits before reporting again.",
+        )
+        return False
+
+    def _work_requests(self, session: _Session, now: float) -> float | None:
+        """One turn of claim, progress and completion work over the session."""
+
+        ipc = self._ipc
+        if ipc is None:
+            return None
+        journal = ClaimJournal(ipc)
+        for _step in range(MAX_REQUEST_STEPS):
+            if self._halted():
+                return None
+            if self._progress_due and now >= self._progress_hold:
+                outcome = self._post_progress(session, journal, self._progress_due[0], now)
+                if outcome is not None:
+                    return outcome
+                continue
+            entry = self._next_entry(journal, CLAIM_STATE_CLAIMING, self._claim_retry, now)
+            if entry is not None:
+                outcome = self._post_claim(session, journal, entry, now)
+                if outcome is not None:
+                    return outcome
+                continue
+            entry = self._next_entry(journal, CLAIM_STATE_OUTCOME, self._outcome_retry, now)
+            if entry is not None:
+                outcome = self._post_completion(session, journal, entry, now)
+                if outcome is not None:
+                    return outcome
+                continue
+            return None
+        return None
+
+    def _next_entry(
+        self, journal: ClaimJournal, state: str, retries: dict[str, float], now: float
+    ) -> dict[str, Any] | None:
+        for entry in journal.scan():
+            if entry["state"] == state and now >= retries.get(entry["operationId"], float("-inf")):
+                return entry
+        return None
+
+    def _post_claim(
+        self, session: _Session, journal: ClaimJournal, entry: dict[str, Any], now: float
+    ) -> float | None:
+        operation_id = entry["operationId"]
+        try:
+            answer = session.transport.request(
+                "POST",
+                f"/requests/{operation_id}/claim",
+                headers={"Content-Type": "application/json", **self._auth(session)},
+                body={"attemptGeneration": entry["attemptGeneration"], "claimId": entry["claimId"]},
+                timeout=self._timeout(),
+            )
+        except NetworkFailure:
+            self._claim_retry[operation_id] = now + POLL_RETRY_SECONDS
+            return self._lost(now, "WG did not answer the request claim")
+        if answer.status == 200 and isinstance(answer.body, Mapping):
+            generation = answer.body.get("attemptGeneration")
+            request = answer.body.get("request")
+            if (
+                not isinstance(generation, bool)
+                and isinstance(generation, int)
+                and generation >= 0
+                and isinstance(request, Mapping)
+            ):
+                with self._lock:
+                    session.last_ok = now
+                self._claim_retry.pop(operation_id, None)
+                claimed = {
+                    **entry,
+                    "state": CLAIM_STATE_CLAIMED,
+                    "attemptGeneration": generation,
+                    "request": dict(request),
+                }
+                try:
+                    journal.write(claimed)
+                except (OSError, ValueError):
+                    # The claim is WG's now but nothing durable records it, so
+                    # the main thread must not be given work whose outcome
+                    # could not be kept. Hand the operation back at once rather
+                    # than leaving WG waiting for an attempt that cannot report.
+                    self._note("journal", "WGLink could not record a live claim; returning it to WG.")
+                    self._give_back(session, operation_id, generation, now)
+                    self._forget_claim(journal, operation_id, now)
+                    return None
+                self._own.add(operation_id)
+                return self._queue_for_fusion(session, journal, claimed, now)
+            return self._refused(session, answer, now, "request claim")
+        if answer.status == 503 and answer.code == "store_busy":
+            with self._lock:
+                session.last_ok = now
+            self._claim_retry[operation_id] = now + STORE_BUSY_RETRY_SECONDS
+            return None
+        if answer.status in (404, 409):
+            with self._lock:
+                session.last_ok = now
+            self._forget_claim(journal, operation_id, now)
+            self._note(
+                f"claim-{answer.code}",
+                f"WG did not hand WGLink this request ({answer.code or answer.status}); nothing ran.",
+            )
+            return None
+        if answer.status == 401:
+            return self._session_lost(session, now, answer.code or "401")
+        return self._refused(session, answer, now, "request claim")
+
+    def _queue_for_fusion(
+        self, session: _Session, journal: ClaimJournal, entry: dict[str, Any], now: float
+    ) -> float | None:
+        """Record ``queuedForFusion``, then hand the request to the main thread.
+
+        The stage answer carries the operation, which is where a dismissal
+        becomes visible: WG has no route that tells a claimed add-in to stop,
+        and `POST /progress` is allowed while ``cancel_requested``.
+        """
+
+        operation_id = entry["operationId"]
+        generation = entry["attemptGeneration"]
+        report = _Report(operation_id, generation, self.epoch, stage=STAGE_QUEUED_FOR_FUSION)
+        try:
+            answer = session.transport.request(
+                "POST",
+                f"/requests/{operation_id}/progress",
+                headers={"Content-Type": "application/json", **self._auth(session)},
+                body={"attemptGeneration": generation, "stage": STAGE_QUEUED_FOR_FUSION},
+                timeout=self._timeout(),
+            )
+        except NetworkFailure:
+            self._progress_due.append(report)
+            self._hand_over(entry)
+            return self._lost(now, "WG did not answer the request progress")
+        with self._lock:
+            session.last_ok = now
+        if answer.status == 200:
+            if self._dismissed(answer.body):
+                # Dismissed before Fusion ever saw it: nothing is modified.
+                self._settle(journal, entry, "discarded", _CANCELLED_BEFORE_START)
+                return None
+            self._hand_over(entry)
+            return None
+        if answer.status == 409 and answer.code in ("claimed_elsewhere", "stale_attempt"):
+            self._forget_claim(journal, operation_id, now)
+            self._note(f"stage-{answer.code}", "WG no longer owns this attempt; nothing ran.")
+            return None
+        if answer.status == 503 and answer.code == "store_busy":
+            self._progress_due.append(report)
+            self._progress_hold = now + STORE_BUSY_RETRY_SECONDS
+        self._hand_over(entry)
+        if answer.status == 401:
+            return self._session_lost(session, now, answer.code or "401")
+        return None
+
+    def _give_back(self, session: _Session, operation_id: str, generation: int, now: float) -> None:
+        """Tell WG this attempt cannot run, so the operation is not left waiting."""
+
+        try:
+            session.transport.request(
+                "POST",
+                f"/requests/{operation_id}/complete",
+                headers={"Content-Type": "application/json", **self._auth(session)},
+                body={
+                    "attemptGeneration": generation,
+                    "outcome": "failed",
+                    "message": "WGLink could not record this request durably and did not run it.",
+                },
+                timeout=self._timeout(),
+            )
+        except NetworkFailure:
+            self._lost(now, "WG did not answer the request completion")
+
+    def _hand_over(self, entry: Mapping[str, Any]) -> None:
+        """Enqueue the claimed request for the main thread and raise the event."""
+
+        self._dispatch.put(
+            Dispatch(
+                str(entry["operationId"]),
+                str(entry["kind"]),
+                int(entry["attemptGeneration"]),
+                dict(entry["request"]),
+                self.epoch,
+            )
+        )
+        self._raise_event()
+
+    @staticmethod
+    def _dismissed(body: object) -> bool:
+        if not isinstance(body, Mapping):
+            return False
+        operation = body.get("operation")
+        return isinstance(operation, Mapping) and operation.get("state") == CANCEL_REQUESTED
+
+    def _settle(
+        self,
+        journal: ClaimJournal,
+        entry: Mapping[str, Any],
+        outcome: str,
+        message: str,
+        evidence: Mapping[str, str] | None = None,
+    ) -> bool:
+        """Journal a terminal outcome. ``False`` when it could not be written.
+
+        Its two siblings -- the claim in ``_post_claim`` and the outcome in
+        ``_keep_claims`` -- both survive a momentary reader. This one did not,
+        and the ``OSError`` reached the worker's blanket handler, which drops
+        the whole live session to the file transport. The claim entry stands,
+        so the outcome is settled from the journal on the next load.
+        """
+
+        record: dict[str, Any] = {"outcome": outcome, "message": message[:MAX_MESSAGE_CHARS]}
+        if evidence:
+            record["evidence"] = dict(evidence)
+        try:
+            journal.write({**dict(entry), "state": CLAIM_STATE_OUTCOME, "outcome": record})
+        except (OSError, ValueError):
+            self._note("journal", "WGLink could not record a live outcome; it will be reported again.")
+            return False
+        return True
+
+    def _post_progress(
+        self, session: _Session, journal: ClaimJournal, report: _Report, now: float
+    ) -> float | None:
+        operation_id = report.operation_id
+        try:
+            answer = session.transport.request(
+                "POST",
+                f"/requests/{operation_id}/progress",
+                headers={"Content-Type": "application/json", **self._auth(session)},
+                body={"attemptGeneration": report.attempt_generation, "stage": report.stage},
+                timeout=self._timeout(),
+            )
+        except NetworkFailure:
+            return self._lost(now, "WG did not answer the request progress")
+        with self._lock:
+            session.last_ok = now
+        if answer.status == 200:
+            if self._dismissed(answer.body):
+                with self._lock:
+                    self._cancelled.add(operation_id)
+                self._note("cancel", "WG asked for this request to be cancelled; stopping at the next safe point.")
+            self._progress_due.popleft()
+            return None
+        if answer.status == 503 and answer.code == "store_busy":
+            self._progress_hold = now + STORE_BUSY_RETRY_SECONDS
+            return None
+        self._progress_due.popleft()
+        if answer.status == 409 and answer.code in ("claimed_elsewhere", "stale_attempt"):
+            self._forget_claim(journal, operation_id, now)
+            self._note(f"stage-{answer.code}", "WG no longer owns this attempt; its progress is not recorded.")
+            return None
+        if answer.status == 409 and answer.code == "stage_out_of_order":
+            self._note("stage-order", "WG refused a request stage as out of order.")
+            return None
+        if answer.status == 401:
+            return self._session_lost(session, now, answer.code or "401")
+        return None
+
+    def _post_completion(
+        self, session: _Session, journal: ClaimJournal, entry: dict[str, Any], now: float
+    ) -> float | None:
+        operation_id = entry["operationId"]
+        outcome = dict(entry["outcome"])
+        body: dict[str, Any] = {
+            "attemptGeneration": entry["attemptGeneration"],
+            "outcome": outcome["outcome"],
+        }
+        if outcome.get("message"):
+            body["message"] = str(outcome["message"])[:MAX_MESSAGE_CHARS]
+        if isinstance(outcome.get("evidence"), Mapping):
+            body["evidence"] = dict(outcome["evidence"])
+        try:
+            answer = session.transport.request(
+                "POST",
+                f"/requests/{operation_id}/complete",
+                headers={"Content-Type": "application/json", **self._auth(session)},
+                body=body,
+                timeout=self._timeout(),
+            )
+        except NetworkFailure:
+            self._outcome_retry[operation_id] = now + POLL_RETRY_SECONDS
+            return self._lost(now, "WG did not answer the request completion")
+        with self._lock:
+            session.last_ok = now
+        if answer.status == 200:
+            self._forget_claim(journal, operation_id, now)
+            return None
+        if answer.status == 503 and answer.code == "store_busy":
+            self._outcome_retry[operation_id] = now + STORE_BUSY_RETRY_SECONDS
+            return None
+        if answer.status in (400, 404, 409):
+            # A conflicting, stale or unusable outcome is never retried: WG's
+            # record stands, and this claim has nothing left to say.
+            self._forget_claim(journal, operation_id, now)
+            self._note(
+                f"outcome-{answer.code}",
+                f"WG kept its own record of this request ({answer.code or answer.status}).",
+            )
+            return None
+        if answer.status == 401:
+            return self._session_lost(session, now, answer.code or "401")
+        return self._refused(session, answer, now, "request completion")
 
     # -- the outbox (worker) ---------------------------------------------------------
 

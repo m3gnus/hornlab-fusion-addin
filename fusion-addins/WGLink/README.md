@@ -273,9 +273,92 @@ Commands and requests cross through WG's machine-local IPC folder,
   `diagnostics.recentOutcomes`: evidence on a link means it
   applied, the applying mark means recovery is required, and neither means it
   never started. None is run again; each claim is removed.
+  **A claim whose Fusion document is not the open one is kept, not settled.**
+  All three answers above are reads of that exact document, so with another one
+  open none of them can be established, and reporting "never started" would
+  cancel an operation that may have applied or may need recovery. Such a claim
+  waits — in this session or a later one — until its document is active, and
+  the heartbeat names it under `diagnostics.liveDispatch.targetDocumentUnavailable`.
+  *Target document unavailable* and *operation never started* stay different
+  things.
 - **Correlation.** The heartbeat's `diagnostics.lastRequest` names the last
   round trip (`channel`, `correlationId`, `attemptId`, `delivery`, `outcome`),
   and each link publishes the `operationId` stamped on it.
+
+### Taking WG's requests over the live session
+
+When the live session is healthy, WG hands its Fusion-bound requests over HTTP
+instead of leaving WGLink to find their files (WG's
+`docs/reference/CADLINK-LIVE-PROTOCOL.md`, section 7). What a request means, and
+every check made before it runs, are the file transport's, unchanged: one
+parser, one run, one set of rules.
+
+- **Two workflows, never a negotiation.** While the session is healthy WGLink
+  claims no request files at all, so a request cannot be taken twice; while it
+  is not, the file path runs exactly as it always has. WGLink never negotiates
+  a protocol with an incompatible WG — any refusal simply leaves it on the
+  files.
+- **A long poll, not a spin.** A separate worker thread holds one
+  `GET /requests` open for WG's advertised window (25 s), so an idle add-in
+  waits in the kernel. It has a thread of its own because a 25 s wait on the
+  sender would push the four-second heartbeat past WG's 20 s freshness window.
+  A poll that answers instantly is not a wait, and the next one is delayed.
+  The same holds for a request WGLink may not take yet — a Fusion command is
+  running, no design is ready, no WG workspace is selected. WG answers a long
+  poll the instant an offerable request exists, so only a *change* in what WG
+  is offering shortens the next wait or raises the custom event; a standing
+  offer is re-examined by the four-second tick instead. The request waits and
+  the heartbeat says why, which is the point — but it waits quietly.
+- **The durable claim comes first.** Before WGLink asks WG for a request it
+  writes `ipc/wglink/.wglink-live-claims/<operationId>.json` with a fresh claim
+  id. Nothing is acknowledged to WG before that file exists, and nothing
+  reaches Fusion's main thread before the claim is answered and the file says
+  `claimed`. A lost answer is replayed with the same claim id, which WG answers
+  from its own store; a lost completion is resent from the same file. Each
+  operation has exactly one such file, and it is the add-in's authoritative
+  record of that operation. A settled file that will not delete — a reader
+  holding it open — is reported and held back, doubling, rather than found by
+  every scan and sent again; WG would answer `alreadyRecorded` each time, so
+  nothing but the request count would show it.
+- **Fusion's main thread does the Fusion work.** The worker raises a second
+  custom event; every `adsk` call for a live request happens in its handler, or
+  in the four-second tick, which services the same queue so a missed event
+  costs one tick rather than an operation. The workers never call into the
+  add-in and never touch a document.
+- **Progress.** `queuedForFusion` is recorded when the claim is answered, and
+  `executing` immediately before the first Fusion write — so a request refused
+  during its checks never makes WG believe the model was being changed.
+- **After an interruption, nothing is re-run.** A `claiming` entry proves its
+  work never reached the main thread, so it replays and runs normally. A
+  `claimed` entry is reconciled against its exact document, read-only, exactly
+  as a leftover file claim is — including the rule above that a claim whose
+  document is not open is kept rather than settled.
+- **Shutdown is bounded.** Stopping the add-in stops the live workers first,
+  with a deadline, then removes both custom events. A request still in flight
+  may finish afterwards on its daemon thread; it starts nothing new, touches no
+  document, and its outcome is already in the claim journal.
+- **Work from a previous owner is refused.** Losing the IPC lease, or stopping,
+  moves the client to a new ownership generation. A dispatch or a report from
+  the old one is dropped rather than reaching the document or WG. A token
+  refresh does **not** do this: an operation belongs to the installation and
+  its attempt generation, never to a session.
+
+### Cancelling a live request
+
+WG has no route that tells a claimed add-in to stop; a dismissal becomes
+visible in the operation WG returns with a progress report. Fusion API calls
+cannot be interrupted, so each step is classified and the classification is
+what WGLink does — it never implies that an arbitrary Fusion call can be
+stopped, and it never terminates a command the user is running.
+
+| Step | Class | Where it stops | What is reported |
+| --- | --- | --- | --- |
+| Waiting to be claimed | interruptible | any tick | WG deletes a dismissed request's file, so the claim is refused and nothing runs |
+| Claim answered, before hand-over | interruptible | the worker | `discarded`; the request never reaches Fusion |
+| Reads (links, applying mark, the live state measurement) | cooperatively cancellable | before each | `discarded`; the model is untouched |
+| `Update` / `Insert` | cooperatively cancellable at the precondition, then deferred | the precondition, after the last read and before the first write | `discarded` there; afterwards the call finishes and the outcome reported is what actually happened |
+| The return export | deferred to the next safe boundary | before the export | it writes no CAD model, so a dismissal during it needs no recovery |
+| A call interrupted by process death | not cancellable | — | the applying mark without evidence is **recovery required**, never a clean cancellation, and never re-applied |
 
 ### The heartbeat reads cached state only
 

@@ -324,6 +324,21 @@ occurrence where it already is and never moves it back to the origin.)
   could read or change, an `ipc/wglink` folder that group or other can write
   to, and an `ipc/wglink` folder or endpoint file that is a symlink; a
   `WG2_DATA_DIR` on a shared location therefore stays on the files.
+- **WG says a request is running and nothing happens in Fusion** — a WGLink
+  command is open, or no design is. WGLink never interrupts the command you are
+  running to service WG: the request waits and the reason travels in the
+  heartbeat. Finish or cancel the command, and it runs on the next pass.
+- **WG shows an update as still running after Fusion restarted** — WGLink
+  settles what it can against the open document, read-only, and never runs an
+  interrupted update again. If the update was for a document you do not have
+  open, WGLink keeps it rather than reporting it as never started; open that
+  document and it is settled. An update that had started changing the model
+  reports **Update interrupted — recovery required**: undo the partial change
+  or repair the link, then send it from WG again.
+- **You cancelled in WG and Fusion still changed the model** — a Fusion call
+  that has started cannot be interrupted. WGLink stops at the last point before
+  a write; past that it finishes the call and reports what actually happened
+  rather than claiming a clean cancellation.
 - **Text Commands alternates between "live" and "ended the live session"** —
   two Fusion processes are running against the same WG data folder. They share
   one WGLink installation id, so each registration replaces the other's. WGLink

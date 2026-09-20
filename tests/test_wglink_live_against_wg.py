@@ -212,7 +212,20 @@ class _Scene:
             return {}
         import json
 
-        return {p.stem: json.loads(p.read_text()) for p in folder.iterdir() if not p.name.startswith(".")}
+        items: dict[str, dict] = {}
+        for path in folder.iterdir():
+            if path.name.startswith("."):
+                continue
+            try:
+                items[path.stem] = json.loads(path.read_text())
+            except FileNotFoundError:
+                # The live worker may settle and delete an item between the
+                # directory snapshot and the read; it is then no longer
+                # waiting, which is what this helper reports. Same race, and
+                # the same treatment, as ``tests/test_wglink_outbox.py``
+                # (commit 4ad32f0).
+                continue
+        return items
 
     def solve_files(self) -> list[Path]:
         folder = self.ipc / ".wg-solve-requests"
@@ -412,3 +425,197 @@ def test_an_add_in_restart_with_a_pending_item_delivers_it_once(scene) -> None:
         operations = _operations(application)
         assert list(operations) == [item["operationId"]]
         assert operations[item["operationId"]]["state"] == "accepted"
+
+
+# -- Fusion-bound requests against a real WG (protocol section 7) ------------------------
+
+
+REQUEST_DOCUMENT = "fusion:doc-against-wg"
+REQUEST_INSTANCE = "instance-against-wg"
+REQUEST_STATE_HASH = "sha256:state-against-wg"
+REQUEST_EXPORT = "wge_against_wg"
+
+
+def _publish_update(scene: "_Scene", store: object, operation_id: str) -> None:
+    from server.exports.cad_handoff import publish_fusion_handoff
+
+    bundle = scene.workspace / "wglink" / "bundle-against-wg"
+    bundle.mkdir(parents=True, exist_ok=True)
+    publish_fusion_handoff(
+        scene.data_dir,
+        scene.workspace,
+        store,
+        {
+            "bundlePath": str(bundle),
+            "exportId": REQUEST_EXPORT,
+            "bundleId": "wgb_against_wg",
+            "identity": {"designId": "wgd_against_wg"},
+        },
+        expected_document_id=REQUEST_DOCUMENT,
+        expected_instance_id=REQUEST_INSTANCE,
+        expected_return_state_hash=REQUEST_STATE_HASH,
+        request_id=operation_id,
+    )
+
+
+def _offer(client: "wglink_live.LiveClient", operation_id: str):
+    _wait(
+        lambda: any(offer.operation_id == operation_id for offer in client.offers()),
+        f"WG to offer {operation_id}",
+    )
+    return next(offer for offer in client.offers() if offer.operation_id == operation_id)
+
+
+def _dispatch(client: "wglink_live.LiveClient", operation_id: str):
+    box: list[object] = []
+
+    def arrived() -> bool:
+        dispatch = client.take_dispatch()
+        if dispatch is not None:
+            box.append(dispatch)
+        return bool(box)
+
+    _wait(arrived, f"WG to hand over {operation_id}")
+    return box[0]
+
+
+def test_a_real_wg_offers_claims_progresses_and_completes_one_operation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The whole of section 7 against WG's own routes, with WG's own publisher."""
+
+    scene = _Scene(tmp_path, monkeypatch)
+    journal = wglink_live.ClaimJournal(scene.ipc)
+    client = scene.client()
+    client.start()
+    try:
+        with scene.serving() as application:
+            store = application.state.cadlink_store
+            _wait(client.healthy, "registration with WG")
+            _publish_update(scene, store, "op-against-wg")
+
+            offer = _offer(client, "op-against-wg")
+            assert offer.kind == wglink_live.KIND_UPDATE_LINK
+            assert offer.request["expectedInstanceId"] == REQUEST_INSTANCE
+            client.claim(offer)
+
+            dispatch = _dispatch(client, "op-against-wg")
+            assert dispatch.attempt_generation == offer.attempt_generation + 1
+            row = store.get_operation("op-against-wg")
+            assert row["state"] == "processing" and row["stage"] == "queued-for-fusion"
+            entry = journal.read("op-against-wg")
+            assert entry is not None and entry["state"] == wglink_live.CLAIM_STATE_CLAIMED
+
+            # A duplicate claim of the same attempt replays the original answer
+            # and creates no second operation (section 9, "A response is lost").
+            client.claim(offer)
+            time.sleep(0.5)
+            assert store.get_operation("op-against-wg")["attempt_generation"] == dispatch.attempt_generation
+
+            client.report_progress(
+                dispatch.operation_id, dispatch.attempt_generation, wglink_live.STAGE_EXECUTING
+            )
+            _wait(
+                lambda: store.get_operation("op-against-wg")["stage"] == "executing",
+                "WG to record the executing stage",
+            )
+
+            client.report_outcome(
+                dispatch.operation_id,
+                dispatch.attempt_generation,
+                "applied",
+                message="applied against a real WG",
+                evidence={"operationId": "op-against-wg", "exportId": REQUEST_EXPORT},
+            )
+            _wait(
+                lambda: store.get_operation("op-against-wg")["state"] == "accepted",
+                "WG to record the outcome",
+            )
+            _wait(lambda: journal.read("op-against-wg") is None, "the journal to be cleared")
+
+            # A terminal notification resent after a lost connection settles
+            # nothing a second time.
+            client.report_outcome(
+                dispatch.operation_id,
+                dispatch.attempt_generation,
+                "applied",
+                evidence={"operationId": "op-against-wg", "exportId": REQUEST_EXPORT},
+            )
+            time.sleep(0.5)
+            assert store.get_operation("op-against-wg")["state"] == "accepted"
+            assert journal.read("op-against-wg") is None
+    finally:
+        scene.stop_all()
+    print("\n".join(client.take_log_lines()))
+
+
+def test_a_wg_restart_between_the_claim_and_the_outcome_settles_it_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The operation persists, the claim replays by its id, one outcome lands."""
+
+    scene = _Scene(tmp_path, monkeypatch)
+    journal = wglink_live.ClaimJournal(scene.ipc)
+    client = scene.client()
+    client.start()
+    try:
+        with scene.serving() as application:
+            store = application.state.cadlink_store
+            _wait(client.healthy, "registration with WG")
+            _publish_update(scene, store, "op-restart")
+            client.claim(_offer(client, "op-restart"))
+            dispatch = _dispatch(client, "op-restart")
+            claim_id = journal.read("op-restart")["claimId"]
+
+        # WG restarts. Its operation and claim survive; its session does not.
+        _wait(lambda: not client.healthy(), "the client to notice WG stopped", seconds=40)
+        with scene.serving() as second:
+            store = second.state.cadlink_store
+            _wait(client.healthy, "registration with the restarted WG", seconds=40)
+            assert store.get_operation("op-restart")["state"] == "processing"
+            client.report_outcome(
+                dispatch.operation_id,
+                dispatch.attempt_generation,
+                "recoveryRequired",
+                message="interrupted by a WG restart",
+            )
+            _wait(
+                lambda: store.get_operation("op-restart")["state"] == "recovery_required",
+                "WG to record the outcome after its restart",
+            )
+            assert journal.read("op-restart") is None
+            # The claim id never changed across the restart.
+            assert claim_id
+    finally:
+        scene.stop_all()
+    print("\n".join(client.take_log_lines()))
+
+
+def test_a_return_request_for_another_fusion_session_is_never_offered(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from server.cadlink.fusion_return import publish_return_request
+
+    scene = _Scene(tmp_path, monkeypatch)
+    client = scene.client()
+    client.start()
+    try:
+        with scene.serving() as application:
+            store = application.state.cadlink_store
+            _wait(client.healthy, "registration with WG")
+            publish_return_request(
+                scene.data_dir, store, session_id="a-different-fusion-session",
+                design_id="wgd_against_wg", document_id=REQUEST_DOCUMENT,
+                instance_id=REQUEST_INSTANCE,
+                expected_return_state_hash=REQUEST_STATE_HASH, request_id="op-other-session",
+            )
+            publish_return_request(
+                scene.data_dir, store, session_id=ADAPTER_SESSION,
+                design_id="wgd_against_wg", document_id=REQUEST_DOCUMENT,
+                instance_id=REQUEST_INSTANCE,
+                expected_return_state_hash=REQUEST_STATE_HASH, request_id="op-this-session",
+            )
+            _offer(client, "op-this-session")
+            assert [offer.operation_id for offer in client.offers()] == ["op-this-session"]
+    finally:
+        scene.stop_all()

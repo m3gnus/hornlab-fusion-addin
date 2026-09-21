@@ -918,6 +918,38 @@ def test_with_coordination_on_the_tick_keeps_its_duty_cycle(monkeypatch, tmp_pat
     assert module._geometry_refresh_pending is not None
 
 
+def test_a_gate_on_watch_tick_defers_a_recent_expensive_measurement(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The gate-on tick keeps an explicit refresh inside its duty cycle."""
+
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_tick_throttle_gate", coordination=None)
+    module = fixture.module
+    clock = types.SimpleNamespace(value=100.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
+
+    module._request_geometry_refresh("initial", module._active_document_id())
+    module._service_geometry_refresh()
+    module._geometry_state_cache["cost_ms"] = 1000.0
+    module._request_geometry_refresh("explicit", module._active_document_id())
+
+    def measurements() -> int:
+        return sum(_counts(module).get("geometry_measurement", {}).values())
+
+    before = measurements()
+    clock.value += 4.0
+    module._on_watch_tick()
+
+    assert measurements() == before
+    assert module._geometry_refresh_pending is not None
+
+    clock.value += 8.0
+    module._on_watch_tick()
+
+    assert measurements() == before + 1
+    assert module._geometry_refresh_pending is None
+
+
 def _queue_pickup_behind_busy(module, app, tmp_path: Path) -> tuple[list[str], Path]:
     """A pickup check that came due while a busy holder had the main thread."""
 

@@ -130,6 +130,16 @@ class WgNotCollectingError(RuntimeError):
     """WG advertises no request inbox at all; nothing was written."""
 
 
+class WriteOutcomeUnknown(OSError):
+    """The rename into the final name raised: the file may or may not have landed.
+
+    Everything before the rename -- staging, writing, syncing -- failing is a
+    known failure: the final name was never touched. The rename itself raising
+    is not, because a rename can land and still report an error, and WG may
+    take the file the moment it lands (M1 transfer contract C5, Amendment A1).
+    """
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -154,9 +164,17 @@ def _write_json_atomically(path: Path, payload: Mapping[str, Any]) -> Path:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            raise WriteOutcomeUnknown(*exc.args) from exc
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # A held staging file must not replace the error that matters;
+            # its hidden name is never read as a request.
+            pass
     return path
 
 
@@ -371,40 +389,38 @@ def landed_request(
     *,
     kind: str,
     command_id: str,
+    return_id: str | None,
     bundle_relative: str,
     manifest_sha256: str,
     requested_at: str,
-    **_ignored: object,
 ) -> Path | None:
-    """The request file for ``command_id`` if it is in the inbox, whole and ours.
+    """The request file for ``command_id`` if it is exactly the one this command wrote.
 
-    Asked only after every write attempt raised: an ``OSError`` during or
-    after the rename can leave a file that did land (C5). The rename is
-    atomic, so a file under the final name that parses and names this
-    command's id and return is the write that landed -- the id is a fresh
-    ``uuid4``, so nobody else wrote it. None when it is absent or anything
-    else, and then the failure stands.
+    Asked only when a write's outcome is unknown (C5, Amendment A1). "Sent" may
+    be reported only for a file equal to the complete request -- every protocol
+    field, ``schemaVersion``, ``target``, ``kind`` and ``returnId`` presence and
+    value included. Two requests are legitimate for these fields: the schema-4
+    file, and for a Solve the schema-3 file written for a WG that reads only 3.
+    Anything else under this name -- incomplete, another target, another return
+    -- is not proof that this command's request landed. None then.
     """
 
-    if not _PLAIN_ID.fullmatch(str(command_id)):
+    if not _PLAIN_ID.fullmatch(str(command_id)) or kind not in WG_REQUEST_KINDS:
         return None
+    fields = {
+        "command_id": command_id,
+        "bundle_relative": bundle_relative,
+        "manifest_sha256": manifest_sha256,
+        "requested_at": requested_at,
+    }
+    legitimate = [wg_request_payload(kind=kind, return_id=return_id, **fields)]
+    if kind == KIND_PREPARE_AND_SOLVE:
+        legitimate.append(solve_request_payload(return_id=str(return_id or ""), **fields))
     path = solve_request_path(ipc_folder, command_id)
     payload = _read_json(path)
-    if not isinstance(payload, dict):
-        return None
-    expected = {
-        "commandId": str(command_id),
-        "operationId": str(command_id),
-        "bundlePath": str(bundle_relative),
-        "manifestSha256": str(manifest_sha256),
-        "requestedAt": str(requested_at),
-    }
-    if any(payload.get(key) != value for key, value in expected.items()):
-        return None
-    if "kind" in payload and payload["kind"] != kind:
+    if not isinstance(payload, dict) or payload not in legitimate:
         return None
     return path
-
 
 #: A request file is a few hundred bytes; anything larger is not one of ours.
 _REQUEST_READ_LIMIT = 64 * 1024
@@ -508,6 +524,28 @@ def solve_request_path(ipc_folder: Path, command_id: str) -> Path:
     return Path(ipc_folder).expanduser().resolve() / SOLVE_REQUESTS_DIRECTORY / f"{command_id}.json"
 
 
+def solve_request_payload(
+    *,
+    command_id: str,
+    return_id: str,
+    bundle_relative: str,
+    manifest_sha256: str,
+    requested_at: str,
+) -> dict[str, Any]:
+    """The schema-3 solve file: no ``kind``, because a schema-3 reader means Solve."""
+
+    return {
+        "schemaVersion": REQUEST_SCHEMA_VERSION,
+        "target": "waveguide-generator",
+        "commandId": str(command_id),
+        "operationId": str(command_id),
+        "returnId": str(return_id),
+        "bundlePath": str(bundle_relative),
+        "manifestSha256": str(manifest_sha256),
+        "requestedAt": str(requested_at),
+    }
+
+
 def write_solve_request_fields(
     ipc_folder: Path,
     *,
@@ -528,16 +566,13 @@ def write_solve_request_fields(
         raise ValueError(
             f"A solve command id must be a plain file name, got {command_id!r}."
         )
-    payload = {
-        "schemaVersion": REQUEST_SCHEMA_VERSION,
-        "target": "waveguide-generator",
-        "commandId": str(command_id),
-        "operationId": str(command_id),
-        "returnId": str(return_id),
-        "bundlePath": str(bundle_relative),
-        "manifestSha256": str(manifest_sha256),
-        "requestedAt": str(requested_at),
-    }
+    payload = solve_request_payload(
+        command_id=command_id,
+        return_id=return_id,
+        bundle_relative=bundle_relative,
+        manifest_sha256=manifest_sha256,
+        requested_at=requested_at,
+    )
     path = solve_request_path(ipc_folder, payload["commandId"])
     path.parent.mkdir(parents=True, exist_ok=True)
     return _write_json_atomically(path, payload)

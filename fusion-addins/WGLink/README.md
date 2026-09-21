@@ -156,9 +156,14 @@ Relink remain full head-less APIs but are not panel commands.
   single-instance handoffs still resolve automatically.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
-  moves fit points in place. The resampler runs in its own session (a job
-  object on Windows); its timeout kills that whole tree, and WGLink never
-  signals a process it did not start. Before its first mutation it also verifies that
+  moves fit points in place. On macOS and Linux the resampler runs in its own
+  session, and its timeout kills that whole process group. On Windows it is
+  put into a kill-on-close job object just after it starts, and a timeout
+  ends the job: the whole tree when the assignment succeeded. There is a short
+  window before the assignment in which a process it started would escape,
+  and where the job cannot be created or assigned the timeout kills only the
+  resampler itself, as before. Either way the wait for its output is bounded,
+  and WGLink never signals a process it did not start. Before its first mutation it also verifies that
   the tagged throat face remains in the component-local link frame. It creates
   and deletes no document features. If the stored path is missing, Update
   searches WG's current workspace for the same design id, selects its highest
@@ -237,12 +242,18 @@ Commands and requests cross through WG's machine-local IPC folder,
   schema-3 reader ignores `kind` and would start a solve. A WG that advertises
   nothing is "not collecting requests", and both refuse. The outcome is said at
   command time: "Sent to Waveguide Generator (request …)", or why WG was not
-  asked. A write whose outcome is unknown is retried once with the same id and
-  fields; pressing Send again is a new request. A second request never
+  asked. Pressing Send again is a new request. A second request never
   replaces one WG has not read yet. The file is staged under a hidden name,
-  synced and renamed into place, so WG never sees part of one; when every
-  attempt raised, WGLink reads the inbox once more, and a file holding exactly
-  this request is reported as sent, because it was.
+  synced and renamed into place, so WG never sees part of one. A failure
+  before the rename wrote nothing and is refused ("not asked"). A rename that
+  raises may still have landed -- and WG may take the file at once -- so the
+  same id and fields are written again, up to three attempts in all, with a
+  short pause. If none succeeds, WGLink reads the inbox once more: a file equal
+  to this command's complete request (every field, the schema-3 Solve
+  included) is "Sent"; anything else is **Unconfirmed** -- the short request id,
+  "WG may already have it", and a pointer to WG's CAD Link panel before
+  sending again. Unconfirmed never says "not asked", and it gets the pickup
+  check like a sent request (contract Amendment A1).
 - **The pickup check.** A minute after a Send or Solve, a one-shot timer asks
   on the main thread whether the request file is still there, and only that;
   if it is, WGLink says once that WG is closed, older than the add-in, or not
@@ -251,7 +262,10 @@ Commands and requests cross through WG's machine-local IPC folder,
   the inbox for its own request files WG has not taken -- reading nothing in
   Fusion, counted under `startup` -- and says once, with the same three causes,
   how many are waiting. Files already older than a minute are checked at once;
-  if one is younger, the single check waits until it has had its minute.
+  if one is younger, the single check waits until it has had its minute. The
+  scan is capped at 256 directory entries, so in an inbox holding more than
+  that a waiting request can be missed, and a later start-up is not
+  guaranteed to reach it either.
 - **Items an earlier session queued** in `.wglink-outbox` are converted at
   start-up, before any live thread starts, against what WG advertises then:
   into request files at schema 4; at 3, solves convert and snapshots are left

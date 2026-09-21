@@ -9,8 +9,10 @@ that stops half way. The invariants:
 * no partial or garbage request is ever visible under its final name, and the
   staging file never outlives the write;
 * a retry re-writes the same id and fields (contract C5);
-* when every attempt fails and nothing landed, the user is refused visibly --
-  and a write that did land is never reported as "not asked" (C6).
+* a failure that provably wrote nothing (before the rename) is refused visibly;
+* a rename that raised leaves the outcome unknown: "Sent" only for a file equal
+  to the complete request, otherwise **Unconfirmed** -- never "not asked", never
+  a new id (contract Amendment A1).
 
 Then the one-time start-up conversion of old outbox items when its write
 raises, when the outbox file is held, and when the process dies between the
@@ -140,9 +142,10 @@ def test_a_rename_that_raises_leaves_no_request_and_no_staging_file(
 
     monkeypatch.setattr(wglink_watch, "os", _os_with(wglink_watch, replace=refuse))
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(wglink_watch.WriteOutcomeUnknown) as raised:
         _write(tmp_path)
 
+    assert raised.value.errno == errno.EACCES
     [(staged, final)] = renames
     assert staged.startswith(".") and staged.endswith(".tmp")
     assert final == "op-1.json"
@@ -183,6 +186,26 @@ def test_a_write_that_stops_half_way_leaves_no_partial_request(monkeypatch, tmp_
 
 def _watch(fixture):
     return fixture.module.wglink_watch
+
+
+def _paused(monkeypatch, fixture) -> list[float]:
+    pauses: list[float] = []
+    monkeypatch.setattr(fixture.module, "_retry_pause", pauses.append)
+    return pauses
+
+
+_UNCONFIRMED = "WGLink request unconfirmed"
+
+
+def _assert_unconfirmed(fixture, request_id: str) -> None:
+    title, text = fixture.ui.messages[-1]
+    assert title == _UNCONFIRMED
+    assert f"request {request_id[:8]}" in text
+    assert "WG may already have it" in text and "CAD Link panel" in text
+    assert "not asked" not in text and "Sent to Waveguide Generator" not in text
+    assert _outcome(fixture) == "unconfirmed"
+    # The pickup check still runs for that id, as for Sent.
+    assert len(fixture.timers) == 1
 
 
 def _outcome(fixture) -> str:
@@ -237,6 +260,7 @@ def test_a_rename_that_landed_and_raised_is_not_reported_as_not_asked(
         raise _sharing_violation()
 
     monkeypatch.setattr(watch, "os", _os_with(watch, replace=landed_then_held))
+    _paused(monkeypatch, fixture)
 
     _run(fixture.module, "solve")
 
@@ -250,30 +274,80 @@ def test_a_rename_that_landed_and_raised_is_not_reported_as_not_asked(
     assert len(fixture.timers) == 1
 
 
-def test_renames_that_never_land_are_a_visible_refusal_with_nothing_left(
+def test_renames_that_raise_every_time_are_unconfirmed_never_not_asked(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """The control for the one above: the same two failures, nothing landed."""
+    """A rename that raises may have landed; absence afterwards proves nothing."""
 
     fixture = _transfer(monkeypatch, tmp_path, "WGLink_fail_never_landed")
     watch = _watch(fixture)
-    calls: list[int] = []
+    pauses = _paused(monkeypatch, fixture)
+    destinations: list[str] = []
 
-    def refuse(_source, _destination):
-        calls.append(1)
+    def refuse(_source, destination):
+        destinations.append(Path(destination).name)
         raise _sharing_violation()
 
     monkeypatch.setattr(watch, "os", _os_with(watch, replace=refuse))
 
     _run(fixture.module, "send")
 
-    assert len(calls) == fixture.module.WG_REQUEST_WRITE_ATTEMPTS
+    assert len(destinations) == fixture.module.WG_REQUEST_WRITE_ATTEMPTS == 3
+    assert len(set(destinations)) == 1  # the same id every time
+    assert len(pauses) == 2 and sum(pauses) < 1.0
     assert _names(fixture.ipc / ".wg-solve-requests") == []
+    _assert_unconfirmed(fixture, destinations[0].removesuffix(".json"))
+
+
+def test_a_known_failure_on_every_attempt_is_still_a_visible_refusal(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The control for Unconfirmed: nothing reached the rename, so nothing landed."""
+
+    fixture = _transfer(monkeypatch, tmp_path, "WGLink_fail_known")
+    watch = _watch(fixture)
+    _paused(monkeypatch, fixture)
+
+    def fail(_descriptor):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, fsync=fail))
+
+    _run(fixture.module, "send")
+
     title, text = fixture.ui.messages[-1]
     assert title == "WGLink refused"
-    assert "was not asked to take it" in text and "could not write the request" in text
+    assert "was not asked to take it" in text
     assert _outcome(fixture) == "writeFailed"
     assert fixture.timers == []
+
+
+def test_an_unknown_first_write_stays_unconfirmed_when_later_attempts_fail_known(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _transfer(monkeypatch, tmp_path, "WGLink_fail_mixed")
+    watch = _watch(fixture)
+    _paused(monkeypatch, fixture)
+    renames: list[str] = []
+
+    def refuse(_source, destination):
+        renames.append(Path(destination).stem)
+        raise OSError(errno.EIO, "the rename reported an error")
+
+    syncs: list[int] = []
+
+    def fsync_after_the_first(descriptor):
+        syncs.append(1)
+        if len(syncs) > 1:
+            raise OSError(errno.EIO, "Input/output error")
+        return os.fsync(descriptor)
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=refuse, fsync=fsync_after_the_first))
+
+    _run(fixture.module, "solve")
+
+    assert len(renames) == 1 and len(syncs) == 3
+    _assert_unconfirmed(fixture, renames[0])
 
 
 def test_a_garbled_file_under_the_final_name_is_not_taken_for_a_landed_write(
@@ -292,11 +366,11 @@ def test_a_garbled_file_under_the_final_name_is_not_taken_for_a_landed_write(
         raise _sharing_violation()
 
     monkeypatch.setattr(watch, "os", _os_with(watch, replace=refuse))
+    _paused(monkeypatch, fixture)
 
     _run(module, "send")
 
-    assert fixture.ui.messages[-1][0] == "WGLink refused"
-    assert _outcome(fixture) == "writeFailed"
+    _assert_unconfirmed(fixture, fixed)
 
 
 @pytest.mark.parametrize("fault", ["fsync", "partial"])
@@ -311,7 +385,10 @@ def test_a_write_that_fails_every_time_is_refused_and_leaves_nothing(
 
         monkeypatch.setattr(watch, "os", _os_with(watch, fsync=fail))
     else:
-        monkeypatch.setattr(watch, "json", _json_with_partial_dump(watch, [1, 1]))
+        monkeypatch.setattr(
+            watch, "json", _json_with_partial_dump(watch, [1] * fixture.module.WG_REQUEST_WRITE_ATTEMPTS)
+        )
+    _paused(monkeypatch, fixture)
 
     _run(fixture.module, "solve")
 
@@ -330,6 +407,238 @@ def test_a_write_that_stops_half_way_once_is_retried_whole(monkeypatch, tmp_path
     [payload] = _inbox(fixture.ipc)
     assert payload["kind"] == SNAPSHOT and payload["bundlePath"] == "wgreturn/speaker.wgreturn"
     assert _staging(fixture.ipc / ".wg-solve-requests") == []
+    assert _outcome(fixture) == "requested"
+
+
+# -- R1: "Sent" only for this command's complete request ---------------------------
+
+
+_FIELDS = {
+    "command_id": "11111111-2222-4333-8444-555555555555",
+    "bundle_relative": "wgreturn/speaker.wgreturn",
+    "manifest_sha256": "sha256:" + "c" * 64,
+    "requested_at": "2026-09-21T12:00:00Z",
+}
+
+
+def _legitimate(kind: str, schema: int = 4) -> dict:
+    if schema == 3:
+        return wglink_watch.solve_request_payload(return_id="wgr_1", **_FIELDS)
+    return wglink_watch.wg_request_payload(
+        kind=kind, return_id="wgr_1" if kind == SOLVE else None, **_FIELDS
+    )
+
+
+def _without(key):
+    return lambda payload: {k: v for k, v in payload.items() if k != key}
+
+
+def _with(key, value):
+    return lambda payload: {**payload, key: value}
+
+
+# The review's six variants: valid JSON, one field missing or wrong.
+_NOT_THIS_REQUEST = {
+    "missing kind": (SNAPSHOT, _without("kind")),
+    "missing schemaVersion": (SNAPSHOT, _without("schemaVersion")),
+    "another target": (SNAPSHOT, _with("target", "fusion")),
+    "unknown schemaVersion": (SNAPSHOT, _with("schemaVersion", 999)),
+    "another returnId": (SOLVE, _with("returnId", "wgr_other")),
+    "Solve without returnId": (SOLVE, _without("returnId")),
+    "Send with a returnId": (SNAPSHOT, _with("returnId", "wgr_1")),
+    "other kind": (SNAPSHOT, _with("kind", SOLVE)),
+    "extra field": (SNAPSHOT, _with("replaces", "op-0")),
+}
+
+
+def _place(ipc: Path, payload: dict) -> Path:
+    path = wglink_watch.solve_request_path(ipc, _FIELDS["command_id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload))
+    return path
+
+
+@pytest.mark.parametrize("variant", sorted(_NOT_THIS_REQUEST))
+def test_a_file_that_is_not_this_complete_request_is_not_confirmation(
+    tmp_path: Path, variant: str
+) -> None:
+    kind, change = _NOT_THIS_REQUEST[variant]
+    _place(tmp_path, change(_legitimate(kind)))
+
+    assert wglink_watch.landed_request(
+        tmp_path, kind=kind, return_id="wgr_1" if kind == SOLVE else None, **_FIELDS
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "schema"), [(SNAPSHOT, 4), (SOLVE, 4), (SOLVE, 3)], ids=["send-4", "solve-4", "solve-3"]
+)
+def test_control_the_complete_request_is_confirmation(tmp_path: Path, kind: str, schema: int) -> None:
+    path = _place(tmp_path, _legitimate(kind, schema))
+
+    assert wglink_watch.landed_request(
+        tmp_path, kind=kind, return_id="wgr_1" if kind == SOLVE else None, **_FIELDS
+    ) == path
+
+
+@pytest.mark.parametrize("return_id", ["", "wgr_1"])
+def test_a_schema_3_file_is_never_confirmation_for_a_send(tmp_path: Path, return_id: str) -> None:
+    """A schema-3 reader ignores ``kind``: that file would be a Solve."""
+
+    _place(tmp_path, wglink_watch.solve_request_payload(return_id=return_id, **_FIELDS))
+
+    assert wglink_watch.landed_request(tmp_path, kind=SNAPSHOT, return_id=None, **_FIELDS) is None
+
+
+def _fixed_command(monkeypatch, fixture) -> dict:
+    """Pin this command's id and timestamp, so a file can be placed under its name."""
+
+    module = fixture.module
+    request_id = _FIELDS["command_id"]
+    monkeypatch.setattr(module, "uuid", types.SimpleNamespace(uuid4=lambda: request_id))
+    monkeypatch.setattr(module.wglink_watch, "utc_timestamp", lambda *_a: _FIELDS["requested_at"])
+    relative, manifest = module.wglink_watch.return_reference(
+        fixture.bundle, fixture.ipc.parent / "workspace"
+    )
+    return {**_FIELDS, "bundle_relative": relative, "manifest_sha256": manifest}
+
+
+@pytest.mark.parametrize("variant", sorted(_NOT_THIS_REQUEST) + ["control: complete"])
+def test_the_command_says_sent_only_for_its_own_complete_request(
+    monkeypatch, tmp_path: Path, variant: str
+) -> None:
+    kind, change = _NOT_THIS_REQUEST.get(variant, (SNAPSHOT, lambda payload: payload))
+    operation = "solve" if kind == SOLVE else "send"
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r1_{variant.replace(' ', '_').replace(':', '')}")
+    fields = _fixed_command(monkeypatch, fixture)
+    watch = _watch(fixture)
+    legitimate = watch.wg_request_payload(
+        kind=kind, return_id="wgr_1" if kind == SOLVE else None, **fields
+    )
+    _place(fixture.ipc, change(legitimate))
+    _paused(monkeypatch, fixture)
+
+    def refuse(_source, _destination):
+        raise _sharing_violation()
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=refuse))
+
+    _run(fixture.module, operation)
+
+    if variant == "control: complete":
+        assert fixture.ui.messages[-1][0] == "WGLink"
+        assert "Sent to Waveguide Generator" in fixture.ui.messages[-1][1]
+        assert _outcome(fixture) == "requested"
+    else:
+        _assert_unconfirmed(fixture, fields["command_id"])
+
+
+# -- R2: a landed request WG took before the re-read -----------------------------
+
+
+@pytest.mark.parametrize("wg", ["claim kept", "accepted and deleted", "refused and deleted"])
+def test_a_request_wg_took_before_the_re_read_is_unconfirmed_never_not_asked(
+    monkeypatch, tmp_path: Path, wg: str
+) -> None:
+    """The first rename lands and WG claims it at once (and, for two of these,
+    accepts or refuses it and deletes the claim); the rename then reports an
+    error and every retry hits a sharing violation. Absence is not proof that
+    nothing landed."""
+
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r2_{wg.replace(' ', '_')}")
+    watch = _watch(fixture)
+    real_replace = watch.os.replace
+    _paused(monkeypatch, fixture)
+    destinations: list[Path] = []
+
+    def landed_then_taken(source, destination):
+        destinations.append(Path(destination))
+        if len(destinations) > 1:
+            raise _sharing_violation()
+        real_replace(source, destination)
+        claim = Path(destination).with_name(".wg-solve-claim-0001.json")
+        real_replace(destination, claim)
+        if wg != "claim kept":
+            claim.unlink()
+        raise OSError(errno.EIO, "the rename reported an error after it landed")
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=landed_then_taken))
+
+    _run(fixture.module, "solve")
+
+    assert len({path.name for path in destinations}) == 1
+    assert len(destinations) == fixture.module.WG_REQUEST_WRITE_ATTEMPTS
+    _assert_unconfirmed(fixture, destinations[0].stem)
+    assert _inbox(fixture.ipc) == []
+
+
+def test_a_capability_refusal_on_the_retry_after_an_unknown_write_is_unconfirmed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """WG took the first write and then stopped collecting: the refusal met on
+    the retry says nothing about the write that may already have landed."""
+
+    fixture = _transfer(monkeypatch, tmp_path, "WGLink_r2_refused_on_retry")
+    watch = _watch(fixture)
+    real_replace = watch.os.replace
+    _paused(monkeypatch, fixture)
+    destinations: list[Path] = []
+
+    def landed_taken_then_wg_stops(source, destination):
+        destinations.append(Path(destination))
+        real_replace(source, destination)
+        Path(destination).unlink()  # WG took it
+        _advertise(fixture.ipc, None)  # and stopped collecting
+        raise OSError(errno.EIO, "the rename reported an error after it landed")
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=landed_taken_then_wg_stops))
+
+    _run(fixture.module, "send")
+
+    assert len(destinations) == 1
+    _assert_unconfirmed(fixture, destinations[0].stem)
+
+
+def test_control_a_capability_refusal_with_nothing_attempted_is_still_refused(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _transfer(monkeypatch, tmp_path, "WGLink_r2_refused_first", advertised=None)
+    _paused(monkeypatch, fixture)
+
+    _run(fixture.module, "send")
+
+    title, text = fixture.ui.messages[-1]
+    assert title == "WGLink refused" and "not collecting requests from Fusion" in text
+    assert _outcome(fixture) == "refused"
+    assert fixture.timers == []
+
+
+def test_a_retry_that_lands_after_wg_took_the_first_is_sent_under_the_same_id(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Re-writing the same id is harmless: WG recovers it as the same operation."""
+
+    fixture = _transfer(monkeypatch, tmp_path, "WGLink_r2_retry_lands")
+    watch = _watch(fixture)
+    real_replace = watch.os.replace
+    _paused(monkeypatch, fixture)
+    destinations: list[Path] = []
+
+    def landed_taken_once(source, destination):
+        destinations.append(Path(destination))
+        real_replace(source, destination)
+        if len(destinations) == 1:
+            Path(destination).unlink()  # WG took it
+            raise OSError(errno.EIO, "the rename reported an error after it landed")
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=landed_taken_once))
+
+    _run(fixture.module, "send")
+
+    assert [path.name for path in destinations] == [destinations[0].name] * 2
+    [payload] = _inbox(fixture.ipc)
+    assert payload["operationId"] == destinations[0].stem
+    assert "Sent to Waveguide Generator" in fixture.ui.messages[-1][1]
     assert _outcome(fixture) == "requested"
 
 

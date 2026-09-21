@@ -1120,6 +1120,8 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             if report.get("solve_requested")
             else "Waveguide Generator will open this return."
         )
+        if report.get("delivery_unconfirmed"):
+            closing = _unconfirmed_text(request_id)
         message = (
             f"Return bundle written: {report.get('bundle_path', '?')}\n"
             f"Return ID: {report.get('return_id', '?')}\n"
@@ -1149,36 +1151,67 @@ def _summary(operation: str, report: dict[str, object]) -> str:
     )
 
 
-#: How many times a request write is tried when its outcome is unknown (C5).
-WG_REQUEST_WRITE_ATTEMPTS = 2
+#: How many times a request write is tried before its outcome is settled (C5, A1).
+WG_REQUEST_WRITE_ATTEMPTS = 3
+#: The pause before the n-th retry is n times this, so all of them take well
+#: under a second of the main thread.
+WG_REQUEST_RETRY_PAUSE_SECONDS = 0.15
 
 
-def _write_wg_request(ipc: Path, **fields: object) -> Path:
-    """Write one request; retry only when this add-in cannot tell whether it landed.
+def _retry_pause(seconds: float) -> None:
+    time.sleep(seconds)
 
-    An ``OSError`` during or after the rename leaves that unknown. The retry
-    re-writes the same file with the same id and fields, which WG recovers as
-    the same operation (C5). A refusal -- WG outdated, WG not collecting -- is
-    an answer, not an unknown, and is never retried.
 
-    When every attempt raised, the inbox is read once more: a file under the
-    final name that holds exactly this request is a write that landed (the
-    first rename succeeded and reported an error, say, and the retry's rename
-    then hit a sharing violation). Reporting "not asked" for it would be
-    false, and a user who pressed Send again would make a second operation.
+def _write_wg_request(ipc: Path, **fields: object) -> tuple[Path, bool]:
+    """Write one request; retry the same id and fields; say whether it is confirmed.
+
+    Returns ``(path, True)`` when the request is known to be in WG's inbox as
+    this command wrote it, and ``(path, False)`` when that is **unconfirmed**
+    (M1 transfer contract C5, Amendment A1): a rename raised
+    (``WriteOutcomeUnknown`` -- it may have landed, and WG may have claimed,
+    accepted or refused it at once), every retry of the same id and fields
+    failed too, and the inbox does not hold this command's complete request.
+    Absence proves nothing then, so the caller must never say "not asked" or
+    advise a new request.
+
+    Raises only for what is known: a refusal before anything could have
+    landed (WG outdated, WG not collecting), or an ``OSError`` from every
+    attempt when none of them reached the rename -- nothing was written.
     """
 
+    unknown = False
     last: OSError | None = None
-    for _attempt in range(WG_REQUEST_WRITE_ATTEMPTS):
+    for attempt in range(WG_REQUEST_WRITE_ATTEMPTS):
+        if attempt:
+            _retry_pause(WG_REQUEST_RETRY_PAUSE_SECONDS * attempt)
         try:
-            return wglink_watch.write_wg_request(ipc, **fields)
+            return wglink_watch.write_wg_request(ipc, **fields), True
+        except (wglink_watch.WgOutdatedError, wglink_watch.WgNotCollectingError):
+            if not unknown:
+                raise
+            # A refusal now does not undo a write that may already have landed.
+            break
         except OSError as exc:
             last = exc
-    assert last is not None
+            unknown = unknown or isinstance(exc, wglink_watch.WriteOutcomeUnknown)
     landed = wglink_watch.landed_request(ipc, **fields)
     if landed is not None:
-        return landed
+        return landed, True
+    if unknown:
+        return wglink_watch.solve_request_path(ipc, str(fields["command_id"])), False
+    assert last is not None
     raise last
+
+
+def _unconfirmed_text(request_id: str) -> str:
+    return (
+        f"The request to Waveguide Generator (request {request_id[:8]}) is "
+        "unconfirmed. Writing it into WG's request folder reported an error, and "
+        "WGLink could not read it back there -- but WG may already have it: WG "
+        "takes a request the moment it lands. Check WG's CAD Link panel before "
+        "sending this model again. If the request is there, it is being handled; "
+        "sending again would make a second request."
+    )
 
 
 def _submit_to_wg(report: dict[str, object], kind: str) -> str:
@@ -1206,7 +1239,7 @@ def _submit_to_wg(report: dict[str, object], kind: str) -> str:
     request_id = str(uuid.uuid4())
     try:
         relative, manifest = wglink_watch.return_reference(bundle, workspace)
-        path = _write_wg_request(
+        path, confirmed = _write_wg_request(
             ipc,
             kind=kind,
             command_id=request_id,
@@ -1224,7 +1257,12 @@ def _submit_to_wg(report: dict[str, object], kind: str) -> str:
             f"{not_asked}WGLink could not write the request for WG: {exc}. "
             f"Check the WGLink folder is writable, then {action}."
         ) from exc
-    _begin_request(channel, request_id, DELIVERY)["outcome"] = "requested"
+    if confirmed:
+        _begin_request(channel, request_id, DELIVERY)["outcome"] = "requested"
+    else:
+        _begin_request(channel, request_id, DELIVERY)["outcome"] = "unconfirmed"
+        report["delivery_unconfirmed"] = True
+    # Unconfirmed included: if the file is there after a minute, WG never took it.
     _schedule_pickup_check(path, channel, request_id)
     return request_id
 
@@ -1558,7 +1596,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             else:
                 raise RuntimeError(f"Unknown WGLink operation: {self.operation}")
             ran = True
-            _message(_summary(self.operation, report))
+            _message(
+                _summary(self.operation, report),
+                f"{PANEL_NAME} request unconfirmed"
+                if isinstance(report, dict) and report.get("delivery_unconfirmed")
+                else PANEL_NAME,
+            )
         except (wglink_core.WgLinkError, wglink_author.AuthorError) as exc:
             # A Send or Solve refused after its export ran (WG outdated or not
             # collecting, a failed request write) may already have changed the

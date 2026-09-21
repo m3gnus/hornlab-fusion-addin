@@ -105,7 +105,7 @@ def test_two_processes_publishing_and_requesting_at_once_never_collide(tmp_path:
     script = tmp_path / "worker.py"
     script.write_text(_WORKER)
     go = tmp_path / "go"
-    count = 25
+    count = 50
     workers = {
         label: subprocess.Popen(
             [sys.executable, str(script), str(ADDIN), str(output), str(ipc), str(workspace), label, str(count), str(go)],

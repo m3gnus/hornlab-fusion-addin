@@ -1443,24 +1443,67 @@ def test_recorded_store_busy_hello_is_not_live(tmp_path: Path, stub_factory) -> 
 # -- loaded identity -----------------------------------------------------------
 
 
-def test_loaded_identity_prefers_the_managed_marker_then_the_dev_marker(tmp_path: Path) -> None:
+def test_loaded_identity_with_no_markers_is_unmanaged(tmp_path: Path) -> None:
     addin = tmp_path / "WGLink"
     addin.mkdir()
-    unmanaged = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
-    assert unmanaged == {"source": "unmanaged", "sourceCommit": None, "addinVersion": "0.1.1",
-                         "managedBy": None, "waveguideGeneratorRoot": None, "loadedAt": "2026-09-17T10:00:00Z"}
-    (addin / "wglink_dev.json").write_text(json.dumps({"sourceCommit": "04b2524-dirty", "sourceRoot": "/x"}))
-    dev = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
-    assert (dev["source"], dev["sourceCommit"]) == ("devSync", None)
+    identity = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert identity == {"source": "unmanaged", "sourceCommit": None, "addinVersion": "0.1.1",
+                        "managedBy": None, "waveguideGeneratorRoot": None,
+                        "loadedAt": "2026-09-17T10:00:00Z"}
+
+
+def test_loaded_identity_with_both_markers_prefers_dev_sync(tmp_path: Path) -> None:
+    addin = tmp_path / "WGLink"
+    addin.mkdir()
+    dev_commit = "04b2524b461929f0657348ac07971e556cccf2f9"
+    managed_commit = "9f8e7d6c5b4a392817161514131211100f0e0d0c"
+    (addin / "wglink_dev.json").write_text(json.dumps({"sourceCommit": dev_commit, "sourceRoot": "/x"}))
+    (addin / "wglink_install.json").write_text(json.dumps({
+        "schema": 1, "managedBy": "waveguide-generator", "waveguideGeneratorRoot": "/Applications/WG",
+        "waveguideGeneratorVersion": "0.3.3", "sourceCommit": managed_commit, "addinVersion": "0.1.1",
+    }))
+    identity = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert identity == {"source": "devSync", "sourceCommit": dev_commit, "addinVersion": "0.1.1",
+                        "managedBy": None, "waveguideGeneratorRoot": None,
+                        "loadedAt": "2026-09-17T10:00:00Z"}
+
+
+def test_loaded_identity_with_only_managed_marker_is_managed(tmp_path: Path) -> None:
+    addin = tmp_path / "WGLink"
+    addin.mkdir()
     commit = "04b2524b461929f0657348ac07971e556cccf2f9"
     (addin / "wglink_install.json").write_text(json.dumps({
         "schema": 1, "managedBy": "waveguide-generator", "waveguideGeneratorRoot": "/Applications/WG",
-        "waveguideGeneratorVersion": "0.3.3", "sourceCommit": commit, "addinVersion": "0.1.1",
+        "sourceCommit": commit, "addinVersion": "0.1.1",
     }))
-    managed = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
-    assert managed == {"source": "managed", "sourceCommit": commit, "addinVersion": "0.1.1",
-                       "managedBy": "waveguide-generator", "waveguideGeneratorRoot": "/Applications/WG",
-                       "loadedAt": "2026-09-17T10:00:00Z"}
+    identity = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert (identity["source"], identity["sourceCommit"]) == ("managed", commit)
+
+
+def test_loaded_identity_with_only_dev_marker_is_dev_sync(tmp_path: Path) -> None:
+    addin = tmp_path / "WGLink"
+    addin.mkdir()
+    commit = "04b2524b461929f0657348ac07971e556cccf2f9"
+    (addin / "wglink_dev.json").write_text(json.dumps({"sourceCommit": commit, "sourceRoot": "/x"}))
+    identity = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert (identity["source"], identity["sourceCommit"]) == ("devSync", commit)
+    # A dev commit outside WG's registration grammar is sent as null, not as-is.
+    (addin / "wglink_dev.json").write_text(json.dumps({"sourceCommit": "04b2524-dirty", "sourceRoot": "/x"}))
+    dirty = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert (dirty["source"], dirty["sourceCommit"]) == ("devSync", None)
+
+
+def test_loaded_identity_with_invalid_dev_marker_falls_back_to_managed(tmp_path: Path) -> None:
+    addin = tmp_path / "WGLink"
+    addin.mkdir()
+    commit = "04b2524b461929f0657348ac07971e556cccf2f9"
+    (addin / "wglink_dev.json").write_text(json.dumps(["not", "a", "mapping"]))
+    (addin / "wglink_install.json").write_text(json.dumps({
+        "schema": 1, "managedBy": "waveguide-generator", "waveguideGeneratorRoot": "/Applications/WG",
+        "sourceCommit": commit, "addinVersion": "0.1.1",
+    }))
+    identity = wglink_live.loaded_identity(addin, addin_version="0.1.1", loaded_at="2026-09-17T10:00:00Z")
+    assert (identity["source"], identity["sourceCommit"]) == ("managed", commit)
 
 
 def test_the_module_never_imports_fusion() -> None:

@@ -391,7 +391,7 @@ def _text(value: object, limit: int) -> str | None:
 
 
 def loaded_identity(addin_dir: Path, *, addin_version: str | None, loaded_at: str | None = None) -> dict[str, Any]:
-    """What this add-in loaded: the managed marker, else the dev marker, else unmanaged.
+    """What this add-in loaded: the dev marker, else the managed marker, else unmanaged.
 
     Values outside WG's registration grammar are sent as null, because WG
     refuses a registration with an invalid identity field.
@@ -399,17 +399,6 @@ def loaded_identity(addin_dir: Path, *, addin_version: str | None, loaded_at: st
 
     loaded_at = loaded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     version = _text(addin_version, 128)
-    managed = _read_json(Path(addin_dir) / "wglink_install.json")
-    if isinstance(managed, Mapping) and _is_int(managed.get("schema")) and managed.get("schema") == 1:
-        commit = managed.get("sourceCommit")
-        return {
-            "source": "managed",
-            "sourceCommit": commit if isinstance(commit, str) and _COMMIT.fullmatch(commit) else None,
-            "addinVersion": _text(managed.get("addinVersion"), 128) or version,
-            "managedBy": _text(managed.get("managedBy"), 128),
-            "waveguideGeneratorRoot": _text(managed.get("waveguideGeneratorRoot"), 4096),
-            "loadedAt": loaded_at,
-        }
     developer = _read_json(Path(addin_dir) / "wglink_dev.json")
     if isinstance(developer, Mapping):
         commit = developer.get("sourceCommit")
@@ -419,6 +408,17 @@ def loaded_identity(addin_dir: Path, *, addin_version: str | None, loaded_at: st
             "addinVersion": version,
             "managedBy": None,
             "waveguideGeneratorRoot": None,
+            "loadedAt": loaded_at,
+        }
+    managed = _read_json(Path(addin_dir) / "wglink_install.json")
+    if isinstance(managed, Mapping) and _is_int(managed.get("schema")) and managed.get("schema") == 1:
+        commit = managed.get("sourceCommit")
+        return {
+            "source": "managed",
+            "sourceCommit": commit if isinstance(commit, str) and _COMMIT.fullmatch(commit) else None,
+            "addinVersion": _text(managed.get("addinVersion"), 128) or version,
+            "managedBy": _text(managed.get("managedBy"), 128),
+            "waveguideGeneratorRoot": _text(managed.get("waveguideGeneratorRoot"), 4096),
             "loadedAt": loaded_at,
         }
     return {

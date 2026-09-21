@@ -3220,27 +3220,70 @@ def _reservation_path(target: Path) -> Path:
     return target.with_name(f".{target.name}.reserve")
 
 
+#: Windows answers an exclusive create on a name another process holds open, or
+#: has just deleted (delete-pending), with PermissionError -- not
+#: FileExistsError. Held is not taken: the name is tried again a few times over
+#: about a tenth of a second before WGLink moves on to the next one.
+_RESERVE_HELD_ATTEMPTS = 5
+_RESERVE_HELD_PAUSE_SECONDS = 0.025
+#: How many names in a row may be held before WGLink stops and says so. A
+#: folder that refuses every name is a permission problem, not a busy name.
+_RESERVE_HELD_NAMES = 8
+
+
+def _create_reservation(reservation: Path) -> int | None:
+    """The exclusive create; None when Windows keeps the name held past the retries.
+
+    ``FileExistsError`` propagates: the name is taken. On POSIX a
+    ``PermissionError`` is a real permission problem with the folder, so it
+    becomes a visible refusal at once and is never retried.
+    """
+
+    for attempt in range(_RESERVE_HELD_ATTEMPTS):
+        if attempt:
+            time.sleep(_RESERVE_HELD_PAUSE_SECONDS)
+        try:
+            return os.open(reservation, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except PermissionError as exc:
+            if os.name != "nt":
+                raise wglink_core.WgLinkError(
+                    f"WGLink cannot create files in the return folder {reservation.parent}: "
+                    f"{exc}. Check that the folder is writable, then send again."
+                ) from exc
+    return None
+
+
 def _reserve_target(target: Path, *, overwrite: bool) -> tuple[Path, Path]:
     """Atomically reserve an immutable bundle name across Fusion processes."""
 
     stem = target.name.removesuffix(".wgreturn")
     index = 1
+    held = 0
     while True:
         candidate = target if index == 1 else target.with_name(f"{stem}-{index}.wgreturn")
         reservation = _reservation_path(candidate)
         try:
-            descriptor = os.open(
-                reservation,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
+            descriptor = _create_reservation(reservation)
         except FileExistsError:
+            descriptor = None
+            held = 0
+        else:
+            if descriptor is None:
+                held += 1
+                if held >= _RESERVE_HELD_NAMES:
+                    raise wglink_core.WgLinkError(
+                        f"WGLink could not reserve a return name in {target.parent}: "
+                        f"{held} names in a row were held by another program. Check "
+                        "that the folder is writable and not locked, then send again."
+                    )
+        if descriptor is None:
             if overwrite:
                 raise wglink_core.WgLinkError(
                     f"Another WGLink export is already publishing {candidate.name}."
-                ) from None
+                )
             index += 1
             continue
+        held = 0
         try:
             os.write(
                 descriptor,

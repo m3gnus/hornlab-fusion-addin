@@ -284,6 +284,11 @@ Commands and requests cross through WG's machine-local IPC folder,
 - **Two Fusion processes on one WG data folder.** Requests stay apart: each
   has a fresh `uuid4` id and its own file. Return bundle names are reserved
   with an exclusive create, so two processes never publish over each other.
+  Windows answers that create with a permission error while another process
+  holds the name or has just deleted it; WGLink retries that name for about a
+  tenth of a second, then takes the next name, and after eight held names in a
+  row refuses visibly. On macOS and Linux a permission error is the folder's
+  and is refused at once.
   **Known limit:** `.fusion-status.json` is one file, and the last writer wins,
   so two Fusion processes overwrite each other's status for WG. The live
   lease is per process; a cross-process lease waits for the activation-boundary

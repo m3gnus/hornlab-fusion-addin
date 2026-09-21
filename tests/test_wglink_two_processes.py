@@ -246,3 +246,107 @@ def test_a_published_name_is_skipped_and_its_reservation_released(send_module, t
 
     assert theirs["target"] == "speaker-2.wgreturn"
     assert not (tmp_path / ".speaker.wgreturn.reserve").exists()
+
+
+# -- a held name on Windows (hosted CI run 35645556433) --------------------------------
+#
+# Windows answers an exclusive create on a name another process holds open, or has
+# just deleted, with PermissionError rather than FileExistsError. These inject that
+# answer deterministically; the two-process test above meets it only by chance.
+
+
+def _held(send_module, monkeypatch, *, windows: bool, held_names: dict[str, int]):
+    """``os`` as ``wglink_send`` sees it: ``open`` of each named reservation raises
+    PermissionError for its first N attempts (``-1``: always)."""
+
+    real = send_module.os
+    opens: list[str] = []
+    sleeps: list[float] = []
+
+    def open_(path, flags, mode=0o777):
+        name = Path(path).name
+        opens.append(name)
+        remaining = held_names.get(name, 0)
+        if remaining:
+            held_names[name] = remaining - 1 if remaining > 0 else -1
+            raise PermissionError(13, "Permission denied", str(path))
+        return real.open(path, flags, mode)
+
+    proxy = types.SimpleNamespace(
+        **{name: getattr(real, name) for name in dir(real) if not name.startswith("__")}
+    )
+    proxy.open = open_
+    proxy.name = "nt" if windows else "posix"
+    monkeypatch.setattr(send_module, "os", proxy)
+    monkeypatch.setattr(send_module.time, "sleep", sleeps.append)
+    return opens, sleeps
+
+
+def test_a_name_held_briefly_on_windows_is_reserved_once_the_hold_clears(
+    send_module, monkeypatch, tmp_path: Path
+) -> None:
+    opens, sleeps = _held(
+        send_module, monkeypatch, windows=True, held_names={".speaker.wgreturn.reserve": 2}
+    )
+
+    target, reservation = send_module._reserve_target(tmp_path / "speaker.wgreturn", overwrite=False)
+
+    assert target.name == "speaker.wgreturn" and reservation.exists()
+    assert opens == [".speaker.wgreturn.reserve"] * 3
+    assert len(sleeps) == 2 and sum(sleeps) < 0.2
+
+
+def test_a_name_held_past_the_retries_on_windows_moves_to_the_next_name(
+    send_module, monkeypatch, tmp_path: Path
+) -> None:
+    opens, sleeps = _held(
+        send_module, monkeypatch, windows=True, held_names={".speaker.wgreturn.reserve": -1}
+    )
+
+    target, reservation = send_module._reserve_target(tmp_path / "speaker.wgreturn", overwrite=False)
+
+    assert target.name == "speaker-2.wgreturn" and reservation.exists()
+    attempts = send_module._RESERVE_HELD_ATTEMPTS
+    assert opens == [".speaker.wgreturn.reserve"] * attempts + [".speaker-2.wgreturn.reserve"]
+    assert sum(sleeps) < 0.2
+
+
+def test_every_name_held_on_windows_is_a_visible_refusal_not_a_crash(
+    send_module, monkeypatch, tmp_path: Path
+) -> None:
+    """The control past the bound: a folder that refuses every name."""
+
+    names = {".speaker.wgreturn.reserve": -1}
+    names.update({f".speaker-{index}.wgreturn.reserve": -1 for index in range(2, 50)})
+    opens, _sleeps = _held(send_module, monkeypatch, windows=True, held_names=names)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="names in a row were held"):
+        send_module._reserve_target(tmp_path / "speaker.wgreturn", overwrite=False)
+
+    bound = send_module._RESERVE_HELD_ATTEMPTS * send_module._RESERVE_HELD_NAMES
+    assert len(opens) == bound
+    assert not any(path.name.endswith(".reserve") for path in tmp_path.iterdir())
+
+
+def test_an_overwrite_of_a_name_held_on_windows_is_refused(
+    send_module, monkeypatch, tmp_path: Path
+) -> None:
+    _held(send_module, monkeypatch, windows=True, held_names={".speaker.wgreturn.reserve": -1})
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="already publishing speaker.wgreturn"):
+        send_module._reserve_target(tmp_path / "speaker.wgreturn", overwrite=True)
+
+
+def test_a_permission_error_on_posix_is_refused_at_once_never_retried(
+    send_module, monkeypatch, tmp_path: Path
+) -> None:
+    """On POSIX it is the folder's permissions, not a held name: no loop, no mask."""
+
+    opens, sleeps = _held(
+        send_module, monkeypatch, windows=False, held_names={".speaker.wgreturn.reserve": -1}
+    )
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="cannot create files in the return folder"):
+        send_module._reserve_target(tmp_path / "speaker.wgreturn", overwrite=False)
+
+    assert opens == [".speaker.wgreturn.reserve"] and sleeps == []

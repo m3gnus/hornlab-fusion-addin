@@ -56,6 +56,8 @@ try:
         DEGENERATE_MIN_QUALITY,
         FREQUENCY_ELEMENTS_PER_WAVELENGTH,
         OCC_HEALING_FALLBACKS,
+        REDUCED_ORIENTATION_MIRRORED_PARENT,
+        REDUCED_ORIENTATION_SOURCE_ANCHOR,
         RIGID_TAG,
         SPEED_OF_SOUND_M_S,
         SurfaceGeometry,
@@ -114,6 +116,22 @@ SYMMETRY_AXIS_FOR_PLANE = {"x0": 0, "y0": 1, "z0": 2}
 # asymmetry small enough to pass is an asymmetry the BEM cannot resolve.
 AUTO_REDUCE_TOL_REL = DEFAULT_AUTO_CUT_TOLERANCE_REL
 AUTO_REDUCE_GRID = DEFAULT_AUTO_CUT_GRID
+
+
+def _reduced_orientation_for_auto_cut(
+    auto_reduce_planes: tuple[str, ...],
+) -> str:
+    """Choose the winding contract for the geometry that produced the mesh.
+
+    An automatic cut starts with the same closed solid that the full-model
+    path would mesh, so its reduced boundary must preserve that parent's
+    outward orientation.  Explicit/pre-cut models retain the source-anchor
+    contract: those may describe a bore-facing acoustic shell rather than a
+    solid, and changing their established interpretation would invert them.
+    """
+    if auto_reduce_planes:
+        return REDUCED_ORIENTATION_MIRRORED_PARENT
+    return REDUCED_ORIENTATION_SOURCE_ANCHOR
 
 
 def _millimetres_to_step_units(value_mm: float, unit_scale_to_m: float) -> float:
@@ -1259,6 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
             if auto_reduce_planes
             else (HEALED_SYMMETRY_BAND_MM if geometry_healed else None)
         ),
+        reduced_orientation=_reduced_orientation_for_auto_cut(auto_reduce_planes),
     )
     resolved_symmetry_planes = tuple(topology["expected_symmetry_planes"])
     # Self-check: the free-edge detector re-reads the cut from the mesh with no

@@ -720,6 +720,65 @@ def test_symmetry_reduced_source_anchor_wins_when_signed_volume_disagrees():
     assert topology["source_normal_projections"]["LF"]["projection_z_step_units2"] > 0.0
 
 
+def test_auto_cut_xz_uses_parent_orientation_and_expands_outward():
+    """An auto-cut solid keeps the full model's winding on an x0+z0 quarter.
+
+    The source anchor deliberately disagrees in this fixture, matching the
+    failure mode of the Fusion run that first exposed the caller bug.  Manual
+    and already-cut models must continue to use that older contract.
+    """
+    module = _load_script()
+    points, triangles, _ = _open_unit_box(inward=True)
+    # Rotate the x0+y0 fixture onto x0+z0.  Put the source at y=0 so its
+    # projection along the one non-cut axis asks for the opposite winding.
+    points = points[:, [0, 2, 1]]
+    tags = np.asarray([1, 1, 1, 1, 2, 2, 1, 1], dtype=np.int32)
+    mesh = meshio.Mesh(
+        points=points,
+        cells=[("triangle", triangles)],
+        cell_data={"gmsh:physical": [tags]},
+    )
+
+    auto_mode = module._reduced_orientation_for_auto_cut(("x0", "z0"))
+    repaired_mesh, repair, topology = module._postprocess_mesh(
+        mesh,
+        [module.SourceSpec("HF", 5.0, 2)],
+        symmetry_planes=("x0", "z0"),
+        tolerance=1e-9,
+        reduced_orientation=auto_mode,
+    )
+
+    assert auto_mode == "mirrored-parent"
+    assert module._reduced_orientation_for_auto_cut(()) == "source-anchor"
+    assert repair["reduced_orientation"] == "mirrored-parent"
+    assert repair["symmetry_source_parent_conflicts"] == 1
+    assert topology["signed_volume_step_units3"] > 0.0
+
+    reduced_points, reduced_triangles, _ = module._mesh_triangle_data(repaired_mesh)
+    expanded_points = []
+    expanded_triangles = []
+    for reflect_x, reflect_z in ((False, False), (True, False), (False, True), (True, True)):
+        image_points = reduced_points.copy()
+        if reflect_x:
+            image_points[:, 0] *= -1.0
+        if reflect_z:
+            image_points[:, 2] *= -1.0
+        image_triangles = reduced_triangles.copy()
+        if reflect_x != reflect_z:
+            image_triangles = image_triangles[:, [0, 2, 1]]
+        offset = sum(len(chunk) for chunk in expanded_points)
+        expanded_points.append(image_points)
+        expanded_triangles.append(image_triangles + offset)
+
+    expanded_volume = module._signed_volume(
+        np.concatenate(expanded_points), np.concatenate(expanded_triangles)
+    )
+    assert expanded_volume == pytest.approx(
+        4.0 * topology["signed_volume_step_units3"]
+    )
+    assert expanded_volume > 0.0
+
+
 def test_symmetry_source_anchor_is_translation_and_rotation_invariant():
     module = _load_script()
     points, triangles, _ = _open_unit_box(inward=True)

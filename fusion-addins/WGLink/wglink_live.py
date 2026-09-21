@@ -880,6 +880,77 @@ def produce_snapshot(
     return item
 
 
+def convert_outbox(
+    ipc_folder: Path,
+    *,
+    solve_files: Any,
+    live_will_run: bool,
+) -> dict[str, list[str]]:
+    """Move unanswered items onto the WG request inbox (M1 transfer contract C1, E1).
+
+    Run once at start-up, before any live thread starts. No network, no CAD.
+    New Sends and Solves no longer create items; this drains the ones an
+    earlier session queued, against what WG advertises *now*:
+
+    * nothing, or older than 3: nothing is converted or removed -- the next
+      start-up tries again;
+    * 4 or more: every unanswered item becomes its request file, same id and
+      fields, and the item is removed;
+    * exactly 3: a solve item becomes its schema-3 file and is removed; a
+      snapshot item is left for the live worker when one will run, and
+      otherwise removed and reported as not delivered.
+
+    A solve item whose file was already written at queue time needs no second
+    file: the item is removed and the file stands. Answered items are the live
+    worker's (their answer is a notice for the user) and are not touched. An
+    item whose write or removal fails stays for the next start-up; a repeat of
+    the same id is recovered by WG as the same operation.
+
+    Returns the operation ids by what happened to them.
+    """
+
+    result: dict[str, list[str]] = {
+        "converted": [], "left": [], "abandoned": [], "failed": [],
+    }
+    advertised = solve_files.wg_request_capability(ipc_folder)
+    outbox = Outbox(ipc_folder)
+    items, _foreign = outbox.scan()
+    pending = [item for item in items if item.get("answer") is None]
+    if advertised is None or advertised < DELIVERY_VERSION:
+        result["left"] = [item["operationId"] for item in pending]
+        return result
+    for item in pending:
+        operation_id = item["operationId"]
+        if item["kind"] == KIND_SNAPSHOT and advertised < solve_files.WG_REQUEST_SCHEMA_VERSION:
+            if live_will_run:
+                result["left"].append(operation_id)
+                continue
+            if outbox.delete(operation_id):
+                result["abandoned"].append(operation_id)
+            else:
+                result["failed"].append(operation_id)
+            continue
+        try:
+            if not (item["kind"] == KIND_SOLVE and item.get("fileWritten")):
+                solve_files.write_wg_request(
+                    ipc_folder,
+                    kind=item["kind"],
+                    command_id=operation_id,
+                    return_id=item.get("returnId") if item["kind"] == KIND_SOLVE else None,
+                    bundle_relative=item["bundlePath"],
+                    manifest_sha256=item["manifestSha256"],
+                    requested_at=item["requestedAt"],
+                )
+        except (OSError, ValueError, RuntimeError):
+            result["failed"].append(operation_id)
+            continue
+        if outbox.delete(operation_id):
+            result["converted"].append(operation_id)
+        else:
+            result["failed"].append(operation_id)
+    return result
+
+
 def item_waiting_live(ipc_folder: Path, operation_id: str) -> bool:
     """An unanswered solve item that only the live delivery carries (no v3 file)."""
 

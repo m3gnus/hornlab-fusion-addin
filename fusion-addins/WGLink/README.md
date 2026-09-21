@@ -226,8 +226,27 @@ Commands and requests cross through WG's machine-local IPC folder,
   gets no solve command, its requests are never run, and WGLink says once per
   session that WG needs updating. WG installs and updates its own managed
   WGLink, so the two are always the pair that shipped together.
-- **Solve commands.** **Solve in WG** writes `.wg-solve-requests/<commandId>.json`.
-  A second command never replaces one WG has not read yet.
+- **Send and Solve: one request file each (the WG request inbox).** Both write
+  `.wg-solve-requests/<operationId>.json` and nothing else — never a live
+  outbox item, whatever the activation gate says — and differ only in `kind`
+  (`receive_snapshot` or `prepare_and_solve`). For a WG that advertises
+  `solveCommandDelivery` 4 the file is schema 4; for one that advertises 3,
+  Solve writes the schema-3 file as before and **Send is refused**, because a
+  schema-3 reader ignores `kind` and would start a solve. A WG that advertises
+  nothing is "not collecting requests", and both refuse. The outcome is said at
+  command time: "Sent to Waveguide Generator (request …)", or why WG was not
+  asked. A write whose outcome is unknown is retried once with the same id and
+  fields; pressing Send again is a new request. A second request never
+  replaces one WG has not read yet.
+- **The pickup check.** A minute after a Send or Solve, a one-shot timer asks
+  on the main thread whether the request file is still there, and only that;
+  if it is, WGLink says once that WG is closed, older than the add-in, or not
+  collecting requests. It is counted under the command that wrote the file.
+- **Items an earlier session queued** in `.wglink-outbox` are converted at
+  start-up, before any live thread starts, against what WG advertises then:
+  into request files at schema 4; at 3, solves convert and snapshots are left
+  for the live worker when one will run (otherwise dropped, with one notice);
+  with nothing advertised, nothing moves until a later start-up.
 - **WG's requests.** Return requests and handoffs arrive as
   `.fusion-return-requests/<id>.json` and `.fusion-handoffs/<id>.json`. WGLink
   takes them in `deliverySequence` order, claims each by renaming it to a

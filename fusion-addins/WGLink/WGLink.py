@@ -211,10 +211,6 @@ _request_trace: dict[str, str] | None = None
 # and whether it has told the user WG is too old to exchange requests with.
 _claims_swept = False
 _wg_outdated_noticed = False
-# Solve commands this session wrote and WG has not taken yet: file -> when
-# written, and the ones the user has already been told about.
-_untaken_solves: dict[Path, float] = {}
-_untaken_noticed: set[Path] = set()
 # Outcomes the per-request trace would overwrite within one tick -- a request
 # dropped as superseded, a leftover claim settled -- kept for the heartbeat's
 # ``diagnostics.recentOutcomes``, newest last.
@@ -271,14 +267,20 @@ _activation: dict[str, object] = {
     "setting": "default",
     "settingsKey": ACTIVATION_SETTING,
 }
-# With coordination off, the only main-thread time WGLink asks for is a
-# follow-up a command scheduled: the geometry refresh it requested, status for
-# WG, and settling a claim start-up could not. Each job carries the cause of
-# the command that scheduled it across the event hop (``wglink_activity``).
+# Main-thread time a command asks for after it returns. The event is part of
+# the transfer path, so it is registered whatever the gate says: it carries
+# the pickup check a Send or Solve schedules (M1 transfer contract C6), and,
+# with coordination off, the command's own follow-up -- the geometry refresh
+# it requested, status for WG, and settling a claim start-up could not. Each
+# job carries the cause of the command that scheduled it across the hop
+# (``wglink_activity``).
 FOLLOWUP_EVENT_ID = f"hornlab_wglink_followup_{_watch_session_id}"
 _followup_event = None
 _followup_handler = None
 _followups: list[object] = []
+# The pickup check's one-shot timer adds its job from its own thread.
+_followups_lock = threading.Lock()
+_timers: list[threading.Timer] = []
 
 
 def _note_outcome(channel: str, request_id: str, outcome: str) -> None:
@@ -1093,11 +1095,17 @@ def _summary(operation: str, report: dict[str, object]) -> str:
     if operation in {"send", "solve"}:
         scope = report.get("scope", {})
         status = scope.get("status", "?") if isinstance(scope, dict) else "?"
-        closing = (
+        request_id = str(report.get("request_id") or "")
+        sent = (
+            f"Sent to Waveguide Generator (request {request_id[:8]}). "
+            if request_id
+            else ""
+        )
+        closing = sent + (
             "Waveguide Generator will prepare this model and start solving it. "
             "It stops and asks if the ingestion reports something blocking."
             if report.get("solve_requested")
-            else "Waveguide Generator will detect and open this return automatically."
+            else "Waveguide Generator will open this return."
         )
         message = (
             f"Return bundle written: {report.get('bundle_path', '?')}\n"
@@ -1128,88 +1136,156 @@ def _summary(operation: str, report: dict[str, object]) -> str:
     )
 
 
-def _request_wg_solve(report: dict[str, object]) -> bool:
-    """Ask WG to prepare and solve the bundle this send just published.
+#: How many times a request write is tried when its outcome is unknown (C5).
+WG_REQUEST_WRITE_ATTEMPTS = 2
 
-    Written after the bundle, and only ever by this command: a plain Send must
-    never start an expensive solve as a side effect, which is also why there is
-    no remembered "solve next time" preference.
+
+def _write_wg_request(ipc: Path, **fields: object) -> Path:
+    """Write one request; retry only when this add-in cannot tell whether it landed.
+
+    An ``OSError`` during or after the rename leaves that unknown. The retry
+    re-writes the same file with the same id and fields, which WG recovers as
+    the same operation (C5). A refusal -- WG outdated, WG not collecting -- is
+    an answer, not an unknown, and is never retried.
     """
 
+    last: OSError | None = None
+    for _attempt in range(WG_REQUEST_WRITE_ATTEMPTS):
+        try:
+            return wglink_watch.write_wg_request(ipc, **fields)
+        except OSError as exc:
+            last = exc
+    assert last is not None
+    raise last
+
+
+def _submit_to_wg(report: dict[str, object], kind: str) -> str:
+    """Hand the return this command just published to WG: one file, one id.
+
+    Send and Solve both come here and differ only in ``kind`` (M1 transfer
+    contract C1/C2). There is one path in every configuration: no live outbox
+    item is created for new work, whatever the activation gate says. The
+    outcome is synchronous -- the returned request id, or a ``WgLinkError``
+    naming why WG was not asked -- and one follow-up, the pickup check, says
+    so later if WG never takes the file.
+    """
+
+    channel = "solveCommand" if kind == wglink_watch.KIND_PREPARE_AND_SOLVE else "snapshot"
+    action = "solve again" if channel == "solveCommand" else "send again"
     ipc = wglink_workspace.ipc_folder(create=True)
     workspace = wglink_workspace.workspace_root()
     if ipc is None or workspace is None:
-        raise wglink_core.WgLinkError(_no_workspace_text("solve again"))
-    command_id = str(uuid.uuid4())
-    return_id = str(report.get("return_id") or "")
+        raise wglink_core.WgLinkError(_no_workspace_text(action))
     bundle = Path(str(report.get("bundle_path") or ""))
-    client = _live_client
+    not_asked = (
+        "The return bundle is in the WGLink folder, but Waveguide Generator was "
+        "not asked to take it. "
+    )
+    request_id = str(uuid.uuid4())
     try:
-        # A WG that speaks the live protocol gets an outbox item: delivered
-        # over HTTP while the session is healthy, and written as the v3 file
-        # (same operation id) right away when it is not. Any other WG gets the
-        # v3 file exactly as before. No network here either way.
-        item = wglink_live.produce_solve(
+        relative, manifest = wglink_watch.return_reference(bundle, workspace)
+        path = _write_wg_request(
             ipc,
-            bundle_path=bundle,
-            workspace_root=workspace,
-            return_id=return_id,
-            healthy=client is not None and client.healthy(),
-            solve_files=wglink_watch,
-            operation_id=command_id,
+            kind=kind,
+            command_id=request_id,
+            return_id=str(report.get("return_id") or "") if channel == "solveCommand" else None,
+            bundle_relative=relative,
+            manifest_sha256=manifest,
+            requested_at=wglink_watch.utc_timestamp(),
         )
-        if item is None:
-            wglink_watch.write_solve_request(
-                ipc,
-                command_id=command_id,
-                return_id=return_id,
-                bundle_path=bundle,
-                workspace_root=workspace,
-            )
-    except wglink_watch.WgOutdatedError as exc:
-        raise wglink_core.WgLinkError(str(exc)) from exc
-    except wglink_live.OutboxFull:
-        report["delivery_note"] = OUTBOX_FULL_NOTE + " The solve request was written as a file for WG to take."
-    if client is not None:
-        client.enqueue_delivery()
-    _untaken_solves[wglink_watch.solve_request_path(ipc, command_id)] = time.monotonic()
-    _begin_request("solveCommand", command_id, DELIVERY)["outcome"] = "requested"
-    return True
+    except (wglink_watch.WgOutdatedError, wglink_watch.WgNotCollectingError) as exc:
+        _begin_request(channel, request_id, DELIVERY)["outcome"] = "refused"
+        raise wglink_core.WgLinkError(f"{not_asked}{exc}") from exc
+    except OSError as exc:
+        _begin_request(channel, request_id, DELIVERY)["outcome"] = "writeFailed"
+        raise wglink_core.WgLinkError(
+            f"{not_asked}WGLink could not write the request for WG: {exc}. "
+            f"Check the WGLink folder is writable, then {action}."
+        ) from exc
+    _begin_request(channel, request_id, DELIVERY)["outcome"] = "requested"
+    _schedule_pickup_check(path, channel, request_id)
+    return request_id
 
 
-def _queue_snapshot(report: dict[str, object]) -> None:
-    """After a plain Send: queue the return for WG's live ``receive_snapshot``.
+def _schedule_pickup_check(path: Path, channel: str, request_id: str) -> None:
+    """The one follow-up a Send or Solve makes: did WG take the file? (C6)
 
-    Only for a WG that advertises the live protocol; the return is already
-    published in the WGLink folder, so nothing here can fail the Send.
+    A one-shot timer, then the follow-up event onto the main thread, counted
+    under the command that wrote the request. It reads whether one file still
+    exists and nothing else -- no document, no link, no geometry -- and it runs
+    whether or not automatic coordination is on.
+    """
+
+    job = wglink_activity.carrying(
+        lambda: _pickup_check(path, channel, request_id)
+    )
+
+    def due() -> None:
+        with _followups_lock:
+            _followups.append(job)
+        try:
+            _raise_followup_event()
+        except Exception:  # noqa: BLE001 - a torn-down event: the add-in is stopping
+            pass
+
+    _start_timer(wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS, due)
+
+
+def _start_timer(delay: float, function: object) -> object:
+    """A one-shot daemon timer, remembered so stop() can cancel it."""
+
+    timer = threading.Timer(delay, function)
+    timer.name = "WGLinkPickupCheck"
+    timer.daemon = True
+    _timers[:] = [item for item in _timers if item.is_alive()]
+    _timers.append(timer)
+    timer.start()
+    return timer
+
+
+def _pickup_check(path: Path, channel: str, request_id: str) -> None:
+    wglink_activity.record(wglink_activity.PICKUP_CHECK)
+    if not path.exists():
+        _note_outcome(channel, request_id, "taken")
+        return
+    _note_outcome(channel, request_id, "notTaken")
+    _modal(wglink_watch.REQUEST_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} request waiting")
+
+
+def _convert_outbox_at_startup() -> None:
+    """Move unanswered live-outbox items onto the one path (C1, E1). Start-up only.
+
+    Runs before any live thread starts, in both gate states, and reads no CAD
+    state. What WG advertises now decides: schema 4 takes every item; at 3 a
+    solve converts and a snapshot is left for the live worker when one will run,
+    otherwise dropped with one notice; with nothing advertised nothing moves,
+    and the next start-up tries again.
     """
 
     ipc = wglink_workspace.ipc_folder()
-    workspace = wglink_workspace.workspace_root()
-    if ipc is None or workspace is None or not report.get("bundle_path"):
+    if ipc is None:
         return
     try:
-        item = wglink_live.produce_snapshot(
+        result = wglink_live.convert_outbox(
             ipc,
-            bundle_path=Path(str(report["bundle_path"])),
-            workspace_root=workspace,
             solve_files=wglink_watch,
+            live_will_run=_coordinating() and wglink_live.advertises_live(ipc),
         )
-    except wglink_live.OutboxFull:
-        report["delivery_note"] = OUTBOX_FULL_NOTE
+    except Exception as exc:  # noqa: BLE001 - the commands must still load
+        _log(f"[{PANEL_NAME}] could not convert queued deliveries: {exc}")
         return
-    except Exception as exc:  # noqa: BLE001 - the return is published whatever happens here
-        _log(f"WGLink could not queue the return for Waveguide Generator: {exc}")
-        return
-    client = _live_client
-    if item is not None and client is not None:
-        client.enqueue_delivery()
-
-
-OUTBOX_FULL_NOTE = (
-    "WGLink's queue of deliveries waiting for Waveguide Generator is full, so this one "
-    "was not queued. The return itself is in the WGLink folder."
-)
+    for operation_id in result["converted"]:
+        _note_outcome("outbox", operation_id, "converted")
+    for operation_id in result["abandoned"]:
+        _note_outcome("outbox", operation_id, "notDelivered")
+    if result["abandoned"]:
+        _message(
+            f"{len(result['abandoned'])} earlier Send(s) to Waveguide Generator were "
+            "never delivered, and this Waveguide Generator cannot take a Send from a "
+            "file. Update Waveguide Generator, then send those models again from "
+            "Fusion. Their returns are still in the WGLink folder.",
+            f"{PANEL_NAME} earlier sends not delivered",
+        )
 
 
 def _delivery_notice_text(notice: dict[str, object]) -> str:
@@ -1254,29 +1330,6 @@ def _notice_deliveries() -> None:
         if notice.get("durable"):
             _modal(_delivery_notice_text(notice), f"{PANEL_NAME} delivery to WG")
             client.acknowledge_delivery_notice(str(notice.get("operationId")))
-
-
-def _notice_untaken_solves() -> None:
-    """Tell the user once when WG has left a solve command untaken too long.
-
-    The bound on a stale capability file: after a downgrade it can still say 3
-    while an older WG, which never reads these files, runs. The command stays
-    where it is and runs when a WG that reads it takes it.
-    """
-
-    now = time.monotonic()
-    for path, written_at in list(_untaken_solves.items()):
-        # Waiting: its v3 file is there, or its outbox item waits for the live
-        # delivery alone.
-        if not path.exists() and not wglink_live.item_waiting_live(path.parent.parent, path.stem):
-            _untaken_solves.pop(path, None)
-            _untaken_noticed.discard(path)
-            continue
-        if path in _untaken_noticed or now - written_at < wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS:
-            continue
-        _untaken_noticed.add(path)
-        _note_outcome("solveCommand", path.stem, "notTaken")
-        _modal(wglink_watch.SOLVE_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} solve request waiting")
 
 
 def _show_export_progress(operation: str) -> object | None:
@@ -1370,15 +1423,24 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     _send_options(inputs),
                     confirm_adoption=_confirm_source_adoption,
                 )
-                if self.operation == "solve":
-                    _update_export_progress(
-                        progress, 2, "Return written. Asking Waveguide Generator to solve…"
-                    )
-                    report = dict(report)
-                    report["solve_requested"] = _request_wg_solve(report)
-                else:
-                    report = dict(report)
-                    _queue_snapshot(report)
+                # One path for both: the return is published, then one request
+                # file hands it to WG. Send and Solve differ only in its kind.
+                solve = self.operation == "solve"
+                _update_export_progress(
+                    progress,
+                    2,
+                    "Return written. Asking Waveguide Generator to solve…"
+                    if solve
+                    else "Return written. Handing it to Waveguide Generator…",
+                )
+                report = dict(report)
+                report["request_id"] = _submit_to_wg(
+                    report,
+                    wglink_watch.KIND_PREPARE_AND_SOLVE
+                    if solve
+                    else wglink_watch.KIND_RECEIVE_SNAPSHOT,
+                )
+                report["solve_requested"] = solve
                 _update_export_progress(progress, 3, "Return ready in Waveguide Generator.")
             elif self.operation == "source":
                 report = _apply_source_role(inputs)
@@ -3717,7 +3779,7 @@ def _on_watch_tick() -> None:
     try:
         _settle_claims(snapshot)
         _notice_outdated_wg()
-        _notice_untaken_solves()
+        # Answers for deliveries queued before the one path existed (C1).
         _notice_deliveries()
         # The live transport is serviced on the same main thread. The custom
         # event makes it prompt; this call makes it certain, so a missed event
@@ -3820,7 +3882,8 @@ def _schedule_followup(job: object) -> None:
     event hop does not turn the command's own follow-up into anonymous work.
     """
 
-    _followups.append(wglink_activity.carrying(job))
+    with _followups_lock:
+        _followups.append(wglink_activity.carrying(job))
     _raise_followup_event()
 
 
@@ -3841,13 +3904,15 @@ def _run_followups() -> None:
     is no tick to retry them any more.
     """
 
-    jobs = list(_followups)
-    _followups.clear()
+    with _followups_lock:
+        jobs = list(_followups)
+        _followups.clear()
     for index, job in enumerate(jobs):
         if _command_busy:
             # A command holds the thread -- from the start, or because a job
             # raised a modal that is still up. Keep the rest for its end.
-            _followups[:0] = jobs[index:]
+            with _followups_lock:
+                _followups[:0] = jobs[index:]
             return
         try:
             job()
@@ -4011,8 +4076,6 @@ def _start_watch(app: object) -> bool:
     _request_trace = None
     _claims_swept = False
     _wg_outdated_noticed = False
-    _untaken_solves.clear()
-    _untaken_noticed.clear()
     _recent_outcomes.clear()
     _live_pending.clear()
     _live_adopted.clear()
@@ -4021,8 +4084,11 @@ def _start_watch(app: object) -> bool:
     _live_declined.clear()
     _live_waiting = None
     _followups.clear()
+    # The transfer path's carrier, in both gate states (C8).
+    if not _start_followups(app):
+        return False
     if not _coordinating():
-        return _start_followups(app)
+        return True
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
         return False
@@ -4044,11 +4110,13 @@ def _start_watch(app: object) -> bool:
 
 
 def _start_followups(app: object) -> bool:
-    """The whole of what starts with coordination off: one command-driven event.
+    """The one event a command raises for itself, registered in both gate states.
 
-    No thread, no timer, and neither the watch nor the live event: engines A
-    to E stay dormant in the tree. The follow-up event is raised only by a
-    command's own completion (:func:`_schedule_followup`).
+    With coordination off it is the whole of what starts: no thread, no timer,
+    and neither the watch nor the live event, so engines A to E stay dormant
+    in the tree. It is raised only by a command's own completion
+    (:func:`_schedule_followup`) or by the one-shot pickup timer a Send or
+    Solve starts (:func:`_schedule_pickup_check`).
     """
 
     global _followup_event, _followup_handler
@@ -4073,8 +4141,12 @@ def _stop_followups(app: object) -> None:
                 app.unregisterCustomEvent(FOLLOWUP_EVENT_ID)
         except Exception:  # noqa: BLE001
             pass
+    for timer in list(_timers):
+        timer.cancel()
+    _timers.clear()
     _followup_event = _followup_handler = None
-    _followups.clear()
+    with _followups_lock:
+        _followups.clear()
 
 
 def _stop_watch(app: object) -> None:
@@ -4132,8 +4204,6 @@ def _stop_watch(app: object) -> None:
     _request_trace = None
     _claims_swept = False
     _wg_outdated_noticed = False
-    _untaken_solves.clear()
-    _untaken_noticed.clear()
     _recent_outcomes.clear()
     _watcher.reset()
 
@@ -4257,6 +4327,8 @@ def _build_owner(app: object, ui: object) -> None:
         if not _activate_ipc_lease():
             raise RuntimeError("WGLink's IPC owner lease was lost during startup")
         _owned = True
+        # Before any live thread starts, and whatever the gate says (C1).
+        _convert_outbox_at_startup()
         if not _coordinating():
             _start_without_coordination()
             return

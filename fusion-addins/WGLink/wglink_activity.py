@@ -72,6 +72,8 @@ MUTATION_DETACH = "mutation_detach"
 MUTATION_SOURCE_IDENTITY = "mutation_source_identity"
 MUTATION_BODY_DECLARATION = "mutation_body_declaration"
 EXPORT_RETURN = "export_return"
+#: A Send or Solve asking whether WG took its request file. Reads one path.
+PICKUP_CHECK = "pickup_check"
 
 #: Causes that are not a finding between commands besides a command itself:
 #: the bounded, once-only handling at start-up and shutdown.
@@ -252,6 +254,7 @@ __all__ = [
     "MUTATION_INSERT",
     "MUTATION_SOURCE_IDENTITY",
     "MUTATION_UPDATE",
+    "PICKUP_CHECK",
     "SOURCE_INVENTORY",
     "STATUS_PUBLICATION",
     "ActivityLog",

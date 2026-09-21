@@ -217,7 +217,11 @@ def test_with_coordination_off_no_engine_starts_or_registers(
 def test_with_coordination_on_every_engine_starts_as_before(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """The positive control for the test above: the same measurement, rising."""
+    """The positive control for the test above: the same measurement, rising.
+
+    The follow-up event is registered here too: it carries the transfer path's
+    pickup check, which is behind neither gate (M1 transfer contract C8).
+    """
 
     fixture = _boundary(monkeypatch, tmp_path, "WGLink_engines_on", coordination=None)
     before = set(threading.enumerate())
@@ -229,7 +233,7 @@ def test_with_coordination_on_every_engine_starts_as_before(
             "live_client": True,
             "watch_event": True,
             "live_event": True,
-            "followup_event": False,
+            "followup_event": True,
         }
         assert {"WGLinkExportWatch", "WGLinkLiveSend", "WGLinkLivePoll"} <= _started_threads(before)
     finally:
@@ -287,7 +291,6 @@ _TIMER_ONLY = (
     "_apply_pending_handoff",
     "_apply_pending_return_request",
     "_apply_announced_updates",
-    "_notice_untaken_solves",
     "_notice_deliveries",
     "_notice_outdated_wg",
 )
@@ -356,7 +359,6 @@ def test_with_coordination_on_the_same_scenario_reaches_them(
             "_on_live_dispatch",
             "_apply_pending_handoff",
             "_apply_pending_return_request",
-            "_notice_untaken_solves",
             "_notice_deliveries",
             "_notice_outdated_wg",
             "survey",

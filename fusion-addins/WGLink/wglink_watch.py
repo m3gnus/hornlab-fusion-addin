@@ -49,8 +49,18 @@ FUSION_REQUEST_DELIVERY = "fusionRequestDelivery"
 # as an integer of at least 1. The add-in declares the feature only then: a WG
 # that does not advertise it refuses the bundle as an unknown required feature.
 SOURCE_IDENTITY = "sourceIdentity"
-# Every request file, in both directions, carries this schema version.
+# Every Fusion-bound request file, and a WG-bound solve file written for a WG
+# that reads nothing newer, carries this schema version. Not bumped for the
+# WG request inbox: it also governs how this add-in reads WG's own requests.
 REQUEST_SCHEMA_VERSION = 3
+# The WG request inbox (M1 transfer contract, C2/C3): one file per Send or
+# Solve, the two differing only in ``kind``. Written only for a WG whose
+# ``solveCommandDelivery`` is at least this, because a schema-3 reader ignores
+# ``kind`` and would start a solve for a plain Send.
+WG_REQUEST_SCHEMA_VERSION = 4
+KIND_RECEIVE_SNAPSHOT = "receive_snapshot"
+KIND_PREPARE_AND_SOLVE = "prepare_and_solve"
+WG_REQUEST_KINDS = (KIND_RECEIVE_SNAPSHOT, KIND_PREPARE_AND_SOLVE)
 # One file per solve command, one per WG request.
 SOLVE_REQUESTS_DIRECTORY = ".wg-solve-requests"
 RETURN_REQUESTS_DIRECTORY = ".fusion-return-requests"
@@ -68,15 +78,27 @@ CLAIM_PREFIX = ".wglink-claim-"
 # command ids.
 _PLAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 
-# How long a solve command may wait untaken before the user is told. WG takes
-# a file on its next poll while its window is open, so a minute is far past
-# normal; past it, WG is closed or older than version 3 (after a downgrade the
-# capability file can still say 3). The command is never dropped or rerouted.
+# How long a request may wait untaken before the user is told. WG takes a file
+# on its next pass while it runs, so a minute is far past normal. The request
+# is never dropped or rerouted.
 SOLVE_PICKUP_NOTICE_SECONDS = 60.0
-SOLVE_NOT_TAKEN_MESSAGE = (
-    "Waveguide Generator has not taken the solve request for a minute. Open "
-    "Waveguide Generator; if an older version is running, update it. The request "
-    "waits, and is solved once WG takes it."
+REQUEST_NOT_TAKEN_MESSAGE = (
+    "Waveguide Generator has not picked up the request from Fusion for a minute. "
+    "Either WG is closed, or it is older than this WGLink add-in, or it is not "
+    "collecting requests from Fusion. Open Waveguide Generator (update it if an "
+    "older version is running). The request waits in the WGLink folder and is "
+    "handled once WG takes it."
+)
+WG_NOT_COLLECTING_MESSAGE = (
+    "Waveguide Generator is not collecting requests from Fusion: it has not said "
+    "that it reads them. Either WG is not running with this CAD Link folder, or "
+    "its CAD Link request handling is switched off. Start Waveguide Generator, "
+    "check its CAD Link folder, then try again."
+)
+SEND_NEEDS_NEWER_WG_MESSAGE = (
+    "This Waveguide Generator can take a solve request from Fusion but not a plain "
+    "Send. Update Waveguide Generator; it installs the WGLink that matches it. "
+    "Until then, use Solve in WG, or open the return from WG's CAD Link panel."
 )
 
 WG_OUTDATED_MESSAGE = (
@@ -88,6 +110,10 @@ WG_OUTDATED_MESSAGE = (
 
 class WgOutdatedError(RuntimeError):
     """WG does not read this add-in's delivery version; nothing was written."""
+
+
+class WgNotCollectingError(RuntimeError):
+    """WG advertises no request inbox at all; nothing was written."""
 
 
 def _read_json(path: Path) -> Any:
@@ -214,6 +240,116 @@ def write_solve_request(
         manifest_sha256=manifest_sha256,
         requested_at=utc_timestamp(requested_at),
     )
+
+
+def wg_request_capability(ipc_folder: Path) -> int | None:
+    """What WG advertises for its request inbox: a version, or None for nothing.
+
+    ``None`` -- no readable capability file, a schema this add-in does not
+    know, or no ``solveCommandDelivery`` at all -- is "WG is not collecting
+    requests" (C3): a WG whose consumer is off advertises nothing. A number
+    below 3 is an older WG. ``wg_delivery_version`` folds both into 1; the two
+    need different remedies, so this keeps them apart.
+    """
+
+    payload = _read_json(Path(ipc_folder) / CAPABILITIES_FILENAME)
+    if not isinstance(payload, Mapping):
+        return None
+    schema = payload.get("schemaVersion")
+    if isinstance(schema, bool) or schema != CAPABILITIES_SCHEMA_VERSION:
+        return None
+    if SOLVE_COMMAND_DELIVERY not in payload:
+        return None
+    return wg_delivery_version(Path(ipc_folder), SOLVE_COMMAND_DELIVERY)
+
+
+def wg_request_payload(
+    *,
+    kind: str,
+    command_id: str,
+    return_id: str | None,
+    bundle_relative: str,
+    manifest_sha256: str,
+    requested_at: str,
+) -> dict[str, Any]:
+    """One schema-4 WG request (C2). ``kind`` is the only Send/Solve difference.
+
+    ``returnId`` is present, as a string that may be empty, on a Solve, and
+    absent on a Send -- the live route's rule.
+    """
+
+    if kind not in WG_REQUEST_KINDS:
+        raise ValueError(f"Not a WG request kind: {kind!r}.")
+    if not _PLAIN_ID.fullmatch(str(command_id)):
+        raise ValueError(
+            f"A request id must be a plain file name, got {command_id!r}."
+        )
+    payload: dict[str, Any] = {
+        "schemaVersion": WG_REQUEST_SCHEMA_VERSION,
+        "target": "waveguide-generator",
+        "kind": kind,
+        "commandId": str(command_id),
+        "operationId": str(command_id),
+        "bundlePath": str(bundle_relative),
+        "manifestSha256": str(manifest_sha256),
+        "requestedAt": str(requested_at),
+    }
+    if kind == KIND_PREPARE_AND_SOLVE:
+        payload["returnId"] = str(return_id or "")
+    return payload
+
+
+def write_wg_request(
+    ipc_folder: Path,
+    *,
+    kind: str,
+    command_id: str,
+    return_id: str | None,
+    bundle_relative: str,
+    manifest_sha256: str,
+    requested_at: str,
+) -> Path:
+    """Write one Send or Solve into WG's request inbox, in the schema WG reads.
+
+    The versioning rule (C3), in one place:
+
+    * WG advertises 4 or more: schema 4, for both kinds.
+    * WG advertises 3: a Solve is the schema-3 solve file, exactly as before;
+      a Send is refused (``WgOutdatedError``). A schema-3 reader ignores
+      ``kind``, so a Send written as schema 3 would start a solve.
+    * WG advertises less than 3: refused as outdated.
+    * WG advertises nothing: refused as not collecting.
+
+    Nothing is written on a refusal.
+    """
+
+    advertised = wg_request_capability(ipc_folder)
+    if advertised is None:
+        raise WgNotCollectingError(WG_NOT_COLLECTING_MESSAGE)
+    if advertised < DELIVERY_VERSION:
+        raise WgOutdatedError(WG_OUTDATED_MESSAGE)
+    if advertised < WG_REQUEST_SCHEMA_VERSION:
+        if kind != KIND_PREPARE_AND_SOLVE:
+            raise WgOutdatedError(SEND_NEEDS_NEWER_WG_MESSAGE)
+        return write_solve_request_fields(
+            ipc_folder,
+            command_id=command_id,
+            return_id=str(return_id or ""),
+            bundle_relative=bundle_relative,
+            manifest_sha256=manifest_sha256,
+            requested_at=requested_at,
+        )
+    payload = wg_request_payload(
+        kind=kind,
+        command_id=command_id,
+        return_id=return_id,
+        bundle_relative=bundle_relative,
+        manifest_sha256=manifest_sha256,
+        requested_at=requested_at,
+    )
+    path = solve_request_path(ipc_folder, payload["commandId"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _write_json_atomically(path, payload)
 
 
 def require_solve_delivery(ipc_folder: Path) -> None:

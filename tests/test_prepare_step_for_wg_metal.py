@@ -779,6 +779,153 @@ def test_auto_cut_xz_uses_parent_orientation_and_expands_outward():
     assert expanded_volume > 0.0
 
 
+def _write_rear_source_box_step(module, step_path, *, pre_cut_x0):
+    """Write a box whose only source is its rear (-y) face, as a surface STEP.
+
+    The box mirrors about x=0 and z=0. Its source faces away from the one
+    non-cut axis, so the source anchor and the mirrored parent disagree about
+    the reduced part. That is the Fusion failure that led to mirrored-parent
+    orientation for auto-cut. With ``pre_cut_x0`` the model arrives already
+    cut on x=0: only the x >= 0 half, with no face on the plane.
+    """
+    x_min = 0.0 if pre_cut_x0 else -40.0
+    module.gmsh.initialize()
+    try:
+        module.gmsh.option.setNumber("General.Terminal", 0)
+        volume = module.gmsh.model.occ.addBox(x_min, -30.0, -20.0, 40.0 - x_min, 60.0, 40.0)
+        module.gmsh.model.occ.synchronize()
+        faces = module.gmsh.model.getBoundary([(3, volume)], oriented=False)
+        module.gmsh.model.occ.remove([(3, volume)])
+        if pre_cut_x0:
+            for dim, tag in faces:
+                if abs(module.gmsh.model.occ.getCenterOfMass(dim, tag)[0]) < 1e-9:
+                    module.gmsh.model.occ.remove([(dim, tag)])
+        module.gmsh.model.occ.synchronize()
+        module.gmsh.write(str(step_path))
+    finally:
+        module.gmsh.finalize()
+
+
+def _run_rear_source_box(module, monkeypatch, tmp_path, *, pre_cut_x0, symmetry):
+    """Run ``main()`` on the rear-source box and return (rc, manifest).
+
+    The STEP carries no painted labels, so the source mapper is replaced by
+    one that picks the y = -30 face from the live gmsh model. Everything else,
+    including auto-cut and the call into the mesher, is the real code path.
+    """
+    step_path = tmp_path / "box.step"
+    _write_rear_source_box_step(module, step_path, pre_cut_x0=pre_cut_x0)
+
+    def rear_face_is_the_source(_step, specs, *, skip_missing_sources=False, gmsh_surfaces=None):
+        del skip_missing_sources
+        rear = [
+            surface
+            for surface in gmsh_surfaces
+            if abs(module.gmsh.model.occ.getCenterOfMass(2, surface)[1] + 30.0) < 1e-6
+        ]
+        assert len(rear) == 1
+        rear_face_is_the_source.last_origins = {specs[0].name: "test"}
+        rear_face_is_the_source.last_missing = {}
+        return {specs[0].name: rear}
+
+    monkeypatch.setattr(module, "_map_step_faces_to_gmsh_surfaces", rear_face_is_the_source)
+    out = tmp_path / "out"
+    rc = module.main(
+        [
+            "--step", str(step_path),
+            "--out", str(out),
+            "--source", "HF:10",
+            "--rigid-res-mm", "10",
+            "--symmetry-planes", symmetry,
+        ]
+    )
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    return rc, manifest
+
+
+def test_main_passes_mirrored_parent_orientation_for_an_auto_cut(monkeypatch, tmp_path, capsys):
+    """main() itself must ask the mesher for mirrored-parent on an auto-cut.
+
+    The unit test above calls the helper directly. This one would fail if
+    main() stopped passing ``reduced_orientation``. The quarter would then
+    be wound inward, and the Metal solve refuses the expanded mesh.
+    """
+    module = _load_script()
+    rc, manifest = _run_rear_source_box(
+        module, monkeypatch, tmp_path, pre_cut_x0=False, symmetry="auto-cut"
+    )
+
+    assert rc == 0
+    assert manifest["auto_reduce"]["cut_planes"] == ["x0", "z0"]
+    assert manifest["symmetry_planes"] == ["x0", "z0"]
+    assert manifest["mesh_repair"]["reduced_orientation"] == "mirrored-parent"
+    assert manifest["mesh_repair"]["symmetry_source_parent_conflicts"] == 1
+    assert manifest["topology"]["signed_volume_step_units3"] == pytest.approx(
+        40.0 * 60.0 * 20.0
+    )
+    assert manifest["auto_reduce"]["pre_cut_planes"] == []
+    assert manifest["auto_reduce"]["orientation_warning"] is None
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_main_warns_when_auto_cut_reorients_a_pre_cut_model(monkeypatch, tmp_path, capsys):
+    """A model cut on x0 and auto-cut on z0 is oriented from its mirrored parent.
+
+    That is the orientation the Metal solve's outward check requires of the
+    expanded mesh. But the same model without auto-cut is oriented by the
+    source anchor, and here the two disagree. The run says so instead of
+    leaving it to the conflict counter.
+    """
+    module = _load_script()
+    rc, manifest = _run_rear_source_box(
+        module, monkeypatch, tmp_path, pre_cut_x0=True, symmetry="auto-cut"
+    )
+
+    assert rc == 0
+    assert manifest["auto_reduce"]["cut_planes"] == ["z0"]
+    assert manifest["symmetry_planes"] == ["x0", "z0"]
+    assert manifest["auto_reduce"]["pre_cut_planes"] == ["x0"]
+    assert manifest["mesh_repair"]["reduced_orientation"] == "mirrored-parent"
+    assert manifest["mesh_repair"]["symmetry_source_parent_conflicts"] == 1
+    assert manifest["topology"]["signed_volume_step_units3"] > 0.0
+    warning = manifest["auto_reduce"]["orientation_warning"]
+    assert warning is not None
+    assert "already cut on x0" in warning and "auto-cut on z0" in warning
+    assert f"WARNING: {warning}" in capsys.readouterr().err
+
+
+def test_pre_cut_model_without_auto_cut_keeps_the_source_anchor(monkeypatch, tmp_path, capsys):
+    """Control: the same pre-cut model without auto-cut is unchanged.
+
+    It keeps the source-anchor contract, and there is no auto-cut report to
+    warn in.
+    """
+    module = _load_script()
+    rc, manifest = _run_rear_source_box(
+        module, monkeypatch, tmp_path, pre_cut_x0=True, symmetry="auto"
+    )
+
+    assert rc == 0
+    assert manifest["auto_reduce"] == {"mode": "off"}
+    assert manifest["symmetry_planes"] == ["x0"]
+    assert manifest["mesh_repair"]["reduced_orientation"] == "source-anchor"
+    assert "WARNING" not in capsys.readouterr().err
+
+
+def test_mixed_cut_warning_needs_a_pre_cut_plane_and_a_conflict():
+    module = _load_script()
+    stats = {"reduced_orientation": "mirrored-parent", "symmetry_source_parent_conflicts": 1}
+
+    assert module._mixed_cut_orientation_warning(("z0",), ("x0", "z0"), stats)
+    # Nothing was pre-cut: every plane came from auto-cut.
+    assert module._mixed_cut_orientation_warning(("x0", "z0"), ("x0", "z0"), stats) is None
+    # No auto-cut at all: the source anchor ran, as for any pre-cut model.
+    assert module._mixed_cut_orientation_warning((), ("x0",), stats) is None
+    # Both verdicts agreed, so the mixed run changed nothing.
+    agreed = {**stats, "symmetry_source_parent_conflicts": 0}
+    assert module._mixed_cut_orientation_warning(("z0",), ("x0", "z0"), agreed) is None
+
+
 def test_symmetry_source_anchor_is_translation_and_rotation_invariant():
     module = _load_script()
     points, triangles, _ = _open_unit_box(inward=True)

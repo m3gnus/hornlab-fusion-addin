@@ -123,15 +123,66 @@ def _reduced_orientation_for_auto_cut(
 ) -> str:
     """Choose the winding contract for the geometry that produced the mesh.
 
-    An automatic cut starts with the same closed solid that the full-model
-    path would mesh, so its reduced boundary must preserve that parent's
-    outward orientation.  Explicit/pre-cut models retain the source-anchor
-    contract: those may describe a bore-facing acoustic shell rather than a
-    solid, and changing their established interpretation would invert them.
+    Any run in which auto-cut removed at least one plane uses
+    ``mirrored-parent``: the reduced boundary keeps the outward orientation
+    of its mirrored, watertight parent, which is what the full-model path
+    gives the same body and what the Metal solve checks when it loads the
+    mirror-expanded mesh.
+
+    That includes a model supplied already cut on one plane and auto-cut on
+    another. The mesher applies one mode to the whole reduced mesh, so the
+    pre-cut plane follows the mirrored parent too. See
+    :func:`_mixed_cut_orientation_warning`, which reports the case where
+    this changes the result.
+
+    A run with no auto-cut plane (explicit planes, or ``auto`` detection on a
+    model supplied already cut) keeps the ``source-anchor`` contract. Those
+    models may describe a bore-facing acoustic shell rather than a solid,
+    and changing their established interpretation would invert them.
     """
     if auto_reduce_planes:
         return REDUCED_ORIENTATION_MIRRORED_PARENT
     return REDUCED_ORIENTATION_SOURCE_ANCHOR
+
+
+def _mixed_cut_orientation_warning(
+    auto_reduce_planes: tuple[str, ...],
+    resolved_symmetry_planes: tuple[str, ...],
+    repair_stats: dict[str, object],
+) -> str | None:
+    """Explain when a model's own cut was oriented against its source anchor.
+
+    A model supplied already cut on one plane and auto-cut on another is
+    oriented as a whole from its mirrored parent. Without auto-cut, the same
+    model would be oriented by the source anchor. When the two verdicts
+    disagree on any component (``symmetry_source_parent_conflicts``), the two
+    runs wind the mesh in opposite directions. That is right for a solid, and
+    it is what the Metal solve's outward check expects of the expanded mesh.
+    It would be wrong for a model whose surfaces enclose the fluid. The flip
+    changes the result and the model cannot show which case it is, so it is
+    reported rather than left to a counter.
+    """
+    if not auto_reduce_planes:
+        return None
+    pre_cut_planes = [
+        plane for plane in resolved_symmetry_planes if plane not in auto_reduce_planes
+    ]
+    if not pre_cut_planes:
+        return None
+    if repair_stats.get("reduced_orientation") != REDUCED_ORIENTATION_MIRRORED_PARENT:
+        return None
+    conflicts = int(repair_stats.get("symmetry_source_parent_conflicts") or 0)
+    if conflicts <= 0:
+        return None
+    return (
+        f"the model was already cut on {','.join(pre_cut_planes)} and auto-cut "
+        f"on {','.join(auto_reduce_planes)}. The whole reduced mesh was "
+        "oriented from its mirrored parent (outward from the enclosed "
+        f"volume), and the source anchor disagreed on {conflicts} "
+        "component(s). Without auto-cut, the same model would be wound the "
+        "other way. This is correct if the model is a solid body. If its "
+        "surfaces enclose the fluid, the reduced mesh is inverted."
+    )
 
 
 def _millimetres_to_step_units(value_mm: float, unit_scale_to_m: float) -> float:
@@ -1289,10 +1340,17 @@ def main(argv: list[str] | None = None) -> int:
     auto_reduce_planes_confirmed = set(auto_reduce_planes) <= set(
         resolved_symmetry_planes
     )
+    orientation_warning = _mixed_cut_orientation_warning(
+        auto_reduce_planes, resolved_symmetry_planes, repair_stats
+    )
     if auto_reduce_planes:
         auto_reduce_report = dict(auto_reduce_report)
         auto_reduce_report["post_cut_detected_planes"] = list(resolved_symmetry_planes)
         auto_reduce_report["post_cut_planes_confirmed"] = bool(auto_reduce_planes_confirmed)
+        auto_reduce_report["pre_cut_planes"] = [
+            plane for plane in resolved_symmetry_planes if plane not in auto_reduce_planes
+        ]
+        auto_reduce_report["orientation_warning"] = orientation_warning
     meshio.write(tagged_mesh_path, repaired_mesh, file_format="gmsh22", binary=False)
     points, triangles, tags = _mesh_triangle_data(repaired_mesh)
     frequency_validation = _mesh_frequency_validation(
@@ -1387,6 +1445,8 @@ def main(argv: list[str] | None = None) -> int:
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     print(json.dumps(manifest, indent=2, sort_keys=True))
+    if orientation_warning is not None:
+        print(f"WARNING: {orientation_warning}", file=sys.stderr)
     if not auto_reduce_planes_confirmed:
         print(
             "ERROR: auto-cut reduced the model on "

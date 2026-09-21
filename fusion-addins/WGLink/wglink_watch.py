@@ -331,7 +331,11 @@ def wg_request_payload(
     return payload
 
 
-def write_wg_request(
+#: A request file is a few hundred bytes; anything larger is not one of ours.
+_REQUEST_READ_LIMIT = 64 * 1024
+
+
+def plan_wg_request(
     ipc_folder: Path,
     *,
     kind: str,
@@ -340,8 +344,8 @@ def write_wg_request(
     bundle_relative: str,
     manifest_sha256: str,
     requested_at: str,
-) -> Path:
-    """Write one Send or Solve into WG's request inbox, in the schema WG reads.
+) -> tuple[Path, dict[str, Any]]:
+    """Decide, once, the exact request file this command writes: where, and what.
 
     The versioning rule (C3), in one place:
 
@@ -352,7 +356,9 @@ def write_wg_request(
     * WG advertises less than 3: refused as outdated.
     * WG advertises nothing: refused as not collecting.
 
-    Nothing is written on a refusal.
+    The payload returned is the one every attempt writes, unchanged, and the
+    only one a re-read may confirm (C5, Amendment A1): a retry never
+    re-decides the schema.
     """
 
     advertised = wg_request_capability(ipc_folder)
@@ -360,70 +366,87 @@ def write_wg_request(
         raise WgNotCollectingError(WG_NOT_COLLECTING_MESSAGE)
     if advertised < DELIVERY_VERSION:
         raise WgOutdatedError(WG_OUTDATED_MESSAGE)
-    if advertised < WG_REQUEST_SCHEMA_VERSION:
-        if kind != KIND_PREPARE_AND_SOLVE:
-            raise WgOutdatedError(SEND_NEEDS_NEWER_WG_MESSAGE)
-        return write_solve_request_fields(
-            ipc_folder,
-            command_id=command_id,
-            return_id=str(return_id or ""),
-            bundle_relative=bundle_relative,
-            manifest_sha256=manifest_sha256,
-            requested_at=requested_at,
-        )
-    payload = wg_request_payload(
-        kind=kind,
-        command_id=command_id,
-        return_id=return_id,
-        bundle_relative=bundle_relative,
-        manifest_sha256=manifest_sha256,
-        requested_at=requested_at,
-    )
-    path = solve_request_path(ipc_folder, payload["commandId"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return _write_json_atomically(path, payload)
-
-
-def landed_request(
-    ipc_folder: Path,
-    *,
-    kind: str,
-    command_id: str,
-    return_id: str | None,
-    bundle_relative: str,
-    manifest_sha256: str,
-    requested_at: str,
-) -> Path | None:
-    """The request file for ``command_id`` if it is exactly the one this command wrote.
-
-    Asked only when a write's outcome is unknown (C5, Amendment A1). "Sent" may
-    be reported only for a file equal to the complete request -- every protocol
-    field, ``schemaVersion``, ``target``, ``kind`` and ``returnId`` presence and
-    value included. Two requests are legitimate for these fields: the schema-4
-    file, and for a Solve the schema-3 file written for a WG that reads only 3.
-    Anything else under this name -- incomplete, another target, another return
-    -- is not proof that this command's request landed. None then.
-    """
-
-    if not _PLAIN_ID.fullmatch(str(command_id)) or kind not in WG_REQUEST_KINDS:
-        return None
     fields = {
         "command_id": command_id,
         "bundle_relative": bundle_relative,
         "manifest_sha256": manifest_sha256,
         "requested_at": requested_at,
     }
-    legitimate = [wg_request_payload(kind=kind, return_id=return_id, **fields)]
-    if kind == KIND_PREPARE_AND_SOLVE:
-        legitimate.append(solve_request_payload(return_id=str(return_id or ""), **fields))
-    path = solve_request_path(ipc_folder, command_id)
-    payload = _read_json(path)
-    if not isinstance(payload, dict) or payload not in legitimate:
+    if advertised < WG_REQUEST_SCHEMA_VERSION:
+        if kind != KIND_PREPARE_AND_SOLVE:
+            raise WgOutdatedError(SEND_NEEDS_NEWER_WG_MESSAGE)
+        if not _PLAIN_ID.fullmatch(str(command_id)):
+            raise ValueError(
+                f"A solve command id must be a plain file name, got {command_id!r}."
+            )
+        payload = solve_request_payload(return_id=str(return_id or ""), **fields)
+    else:
+        payload = wg_request_payload(kind=kind, return_id=return_id, **fields)
+    return solve_request_path(ipc_folder, payload["commandId"]), payload
+
+
+def publish_wg_request(path: Path, payload: Mapping[str, Any]) -> Path:
+    """Write a planned request atomically under its final name (one attempt)."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _write_json_atomically(path, payload)
+
+
+def write_wg_request(ipc_folder: Path, **fields: Any) -> Path:
+    """Plan and write one Send or Solve into WG's request inbox (one attempt).
+
+    See :func:`plan_wg_request` for the versioning rule. Nothing is written on
+    a refusal.
+    """
+
+    path, payload = plan_wg_request(ipc_folder, **fields)
+    return publish_wg_request(path, payload)
+
+
+def _same_typed(found: Any, expected: Mapping[str, Any]) -> bool:
+    """Equal key for key, value for value and *type* for type.
+
+    Python's ``==`` calls ``4.0`` and ``True`` equal to ``4`` and ``1``; WG
+    does not read them as a schema, so neither may confirm one.
+    """
+
+    return (
+        isinstance(found, dict)
+        and set(found) == set(expected)
+        and all(
+            type(found[key]) is type(value) and found[key] == value
+            for key, value in expected.items()
+        )
+    )
+
+
+def landed_request(path: Path, payload: Mapping[str, Any]) -> Path | None:
+    """``path`` if it holds exactly ``payload`` -- the request this command planned.
+
+    Asked only when a write's outcome is unknown (C5, Amendment A1). "Sent" may
+    be reported only for a file equal to the complete request that was
+    attempted: every protocol field, ``schemaVersion``, ``target``, ``kind``
+    and ``returnId`` presence and value, each of the same JSON type. The
+    schema-3 Solve file confirms only when schema 3 was what this command
+    planned, never for a Send. A file larger than any request is not read
+    whole and is not confirmation. None otherwise.
+    """
+
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(_REQUEST_READ_LIMIT + 1)
+    except OSError:
+        return None
+    if len(raw) > _REQUEST_READ_LIMIT:
+        return None
+    try:
+        found = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not _same_typed(found, payload):
         return None
     return path
 
-#: A request file is a few hundred bytes; anything larger is not one of ours.
-_REQUEST_READ_LIMIT = 64 * 1024
 
 
 def untaken_requests(

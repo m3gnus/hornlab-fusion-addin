@@ -1152,9 +1152,11 @@ def _summary(operation: str, report: dict[str, object]) -> str:
 
 
 #: How many times a request write is tried before its outcome is settled (C5, A1).
+#: Known failures are retried too: the same id and bytes, so a retry is harmless.
 WG_REQUEST_WRITE_ATTEMPTS = 3
-#: The pause before the n-th retry is n times this, so all of them take well
-#: under a second of the main thread.
+#: The pause before the n-th retry is n times this: 0.45 s of pauses in all.
+#: That bounds the pauses, not the filesystem calls around them, which run on
+#: the calling (main) thread and have no deadline of their own.
 WG_REQUEST_RETRY_PAUSE_SECONDS = 0.15
 
 
@@ -1163,42 +1165,42 @@ def _retry_pause(seconds: float) -> None:
 
 
 def _write_wg_request(ipc: Path, **fields: object) -> tuple[Path, bool]:
-    """Write one request; retry the same id and fields; say whether it is confirmed.
+    """Write one request; retry the same bytes; say whether it is confirmed.
+
+    The request is planned once (``plan_wg_request``): WG's capability decides
+    its schema and the exact payload here, before the first attempt, and every
+    attempt writes that same payload -- A1's "same id and fields". A retry
+    never re-decides the schema, so a capability change mid-retry cannot
+    change what is written, and nothing but that payload can confirm it.
 
     Returns ``(path, True)`` when the request is known to be in WG's inbox as
-    this command wrote it, and ``(path, False)`` when that is **unconfirmed**
-    (M1 transfer contract C5, Amendment A1): a rename raised
-    (``WriteOutcomeUnknown`` -- it may have landed, and WG may have claimed,
-    accepted or refused it at once), every retry of the same id and fields
-    failed too, and the inbox does not hold this command's complete request.
-    Absence proves nothing then, so the caller must never say "not asked" or
-    advise a new request.
+    planned, and ``(path, False)`` when that is **unconfirmed** (M1 transfer
+    contract C5, Amendment A1): a rename raised (``WriteOutcomeUnknown`` -- it
+    may have landed, and WG may have claimed, accepted or refused it at once),
+    every retry failed too, and the inbox does not hold exactly the planned
+    request. Absence proves nothing then, so the caller must never say "not
+    asked" or advise a new request.
 
-    Raises only for what is known: a refusal before anything could have
-    landed (WG outdated, WG not collecting), or an ``OSError`` from every
-    attempt when none of them reached the rename -- nothing was written.
+    Raises only for what is known: a refusal while planning (WG outdated, WG
+    not collecting) -- nothing was attempted -- or an ``OSError`` from every
+    attempt when none of them reached the rename, so nothing was written.
     """
 
+    path, payload = wglink_watch.plan_wg_request(ipc, **fields)
     unknown = False
     last: OSError | None = None
     for attempt in range(WG_REQUEST_WRITE_ATTEMPTS):
         if attempt:
             _retry_pause(WG_REQUEST_RETRY_PAUSE_SECONDS * attempt)
         try:
-            return wglink_watch.write_wg_request(ipc, **fields), True
-        except (wglink_watch.WgOutdatedError, wglink_watch.WgNotCollectingError):
-            if not unknown:
-                raise
-            # A refusal now does not undo a write that may already have landed.
-            break
+            return wglink_watch.publish_wg_request(path, payload), True
         except OSError as exc:
             last = exc
             unknown = unknown or isinstance(exc, wglink_watch.WriteOutcomeUnknown)
-    landed = wglink_watch.landed_request(ipc, **fields)
-    if landed is not None:
-        return landed, True
+    if wglink_watch.landed_request(path, payload) is not None:
+        return path, True
     if unknown:
-        return wglink_watch.solve_request_path(ipc, str(fields["command_id"])), False
+        return path, False
     assert last is not None
     raise last
 

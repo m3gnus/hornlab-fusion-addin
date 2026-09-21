@@ -322,35 +322,37 @@ def test_a_write_whose_outcome_is_unknown_is_retried_once_with_the_same_id(
     """C5: the retry re-writes the same file; WG recovers it as the same operation."""
 
     fixture = _transfer(monkeypatch, tmp_path, "WGLink_retry_once")
-    real = fixture.module.wglink_watch.write_wg_request
-    calls: list[dict] = []
+    monkeypatch.setattr(fixture.module, "_retry_pause", lambda _seconds: None)
+    real = fixture.module.wglink_watch.publish_wg_request
+    calls: list[tuple] = []
 
-    def flaky(ipc, **fields):
-        calls.append(dict(fields))
+    def flaky(path, payload):
+        calls.append((path, dict(payload)))
         if len(calls) == 1:
-            real(ipc, **fields)
+            real(path, payload)
             raise OSError("the rename reported an error after it landed")
-        return real(ipc, **fields)
+        return real(path, payload)
 
-    monkeypatch.setattr(fixture.module.wglink_watch, "write_wg_request", flaky)
+    monkeypatch.setattr(fixture.module.wglink_watch, "publish_wg_request", flaky)
 
     _run(fixture.module, "send")
 
     assert len(calls) == 2 and calls[0] == calls[1]
     [payload] = _inbox(fixture.ipc)
-    assert payload["operationId"] == calls[0]["command_id"]
+    assert payload == calls[0][1]
     assert "Sent to Waveguide Generator" in fixture.ui.messages[-1][1]
 
 
 def test_a_write_that_keeps_failing_is_a_visible_refusal(monkeypatch, tmp_path: Path) -> None:
     fixture = _transfer(monkeypatch, tmp_path, "WGLink_write_fails")
+    monkeypatch.setattr(fixture.module, "_retry_pause", lambda _seconds: None)
     calls: list[int] = []
 
-    def failing(_ipc, **_fields):
+    def failing(_path, _payload):
         calls.append(1)
         raise OSError("disk full")
 
-    monkeypatch.setattr(fixture.module.wglink_watch, "write_wg_request", failing)
+    monkeypatch.setattr(fixture.module.wglink_watch, "publish_wg_request", failing)
 
     _run(fixture.module, "solve")
 
@@ -363,15 +365,21 @@ def test_a_write_that_keeps_failing_is_a_visible_refusal(monkeypatch, tmp_path: 
 def test_a_refusal_is_an_answer_and_is_never_retried(monkeypatch, tmp_path: Path) -> None:
     fixture = _transfer(monkeypatch, tmp_path, "WGLink_refusal_not_retried", advertised=2)
     calls: list[int] = []
-    real = fixture.module.wglink_watch.write_wg_request
+    published: list[int] = []
+    real = fixture.module.wglink_watch.plan_wg_request
 
     def counting(ipc, **fields):
         calls.append(1)
         return real(ipc, **fields)
 
-    monkeypatch.setattr(fixture.module.wglink_watch, "write_wg_request", counting)
+    monkeypatch.setattr(fixture.module.wglink_watch, "plan_wg_request", counting)
+    monkeypatch.setattr(
+        fixture.module.wglink_watch, "publish_wg_request", lambda *_a: published.append(1)
+    )
 
     _run(fixture.module, "solve")
+
+    assert published == []
 
     assert calls == [1]
 

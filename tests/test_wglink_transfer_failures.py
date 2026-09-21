@@ -463,31 +463,95 @@ def test_a_file_that_is_not_this_complete_request_is_not_confirmation(
     tmp_path: Path, variant: str
 ) -> None:
     kind, change = _NOT_THIS_REQUEST[variant]
-    _place(tmp_path, change(_legitimate(kind)))
+    planned = _legitimate(kind)
+    path = _place(tmp_path, change(planned))
 
-    assert wglink_watch.landed_request(
-        tmp_path, kind=kind, return_id="wgr_1" if kind == SOLVE else None, **_FIELDS
-    ) is None
+    assert wglink_watch.landed_request(path, planned) is None
+
+
+# R1a: equal under Python's ``==`` but not the same JSON type -- not a request WG reads.
+_WRONG_TYPE = {
+    "float schema, Send": (SNAPSHOT, _with("schemaVersion", 4.0)),
+    "float schema, Solve": (SOLVE, _with("schemaVersion", 4.0)),
+    "string schema": (SNAPSHOT, _with("schemaVersion", "4")),
+    "numeric returnId": (SOLVE, _with("returnId", 1)),
+    "null returnId": (SOLVE, _with("returnId", None)),
+    "list target": (SNAPSHOT, _with("target", ["waveguide-generator"])),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(_WRONG_TYPE))
+def test_a_field_of_another_type_is_not_confirmation(tmp_path: Path, variant: str) -> None:
+    kind, change = _WRONG_TYPE[variant]
+    planned = _legitimate(kind)
+    path = _place(tmp_path, change(planned))
+
+    assert wglink_watch.landed_request(path, planned) is None
+
+
+def test_a_bool_is_not_an_int_schema(tmp_path: Path) -> None:
+    """``True == 1``; a planned schema-1 payload is hypothetical, so compare directly."""
+
+    planned = {**_legitimate(SNAPSHOT), "schemaVersion": 1}
+    path = _place(tmp_path, {**planned, "schemaVersion": True})
+
+    assert wglink_watch.landed_request(path, planned) is None
 
 
 @pytest.mark.parametrize(
     ("kind", "schema"), [(SNAPSHOT, 4), (SOLVE, 4), (SOLVE, 3)], ids=["send-4", "solve-4", "solve-3"]
 )
 def test_control_the_complete_request_is_confirmation(tmp_path: Path, kind: str, schema: int) -> None:
-    path = _place(tmp_path, _legitimate(kind, schema))
+    planned = _legitimate(kind, schema)
+    path = _place(tmp_path, planned)
 
-    assert wglink_watch.landed_request(
-        tmp_path, kind=kind, return_id="wgr_1" if kind == SOLVE else None, **_FIELDS
-    ) == path
+    assert wglink_watch.landed_request(path, planned) == path
+
+
+@pytest.mark.parametrize(("planned_schema", "found_schema"), [(4, 3), (3, 4)])
+def test_a_solve_file_of_the_schema_not_planned_is_not_confirmation(
+    tmp_path: Path, planned_schema: int, found_schema: int
+) -> None:
+    """R1b: only the schema this command chose, never the other one."""
+
+    path = _place(tmp_path, _legitimate(SOLVE, found_schema))
+
+    assert wglink_watch.landed_request(path, _legitimate(SOLVE, planned_schema)) is None
 
 
 @pytest.mark.parametrize("return_id", ["", "wgr_1"])
 def test_a_schema_3_file_is_never_confirmation_for_a_send(tmp_path: Path, return_id: str) -> None:
     """A schema-3 reader ignores ``kind``: that file would be a Solve."""
 
-    _place(tmp_path, wglink_watch.solve_request_payload(return_id=return_id, **_FIELDS))
+    path = _place(tmp_path, wglink_watch.solve_request_payload(return_id=return_id, **_FIELDS))
 
-    assert wglink_watch.landed_request(tmp_path, kind=SNAPSHOT, return_id=None, **_FIELDS) is None
+    assert wglink_watch.landed_request(path, _legitimate(SNAPSHOT)) is None
+
+
+def test_a_file_over_the_size_cap_is_not_read_as_confirmation(tmp_path: Path) -> None:
+    planned = _legitimate(SNAPSHOT)
+    padded = json.dumps(planned) + " " * (64 * 1024)
+    path = _place(tmp_path, planned)
+    path.write_text(padded)
+    assert json.loads(path.read_text()) == planned  # the same request, only too large
+
+    assert wglink_watch.landed_request(path, planned) is None
+
+
+def test_a_capability_that_changes_between_attempts_does_not_change_the_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The schema is decided once; every attempt writes the same bytes (A1)."""
+
+    _advertise(tmp_path, 4)
+    planned_path, planned = wglink_watch.plan_wg_request(
+        tmp_path, kind=SOLVE, return_id="wgr_1", **_FIELDS
+    )
+    _advertise(tmp_path, 3)
+
+    assert planned["schemaVersion"] == 4 and planned["kind"] == SOLVE
+    assert wglink_watch.publish_wg_request(planned_path, planned) == planned_path
+    assert json.loads(planned_path.read_text()) == planned
 
 
 def _fixed_command(monkeypatch, fixture) -> dict:
@@ -572,31 +636,136 @@ def test_a_request_wg_took_before_the_re_read_is_unconfirmed_never_not_asked(
     assert _inbox(fixture.ipc) == []
 
 
-def test_a_capability_refusal_on_the_retry_after_an_unknown_write_is_unconfirmed(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """WG took the first write and then stopped collecting: the refusal met on
-    the retry says nothing about the write that may already have landed."""
+def _staged_payloads(watch, behaviour):
+    """A ``replace`` that records what each attempt staged, then does ``behaviour``."""
 
-    fixture = _transfer(monkeypatch, tmp_path, "WGLink_r2_refused_on_retry")
+    staged: list[dict] = []
+
+    def replace(source, destination):
+        staged.append(json.loads(Path(source).read_text()))
+        return behaviour(len(staged), source, destination)
+
+    return staged, replace
+
+
+@pytest.mark.parametrize("afterwards", [None, 3], ids=["stops-collecting", "reads-only-3"])
+def test_a_capability_change_after_an_unknown_write_changes_nothing_that_is_retried(
+    monkeypatch, tmp_path: Path, afterwards: object
+) -> None:
+    """WG took the first write and then stopped collecting, or became a WG that
+    reads only schema 3. The retries write the planned request unchanged and are
+    never refused on the new capability: that says nothing about a write that
+    may already have landed."""
+
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r2_capability_{afterwards}")
     watch = _watch(fixture)
     real_replace = watch.os.replace
     _paused(monkeypatch, fixture)
-    destinations: list[Path] = []
 
-    def landed_taken_then_wg_stops(source, destination):
-        destinations.append(Path(destination))
+    def first_landed_then_held(count, source, destination):
+        if count > 1:
+            raise _sharing_violation()
         real_replace(source, destination)
         Path(destination).unlink()  # WG took it
-        _advertise(fixture.ipc, None)  # and stopped collecting
+        _advertise(fixture.ipc, afterwards)
         raise OSError(errno.EIO, "the rename reported an error after it landed")
 
-    monkeypatch.setattr(watch, "os", _os_with(watch, replace=landed_taken_then_wg_stops))
+    staged, replace = _staged_payloads(watch, first_landed_then_held)
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=replace))
 
-    _run(fixture.module, "send")
+    _run(fixture.module, "solve")
 
-    assert len(destinations) == 1
-    _assert_unconfirmed(fixture, destinations[0].stem)
+    assert len(staged) == fixture.module.WG_REQUEST_WRITE_ATTEMPTS
+    assert all(payload == staged[0] for payload in staged)
+    assert staged[0]["schemaVersion"] == 4 and staged[0]["kind"] == SOLVE
+    _assert_unconfirmed(fixture, staged[0]["operationId"])
+
+
+@pytest.mark.parametrize(("advertised", "stale_schema"), [(4, 3), (3, 4)])
+def test_a_solve_file_of_the_schema_not_attempted_does_not_say_sent(
+    monkeypatch, tmp_path: Path, advertised: int, stale_schema: int
+) -> None:
+    """R1b, the review's reproductions: every attempt writes the schema WG
+    advertises and fails; a file of the other schema under the same id is not
+    this command's request."""
+
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r1b_{advertised}", advertised=advertised)
+    watch = _watch(fixture)
+    fields = _fixed_command(monkeypatch, fixture)
+    _paused(monkeypatch, fixture)
+    stale = (
+        watch.solve_request_payload(return_id="wgr_1", **fields)
+        if stale_schema == 3
+        else watch.wg_request_payload(kind=SOLVE, return_id="wgr_1", **fields)
+    )
+    path = _place(fixture.ipc, stale)
+
+    def refuse(_count, _source, _destination):
+        raise _sharing_violation()
+
+    staged, replace = _staged_payloads(watch, refuse)
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=replace))
+
+    _run(fixture.module, "solve")
+
+    assert [payload["schemaVersion"] for payload in staged] == [advertised] * 3
+    assert json.loads(path.read_text()) == stale
+    _assert_unconfirmed(fixture, fields["command_id"])
+
+
+@pytest.mark.parametrize("advertised", [4, 3])
+def test_control_a_solve_file_of_the_schema_attempted_says_sent(
+    monkeypatch, tmp_path: Path, advertised: int
+) -> None:
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r1b_control_{advertised}", advertised=advertised)
+    watch = _watch(fixture)
+    fields = _fixed_command(monkeypatch, fixture)
+    _paused(monkeypatch, fixture)
+    attempted = (
+        watch.solve_request_payload(return_id="wgr_1", **fields)
+        if advertised == 3
+        else watch.wg_request_payload(kind=SOLVE, return_id="wgr_1", **fields)
+    )
+    _place(fixture.ipc, attempted)
+
+    def refuse(_count, _source, _destination):
+        raise _sharing_violation()
+
+    staged, replace = _staged_payloads(watch, refuse)
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=replace))
+
+    _run(fixture.module, "solve")
+
+    assert staged == [attempted] * 3
+    assert "Sent to Waveguide Generator" in fixture.ui.messages[-1][1]
+    assert _outcome(fixture) == "requested"
+
+
+@pytest.mark.parametrize("operation", ["send", "solve"])
+def test_a_float_schema_under_the_same_id_does_not_say_sent(
+    monkeypatch, tmp_path: Path, operation: str
+) -> None:
+    """R1a, the review's reproduction, through the command."""
+
+    fixture = _transfer(monkeypatch, tmp_path, f"WGLink_r1a_{operation}")
+    watch = _watch(fixture)
+    fields = _fixed_command(monkeypatch, fixture)
+    _paused(monkeypatch, fixture)
+    kind = SOLVE if operation == "solve" else SNAPSHOT
+    planned = watch.wg_request_payload(
+        kind=kind, return_id="wgr_1" if kind == SOLVE else None, **fields
+    )
+    path = _place(fixture.ipc, {**planned, "schemaVersion": 4.0})
+
+    def refuse(_source, _destination):
+        raise _sharing_violation()
+
+    monkeypatch.setattr(watch, "os", _os_with(watch, replace=refuse))
+
+    _run(fixture.module, operation)
+
+    assert isinstance(json.loads(path.read_text())["schemaVersion"], float)
+    _assert_unconfirmed(fixture, fields["command_id"])
 
 
 def test_control_a_capability_refusal_with_nothing_attempted_is_still_refused(

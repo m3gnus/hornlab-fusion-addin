@@ -244,16 +244,22 @@ Commands and requests cross through WG's machine-local IPC folder,
   command time: "Sent to Waveguide Generator (request …)", or why WG was not
   asked. Pressing Send again is a new request. A second request never
   replaces one WG has not read yet. The file is staged under a hidden name,
-  synced and renamed into place, so WG never sees part of one. A failure
-  before the rename wrote nothing and is refused ("not asked"). A rename that
-  raises may still have landed -- and WG may take the file at once -- so the
-  same id and fields are written again, up to three attempts in all, with a
-  short pause. If none succeeds, WGLink reads the inbox once more: a file equal
-  to this command's complete request (every field, the schema-3 Solve
-  included) is "Sent"; anything else is **Unconfirmed** -- the short request id,
+  synced and renamed into place, so WG never sees part of one. The request is
+  planned once: WG's capability decides its schema and exact contents before
+  the first attempt, and every attempt writes that same request -- a retry
+  never re-decides the schema. Any failed attempt is retried, up to three
+  attempts in all with a short pause (0.45 s of pauses; the file operations
+  themselves have no deadline). If none succeeds, the outcome depends on how
+  they failed. When no attempt reached the rename, nothing was written and
+  the command is refused ("not asked"). When a rename raised, the file may
+  still have landed -- and WG may take it at once -- so WGLink reads the inbox
+  once more: a file equal to the planned request, field for field and type for
+  type, is "Sent"; anything else is **Unconfirmed** -- the short request id,
   "WG may already have it", and a pointer to WG's CAD Link panel before
   sending again. Unconfirmed never says "not asked", and it gets the pickup
-  check like a sent request (contract Amendment A1).
+  check like a sent request (contract Amendment A1). "Never replaces" rests on
+  each request id being a fresh `uuid4`: a rename replaces whatever holds its
+  name.
 - **The pickup check.** A minute after a Send or Solve, a one-shot timer asks
   on the main thread whether the request file is still there, and only that;
   if it is, WGLink says once that WG is closed, older than the add-in, or not

@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -2672,6 +2673,209 @@ def _verify_resample_identity(bundle: object, payload: Mapping[str, Any]) -> Non
     )
 
 
+#: How long a killed resampler tree gets to close its pipes before WGLink stops
+#: waiting for its output. Bounded, so a descendant that somehow escaped the
+#: tree can never hang Fusion's main thread.
+_CONTAINED_REAP_SECONDS = 5.0
+#: ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` and ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``.
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class _WindowsJob:
+    """A kill-on-close job object holding the one process tree WGLink started."""
+
+    def __init__(self, handle: Any, kernel32: Any) -> None:
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    def terminate(self) -> None:
+        try:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+        except Exception:  # noqa: BLE001 - the direct kill below still runs
+            pass
+
+    def close(self) -> None:
+        try:
+            self._kernel32.CloseHandle(self._handle)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _confine_to_windows_job(process: subprocess.Popen) -> _WindowsJob | None:
+    """Put the child WGLink just started, and what it starts, in a job object.
+
+    The same approach as Waveguide Generator's ``server/platform/process_tree``.
+    Best effort: the resampler must still run where the job API is refused
+    (a Fusion already inside a job that forbids nesting), and then a timeout
+    kills the direct child only, as before. The child is assigned right after
+    it starts; the resampler imports for far longer than that before it could
+    start a process of its own.
+    """
+
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_uint64)
+                for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+                )
+            ]
+
+        class _ExtendedLimits(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimits),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        limits = _ExtendedLimits()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            kernel32.CloseHandle(job)
+            return None
+        # PROCESS_SET_QUOTA | PROCESS_TERMINATE, on the pid Popen still holds a
+        # handle to -- so it cannot have been reused for anyone else's process.
+        handle = kernel32.OpenProcess(0x0100 | 0x0001, False, int(process.pid))
+        if not handle:
+            kernel32.CloseHandle(job)
+            return None
+        try:
+            assigned = kernel32.AssignProcessToJobObject(job, handle)
+        finally:
+            kernel32.CloseHandle(handle)
+        if not assigned:
+            kernel32.CloseHandle(job)
+            return None
+        return _WindowsJob(job, kernel32)
+    except Exception:  # noqa: BLE001 - containment is best effort; see above
+        return None
+
+
+def _kill_started_tree(process: subprocess.Popen, job: _WindowsJob | None) -> None:
+    """Kill the tree ``process`` leads -- and nothing WGLink did not start.
+
+    This is the add-in's only process kill. Its sole target is a child this
+    module started a moment ago through :func:`_run_contained`:
+
+    * Windows: the job object that child was put in, then the child itself.
+    * POSIX: the process group the child leads. ``start_new_session`` made the
+      child a session leader, so its group id is its own pid, and its
+      descendants are in that group. The child is still unreaped (only
+      ``Popen`` reaps it, and it has not been asked to), so its pid cannot yet
+      name anybody else's process. A group the child does not lead is never
+      signalled.
+    """
+
+    if job is not None:
+        job.terminate()
+    elif os.name == "posix" and process.returncode is None:
+        try:
+            group = os.getpgid(process.pid)
+        except OSError:
+            # A zombie leader on some kernels: the unreaped pid is still ours
+            # and still names the session it created.
+            group = process.pid
+        if group == process.pid:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
+def _run_contained(
+    command: Sequence[str],
+    *,
+    cwd: str,
+    env: Mapping[str, str],
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run(..., timeout=)`` whose timeout kills the whole tree it started.
+
+    ``subprocess.run`` kills only its direct child. A resampler that started
+    a process of its own would leave it running after the timeout -- and on
+    Windows ``run`` then waits for that orphan to close the output pipes it
+    inherited, so the timeout would not bound Fusion's wait at all. Here the
+    child starts in its own session (POSIX) or a kill-on-close job object
+    (Windows), and a timeout kills that, then waits a bounded time for the
+    pipes.
+    """
+
+    windows = os.name == "nt"
+    process = subprocess.Popen(
+        list(command),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=not windows,
+    )
+    job = _confine_to_windows_job(process) if windows else None
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            _kill_started_tree(process, job)
+            try:
+                process.communicate(timeout=_CONTAINED_REAP_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+    finally:
+        if job is not None:
+            job.close()
+
+
 def _resample_payload(
     bundle_path: str | os.PathLike[str],
     topology: dict[str, Any],
@@ -2700,16 +2904,11 @@ def _resample_payload(
             str(output_path),
         ]
         try:
-            completed = subprocess.run(
+            completed = _run_contained(
                 command,
                 cwd=str(repo_root),
                 env=_subprocess_env(),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
                 timeout=timeout,
-                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise WgLinkError(

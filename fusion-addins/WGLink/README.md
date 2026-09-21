@@ -156,7 +156,9 @@ Relink remain full head-less APIs but are not panel commands.
   single-instance handoffs still resolve automatically.
 - **Update** reads the stored bundle path, resamples the new grid outside
   Fusion, validates the existing sketch topology, rolls the timeline back, and
-  moves fit points in place. Before its first mutation it also verifies that
+  moves fit points in place. The resampler runs in its own session (a job
+  object on Windows); its timeout kills that whole tree, and WGLink never
+  signals a process it did not start. Before its first mutation it also verifies that
   the tagged throat face remains in the component-local link frame. It creates
   and deletes no document features. If the stored path is missing, Update
   searches WG's current workspace for the same design id, selects its highest
@@ -237,16 +239,35 @@ Commands and requests cross through WG's machine-local IPC folder,
   command time: "Sent to Waveguide Generator (request …)", or why WG was not
   asked. A write whose outcome is unknown is retried once with the same id and
   fields; pressing Send again is a new request. A second request never
-  replaces one WG has not read yet.
+  replaces one WG has not read yet. The file is staged under a hidden name,
+  synced and renamed into place, so WG never sees part of one; when every
+  attempt raised, WGLink reads the inbox once more, and a file holding exactly
+  this request is reported as sent, because it was.
 - **The pickup check.** A minute after a Send or Solve, a one-shot timer asks
   on the main thread whether the request file is still there, and only that;
   if it is, WGLink says once that WG is closed, older than the add-in, or not
   collecting requests. It is counted under the command that wrote the file.
+  The timer does not survive a restart, so at start-up WGLink looks once at
+  the inbox for its own request files WG has not taken -- reading nothing in
+  Fusion, counted under `startup` -- and says once, with the same three causes,
+  how many are waiting. Files already older than a minute are checked at once;
+  if one is younger, the single check waits until it has had its minute.
 - **Items an earlier session queued** in `.wglink-outbox` are converted at
   start-up, before any live thread starts, against what WG advertises then:
   into request files at schema 4; at 3, solves convert and snapshots are left
   for the live worker when one will run (otherwise dropped, with one notice);
-  with nothing advertised, nothing moves until a later start-up.
+  with nothing advertised, nothing moves until a later start-up. An item whose
+  write fails, or whose outbox file is held, is kept and reported once; the next
+  start-up writes it again under the same id, which WG recovers as the same
+  operation. A failure of the conversion as a whole is reported the same way
+  and never stops start-up.
+- **Two Fusion processes on one WG data folder.** Requests stay apart: each
+  has a fresh `uuid4` id and its own file. Return bundle names are reserved
+  with an exclusive create, so two processes never publish over each other.
+  **Known limit:** `.fusion-status.json` is one file, and the last writer wins,
+  so two Fusion processes overwrite each other's status for WG. The live
+  lease is per process; a cross-process lease waits for the activation-boundary
+  decision.
 - **WG's requests.** Return requests and handoffs arrive as
   `.fusion-return-requests/<id>.json` and `.fusion-handoffs/<id>.json`. WGLink
   takes them in `deliverySequence` order, claims each by renaming it to a

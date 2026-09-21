@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from typing import Any, Iterable, Mapping, TypeVar
 import uuid
 
@@ -106,6 +107,19 @@ WG_OUTDATED_MESSAGE = (
     "exchange requests. Update Waveguide Generator; it installs the WGLink that "
     "matches it."
 )
+
+
+# The same three causes, for requests a restart found still waiting (A8 brief 5):
+# the pickup timer that would have said so did not survive the restart.
+def requests_not_taken_at_startup_message(count: int) -> str:
+    return (
+        f"{count} request(s) from Fusion to Waveguide Generator that were waiting "
+        "when WGLink started have not been picked up. Either WG is closed, or it "
+        "is older than this WGLink add-in, or it is not collecting requests from "
+        "Fusion. Open Waveguide Generator (update it if an older version is "
+        "running). The requests wait in the WGLink folder and are handled once WG "
+        "takes them."
+    )
 
 
 class WgOutdatedError(RuntimeError):
@@ -351,6 +365,104 @@ def write_wg_request(
     path.parent.mkdir(parents=True, exist_ok=True)
     return _write_json_atomically(path, payload)
 
+
+def landed_request(
+    ipc_folder: Path,
+    *,
+    kind: str,
+    command_id: str,
+    bundle_relative: str,
+    manifest_sha256: str,
+    requested_at: str,
+    **_ignored: object,
+) -> Path | None:
+    """The request file for ``command_id`` if it is in the inbox, whole and ours.
+
+    Asked only after every write attempt raised: an ``OSError`` during or
+    after the rename can leave a file that did land (C5). The rename is
+    atomic, so a file under the final name that parses and names this
+    command's id and return is the write that landed -- the id is a fresh
+    ``uuid4``, so nobody else wrote it. None when it is absent or anything
+    else, and then the failure stands.
+    """
+
+    if not _PLAIN_ID.fullmatch(str(command_id)):
+        return None
+    path = solve_request_path(ipc_folder, command_id)
+    payload = _read_json(path)
+    if not isinstance(payload, dict):
+        return None
+    expected = {
+        "commandId": str(command_id),
+        "operationId": str(command_id),
+        "bundlePath": str(bundle_relative),
+        "manifestSha256": str(manifest_sha256),
+        "requestedAt": str(requested_at),
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        return None
+    if "kind" in payload and payload["kind"] != kind:
+        return None
+    return path
+
+
+#: A request file is a few hundred bytes; anything larger is not one of ours.
+_REQUEST_READ_LIMIT = 64 * 1024
+
+
+def untaken_requests(
+    ipc_folder: Path,
+    *,
+    limit: int,
+    now: float | None = None,
+) -> list[tuple[Path, float]]:
+    """WGLink's request files still in WG's inbox, with how long each has waited.
+
+    Bounded: at most ``limit`` directory entries are looked at, and a file is
+    read only if it is small. Only files under their final name count -- WG
+    claims a file by renaming it to a hidden name, and staging names start
+    with "." too -- and only those that parse as a WGLink request to WG under
+    their own id. Reads the inbox and nothing else. The age is from the file's
+    modification time, so a request converted from the outbox at this very
+    start-up is young even though its ``requestedAt`` is old.
+    """
+
+    folder = Path(ipc_folder).expanduser().resolve() / SOLVE_REQUESTS_DIRECTORY
+    moment = time.time() if now is None else float(now)
+    found: list[tuple[Path, float]] = []
+    try:
+        entries = os.scandir(folder)
+    except OSError:
+        return found
+    with entries:
+        for examined, entry in enumerate(entries):
+            if examined >= limit:
+                break
+            name = entry.name
+            if name.startswith(".") or not name.endswith(".json"):
+                continue
+            stem = name[: -len(".json")]
+            if not _PLAIN_ID.fullmatch(stem):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                status = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if status.st_size > _REQUEST_READ_LIMIT:
+                continue
+            payload = _read_json(Path(entry.path))
+            if (
+                not isinstance(payload, dict)
+                or payload.get("target") != "waveguide-generator"
+                or payload.get("commandId") != stem
+                or payload.get("schemaVersion")
+                not in (REQUEST_SCHEMA_VERSION, WG_REQUEST_SCHEMA_VERSION)
+            ):
+                continue
+            found.append((Path(entry.path), max(0.0, moment - status.st_mtime)))
+    return found
 
 def require_solve_delivery(ipc_folder: Path) -> None:
     """``WgOutdatedError`` unless WG reads this add-in's solve-command version."""

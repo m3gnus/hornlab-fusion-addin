@@ -1936,7 +1936,7 @@ def _run_resampler_in_process(core, monkeypatch, transform=None):
         calls.append(options)
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(core.subprocess, "run", fake_run)
+    monkeypatch.setattr(core, "_run_contained", fake_run)
     monkeypatch.setattr(core, "_repo_root", lambda _options: ROOT)
     monkeypatch.setattr(core, "_python_for_resampler", lambda _root, _options: Path(sys.executable))
     return calls

@@ -1160,6 +1160,12 @@ def _write_wg_request(ipc: Path, **fields: object) -> Path:
     re-writes the same file with the same id and fields, which WG recovers as
     the same operation (C5). A refusal -- WG outdated, WG not collecting -- is
     an answer, not an unknown, and is never retried.
+
+    When every attempt raised, the inbox is read once more: a file under the
+    final name that holds exactly this request is a write that landed (the
+    first rename succeeded and reported an error, say, and the retry's rename
+    then hit a sharing violation). Reporting "not asked" for it would be
+    false, and a user who pressed Send again would make a second operation.
     """
 
     last: OSError | None = None
@@ -1169,6 +1175,9 @@ def _write_wg_request(ipc: Path, **fields: object) -> Path:
         except OSError as exc:
             last = exc
     assert last is not None
+    landed = wglink_watch.landed_request(ipc, **fields)
+    if landed is not None:
+        return landed
     raise last
 
 
@@ -1229,9 +1238,14 @@ def _schedule_pickup_check(path: Path, channel: str, request_id: str) -> None:
     whether or not automatic coordination is on.
     """
 
-    job = wglink_activity.carrying(
-        lambda: _pickup_check(path, channel, request_id)
+    _start_pickup_timer(
+        wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS,
+        wglink_activity.carrying(lambda: _pickup_check(path, channel, request_id)),
     )
+
+
+def _start_pickup_timer(delay: float, job: object) -> None:
+    """A one-shot timer that hands ``job`` to the main thread through the follow-up event."""
 
     def due() -> None:
         with _followups_lock:
@@ -1241,7 +1255,7 @@ def _schedule_pickup_check(path: Path, channel: str, request_id: str) -> None:
         except Exception:  # noqa: BLE001 - a torn-down event: the add-in is stopping
             pass
 
-    _start_timer(wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS, due)
+    _start_timer(delay, due)
 
 
 def _start_timer(delay: float, function: object) -> object:
@@ -1265,6 +1279,66 @@ def _pickup_check(path: Path, channel: str, request_id: str) -> None:
     _modal(wglink_watch.REQUEST_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} request waiting")
 
 
+#: At most this many inbox entries are looked at when WGLink starts.
+STARTUP_RECHECK_LIMIT = 256
+
+
+def _recheck_requests_at_startup() -> None:
+    """The pickup check a restart lost (C6; A8 brief 5). Start-up only, bounded.
+
+    A Send or Solve's pickup check is an in-memory timer, so stopping WGLink
+    or Fusion within the minute loses it, and a request WG never takes would
+    then wait unreported. At start-up this looks once at WG's inbox for
+    WGLink's request files still under their final name -- files WG has not
+    claimed -- and reads nothing else: no document, no link, no geometry. It
+    runs whatever the activation gate says (C8), under the ``startup`` cause.
+
+    One check, one notice at most. Every file already older than the pickup
+    window is checked now; if any is younger (written within the last minute,
+    or converted from the outbox just now) the one check waits until the
+    youngest has had its full window, so WG gets the same minute a pickup
+    check always gives it. Nothing is waiting: no check, and no timer.
+    """
+
+    ipc = wglink_workspace.ipc_folder()
+    if ipc is None:
+        return
+    try:
+        pending = wglink_watch.untaken_requests(ipc, limit=STARTUP_RECHECK_LIMIT)
+        if not pending:
+            return
+        paths = [path for path, _age in pending]
+        remaining = wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS - min(age for _path, age in pending)
+        job = wglink_activity.carrying(lambda: _startup_pickup_check(paths))
+        if remaining <= 0.0:
+            job()
+        else:
+            _start_pickup_timer(remaining, job)
+    except Exception as exc:  # noqa: BLE001 - a notice must never stop start-up
+        _log(f"[{PANEL_NAME}] could not re-check waiting requests at start-up: {exc}")
+
+
+def _startup_pickup_check(paths: list[Path]) -> None:
+    wglink_activity.record(wglink_activity.PICKUP_CHECK)
+    waiting = [path for path in paths if path.exists()]
+    for path in paths:
+        _note_outcome("startup", path.stem, "notTaken" if path in waiting else "taken")
+    if waiting:
+        _modal(
+            wglink_watch.requests_not_taken_at_startup_message(len(waiting)),
+            f"{PANEL_NAME} request waiting",
+        )
+
+
+#: What an item that start-up could not convert still has: it is kept, and the
+#: next start-up writes it again under its own id -- never a new one.
+OUTBOX_KEPT_TEXT = (
+    "Nothing was dropped. They stay in the WGLink folder, and WGLink tries again "
+    "the next time it starts, under the same request ids, so Waveguide Generator "
+    "never runs one twice. Restart Fusion once the folder is writable."
+)
+
+
 def _convert_outbox_at_startup() -> None:
     """Move unanswered live-outbox items onto the one path (C1, E1). Start-up only.
 
@@ -1286,11 +1360,27 @@ def _convert_outbox_at_startup() -> None:
         )
     except Exception as exc:  # noqa: BLE001 - the commands must still load
         _log(f"[{PANEL_NAME}] could not convert queued deliveries: {exc}")
+        _message(
+            "WGLink could not hand the requests an earlier session queued for "
+            f"Waveguide Generator over at start-up: {exc}\n\n"
+            + OUTBOX_KEPT_TEXT,
+            f"{PANEL_NAME} earlier requests waiting",
+        )
         return
     for operation_id in result["converted"]:
         _note_outcome("outbox", operation_id, "converted")
     for operation_id in result["abandoned"]:
         _note_outcome("outbox", operation_id, "notDelivered")
+    for operation_id in result["failed"]:
+        _note_outcome("outbox", operation_id, "conversionFailed")
+    if result["failed"]:
+        _message(
+            f"{len(result['failed'])} request(s) an earlier session queued for "
+            "Waveguide Generator could not be moved into WG's request folder at "
+            "start-up: the WGLink folder could not be written, or a file in it "
+            "was held by another program.\n\n" + OUTBOX_KEPT_TEXT,
+            f"{PANEL_NAME} earlier requests waiting",
+        )
     if result["abandoned"]:
         _message(
             f"{len(result['abandoned'])} earlier Send(s) to Waveguide Generator were "
@@ -4160,7 +4250,8 @@ def _start_followups(app: object) -> bool:
     and neither the watch nor the live event, so engines A to E stay dormant
     in the tree. It is raised only by a command's own completion
     (:func:`_schedule_followup`) or by the one-shot pickup timer a Send or
-    Solve starts (:func:`_schedule_pickup_check`).
+    Solve starts (:func:`_schedule_pickup_check`), or that start-up starts
+    for a request it found still waiting (:func:`_recheck_requests_at_startup`).
     """
 
     global _followup_event, _followup_handler
@@ -4373,6 +4464,8 @@ def _build_owner(app: object, ui: object) -> None:
         _owned = True
         # Before any live thread starts, and whatever the gate says (C1).
         _convert_outbox_at_startup()
+        # The pickup checks a restart lost, whatever the gate says (C6, C8).
+        _recheck_requests_at_startup()
         if not _coordinating():
             _start_without_coordination()
             return

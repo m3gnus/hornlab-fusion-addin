@@ -1554,8 +1554,8 @@ def _strict_assembly_from_link(
             "it were real.\n\n"
             "Check that the waveguide's component is still in the design. If it "
             "was deleted or replaced, undo that and send again. If it is there "
-            "and this keeps happening, insert the waveguide from WG again and "
-            "send that copy.\n\n"
+            "and this keeps happening, do not insert a second copy; report it, "
+            "with this message, so the cause can be found.\n\n"
             f"(WGLink link {instance_id}: no wrapper occurrence could be resolved.)"
         )
     if len(occurrences) > 1:

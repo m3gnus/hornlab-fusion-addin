@@ -271,9 +271,10 @@ occurrence where it already is and never moves it back to the origin.)
 - **"WGLink cannot find the component that holds the WG waveguide …"** — Send
   could not find the component the waveguide was inserted into, so it cannot
   say where the waveguide sits, and it will not guess. If you deleted or
-  replaced that component, undo it and send again. If it is still there,
-  insert the waveguide from WG again and send that copy. What makes the
-  component unfindable in the remaining cases is not yet known.
+  replaced that component, undo it and send again. If it is still there, do
+  not insert a second copy (a whole-assembly Send would carry both); report it
+  with the message. What makes the component unfindable in that case is not
+  yet known.
 - **The panel is missing after a Fusion restart** — tick Run on Startup for
   WGLink (see Install); Fusion's toggle overrides the manifest.
 - **"WGLink helper body … is still visible"** on Send — a freestanding

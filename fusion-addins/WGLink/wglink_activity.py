@@ -53,6 +53,9 @@ CAUSE_SHUTDOWN = "shutdown"
 #: replay, once per claim. Bounded like start-up, and counted apart from it so a
 #: run can say exactly how much of its start-up work was this.
 CAUSE_CLAIM_SETTLEMENT = "claim-settlement"
+#: A standby registration promoting itself after the owner's lease lapsed. Its
+#: candidate thread's timer starts it, so it is a finding between commands.
+CAUSE_PROMOTION = "promotion"
 #: No cause was declared. Deliberately not a synonym for ``command``.
 CAUSE_UNATTRIBUTED = "unattributed"
 
@@ -237,6 +240,7 @@ def carrying(function: Callable[..., object]) -> Callable[..., object]:
 
 __all__ = [
     "CAUSE_CLAIM_SETTLEMENT",
+    "CAUSE_PROMOTION",
     "CAUSE_COMMAND",
     "CAUSE_LIVE",
     "CAUSE_SHUTDOWN",

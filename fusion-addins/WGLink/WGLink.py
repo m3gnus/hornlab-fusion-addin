@@ -296,8 +296,21 @@ def _modal(text: str, title: str) -> None:
     try:
         _message(text, title)
     finally:
-        _command_busy = False
-        _command_finished()
+        _release_command_busy()
+
+
+def _release_command_busy() -> None:
+    """Clear ``_command_busy`` and re-drive whatever waited behind it.
+
+    The only way the flag is cleared. Work deferred behind a busy holder --
+    a pickup check, a command's follow-up, a live request -- is queued rather
+    than dropped, and nothing but this re-raises it: the tick does not drain
+    follow-ups, and with coordination off there is no tick.
+    """
+
+    global _command_busy
+    _command_busy = False
+    _command_finished()
 
 # What one IPC channel did for a single watch tick. The distinction exists
 # because suppressing a repeat error is not the same as doing work: a refused
@@ -1396,6 +1409,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         # Hold the watcher off: it must not open a prompt over a running
         # command, and an operation that rewrites a link's stored export id
         # would otherwise be surveyed halfway through.
+        exported = False
         _command_busy = True
         try:
             adsk.doEvents()
@@ -1423,6 +1437,7 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     _send_options(inputs),
                     confirm_adoption=_confirm_source_adoption,
                 )
+                exported = True
                 # One path for both: the return is published, then one request
                 # file hands it to WG. Send and Solve differ only in its kind.
                 solve = self.operation == "solve"
@@ -1455,11 +1470,19 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             ran = True
             _message(_summary(self.operation, report))
         except (wglink_core.WgLinkError, wglink_author.AuthorError) as exc:
+            # A Send or Solve refused after its export ran (WG outdated or not
+            # collecting, a failed request write) may already have changed the
+            # document -- an adopted source -- and has published a return.
+            # It is owed a refresh and a status like any command that ran.
+            if exported:
+                ran = True
             _message(str(exc), "WGLink refused")
         except Exception as exc:  # noqa: BLE001 - UI boundary; core remains head-less
             _report_error(COMMANDS[self.operation][1], "WGLink error", exc)
         finally:
             _hide_export_progress(progress)
+            # Cleared here; re-driven by the _command_finished() below, after
+            # this command has scheduled its own follow-up.
             _command_busy = False
             # This command may have moved the link on; re-survey from scratch so
             # a stale announcement cannot re-offer what was just applied.
@@ -1903,6 +1926,10 @@ def _linked_records_now() -> dict | None:
     Stored-attribute reads and inventory resolution -- the same call the tick
     already makes in :func:`_document_links`, and nothing that evaluates a
     surface. It exists so a refresh can be refused *before* it costs anything.
+
+    Raises :class:`LinksNotInspected` when the records cannot be read: that is
+    not "no links", and the caller records it as an attempt rather than
+    deciding the document is unlinked.
     """
 
     app = _app()
@@ -1913,12 +1940,12 @@ def _linked_records_now() -> dict | None:
         return None
     try:
         records = wglink_core._resolved_link_records(design)
-    except Exception:  # noqa: BLE001 - a document we cannot read has no links
-        return None
+    except Exception as exc:  # noqa: BLE001 - unreadable is "not inspected"
+        raise LinksNotInspected(_NOT_INSPECTED_TEXT) from exc
     return records or None
 
 
-def _service_geometry_refresh() -> None:
+def _service_geometry_refresh(*, throttle: bool = True) -> None:
     """Pay for a requested inspection on the main thread, at most once.
 
     The tick is the only place a Fusion API call may run, so it is where a
@@ -1943,6 +1970,11 @@ def _service_geometry_refresh() -> None:
     never outlive the observation it is protecting, and it is never applied
     against a cache entry belonging to a different document -- switching away
     from an expensive model must not throttle the one switched to.
+
+    ``throttle=False`` is for a carrier that runs once and has no next tick to
+    defer to: a command's own follow-up with coordination off. The command is
+    the explicit cause, so it pays now rather than leaving the request
+    pending for a tick that will never come.
     """
 
     global _geometry_refresh_pending
@@ -1954,7 +1986,7 @@ def _service_geometry_refresh() -> None:
         _geometry_refresh_pending = None
         return
     cached = _geometry_state_cache
-    if cached is not None and cached["key"][0] == document_id:
+    if throttle and cached is not None and cached["key"][0] == document_id:
         wait = min(
             float(cached["cost_ms"]) / 1000.0 * GEOMETRY_STATE_DUTY_CYCLE,
             GEOMETRY_STATE_MAX_WAIT_SECONDS,
@@ -1966,7 +1998,15 @@ def _service_geometry_refresh() -> None:
     # retried on the next tick and the next, which is a periodic inspection
     # attempt wearing an explicit cause's clothes.
     _geometry_refresh_pending = None
-    if _linked_records_now() is None:
+    try:
+        linked = _linked_records_now() is not None
+    except LinksNotInspected:
+        # Could not read, which is not "no links": record the attempt, so the
+        # document is asked about again at the retry rate instead of being
+        # treated as one WGLink never touched.
+        linked = False
+        _geometry_refresh_attempts[document_id] = time.monotonic()
+    if not linked:
         return
     if len(_geometry_refresh_attempts) >= _GEOMETRY_REFRESH_ATTEMPTS_TRACKED:
         # A session's worth of documents, not a leak. The oldest entries are
@@ -2788,7 +2828,7 @@ def _execute_return_request(
         _report_error("Returning this model to WG", "WGLink return to WG error", exc)
     finally:
         trace["outcome"] = outcome
-        _command_busy = False
+        _release_command_busy()
     return outcome
 
 
@@ -3214,7 +3254,7 @@ def _execute_handoff(
         )
     finally:
         trace["outcome"] = outcome
-        _command_busy = False
+        _release_command_busy()
     return outcome
 
 
@@ -3827,7 +3867,7 @@ def _on_watch_tick() -> None:
         except Exception as exc:  # noqa: BLE001
             _report_error("Offering a newer export", "WGLink watch error", exc)
         finally:
-            _command_busy = False
+            _release_command_busy()
     finally:
         _publish_fusion_status(snapshot)
         _print_live_log()
@@ -3851,8 +3891,10 @@ class CandidateEventHandler(adsk.core.CustomEventHandler):
 
     def notify(self, _args: object) -> None:
         try:
-            # A promotion is this registration starting up as the owner.
-            with wglink_activity.because(wglink_activity.CAUSE_STARTUP):
+            # The candidate thread's timer raised this: a recovery path that
+            # started on its own. Counted apart from start-up, and between
+            # commands, so Gate AR sees it (it cannot run with the gate off).
+            with wglink_activity.because(wglink_activity.CAUSE_PROMOTION):
                 _attempt_promotion()
         except Exception as exc:  # noqa: BLE001
             _report_error("Promoting a standby WGLink", "WGLink recovery error", exc)
@@ -3950,7 +3992,9 @@ def _after_command() -> None:
     user is now in, read-only.
     """
 
-    _service_geometry_refresh()
+    # No tick will come back for a request the duty cycle defers, so this
+    # command pays for its own refresh now (review M1).
+    _service_geometry_refresh(throttle=False)
     snapshot = _fusion_snapshot()
     if _claims_outstanding():
         _settle_claims(snapshot)
@@ -4412,7 +4456,10 @@ def _run() -> None:
                 # with the gate off waits for a restart rather than a timer.
                 _log(
                     f"[{PANEL_NAME}] another WGLink registration owns this Fusion "
-                    "session; this one stays idle until Fusion restarts."
+                    "session, and automatic coordination is off, so this one does "
+                    "not take over by itself. It stays idle until it is started "
+                    "again (Stop and Run it in Scripts and Add-Ins, or restart "
+                    "Fusion) after the owner has stopped."
                 )
             return
         try:

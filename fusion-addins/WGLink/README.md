@@ -497,8 +497,15 @@ The heartbeat's `diagnostics.activation` states the setting, and
 geometry measurement, source inventory, document signature, status
 publication, mutation and export, by the cause that reached it
 (`command:<name>`, `startup`, `claim-settlement`, `shutdown`, `tick`,
-`live-dispatch`, or `unattributed`). `betweenCommands` is everything no command
-asked for.
+`live-dispatch`, `promotion`, or `unattributed`). `betweenCommands` is
+everything no command asked for; start-up, claim settlement and shutdown are
+bounded and excluded, and a standby's timer-started `promotion` is not.
+
+With coordination off the owner's lease has no clock, because no thread renews
+it: it is held until that registration is stopped. A second registration in
+the same Fusion (a managed and a dev-synced copy, say) therefore does not take
+over by itself; it stays idle until it is itself stopped and run again, or
+Fusion restarts.
 
 A document whose WG links cannot be read is "not inspected", never "no links":
 nothing is reconciled against it, no insert or update is decided from it, and

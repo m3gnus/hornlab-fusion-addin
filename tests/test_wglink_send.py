@@ -3002,7 +3002,8 @@ def test_an_unresolvable_wrapper_is_refused_in_words_a_modeller_can_act_on(send_
     assert "cannot find the component that holds the WG waveguide 'Horn'" in text
     assert "will not guess a position" in text
     assert "undo that and send again" in text
-    assert "insert the waveguide from WG again" in text
+    assert "do not insert a second copy" in text
+    assert "insert the waveguide from WG again" not in text
     assert "wgi-gone" in text
     assert "defaulted to identity" not in text
     assert "nested" not in text

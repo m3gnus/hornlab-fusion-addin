@@ -863,3 +863,286 @@ def test_a_folder_never_chosen_or_still_there_is_not_called_missing(
 
     assert module.wglink_workspace.missing_workspace() is None
     assert "no longer exists" not in module._no_workspace_text()
+
+
+# -- review of d4d0b308: M1, M2, L1, L2, L7, L8 ----------------------------------
+
+
+def test_back_to_back_commands_each_pay_for_their_refresh_with_coordination_off(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Review M1. The duty cycle used to leave the second request "for the next
+    tick"; with coordination off there is none, so it stayed unpaid."""
+
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_m1_refresh", coordination=False)
+    module = fixture.module
+    module.run(None)
+    try:
+        _declare_command(module)
+        _deliver_every_event(fixture.app)
+        assert _count(module, "geometry_measurement", "command:declare") == 1
+        # The first measurement was expensive: the duty cycle would now defer
+        # the next request for twelve seconds.
+        module._geometry_state_cache["cost_ms"] = 1000.0
+        fixture.body.revisionId = "revision-2"
+
+        _declare_command(module)
+        _deliver_every_event(fixture.app)
+
+        assert _count(module, "geometry_measurement", "command:declare") == 2
+        assert module._geometry_refresh_pending is None
+        status = json.loads(
+            (fixture.ipc / module.wglink_watch.FUSION_STATUS_FILENAME).read_text()
+        )
+        [link] = status["document"]["links"]
+        assert link["measuredRevisionToken"] == link["geometryRevisionToken"]
+    finally:
+        module.stop(None)
+
+
+def test_with_coordination_on_the_tick_keeps_its_duty_cycle(monkeypatch, tmp_path: Path) -> None:
+    """The control: only the gate-off carrier pays unthrottled."""
+
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_m1_throttle_on", coordination=None)
+    module = fixture.module
+    module._request_geometry_refresh("test", module._active_document_id())
+    module._service_geometry_refresh()
+    module._geometry_state_cache["cost_ms"] = 1000.0
+    module._request_geometry_refresh("test", "other-document")
+    module._request_geometry_refresh("test", module._active_document_id())
+    before = _counts(module).get("geometry_measurement", {})
+
+    module._service_geometry_refresh()
+
+    assert _counts(module).get("geometry_measurement", {}) == before
+    assert module._geometry_refresh_pending is not None
+
+
+def _queue_pickup_behind_busy(module, app, tmp_path: Path) -> tuple[list[str], Path]:
+    """A pickup check that came due while a busy holder had the main thread."""
+
+    request = tmp_path / "request.json"
+    request.write_text("{}")
+    due: list[object] = []
+    module._followup_event = object()  # registered; delivery is what we check
+    real_timer = module._start_timer
+    module._start_timer = lambda _delay, function: due.append(function)
+    try:
+        with module.wglink_activity.because("command:send"):
+            module._schedule_pickup_check(request, "snapshot", "req-held")
+    finally:
+        module._start_timer = real_timer
+    module._command_busy = True
+    [function] = due
+    function()
+    module._run_followups()  # delivered while busy: stays queued
+    assert len(module._followups) == 1
+    module._command_busy = False
+    app.fired.clear()
+    return app.fired, request
+
+
+def _busy_return_request(module) -> None:
+    module._execute_return_request(types.SimpleNamespace(
+        request_id="r-1", design_id="", document_id="", instance_id="",
+        expected_return_state_hash="",
+    ))
+
+
+def _busy_handoff(module) -> None:
+    module._execute_handoff(
+        types.SimpleNamespace(
+            operation_id="h-1", request_id="h-1", export_id="wge_1", design_id="wgd",
+            expected_instance_id="instance", expected_document_id="another-document",
+            expected_return_state_hash="sha256:x",
+        ),
+        {"document_id": "fusion:doc-a", "links": [], "applying_operation": None},
+    )
+
+
+def _busy_newer_export_prompt(module) -> None:
+    announcement = types.SimpleNamespace(instance_id="i", describe=lambda: "i")
+    snapshot = {
+        "document_name": "Horn", "document_id": "fusion:doc-a",
+        "links": [{"instance_id": "i"}], "links_inspected": True, "diagnostics": {},
+    }
+    module._fusion_snapshot = lambda: snapshot
+    module._settle_claims = lambda _snapshot: None
+    module._notice_outdated_wg = lambda: None
+    module._notice_deliveries = lambda: None
+    module._on_live_dispatch = lambda _snapshot=None: False
+    module._live_transport_healthy = lambda: True
+    module._publish_fusion_status = lambda _snapshot=None: None
+    module._watcher.survey = lambda _links: [announcement]
+    module.wglink_watch.prompt_text = lambda _items: "newer export"
+    module._on_watch_tick()
+
+
+def _busy_modal(module) -> None:
+    module._modal("an outdated-WG or pickup notice", "WGLink")
+
+
+@pytest.mark.parametrize(
+    "holder",
+    [_busy_return_request, _busy_handoff, _busy_newer_export_prompt, _busy_modal],
+    ids=["return-request", "handoff", "newer-export-prompt", "modal"],
+)
+def test_a_pickup_check_held_behind_any_busy_holder_is_re_driven_when_it_ends(
+    monkeypatch, tmp_path: Path, holder
+) -> None:
+    """Review M2 and R01: every place that clears ``_command_busy`` re-drives."""
+
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_m2_{holder.__name__}", coordination=None)
+    module = fixture.module
+    fixture.ui.dialog_result = "no"
+    for name in ("_fusion_snapshot", "_settle_claims", "_notice_outdated_wg", "_notice_deliveries",
+                 "_on_live_dispatch", "_live_transport_healthy", "_publish_fusion_status"):
+        monkeypatch.setattr(module, name, getattr(module, name))
+    monkeypatch.setattr(module._watcher, "survey", module._watcher.survey)
+    monkeypatch.setattr(module.wglink_watch, "prompt_text", module.wglink_watch.prompt_text)
+    fired, _request = _queue_pickup_behind_busy(module, fixture.app, tmp_path)
+
+    holder(module)
+
+    assert module._command_busy is False
+    assert module.FOLLOWUP_EVENT_ID in fired
+    before = len(fixture.ui.messages)
+    module._run_followups()
+    assert [title for title, _text in fixture.ui.messages[before:]] == ["WGLink request waiting"]
+    assert module._followups == []
+
+
+def test_candidate_promotion_is_counted_between_commands(monkeypatch) -> None:
+    """Review L1 and R18: a timer-started recovery path is not bounded start-up."""
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    first = _load_instance(monkeypatch, "WGLink_l1_owner", ui, app)
+    second = _load_instance(monkeypatch, "WGLink_l1_standby", ui, app)
+    ipc = Path(__import__("tempfile").mkdtemp())
+    for module in (first, second):
+        monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: ipc)
+    first.run(None)
+    second.run(None)
+    candidate = second._candidate_handler
+    try:
+        first.stop(None)
+        candidate.notify(None)
+        assert second._owned is True
+        counts = second.wglink_activity.LOG.counts()
+        assert counts["status_publication"].get("promotion") == 1
+        assert "startup" not in counts["status_publication"] or counts["status_publication"]["startup"] == 0
+        assert second.wglink_activity.LOG.between_commands().get("status_publication") == 1
+    finally:
+        second.stop(None)
+
+
+@pytest.mark.parametrize("inspected", [False, True], ids=["not-inspected", "control"])
+def test_an_adopted_live_claim_is_never_judged_against_unread_links(
+    monkeypatch, tmp_path: Path, inspected: bool
+) -> None:
+    """Review R02: the live-path half of the trap."""
+
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r02_{inspected}", coordination=None)
+    module = fixture.module
+    reports: list[tuple] = []
+    client = types.SimpleNamespace(
+        report_outcome=lambda operation_id, generation, wire, **kw: reports.append((operation_id, wire))
+    )
+    module._live_adopted["op-9"] = {
+        "operationId": "op-9", "kind": module.wglink_live.KIND_UPDATE_LINK, "attemptGeneration": 1,
+        "request": {"exportId": "wge_9", "expectedDocumentId": "fusion:doc-a"},
+    }
+    links = [{"instance_id": "i", "export_id": "wge_9", "operation_id": "op-9"}]
+
+    module._settle_adopted_claims(client, {
+        "document_id": "fusion:doc-a",
+        "links": links if inspected else [],
+        "links_inspected": inspected,
+        "applying_operation": None,
+    })
+
+    if inspected:
+        assert reports == [("op-9", "reconciled")]
+        assert "op-9" not in module._live_adopted
+    else:
+        assert reports == []
+        assert "op-9" in module._live_adopted
+
+
+@pytest.mark.parametrize("owner", [False, True], ids=["non-owner", "owner"])
+def test_status_publication_is_counted_whoever_calls_it(
+    monkeypatch, tmp_path: Path, owner: bool
+) -> None:
+    """Review R04: counted on entry, before the lease check can return."""
+
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r04_{owner}", coordination=None)
+    module = fixture.module
+    monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: owner)
+    with module.wglink_activity.because("command:probe"):
+        module._publish_fusion_status({
+            "document_name": None, "document_id": None, "links": [], "diagnostics": {},
+        })
+
+    assert _count(module, "status_publication", "command:probe") == 1
+    assert (fixture.ipc / module.wglink_watch.FUSION_STATUS_FILENAME).exists() is owner
+
+
+@pytest.mark.parametrize("readable", [False, True], ids=["unreadable", "control"])
+def test_a_refresh_for_an_unreadable_document_is_an_attempt_not_no_links(
+    monkeypatch, tmp_path: Path, readable: bool
+) -> None:
+    """Review L7: "could not read" is recorded and retried at the retry rate."""
+
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_l7_{readable}", coordination=None)
+    module = fixture.module
+    document_id = module._active_document_id()
+    if not readable:
+        monkeypatch.setattr(
+            module.wglink_core,
+            "_all_link_attributes",
+            lambda _design: (_ for _ in ()).throw(RuntimeError("unreadable")),
+        )
+    module._request_geometry_refresh("test", document_id)
+
+    module._service_geometry_refresh()
+
+    assert module._geometry_refresh_pending is None
+    # Unreadable: remembered as an attempt. Readable: measured, which clears it.
+    assert (document_id in module._geometry_refresh_attempts) is (not readable)
+    measured = sum(_counts(module).get("geometry_measurement", {}).values())
+    assert measured == (1 if readable else 0)
+
+
+def test_a_refused_send_still_publishes_status_after_the_command(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Review L8: the export ran (it may have adopted a source); only WG refused."""
+
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_l8", coordination=False)
+    module = fixture.module
+    workspace = tmp_path / "workspace"
+    bundle = workspace / "wgreturn" / "speaker.wgreturn"
+    bundle.mkdir(parents=True)
+    (bundle / "wgreturn.json").write_text("{}")
+    monkeypatch.setattr(module.wglink_workspace, "workspace_root", lambda: workspace)
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: workspace / "wgreturn")
+    monkeypatch.setattr(
+        module.wglink_send, "send",
+        lambda _app, _options, **_k: {"bundle_path": str(bundle), "return_id": "wgr_1"},
+    )
+    module.run(None)
+    try:
+        _command(module, "send")  # no capabilities file: WG is not collecting
+        assert fixture.ui.messages[-1][0] == "WGLink refused"
+        _deliver_every_event(fixture.app)
+        assert _count(module, "status_publication", "command:send") == 1
+
+        # A command refused before it did anything still publishes nothing.
+        monkeypatch.setattr(module, "_send_options", lambda _inputs: (_ for _ in ()).throw(
+            module.wglink_core.WgLinkError("no folder")))
+        _command(module, "solve")
+        _deliver_every_event(fixture.app)
+        assert _count(module, "status_publication", "command:solve") == 0
+    finally:
+        module.stop(None)

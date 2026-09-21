@@ -2978,3 +2978,31 @@ def test_a_moved_parent_holding_sub_assemblies_is_refused_in_the_walk_too(
         match="contains sub-assemblies; its bodies cannot be measured",
     ):
         send_module._scope_walk(design, occurrence)
+
+
+def test_an_unresolvable_wrapper_is_refused_in_words_a_modeller_can_act_on(send_module):
+    """F3: the refusal stays -- a defaulted placement would be solved as real --
+    but it says what to check and do, and claims no cause nobody established
+    (nesting was ruled out and has its own refusal)."""
+
+    design = types.SimpleNamespace(
+        findEntityByToken=lambda _token: [],
+        rootComponent=types.SimpleNamespace(allOccurrences=Collection()),
+    )
+    record = {
+        "instance_id": "wgi-gone",
+        "payload": {"wrapper": "occurrence", "occurrence_token": "token-a", "design_name": "Horn"},
+        "wrapper_component": object(),
+    }
+
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refused:
+        send_module._strict_assembly_from_link(design, record)
+
+    text = str(refused.value)
+    assert "cannot find the component that holds the WG waveguide 'Horn'" in text
+    assert "will not guess a position" in text
+    assert "undo that and send again" in text
+    assert "insert the waveguide from WG again" in text
+    assert "wgi-gone" in text
+    assert "defaulted to identity" not in text
+    assert "nested" not in text

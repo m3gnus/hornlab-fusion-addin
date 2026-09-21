@@ -437,6 +437,54 @@ read, so neither `id(document)` nor holding the object says anything durable
 about the document. A document that cannot be named at all is cached under
 nothing and reports "cannot tell".
 
+## Automatic coordination, and switching it off
+
+WGLink runs five engines that act without a user command: the four-second
+watch tick, owner-candidate promotion, the live session's send and poll
+workers, and the live custom event. Together they resolve every managed link
+on a timer, publish status every tick, apply WG's handoffs and return requests,
+and offer newer exports. That is **automatic coordination**, and it is on by
+default, exactly as before.
+
+The owner can switch it off in WGLink's own settings file,
+`~/.hornlab/WGLink/settings.json` (Fusion does not inherit a shell, so this is
+not an environment variable):
+
+```json
+{"automatic_coordination": false}
+```
+
+The value is read once when the add-in starts; restart Fusion or the add-in to
+change it. Anything other than a JSON `false` leaves coordination on (a value
+that is not a boolean is reported as `invalid`). With it off:
+
+- none of the five engines starts or registers. The live layer stays in the
+  tree, dormant: its threads are not started and its event is not registered;
+- WG's handoffs and return requests, and the newer-export prompt, are not
+  consumed. Insert and Update remain as commands;
+- status is published once at start-up, after each command, and removed at
+  shutdown, never on a clock. WG therefore sees Fusion's status age out between
+  commands;
+- the geometry refresh a command asks for is paid for by that command's own
+  follow-up, a one-shot main-thread event raised when the command returns;
+- interrupted claims are settled once at start-up, read-only and never re-run.
+  One whose document is not open, or whose links cannot be read, is kept and
+  settled after a later command once it can be;
+- a follow-up delivered while another WGLink command holds the main thread
+  waits, and that command's completion runs it.
+
+The heartbeat's `diagnostics.activation` states the setting, and
+`diagnostics.activity` carries the execution counters: every link resolution,
+geometry measurement, source inventory, document signature, status
+publication, mutation and export, by the cause that reached it
+(`command:<name>`, `startup`, `claim-settlement`, `shutdown`, `tick`,
+`live-dispatch`, or `unattributed`). `betweenCommands` is everything no command
+asked for.
+
+A document whose WG links cannot be read is "not inspected", never "no links":
+nothing is reconciled against it, no insert or update is decided from it, and
+no status claiming it has no links is published.
+
 ## Duplicate-registration ownership and recovery
 
 Fusion may load several registered WGLink paths into one Python process. Each

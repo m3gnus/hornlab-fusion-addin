@@ -24,7 +24,7 @@ import uuid
 import adsk.core
 import adsk.fusion
 if __package__:
-    from . import wglink_workspace
+    from . import wglink_activity, wglink_workspace
     from .wglink_bundle import (
         IDENTITY_MATRIX,
         TAG_AREA_TOLERANCE,
@@ -49,6 +49,7 @@ if __package__:
         transform_points,
     )
 else:
+    import wglink_activity
     import wglink_workspace
     from wglink_bundle import (
         IDENTITY_MATRIX,
@@ -699,6 +700,7 @@ def _parent(attribute: object) -> object | None:
         return None
 
 
+@wglink_activity.counted(wglink_activity.LINK_RESOLUTION)
 def _link_records(design: adsk.fusion.Design) -> dict[str, dict[str, Any]]:
     by_parent: dict[int, dict[str, Any]] = {}
     for attribute in _all_link_attributes(design):
@@ -3174,6 +3176,7 @@ def _group_timeline(design: object, start: int, name: str, warnings: list[str]) 
         warnings.append(f"Could not group the WGLink timeline range: {exc}")
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_INSERT)
 def insert(
     app: adsk.core.Application,
     bundle_path: str | os.PathLike[str],
@@ -3670,6 +3673,7 @@ def _no_op_update_report(
     return report
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_UPDATE)
 def update(
     app: adsk.core.Application,
     bundle_path: str | os.PathLike[str] | None,
@@ -4392,6 +4396,7 @@ def _target_covers(target: object, entity: object) -> bool:
     return _same_entity(component, _parent_component(entity))
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_DETACH)
 def detach(
     app: adsk.core.Application,
     options: dict[str, Any] | None = None,

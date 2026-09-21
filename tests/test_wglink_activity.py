@@ -161,3 +161,54 @@ def test_a_snapshot_is_a_copy_not_the_live_mapping(log):
         log.record("resolve_links")
 
     assert snapshot == {"resolve_links": {wglink_activity.CAUSE_TICK: 1}}
+
+
+def test_a_named_command_is_a_command_and_bounded_work_is_not_a_finding(log):
+    with wglink_activity.because(wglink_activity.command_cause("send")):
+        log.record("resolve_links")
+    for cause in (
+        wglink_activity.CAUSE_STARTUP,
+        wglink_activity.CAUSE_SHUTDOWN,
+        wglink_activity.CAUSE_CLAIM_SETTLEMENT,
+    ):
+        with wglink_activity.because(cause):
+            log.record("resolve_links")
+
+    assert log.counts()["resolve_links"]["command:send"] == 1
+    assert log.between_commands() == {}
+
+
+def test_a_cause_that_merely_starts_with_the_word_command_is_not_one(log):
+    with wglink_activity.because("commander"):
+        log.record("resolve_links")
+
+    assert log.between_commands() == {"resolve_links": 1}
+
+
+def test_carrying_binds_the_cause_where_the_work_was_handed_off(log):
+    """A follow-up runs later, on a thread or event with no cause of its own."""
+
+    with wglink_activity.because(wglink_activity.command_cause("solve")):
+        job = wglink_activity.carrying(lambda: log.record("publish_status"))
+
+    ran = threading.Thread(target=job)
+    ran.start()
+    ran.join(timeout=5)
+    job()
+
+    assert log.counts() == {"publish_status": {"command:solve": 2}}
+    assert wglink_activity.current_cause() == wglink_activity.CAUSE_UNATTRIBUTED
+
+
+def test_counted_records_before_the_body_can_raise(monkeypatch):
+    fresh = wglink_activity.ActivityLog()
+    monkeypatch.setattr(wglink_activity, "LOG", fresh)
+
+    @wglink_activity.counted("resolve_links")
+    def refuses():
+        raise RuntimeError("refused")
+
+    with pytest.raises(RuntimeError):
+        refuses()
+
+    assert fresh.counts() == {"resolve_links": {wglink_activity.CAUSE_UNATTRIBUTED: 1}}

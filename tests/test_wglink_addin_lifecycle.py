@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -348,6 +349,11 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     # workspace. Individual handoff tests replace this with their temp folder.
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: None)
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: None)
+    # Nor read the user's own WGLink settings: the activation gate lives there,
+    # and a developer who switched coordination off must not flip this suite.
+    monkeypatch.setattr(
+        module, "SETTINGS_PATH", Path(tempfile.mkdtemp(prefix="wglink-settings-")) / "settings.json"
+    )
     return module
 
 

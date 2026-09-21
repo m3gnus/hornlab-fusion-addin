@@ -265,6 +265,15 @@ occurrence where it already is and never moves it back to the origin.)
   keep the bundle's namespace either way, on purpose.
 - **"Waveguide Generator has no selected CAD Link workspace"** — choose the
   WGLink folder in WG under Settings → CAD Link, then send again.
+- **"The CAD Link folder Waveguide Generator is set to no longer exists"** — the
+  folder WG remembers was moved, renamed or deleted. The message names it.
+  Choose the folder again in WG under Settings → CAD Link, then send again.
+- **"WGLink cannot find the component that holds the WG waveguide …"** — Send
+  could not find the component the waveguide was inserted into, so it cannot
+  say where the waveguide sits, and it will not guess. If you deleted or
+  replaced that component, undo it and send again. If it is still there,
+  insert the waveguide from WG again and send that copy. What makes the
+  component unfindable in the remaining cases is not yet known.
 - **The panel is missing after a Fusion restart** — tick Run on Startup for
   WGLink (see Install); Fusion's toggle overrides the manifest.
 - **"WGLink helper body … is still visible"** on Send — a freestanding

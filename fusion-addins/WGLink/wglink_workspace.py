@@ -117,6 +117,33 @@ def workspace_root(**kwargs: Any) -> Path | None:
     return None
 
 
+def missing_workspace(**kwargs: Any) -> Path | None:
+    """The CAD Link folder WG has persisted, when that folder no longer exists.
+
+    ``workspace_root`` answers ``None`` both when nothing was ever chosen and
+    when the chosen folder was moved or deleted, and those need different
+    remedies. WG already tells them apart ("Persisted WGLink path is
+    unavailable"); this lets the add-in say the same thing at command time
+    instead of a generic "no folder selected". Only the current settings file
+    is read: the legacy fallback was never a user's explicit choice of path.
+    """
+
+    root = data_dir(**kwargs)
+    if root is None:
+        return None
+    try:
+        payload = json.loads((root / SETTINGS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    raw = str(payload.get(SETTINGS_KEY) or "").strip()
+    if not raw:
+        return None
+    selected = Path(raw).expanduser()
+    return None if selected.is_dir() else selected
+
+
 def capture_document(**kwargs: Any) -> bool:
     """Whether WG wants a copy of the document carried out with the return.
 

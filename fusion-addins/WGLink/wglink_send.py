@@ -27,7 +27,7 @@ import adsk.core
 import adsk.fusion
 
 if __package__:
-    from . import wglink_author, wglink_core
+    from . import wglink_activity, wglink_author, wglink_core
     from .wglink_return import (
         BASE_RETURN_FEATURES,
         DOMAIN_KIND_FOR_PLANES,
@@ -38,6 +38,7 @@ if __package__:
         plan_export_scope,
     )
 else:
+    import wglink_activity
     import wglink_author
     import wglink_core
     from wglink_return import (
@@ -139,6 +140,7 @@ def _shape_fingerprint(body: object) -> dict[str, Any]:
     }
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_BODY_DECLARATION)
 def declare_body(body: object, declaration: str) -> None:
     """Set or replace the explicit return classification on one body."""
 
@@ -149,6 +151,7 @@ def declare_body(body: object, declaration: str) -> None:
     wglink_core._set_attribute(body, DECLARATION_ATTRIBUTE, value)
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_BODY_DECLARATION)
 def clear_declaration(body: object) -> None:
     """Remove an explicit classification, restoring automatic scoping.
 
@@ -735,6 +738,7 @@ def _fem_slug(component: object) -> str:
     return _slug(name)
 
 
+@wglink_activity.counted(wglink_activity.SOURCE_INVENTORY)
 def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
     selection, geometry, selected_entity, export_frame = _selection(design, selection_value)
     # Every frame-dependent measurement is taken from the handle that lives in
@@ -1245,6 +1249,7 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
     return report
 
 
+@wglink_activity.counted(wglink_activity.DOCUMENT_SIGNATURE)
 def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str, Any]:
     """Fingerprint the same root assembly, sources, and parameters a return exports.
 
@@ -1534,8 +1539,24 @@ def _strict_assembly_from_link(
         ], None
     occurrences = _matching_occurrences(design, record)
     if not occurrences:
+        # Refused, never defaulted: an identity placement would solve the horn
+        # at the wrong position. What makes the component unfindable is not
+        # established (FIELD-FINDINGS F3; nesting was ruled out -- it has its
+        # own refusal below), so the message names no cause, only what the
+        # user can check and do.
+        payload = record.get("payload") or {}
+        label = str(payload.get("link_name") or payload.get("design_name") or "").strip()
+        named = f"the WG waveguide {label!r}" if label else "a WG waveguide"
         raise wglink_core.WgLinkError(
-            f"WGLink instance {instance_id!r} has no resolvable wrapper occurrence; placement was not defaulted to identity."
+            f"WGLink cannot find the component that holds {named} in this "
+            "assembly, so it cannot tell where the waveguide sits. It will not "
+            "guess a position, because a guessed position would be solved as if "
+            "it were real.\n\n"
+            "Check that the waveguide's component is still in the design. If it "
+            "was deleted or replaced, undo that and send again. If it is there "
+            "and this keeps happening, insert the waveguide from WG again and "
+            "send that copy.\n\n"
+            f"(WGLink link {instance_id}: no wrapper occurrence could be resolved.)"
         )
     if len(occurrences) > 1:
         raise wglink_core.WgLinkError(
@@ -2567,6 +2588,7 @@ def _valid_group(
     return counts == {len(natives)} and len(set(nonces)) == len(nonces)
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_SOURCE_IDENTITY)
 def assign_source_identity(design: object, faces: list[object], role: str) -> dict[str, Any]:
     """Stamp the selected faces, just painted ``role``, with that source's identity.
 
@@ -2667,6 +2689,7 @@ def _adopt_painted_source(design: object, natives: list[object], canonical: str)
     return _run_edit(f"adopt the {canonical} source identity", body)
 
 
+@wglink_activity.counted(wglink_activity.MUTATION_SOURCE_IDENTITY)
 def clear_source_identity(design: object, faces: list[object]) -> int:
     """Remove the source identity from every selected face, painted or not.
 
@@ -3290,6 +3313,7 @@ def _publish(temp: Path, target: Path, overwrite: bool) -> None:
     shutil.rmtree(backup)
 
 
+@wglink_activity.counted(wglink_activity.EXPORT_RETURN)
 def send(
     app: object,
     options: dict[str, Any],

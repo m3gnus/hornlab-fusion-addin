@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -40,6 +41,7 @@ def _load_registration_package() -> dict[str, types.ModuleType]:
     sys.modules[_registration_package_name] = package
     loaded: dict[str, types.ModuleType] = {}
     for name in (
+        "wglink_activity",
         "wglink_workspace",
         "wglink_author",
         "wglink_bundle",
@@ -54,6 +56,7 @@ def _load_registration_package() -> dict[str, types.ModuleType]:
 
 
 _registration_modules = _load_registration_package()
+wglink_activity = _registration_modules["wglink_activity"]
 wglink_workspace = _registration_modules["wglink_workspace"]
 wglink_author = _registration_modules["wglink_author"]
 wglink_core = _registration_modules["wglink_core"]
@@ -246,6 +249,37 @@ _loaded_identity = wglink_live.loaded_identity(
     ADDIN_DIR, addin_version=wglink_send.ADAPTER_VERSION
 )
 
+# -- the activation boundary (STEP2 section 4) ---------------------------------
+#
+# One gate, read once when this registration starts, and checked where each
+# engine starts -- never threaded through the tick. On, WGLink coordinates as
+# it always has: the four-second watch tick (A), owner-candidate promotion (B),
+# the live session's send and poll workers (C, D) and the live custom event
+# (E). Off, none of them starts or registers, so nothing between the user's
+# commands can inspect the document, publish status or apply a WG request.
+#
+# Off is a key in WGLink's own settings file (``SETTINGS_PATH``), because
+# Fusion does not inherit a shell's environment:
+#
+#     {"automatic_coordination": false}
+#
+# Anything else -- the key absent, or not a JSON boolean -- is on, today's
+# behaviour. Restart Fusion (or the add-in) for a change to take effect.
+ACTIVATION_SETTING = "automatic_coordination"
+_activation: dict[str, object] = {
+    "automaticCoordination": True,
+    "setting": "default",
+    "settingsKey": ACTIVATION_SETTING,
+}
+# With coordination off, the only main-thread time WGLink asks for is a
+# follow-up a command scheduled: the geometry refresh it requested, status for
+# WG, and settling a claim start-up could not. Each job carries the cause of
+# the command that scheduled it across the event hop (``wglink_activity``).
+FOLLOWUP_EVENT_ID = f"hornlab_wglink_followup_{_watch_session_id}"
+_followup_event = None
+_followup_handler = None
+_followups: list[object] = []
+
 
 def _note_outcome(channel: str, request_id: str, outcome: str) -> None:
     _recent_outcomes.append({"channel": channel, "requestId": request_id, "outcome": outcome})
@@ -261,6 +295,7 @@ def _modal(text: str, title: str) -> None:
         _message(text, title)
     finally:
         _command_busy = False
+        _command_finished()
 
 # What one IPC channel did for a single watch tick. The distinction exists
 # because suppressing a repeat error is not the same as doing work: a refused
@@ -344,7 +379,13 @@ def _activate_ipc_lease() -> bool:
         if _ipc_owner_runtime.owner != _watch_session_id:
             return False
         _ipc_owner_runtime.phase = "active"
-        _ipc_owner_runtime.renewed_at = _lease_now()
+        # The watch thread renews the lease, and only it. With coordination off
+        # there is no such thread, so the lease is committed without a clock:
+        # an owner in this process holds it until its own stop() releases it,
+        # and a second registration waits rather than taking over an owner
+        # that is merely idle. Every registration's expiry test reads
+        # ``now - renewed_at``, which never exceeds the timeout for infinity.
+        _ipc_owner_runtime.renewed_at = _lease_now() if _coordinating() else math.inf
         _ipc_owner_runtime.watch_event_id = WATCH_EVENT_ID
         return True
 
@@ -541,6 +582,30 @@ def _save_settings(settings: dict[str, object]) -> None:
         pass
 
 
+def _read_activation() -> dict[str, object]:
+    """The activation gate as the owner set it, read from the settings file.
+
+    Called once per start. A value that is not a JSON boolean is reported as
+    ``invalid`` and leaves coordination on: the default is today's behaviour,
+    and a typo must not switch a subsystem off silently.
+    """
+
+    settings = _load_settings()
+    state: dict[str, object] = {"settingsKey": ACTIVATION_SETTING}
+    if ACTIVATION_SETTING not in settings:
+        return {**state, "automaticCoordination": True, "setting": "default"}
+    value = settings[ACTIVATION_SETTING]
+    if isinstance(value, bool):
+        return {**state, "automaticCoordination": value, "setting": "settings"}
+    return {**state, "automaticCoordination": True, "setting": "invalid"}
+
+
+def _coordinating() -> bool:
+    """Whether this registration runs automatic coordination (read at start)."""
+
+    return _activation.get("automaticCoordination") is not False
+
+
 def _discovered_bundles() -> list:
     try:
         return wglink_workspace.discover_bundles()
@@ -623,7 +688,12 @@ def _document_link_choices() -> list[tuple[str, str]]:
     """``(label, instance_id)`` for every managed link in the active document."""
 
     choices = []
-    for link in _document_links():
+    try:
+        links = _document_links()
+    except LinksNotInspected:
+        # A chooser only shows links; the command it opens refuses on its own.
+        links = []
+    for link in links:
         instance_id = str(link.get("instance_id") or "")
         if not instance_id:
             continue
@@ -687,6 +757,31 @@ def _source_identity_enabled() -> bool:
         return False
 
 
+def _no_workspace_text(action: str = "send again") -> str:
+    """Why there is no CAD Link folder to use, told apart the way WG tells it.
+
+    A folder that was chosen and has since been moved or deleted is not the
+    same situation as one never chosen, and a user told "choose one" when he
+    already did has no way to learn which folder WG is still pointing at.
+    """
+
+    try:
+        missing = wglink_workspace.missing_workspace()
+    except Exception:  # noqa: BLE001 - the generic refusal is still true
+        missing = None
+    if missing is not None:
+        return (
+            "The CAD Link folder Waveguide Generator is set to no longer exists:\n"
+            f"{missing}\n\n"
+            "It may have been moved, renamed or deleted. Choose the CAD Link folder "
+            f"again in WG under Settings → CAD Link, then {action}."
+        )
+    return (
+        "Waveguide Generator has no selected CAD Link workspace. Choose one in "
+        f"WG under Settings → CAD Link, then {action}."
+    )
+
+
 def _send_options(command_inputs: object) -> dict[str, object]:
     # WG only ingests from its own workspace, so there is one correct
     # destination and the UI no longer asks. Collision-safe naming is kept:
@@ -694,10 +789,7 @@ def _send_options(command_inputs: object) -> dict[str, object]:
     # so overwriting one loses evidence.
     output = wglink_workspace.return_folder()
     if output is None:
-        raise wglink_core.WgLinkError(
-            "Waveguide Generator has no selected CAD Link workspace. Choose one in "
-            "WG under Settings → CAD Link, then send again."
-        )
+        raise wglink_core.WgLinkError(_no_workspace_text())
     options: dict[str, object] = {
         "selection": _send_selection(command_inputs),
         "output_folder": str(output),
@@ -1047,9 +1139,7 @@ def _request_wg_solve(report: dict[str, object]) -> bool:
     ipc = wglink_workspace.ipc_folder(create=True)
     workspace = wglink_workspace.workspace_root()
     if ipc is None or workspace is None:
-        raise wglink_core.WgLinkError(
-            "Waveguide Generator has no selected CAD Link workspace, so it cannot be asked to solve."
-        )
+        raise wglink_core.WgLinkError(_no_workspace_text("solve again"))
     command_id = str(uuid.uuid4())
     return_id = str(report.get("return_id") or "")
     bundle = Path(str(report.get("bundle_path") or ""))
@@ -1238,6 +1328,12 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
         self.operation = operation
 
     def notify(self, args: object) -> None:
+        # Everything this command inspects or changes, including the follow-up
+        # it schedules below, is counted under the command that asked for it.
+        with wglink_activity.because(wglink_activity.command_cause(self.operation)):
+            self._execute(args)
+
+    def _execute(self, args: object) -> None:
         global _command_busy
         progress = None
         # Whether this command got as far as producing a report. A user who
@@ -1313,10 +1409,24 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
             # asks for nothing.
             if ran:
                 _request_geometry_refresh("command", _active_document_id())
+                if not _coordinating():
+                    # No tick will pay for that refresh or publish the
+                    # result, so this command schedules both itself.
+                    _schedule_followup(_after_command)
+            _command_finished()
 
 
 class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
+    def __init__(self, operation: str = "dialog"):
+        super().__init__()
+        self.operation = operation
+
     def notify(self, args: object) -> None:
+        # A dialog's refresh is part of the command whose dialog it is.
+        with wglink_activity.because(wglink_activity.command_cause(self.operation)):
+            self._changed(args)
+
+    def _changed(self, args: object) -> None:
         try:
             changed = getattr(args, "input", None)
             input_id = str(getattr(changed, "id", ""))
@@ -1366,6 +1476,12 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
         self.operation = operation
 
     def notify(self, args: object) -> None:
+        # Building the dialog reads the document (pre-flight, link choices):
+        # that is this command's work.
+        with wglink_activity.because(wglink_activity.command_cause(self.operation)):
+            self._created(args)
+
+    def _created(self, args: object) -> None:
         try:
             inputs = args.command.commandInputs
             if self.operation in {"send", "solve"}:
@@ -1418,7 +1534,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     "",
                     False,
                 )
-                changed = CommandInputChangedHandler()
+                changed = CommandInputChangedHandler(self.operation)
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)
             if self.operation == "source":
@@ -1445,7 +1561,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     2,
                     True,
                 )
-                changed = CommandInputChangedHandler()
+                changed = CommandInputChangedHandler(self.operation)
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)
             if self.operation == "declare":
@@ -1474,7 +1590,7 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                     3,
                     True,
                 )
-                changed = CommandInputChangedHandler()
+                changed = CommandInputChangedHandler(self.operation)
                 args.command.inputChanged.add(changed)
                 _handlers.append(changed)
             if self.operation == "insert":
@@ -1599,6 +1715,9 @@ def _geometry_change_key(design: object, records: dict) -> tuple:
 def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
     """The part of the heartbeat that costs real geometry evaluation."""
 
+    # Counted before the advisory ``except`` below, which turns a measurement
+    # that ran and failed into empty strings indistinguishable from none.
+    wglink_activity.record(wglink_activity.GEOMETRY_MEASUREMENT)
     first_instance = next(iter(sorted(records)), None)
     try:
         return_state = wglink_send.return_state(
@@ -2015,8 +2134,39 @@ def _geometry_state(
     return _with_revision_tokens(state, revision_token, revision_token), "measured"
 
 
+class LinksNotInspected(wglink_core.WgLinkError):
+    """The document's links could not be read, so there is no evidence either way."""
+
+
+_NOT_INSPECTED_TEXT = (
+    "WGLink could not read this Fusion document's WG links, so it cannot tell "
+    "whether this change already happened. Nothing was changed."
+)
+
+
+def _link_evidence(snapshot: dict[str, object]) -> list[dict[str, object]] | None:
+    """The links a snapshot read, or None when it did not read them.
+
+    "Not inspected" is its own state. Reconciliation decides from link evidence
+    whether an interrupted operation applied, and an empty list read as "no
+    evidence" would call an applied operation never-started. A snapshot built
+    by :func:`_fusion_snapshot` always says whether it looked; a hand-made one
+    that carries a ``links`` list is taken as having looked.
+    """
+
+    if snapshot.get("links_inspected") is False or "links" not in snapshot:
+        return None
+    return list(snapshot.get("links") or [])
+
+
 def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, object]]:
     """Copy each managed link's identity out of the document as plain strings.
+
+    Raises :class:`LinksNotInspected` when the document's links cannot be
+    read. It used to return ``[]``, and every caller then read "could not
+    read" as "there are no links": reconciliation called an applied operation
+    never-started, and an insert's already-linked guard passed. A caller that
+    only *shows* links catches it; one that decides from them refuses.
 
     Called on Fusion's main thread only. What it returns is deliberately inert
     data: the watcher runs on another thread and must never hold a live Fusion
@@ -2025,8 +2175,10 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
     Identity comes from stored attributes and costs nothing, so it is read on
     every tick. The measured half -- the export fingerprint and the body
     fingerprints -- goes through :func:`_geometry_state`, which on this path
-    reads the cache and never measures. Called on a timer, this function
-    inspects no geometry at all.
+    reads the cache and never measures. Called on a timer it measures no
+    geometry, but it does resolve every managed link through the Fusion API
+    (STEP2 section 3), which is why no timer calls it while automatic
+    coordination is off.
 
     ``timings`` collects the wall clock of each phase in milliseconds, which is
     the only way to say what this costs on a real document without attaching a
@@ -2053,9 +2205,9 @@ def _document_links(timings: dict[str, float] | None = None) -> list[dict[str, o
         # to publish `missing` and no fingerprint for links Audit reports as
         # intact.
         records = wglink_core._resolved_link_records(design)
-    except Exception:  # noqa: BLE001 - a document we cannot read has no links
+    except Exception as exc:  # noqa: BLE001 - unreadable is "not inspected", never "no links"
         _record("resolve_links_ms", resolve_started)
-        return []
+        raise LinksNotInspected(_NOT_INSPECTED_TEXT) from exc
     _record("resolve_links_ms", resolve_started)
     if not records:
         # A heartbeat has no link state or optimistic-concurrency token to
@@ -2309,17 +2461,22 @@ def _fusion_snapshot() -> dict[str, object]:
     app = _app()
     product = app.activeProduct if app else None
     active_document = getattr(app, "activeDocument", None) if app else None
+    links_inspected = True
     if active_document is None and product is None:
         document_name = None
         links: list[dict[str, object]] = []
     else:
         document_name = str(getattr(active_document, "name", "") or "Untitled")
-        links = _document_links(timings)
+        try:
+            links = _document_links(timings)
+        except LinksNotInspected:
+            # Carried as its own state: nothing downstream may read the empty
+            # list as "this document has no links" (see ``_link_evidence``).
+            links, links_inspected = [], False
     timings["snapshot_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
-    diagnostics: dict[str, object] = {
-        "watchIntervalSeconds": WATCH_INTERVAL_SECONDS,
-        "lastTickMs": timings,
-    }
+    diagnostics: dict[str, object] = {"lastTickMs": timings}
+    if _coordinating():
+        diagnostics["watchIntervalSeconds"] = WATCH_INTERVAL_SECONDS
     source = _installed_source()
     if source:
         diagnostics["source"] = source
@@ -2327,14 +2484,20 @@ def _fusion_snapshot() -> dict[str, object]:
         "document_name": document_name,
         "document_id": _active_document_id(),
         "links": links,
+        "links_inspected": links_inspected,
         "applying_operation": _applying_operation() if document_name is not None else None,
         "diagnostics": diagnostics,
     }
 
 
 def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
-    """Best-effort owner presence for WG; every Fusion read stays on this thread."""
+    """Best-effort owner presence for WG; every Fusion read stays on this thread.
 
+    Counted on entry, whoever calls it: with automatic coordination off it is
+    reached only from start-up and from a command's follow-up, never a clock.
+    """
+
+    wglink_activity.record(wglink_activity.STATUS_PUBLICATION)
     if not _owns_active_ipc_lease():
         return
 
@@ -2342,7 +2505,16 @@ def _publish_fusion_status(snapshot: dict[str, object] | None = None) -> None:
     if folder is None:
         return
     current = snapshot if snapshot is not None else _fusion_snapshot()
+    if current.get("links_inspected") is False and current.get("document_name") is not None:
+        # The document's links could not be read. Publishing its link list
+        # empty would tell WG "this document has no links"; the last status
+        # stands instead, and ages out on WG's side as it would with no add-in.
+        return
     diagnostics = dict(current.get("diagnostics") or {})
+    # How this add-in is configured, from its own mouth, so a comparison run
+    # records its configuration from the components rather than from notes.
+    diagnostics["activation"] = dict(_activation)
+    diagnostics["activity"] = dict(wglink_activity.LOG.as_payload())
     if _request_trace is not None:
         diagnostics["lastRequest"] = dict(_request_trace)
     if _recent_outcomes:
@@ -2500,7 +2672,7 @@ def _execute_return_request(
             raise wglink_core.WgLinkError(
                 "The active Fusion document changed after WG requested the model. Reopen CAD Link and try again."
             )
-        links = snapshot["links"] if snapshot is not None else _document_links()
+        links = _evidence_or_refuse(snapshot)
         matching = [
             link for link in links
             if link.get("design_id") == request.design_id
@@ -2556,6 +2728,17 @@ def _execute_return_request(
         trace["outcome"] = outcome
         _command_busy = False
     return outcome
+
+
+def _evidence_or_refuse(snapshot: dict[str, object] | None) -> list[dict[str, object]]:
+    """Link evidence for a decision: the snapshot's, or a live read; never a guess."""
+
+    if snapshot is None:
+        return _document_links()
+    links = _link_evidence(snapshot)
+    if links is None:
+        raise LinksNotInspected(_NOT_INSPECTED_TEXT)
+    return links
 
 
 def _reconciled(
@@ -2823,7 +3006,6 @@ def _execute_handoff(
     """
 
     global _command_busy
-    links = snapshot["links"] if snapshot is not None else _document_links()
     document_id = (
         snapshot["document_id"] if snapshot is not None else _active_document_id()
     )
@@ -2838,6 +3020,9 @@ def _execute_handoff(
     _command_busy = True
     try:
         _stop_if_cancelled(cancelled)
+        # Reconciliation below decides from these whether this operation
+        # already applied; with no reading of them there is no deciding.
+        links = _evidence_or_refuse(snapshot)
         if handoff.expected_document_id and handoff.expected_document_id != document_id:
             raise wglink_core.WgLinkError(
                 "The active Fusion document changed after WG prepared this "
@@ -2995,6 +3180,11 @@ def _sweep_leftover_claims(snapshot: dict[str, object]) -> None:
         # Fusion is still opening: a claim for a document is settled against
         # that document, so wait until one is active.
         return
+    if _link_evidence(snapshot) is None:
+        # The document is open but its links were not read. Settling now would
+        # judge every claim against no evidence -- an applied operation would
+        # read as never started -- so nothing is settled and nothing is spent.
+        return
     _claims_swept = True
     ipc = wglink_workspace.ipc_folder(create=True)
     if ipc is None:
@@ -3008,18 +3198,23 @@ def _settle_file_claims(
     """Settle what this document can answer for; keep the rest for later."""
 
     deferred: list[object] = []
+    evidence = _link_evidence(snapshot)
     for claim in claims:
         reconcilable = claim.channel == "handoff" and bool(claim.request_id)
-        if (
-            reconcilable
-            and claim.expected_document_id
-            and claim.expected_document_id != snapshot.get("document_id")
+        if reconcilable and (
+            evidence is None
+            or (
+                claim.expected_document_id
+                and claim.expected_document_id != snapshot.get("document_id")
+            )
         ):
+            # Kept, never discarded: with no reading of this document's links
+            # there is no evidence either way.
             deferred.append(claim)
             continue
         outcome = "discarded"
         if reconcilable:
-            if _reconciled(claim.request_id, claim.export_id, list(snapshot.get("links") or [])):
+            if _reconciled(claim.request_id, claim.export_id, evidence or []):
                 outcome = "reconciled"
             elif _interrupted(claim.request_id, snapshot.get("applying_operation")):
                 outcome = "recoveryRequired"
@@ -3253,7 +3448,11 @@ def _settle_adopted_claims(client: object, snapshot: dict[str, object]) -> bool:
             expected_document = str(request.get("expectedDocumentId") or "")
             if expected_document and expected_document != snapshot.get("document_id"):
                 continue
-            if _reconciled(operation_id, export_id, list(snapshot.get("links") or [])):
+            evidence = _link_evidence(snapshot)
+            if evidence is None:
+                # Not inspected is not "no sign of it": keep the claim.
+                continue
+            if _reconciled(operation_id, export_id, evidence):
                 outcome, message = "reconciled", _ADOPTED_RECONCILED_TEXT
             elif _interrupted(operation_id, snapshot.get("applying_operation")):
                 outcome, message = "recoveryRequired", _RECOVERY_REQUIRED_TEXT
@@ -3458,7 +3657,8 @@ class LiveEventHandler(adsk.core.CustomEventHandler):
             # after a candidate has promoted and taken over the connection.
             if not _owns_active_ipc_lease():
                 return
-            _on_live_dispatch()
+            with wglink_activity.because(wglink_activity.CAUSE_LIVE):
+                _on_live_dispatch()
         except Exception as exc:  # noqa: BLE001
             _report_error("Servicing a live WG request", "WGLink live request error", exc)
         finally:
@@ -3482,6 +3682,26 @@ def _notice_outdated_wg() -> None:
     _modal(wglink_watch.WG_OUTDATED_MESSAGE, f"{PANEL_NAME} cannot read this request")
 
 
+def _settle_claims(snapshot: dict[str, object]) -> None:
+    """Settle interrupted claims read-only: once per session, then as documents open.
+
+    Bounded and never a replay, and counted as claim settlement whichever
+    carrier -- start-up, the tick, a command's follow-up -- reaches it.
+    """
+
+    with wglink_activity.because(wglink_activity.CAUSE_CLAIM_SETTLEMENT):
+        if not _claims_swept:
+            _sweep_leftover_claims(snapshot)
+        elif _deferred_file_claims and snapshot.get("document_id") is not None:
+            # An interrupted claim whose document was not open is settled as
+            # soon as it is -- read-only, and never re-run.
+            _settle_file_claims(list(_deferred_file_claims), snapshot, announce=False)
+
+
+def _claims_outstanding() -> bool:
+    return not _claims_swept or bool(_deferred_file_claims)
+
+
 def _on_watch_tick() -> None:
     """Main-thread half of the watcher: survey, ask, and apply if asked."""
 
@@ -3495,20 +3715,17 @@ def _on_watch_tick() -> None:
     _service_geometry_refresh()
     snapshot = _fusion_snapshot()
     try:
-        if not _claims_swept:
-            _sweep_leftover_claims(snapshot)
-        elif _deferred_file_claims and snapshot.get("document_id") is not None:
-            # An interrupted claim whose document was not open is settled as
-            # soon as it is -- read-only, and never re-run.
-            _settle_file_claims(list(_deferred_file_claims), snapshot, announce=False)
+        _settle_claims(snapshot)
         _notice_outdated_wg()
         _notice_untaken_solves()
         _notice_deliveries()
         # The live transport is serviced on the same main thread. The custom
         # event makes it prompt; this call makes it certain, so a missed event
-        # costs one tick rather than an operation.
-        if _on_live_dispatch(snapshot):
-            return
+        # costs one tick rather than an operation. What it runs was asked for
+        # over the live channel, so it is counted there, not under the tick.
+        with wglink_activity.because(wglink_activity.CAUSE_LIVE):
+            if _on_live_dispatch(snapshot):
+                return
         # Live and file are two workflows, not a negotiation. While the session
         # is healthy WG hands requests over it and the request files stand
         # still, so nothing can be claimed by both; when it is not, the file
@@ -3524,7 +3741,12 @@ def _on_watch_tick() -> None:
                 return
             if _apply_pending_return_request(snapshot) == HANDLED:
                 return
-        announcements = _watcher.survey(snapshot["links"])
+        surveyed = _link_evidence(snapshot)
+        if surveyed is None:
+            # Unread links are not an empty document: surveying [] would drop
+            # what the watcher knows about every link.
+            return
+        announcements = _watcher.survey(surveyed)
         if not announcements:
             return
         ui = _ui()
@@ -3556,7 +3778,8 @@ class WatchEventHandler(adsk.core.CustomEventHandler):
             # after a candidate has promoted and replaced its panel.
             if not _owns_active_ipc_lease():
                 return
-            _on_watch_tick()
+            with wglink_activity.because(wglink_activity.CAUSE_TICK):
+                _on_watch_tick()
         except Exception as exc:  # noqa: BLE001
             _report_error("Watching for WG exports", "WGLink watch error", exc)
 
@@ -3566,9 +3789,108 @@ class CandidateEventHandler(adsk.core.CustomEventHandler):
 
     def notify(self, _args: object) -> None:
         try:
-            _attempt_promotion()
+            # A promotion is this registration starting up as the owner.
+            with wglink_activity.because(wglink_activity.CAUSE_STARTUP):
+                _attempt_promotion()
         except Exception as exc:  # noqa: BLE001
             _report_error("Promoting a standby WGLink", "WGLink recovery error", exc)
+
+
+class FollowupEventHandler(adsk.core.CustomEventHandler):
+    """Main-thread time a command asked for; registered only with coordination off.
+
+    Declares no cause of its own. Each job carries the cause of the command
+    that scheduled it, so anything this handler did outside a job would count
+    as ``unattributed`` -- which is the point.
+    """
+
+    def notify(self, _args: object) -> None:
+        try:
+            if not _owns_active_ipc_lease():
+                return
+            _run_followups()
+        except Exception as exc:  # noqa: BLE001
+            _report_error("Finishing a WGLink command", "WGLink error", exc)
+
+
+def _schedule_followup(job: object) -> None:
+    """Run ``job`` on the main thread after the current handler returns.
+
+    Bound here to the cause declared here -- the command running now -- so the
+    event hop does not turn the command's own follow-up into anonymous work.
+    """
+
+    _followups.append(wglink_activity.carrying(job))
+    _raise_followup_event()
+
+
+def _raise_followup_event() -> None:
+    if _followup_event is None:
+        return
+    app = _app()
+    if app is not None:
+        app.fireCustomEvent(FOLLOWUP_EVENT_ID)
+
+
+def _run_followups() -> None:
+    """Run what commands scheduled, unless a WGLink command holds the thread.
+
+    Fusion can deliver this event inside a running command (``adsk.doEvents``
+    in a progress update, a modal). The jobs then stay queued, and that
+    command's completion re-drives them (:func:`_command_finished`) -- there
+    is no tick to retry them any more.
+    """
+
+    if _command_busy:
+        return
+    jobs = list(_followups)
+    _followups.clear()
+    for index, job in enumerate(jobs):
+        if _command_busy:
+            # A job raised a modal that is still up; keep the rest for its end.
+            _followups[:0] = jobs[index:]
+            return
+        try:
+            job()
+        except Exception as exc:  # noqa: BLE001 - one follow-up must not stop the rest
+            _log(f"[{PANEL_NAME}] a command's follow-up failed: {exc}\n{traceback.format_exc()}")
+
+
+def _command_finished() -> None:
+    """A WGLink command or modal released the main thread: re-drive what waited.
+
+    ``_command_busy`` defers work rather than dropping it. The watch tick used
+    to be the retry; this is the retry that does not need one. With
+    coordination on, live work that waited is re-raised at once instead of on
+    the next tick; with it off, the queued follow-ups run.
+    """
+
+    if _followups:
+        _raise_followup_event()
+    if _coordinating() and _live_client is not None and (
+        _live_pending
+        or (isinstance(_live_waiting, dict) and _live_waiting.get("reason") == "commandBusy")
+    ):
+        try:
+            _raise_live_event()
+        except Exception:  # noqa: BLE001 - the tick remains the backstop
+            pass
+
+
+def _after_command() -> None:
+    """What a finished command owes WG and itself when no tick runs.
+
+    Runs as a follow-up under that command's cause: pay for the geometry
+    refresh the command requested, publish status once, and -- only while an
+    interrupted claim is still unsettled -- settle it against the document the
+    user is now in, read-only.
+    """
+
+    _service_geometry_refresh()
+    snapshot = _fusion_snapshot()
+    if _claims_outstanding():
+        _settle_claims(snapshot)
+    _publish_fusion_status(snapshot)
 
 
 def _watch_loop(app: object, stop: threading.Event) -> None:
@@ -3699,6 +4021,9 @@ def _start_watch(app: object) -> bool:
     _live_superseded.clear()
     _live_declined.clear()
     _live_waiting = None
+    _followups.clear()
+    if not _coordinating():
+        return _start_followups(app)
     _watch_event = app.registerCustomEvent(WATCH_EVENT_ID)
     if _watch_event is None:
         return False
@@ -3719,6 +4044,40 @@ def _start_watch(app: object) -> bool:
     return True
 
 
+def _start_followups(app: object) -> bool:
+    """The whole of what starts with coordination off: one command-driven event.
+
+    No thread, no timer, and neither the watch nor the live event: engines A
+    to E stay dormant in the tree. The follow-up event is raised only by a
+    command's own completion (:func:`_schedule_followup`).
+    """
+
+    global _followup_event, _followup_handler
+    _followup_event = app.registerCustomEvent(FOLLOWUP_EVENT_ID)
+    if _followup_event is None:
+        return False
+    _followup_handler = FollowupEventHandler()
+    _followup_event.add(_followup_handler)
+    return True
+
+
+def _stop_followups(app: object) -> None:
+    global _followup_event, _followup_handler
+    if _followup_event is not None and _followup_handler is not None:
+        try:
+            _followup_event.remove(_followup_handler)
+        except Exception:  # noqa: BLE001
+            pass
+    if _followup_event is not None:
+        try:
+            if app:
+                app.unregisterCustomEvent(FOLLOWUP_EVENT_ID)
+        except Exception:  # noqa: BLE001
+            pass
+    _followup_event = _followup_handler = None
+    _followups.clear()
+
+
 def _stop_watch(app: object) -> None:
     global _watch_event, _watch_handler, _watch_stop, _watch_thread
     global _handoff_attempted_id, _return_request_attempted_id, _request_trace
@@ -3728,6 +4087,7 @@ def _stop_watch(app: object) -> None:
     # handler that is about to be removed, and its bounded stop is what makes
     # the add-in's shutdown bounded.
     _stop_live()
+    _stop_followups(app)
     if _live_event is not None and _live_handler is not None:
         try:
             _live_event.remove(_live_handler)
@@ -3898,6 +4258,9 @@ def _build_owner(app: object, ui: object) -> None:
         if not _activate_ipc_lease():
             raise RuntimeError("WGLink's IPC owner lease was lost during startup")
         _owned = True
+        if not _coordinating():
+            _start_without_coordination()
+            return
         _start_live()
         # No separate startup refresh. Loading the add-in is not the event that
         # matters -- seeing a linked document is, and a document stamped at
@@ -3910,6 +4273,28 @@ def _build_owner(app: object, ui: object) -> None:
         _stop_watch(app)
         _delete_owned_ui(ui)
         raise
+
+
+def _start_without_coordination() -> None:
+    """Start-up with the gate off: bounded, once, and then nothing until a command.
+
+    The live session is not started, so nothing is posted to WG and nothing
+    arrives from it. What start-up still owes is done here, once: read the
+    document if one is open, settle interrupted claims against it read-only
+    (a claim for a document that is not open is kept, as always), and publish
+    one status so WG knows which add-in is present and how it is configured.
+    """
+
+    _log(
+        f"[{PANEL_NAME}] automatic coordination is off ({ACTIVATION_SETTING} = false in "
+        f"{SETTINGS_PATH.name}). WGLink acts only when you run one of its commands."
+    )
+    try:
+        snapshot = _fusion_snapshot()
+        _settle_claims(snapshot)
+        _publish_fusion_status(snapshot)
+    except Exception as exc:  # noqa: BLE001 - the commands must still load
+        _log(f"[{PANEL_NAME}] start-up handling failed: {exc}\n{traceback.format_exc()}")
 
 
 def _attempt_promotion() -> None:
@@ -3931,7 +4316,12 @@ def _attempt_promotion() -> None:
 
 
 def run(_context: object) -> None:
-    global _panel, _owned
+    with wglink_activity.because(wglink_activity.CAUSE_STARTUP):
+        _run()
+
+
+def _run() -> None:
+    global _panel, _owned, _activation
     try:
         app = _app()
         ui = app.userInterface if app else None
@@ -3939,10 +4329,20 @@ def run(_context: object) -> None:
             return
         if _owned and _owns_active_ipc_lease():
             return
+        # The activation gate, read once for this start and not again.
+        _activation = _read_activation()
         if not _claim_ipc_lease():
             _panel = _workspace(ui).toolbarPanels.itemById(PANEL_ID)
             _owned = False
-            _start_candidate(app)
+            if _coordinating():
+                _start_candidate(app)
+            else:
+                # Candidate promotion is coordination (engine B): a standby
+                # with the gate off waits for a restart rather than a timer.
+                _log(
+                    f"[{PANEL_NAME}] another WGLink registration owns this Fusion "
+                    "session; this one stays idle until Fusion restarts."
+                )
             return
         try:
             _build_owner(app, ui)
@@ -3954,6 +4354,11 @@ def run(_context: object) -> None:
 
 
 def stop(_context: object) -> None:
+    with wglink_activity.because(wglink_activity.CAUSE_SHUTDOWN):
+        _stop()
+
+
+def _stop() -> None:
     try:
         app = _app()
         _stop_candidate(app)

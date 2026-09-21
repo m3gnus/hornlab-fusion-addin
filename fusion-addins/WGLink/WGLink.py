@@ -3841,13 +3841,12 @@ def _run_followups() -> None:
     is no tick to retry them any more.
     """
 
-    if _command_busy:
-        return
     jobs = list(_followups)
     _followups.clear()
     for index, job in enumerate(jobs):
         if _command_busy:
-            # A job raised a modal that is still up; keep the rest for its end.
+            # A command holds the thread -- from the start, or because a job
+            # raised a modal that is still up. Keep the rest for its end.
             _followups[:0] = jobs[index:]
             return
         try:

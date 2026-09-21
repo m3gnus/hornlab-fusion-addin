@@ -595,6 +595,35 @@ def test_start_up_never_settles_a_claim_against_links_it_could_not_read(
         module.stop(None)
 
 
+@pytest.mark.parametrize("readable", [False, True], ids=["unreadable", "control"])
+def test_a_document_whose_links_cannot_be_read_is_not_inspected_not_empty(
+    monkeypatch, tmp_path: Path, readable: bool
+) -> None:
+    """The real read, failing: the snapshot says it did not look, and a decision refuses."""
+
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_unreadable_{readable}", coordination=False)
+    module = fixture.module
+    if not readable:
+        monkeypatch.setattr(
+            module.wglink_core,
+            "_all_link_attributes",
+            lambda _design: (_ for _ in ()).throw(RuntimeError("unreadable")),
+        )
+
+    snapshot = module._fusion_snapshot()
+
+    assert snapshot["links_inspected"] is readable
+    if readable:
+        assert [link["instance_id"] for link in snapshot["links"]] == ["wgi-heartbeat"]
+        assert module._evidence_or_refuse(None)[0]["instance_id"] == "wgi-heartbeat"
+    else:
+        assert module._link_evidence(snapshot) is None
+        with pytest.raises(module.LinksNotInspected):
+            module._evidence_or_refuse(None)
+        # Showing links is allowed to degrade; deciding from them is not.
+        assert module._document_link_choices() == []
+
+
 @pytest.mark.parametrize(
     ("inspected", "outcome"),
     [(False, None), (True, "discarded")],

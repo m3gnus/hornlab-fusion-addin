@@ -442,30 +442,7 @@ def test_an_unsurveyable_model_says_so_in_the_pre_flight_box(author):
     )
 
 
-# ---------------------------------------------------------- model domain copy
-
-
-def test_the_domain_dropdown_offers_full_first_and_resolves_every_spelling(author):
-    choices = author.domain_choices()
-
-    assert choices[0] == author.FULL_DOMAIN_LABEL
-    assert author.resolve_domain_choice(choices[0]) == ()
-    assert author.resolve_domain_choice(choices[1]) == ("x0",)
-    assert author.resolve_domain_choice(choices[2]) == ("y0",)
-    assert author.resolve_domain_choice(choices[3]) == ("x0", "y0")
-    # Head-less callers pass planes; the order is fixed either way.
-    assert author.resolve_domain_choice(["y0", "x0"]) == ("x0", "y0")
-    with pytest.raises(author.AuthorError, match="not a model domain"):
-        author.resolve_domain_choice("upside down")
-    with pytest.raises(author.AuthorError, match="not a symmetry plane"):
-        author.resolve_domain_choice(["z0"])
-
-
-def test_every_domain_choice_explains_what_the_solver_will_do(author):
-    for choice in author.domain_choices():
-        text = author.domain_help_text(choice)
-        assert text and text[0].isupper()
-    assert "mirrors" in author.domain_help_text(author.domain_choices()[2])
+def test_historical_declared_domain_phrases_remain_readable(author):
     assert author.domain_phrase(["y0"]) == "half model, already cut on y = 0"
     assert author.domain_phrase([]) == "full model"
     assert author.domain_phrase(["x0", "y0"]).startswith("quarter model")

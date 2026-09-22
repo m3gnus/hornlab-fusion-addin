@@ -588,6 +588,8 @@ def test_removed_model_domain_code_is_not_kept_as_dead_state(monkeypatch) -> Non
     )
     assert not hasattr(module, "_domain_choice_by_document")
     assert not hasattr(module, "_send_domain")
+    assert not hasattr(module.wglink_author, "domain_choices")
+    assert not hasattr(module.wglink_author, "domain_help_text")
 
 
 class _SelectionInput:

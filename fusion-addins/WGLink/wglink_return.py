@@ -526,20 +526,19 @@ def plan_export_scope(
             if painted:
                 # Hiding a body is how a user leaves it out, but a painted
                 # source on it would silently vanish from the solve. That is
-                # missing required geometry, not an intentional exclusion.
-                record = _skipped_record(
-                    candidate,
-                    index,
-                    kind="hidden_source_body",
-                    reason=(
-                        f"hidden body {name!r} carries painted source face(s) "
-                        f"{', '.join(painted)}; show the body to solve with them, "
-                        "or clear the paint with Set WG Source…"
-                    ),
-                    severity="degraded",
+                # missing required geometry, so it refuses rather than
+                # becoming a finding that Approve could wave through.
+                refusals.append(
+                    _refusal_record(
+                        candidate,
+                        index,
+                        reason=(
+                            f"hidden body {name!r} carries painted source face(s) "
+                            f"{', '.join(painted)}; show the body to solve with "
+                            "them, or clear the paint with Set WG Source…"
+                        ),
+                    )
                 )
-                skipped.append((record, candidate))
-                degraded = True
                 continue
             record = _skipped_record(
                 candidate,

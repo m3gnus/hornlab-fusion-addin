@@ -452,6 +452,30 @@ def _try_auto_cut_opposite_sides(
     return None, None
 
 
+def _recover_auto_cut_mesh_failure(
+    gmsh_state: dict[str, object],
+    run_attempt,
+) -> tuple[dict[str, object], object | None]:
+    """Replace a failed default auto-cut attempt with a verified opposite side."""
+    mesh_generation_error = gmsh_state.get("mesh_generation_error")
+    if mesh_generation_error is None:
+        return gmsh_state, None
+    accepted_planes = tuple(gmsh_state.get("auto_reduce_planes", ()))
+    if not accepted_planes:
+        return gmsh_state, mesh_generation_error
+    opposite_state, reflected_planes = _try_auto_cut_opposite_sides(
+        run_attempt,
+        accepted_planes=accepted_planes,
+    )
+    if opposite_state is None:
+        return gmsh_state, mesh_generation_error
+    auto_reduce_report = dict(opposite_state["auto_reduce"])
+    auto_reduce_report["input_side_reflected_across"] = list(reflected_planes or ())
+    auto_reduce_report["side_selection"] = "symmetry-equivalent-opposite"
+    opposite_state["auto_reduce"] = auto_reduce_report
+    return opposite_state, None
+
+
 _evaluate_plane_symmetry = evaluate_occ_plane_symmetry
 _sample_surface_points = sample_occ_surface_points
 _remap_after_cut = remap_surface_tags
@@ -1339,24 +1363,10 @@ def main(argv: list[str] | None = None) -> int:
     geometry_healed = False
     geometry_healing_mode = "none"
     gmsh_state = _run_gmsh_attempt()
-    mesh_generation_error = gmsh_state.get("mesh_generation_error")
-    if mesh_generation_error is not None:
-        accepted_planes = tuple(gmsh_state.get("auto_reduce_planes", ()))
-        opposite_side_planes: tuple[str, ...] | None = None
-        if accepted_planes:
-            opposite_state, opposite_side_planes = _try_auto_cut_opposite_sides(
-                _run_gmsh_attempt,
-                accepted_planes=accepted_planes,
-            )
-            if opposite_state is not None:
-                gmsh_state = opposite_state
-                mesh_generation_error = None
-                auto_reduce_report = dict(gmsh_state["auto_reduce"])
-                auto_reduce_report["input_side_reflected_across"] = list(
-                    opposite_side_planes or ()
-                )
-                auto_reduce_report["side_selection"] = "symmetry-equivalent-opposite"
-                gmsh_state["auto_reduce"] = auto_reduce_report
+    gmsh_state, mesh_generation_error = _recover_auto_cut_mesh_failure(
+        gmsh_state,
+        _run_gmsh_attempt,
+    )
 
     if mesh_generation_error is not None:
         original_mesh_error = mesh_generation_error

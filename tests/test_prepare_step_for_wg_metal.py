@@ -274,6 +274,63 @@ def test_auto_cut_opposite_side_fallback_rejects_a_changed_symmetry_verdict():
     assert reflected is None
 
 
+def test_auto_cut_mesh_failure_recovery_wires_the_reflected_state_and_metadata():
+    module = _load_script()
+    original_error = RuntimeError("default side did not mesh")
+    failed = {
+        "auto_reduce": {"mode": "auto-cut"},
+        "auto_reduce_planes": ("x0", "z0"),
+        "mesh_generation_error": original_error,
+    }
+
+    def run_attempt(*, auto_cut_reflect_planes):
+        assert auto_cut_reflect_planes == ("x0",)
+        return {
+            "auto_reduce": {"mode": "auto-cut"},
+            "auto_reduce_planes": ("x0", "z0"),
+            "mesh_generation_error": None,
+            "source_surfaces": {"HF": [58]},
+        }
+
+    recovered, error = module._recover_auto_cut_mesh_failure(failed, run_attempt)
+
+    assert error is None
+    assert recovered["source_surfaces"] == {"HF": [58]}
+    assert recovered["auto_reduce"] == {
+        "mode": "auto-cut",
+        "input_side_reflected_across": ["x0"],
+        "side_selection": "symmetry-equivalent-opposite",
+    }
+
+
+def test_occ_reflection_targets_the_requested_axes_and_synchronizes(monkeypatch):
+    module = _load_script()
+    calls = []
+
+    class FakeOcc:
+        def affineTransform(self, entities, matrix):
+            calls.append(("transform", entities, matrix))
+
+        def synchronize(self):
+            calls.append(("synchronize",))
+
+    class FakeModel:
+        occ = FakeOcc()
+
+        @staticmethod
+        def getEntities(dimension):
+            return [(3, 7)] if dimension == 3 else [(2, 11)]
+
+    monkeypatch.setattr(module.gmsh, "model", FakeModel())
+
+    module._reflect_occ_geometry_across_planes(("x0", "z0"))
+
+    assert calls[0][0:2] == ("transform", [(3, 7)])
+    matrix = calls[0][2]
+    assert (matrix[0], matrix[5], matrix[10]) == (-1.0, 1.0, -1.0)
+    assert calls[1] == ("synchronize",)
+
+
 def test_anchor_surface_order_fails_loudly_on_bad_input():
     module = _load_script()
 

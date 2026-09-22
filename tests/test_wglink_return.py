@@ -240,7 +240,7 @@ def test_surface_fingerprint_accepts_the_observer_null_volume():
     validate_return_manifest(manifest)
 
 
-def test_explicit_body_exclusion_is_a_recorded_degradation():
+def test_explicit_body_exclusion_is_recorded_as_information():
     plan = plan_export_scope(
         "root",
         [
@@ -256,8 +256,32 @@ def test_explicit_body_exclusion_is_a_recorded_degradation():
         ],
     )
 
-    assert plan.status == "degraded"
+    assert plan.status == "clean"
     assert plan.skipped[0]["kind"] == "excluded_body"
+    assert plan.skipped[0]["severity"] == "info"
+
+
+def test_an_excluded_body_carrying_a_painted_source_refuses():
+    # Positive control: the exclusion is information only while the body
+    # takes nothing the solve needs with it.
+    plan = plan_export_scope(
+        "root",
+        [
+            Candidate("cabinet", "speaker", "solid", True, source_face_roles=("LF",)),
+            Candidate(
+                "jig",
+                "tweeter",
+                "solid",
+                False,
+                declaration="exclude",
+                source_face_roles=("HF",),
+            ),
+        ],
+    )
+
+    assert plan.refusals and "HF" in plan.refusals[0]["reason"]
+    with pytest.raises(WgReturnError, match="painted source"):
+        plan.manifest_scope()
 
 
 def test_visible_explicit_body_exclusion_refuses_with_visibility_recovery():

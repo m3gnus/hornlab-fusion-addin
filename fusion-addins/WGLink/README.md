@@ -194,7 +194,7 @@ Relink remain full head-less APIs but are not panel commands.
   `exclude`, or clears the declaration. A single visible, undeclared body is
   taken as the exterior shell whether Fusion reports it as a solid or surface.
   With multiple visible bodies, undeclared surfaces refuse the export and this
-  command is the in-product remedy. Hidden bodies are intentionally excluded
+  command is the in-product remedy. Hidden and explicitly excluded bodies are intentionally left out
   and recorded as information, not as degraded export evidence.
 - The head-less **`relink` API** records a manually moved or renamed bundle
   path outside the current WG workspace. The design id must match unless the

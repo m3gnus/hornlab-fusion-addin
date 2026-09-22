@@ -345,15 +345,31 @@ def plan_export_scope(
                     )
                 )
                 continue
+            painted = tuple(candidate.get("source_face_roles") or ())
+            if painted:
+                # An explicit exclusion is intent, but not for the painted
+                # source on the body: that would vanish from the solve.
+                refusals.append(
+                    _refusal_record(
+                        candidate,
+                        index,
+                        reason=(
+                            f"body {name!r} is declared 'exclude' but carries painted "
+                            f"source face(s) {', '.join(painted)}; clear the "
+                            "declaration to solve with them, or clear the paint "
+                            "with Set WG Source…"
+                        ),
+                    )
+                )
+                continue
             record = _skipped_record(
                 candidate,
                 index,
                 kind="excluded_body",
                 reason="body is explicitly excluded from the acoustic exterior",
-                severity="degraded",
+                severity="info",
             )
             skipped.append((record, candidate))
-            degraded = True
             continue
 
         if external == "unresolved":

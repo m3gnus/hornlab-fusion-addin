@@ -1,81 +1,41 @@
 # hornlab-fusion-addin
 
-A Fusion 360 add-in plus background pipeline for simulating loudspeaker
-designs directly from CAD: export the active design to STEP, mesh it with
-acoustic source tags (gmsh), and run native Apple Metal BEM solves with
-crossover summing, passive-cardioid post-processing, and VituixCAD export.
-An opt-in MF chamber path exports a separate watertight air volume, solves its
-3D pressure field with tetrahedral FEM, and couples its individual entry flows
-to the existing exterior Metal BEM bases.
+WGLink is the maintained Fusion add-in for sending Fusion geometry to Waveguide Generator (WG), solving it there, and inserting or updating native WG geometry in Fusion. The add-in lives in `fusion-addins/WGLink/`. WG's platform installers package WGLink for macOS and Windows.
 
-The add-in lives in `fusion-addins/WGMetalPipeline/`; it launches the
-pipeline in `scripts/` as a background process so Fusion stays usable while
-meshing and solves run:
-
-1. `scripts/prepare_step_for_wg_metal.py` — STEP → tagged, role-sized meshes
-2. `scripts/diagnose_wg_metal_orientation.py` — orientation/symmetry checks
-3. `scripts/solve_fusion_wg_metal.py` — per-source Metal BEM solves, crossover
-   alignment, passive-cardioid combine, plots, VituixCAD FRD/ZMA export
+The former WG Metal pipeline is maintained separately as a frozen fallback. It is not part of this repository or WGLink's updater.
 
 ## Docs
 
-- [WGLink user guide](docs/WGLINK-GUIDE.md) — the WG-linked add-in
-- [Naming a WGLink link](docs/WGLINK-LINK-NAMING.md) — which names are labels,
-  which are frozen identifiers, and why
-- [Validating a WGLink change without a release](docs/WGLINK-DEV-LOOP.md) — the
-  in-place dev sync, and reading the heartbeat's tick timings
-- [WG Metal Pipeline user guide](docs/WGMETAL-PIPELINE-GUIDE.md) — the standalone solver add-in
-- [Headless reruns, sweeps, and A/B compare](docs/HEADLESS.md)
-- [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)
+- [WGLink user guide](docs/WGLINK-GUIDE.md)
+- [WGLink implementation and development guide](fusion-addins/WGLink/README.md)
+- [Naming a WGLink link](docs/WGLINK-LINK-NAMING.md)
+- [Validating a WGLink change without a release](docs/WGLINK-DEV-LOOP.md)
+- [Headless workflow status](docs/HEADLESS.md)
+- [Retired pipeline guide](docs/WGMETAL-PIPELINE-GUIDE.md)
 
-WGLink's Send and Solve dialogs use an automatic model domain; there is no
-manual Model dropdown. With a current Waveguide Generator, explicit exports
-also record surviving Fusion origin-plane cut history and the Y-up/Z-up
-modelling orientation. Older WG versions receive neither new manifest feature
-and retain their previous absent-domain behaviour.
+WGLink's Send and Solve dialogs use an automatic model domain; there is no manual Model dropdown. With a current WG, explicit exports also record surviving Fusion origin-plane cut history and the Y-up/Z-up modelling orientation. Older WG versions receive neither new manifest feature and retain their previous absent-domain behaviour.
 
 ## Install
 
+The WG platform installer installs the packaged add-in and connects it to WG's runtime. For development from this checkout:
+
 ```bash
-git clone https://github.com/m3gnus/hornlab-fusion-addin.git
-cd hornlab-fusion-addin
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-python3 scripts/install_fusion_wg_metal_addin.py --symlink --replace
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python scripts/install_wglink_addin.py --symlink
 ```
 
-Restart Fusion, then enable it under Utilities > Add-Ins > WGMetalPipeline.
-The add-in runs the pipeline with the interpreter configured in the dialog
-under Advanced > Python (default: `<repo>/.venv/bin/python` when present).
+Restart Fusion, then enable WGLink under Utilities > Add-Ins. A symlinked development install uses this repository's active environment for Update resampling. It does not depend on a sibling or legacy checkout.
 
 ## Dependencies
 
-- Meshing/diagnostics and chamber FEM need `numpy`, `scipy`, `gmsh`, `meshio`.
-- Direct solves need [hornlab-metal-bem](https://github.com/m3gnus/hornlab-metal-bem)
-  (Apple Silicon) plus the `hornlab_sim` and `hornlab_plots` packages.
-  `requirements.txt` installs all three from their standalone GitHub
-  repositories. Runtime imports use those packages from the active environment
-  and do not depend on a sibling or legacy monorepo checkout. Without them the
-  mesh-only path (`Mesh only` in the dialog) still works.
+`requirements.txt` installs WGLink's development and test dependencies into the active environment. The packaged add-in uses WG's pinned runtime.
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest tests/
+.venv/bin/python -m pytest tests -v
 ```
-
-Some solve tests exercise a real smoke mesh and skip automatically when
-`runs/scratch/260609-fusion-addin-normalized-sources-smoke/` is absent
-(run artifacts under `runs/` are never tracked).
-
-## Compatibility note
-
-On 2026-08-03 the bianco-era Waveguide Generator bridges were retired. The
-preparation CLI no longer creates per-source metre-unit meshes or accepts
-`--skip-source-mesh-export`, and its manifest no longer contains
-`wg_source_meshes_m`. Orientation diagnosis now emits only its authoritative
-expanded tagged mesh and report. The Fusion dialog's WG-folder and Launch-WG
-controls and the pipeline's `waveguide_generator` handoff were also removed.
-Git history preserves the retired behavior and artifacts.
 
 ## License
 

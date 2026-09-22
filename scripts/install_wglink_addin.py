@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install HornLab Fusion add-ins into Fusion's AddIns folder."""
+"""Install WGLink into Fusion's AddIns folder."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import shutil
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ADDIN_NAMES = ("WGMetalPipeline", "WGLink")
+ADDIN_NAMES = ("WGLink",)
 DEFAULT_LEGACY_ADDINS_DIR = (
     Path.home()
     / "Library"
@@ -45,12 +45,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--addin",
         action="append",
-        choices=(*ADDIN_NAMES, "all"),
+        choices=ADDIN_NAMES,
         default=[],
-        help=(
-            "Add-in to install; may be repeated. Defaults to WGMetalPipeline for "
-            "backwards compatibility. Use '--addin all' for both add-ins."
-        ),
+        help="Add-in to install; may be repeated. Defaults to WGLink.",
     )
     parser.add_argument("--symlink", action="store_true", help="Symlink instead of copying")
     parser.add_argument(
@@ -97,8 +94,8 @@ def _install_one(
 def main() -> int:
     args = parse_args()
     addins_dirs = args.addins_dir or _default_addins_dirs()
-    requested = args.addin or ["WGMetalPipeline"]
-    addin_names = ADDIN_NAMES if "all" in requested else tuple(dict.fromkeys(requested))
+    requested = args.addin or ["WGLink"]
+    addin_names = tuple(dict.fromkeys(requested))
     for addins_dir in addins_dirs:
         for addin_name in addin_names:
             source_dir = REPO_ROOT / "fusion-addins" / addin_name

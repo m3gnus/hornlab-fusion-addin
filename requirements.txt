@@ -1,27 +1,7 @@
-# Mesh preparation and orientation diagnostics (prepare/diagnose steps)
+# WGLink development and test environment. The mesher package supplies
+# grid resampling used by Update and its tests.
 numpy
 scipy
-gmsh
-meshio
+Pillow  # scripts/make_wglink_icons.py
 git+https://github.com/m3gnus/hornlab-waveguide-mesher.git@63bf827607252f608640eef7ecba508c13f2a186
-
-# Direct BEM solves (Apple Silicon required). This revision includes the
-# corrected acceleration-drive sign used by absolute-phase exports.
-git+https://github.com/m3gnus/hornlab-metal-bem.git@328f981d2ad37642a68be97a7ea2e46cb7b14683
-
-# Plot rendering dependencies used through hornlab-plots
-matplotlib
-Pillow
-
-# LEM/coupling physics and canonical plotting (incl. hornlab_plots.derived,
-# which the solve step imports at module level). Runtime imports always use
-# these active environment packages rather than undeclared sibling checkouts.
-# Includes hornlab_sim.methods.acoustic_fem for the optional MF chamber path.
-# These revisions include the radiation matrix's refusal of incomplete basis
-# sweeps, full-sphere DI/power from a solved balloon, and the refusal of
-# partial spherical caps that were integrated as a whole hemisphere.
-git+https://github.com/m3gnus/hornlab-sim.git@260155deac6c539b2e55bd8573b007da1114c004
-git+https://github.com/m3gnus/hornlab-plots.git@ff30cafbe1631012f2e69c378dfe1fcc27ec7e75
-
-# Tests
 pytest

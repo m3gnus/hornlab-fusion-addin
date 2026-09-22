@@ -1,33 +1,4 @@
-"""Prove the suite is measuring the hornlab-waveguide-mesher revision we pin.
-
-The add-in is a thin caller: most of what these tests assert lives in
-``hornlab_mesher``, pinned to an exact commit in ``requirements.txt``. Two
-different mechanisms load that package, and neither of them is guaranteed to
-be the pin:
-
-* ``hornlab_mesher`` is imported from wherever ``sys.path`` finds it. A
-  development venv here carries
-  ``site-packages/hornlab_waveguide_mesher_local.pth``, one line doing
-  ``sys.path.insert(0, "<workspace>/hornlab-waveguide-mesher")``. It runs at
-  interpreter start and inserts at index 0, so it beats both the installed
-  package and ``PYTHONPATH`` -- silently, and with no error.
-* ``tests/test_wg_mesh_sizing.py`` loads ``mesh_sizing.py`` by path from
-  ``<repo>/../hornlab-waveguide-mesher``, which need not be the same tree.
-
-So a run can import one revision, read a second by path, and report a
-red/green that belongs to neither the pin nor anything the product ships.
-That has happened here more than once, and it always looks like a defect in
-the add-in rather than an environment fault. CI proves the pin resolves (see
-the "Prove the pinned mesher is the one that imports" step in
-``.github/workflows/ci.yml``); this file is the same proof for a local run,
-which is where the mistake is actually made.
-
-A checkout *ahead* of the pin passes -- developing the two repositories
-together is the normal reason to have that ``.pth`` -- but a checkout that
-does not contain the pin at all is stale, and stops the run. An installed
-copy is judged on the exact revision pip recorded for it, and an install made
-from a local directory records none, so it can only be reported, not checked.
-"""
+"""Prove the suite imports a mesher revision compatible with requirements.txt."""
 
 from __future__ import annotations
 
@@ -41,7 +12,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements.txt"
-SIBLING_MESHER = ROOT.parent / "hornlab-waveguide-mesher"
 
 _PIN_PATTERN = re.compile(r"hornlab-waveguide-mesher\.git@([0-9a-f]{40})")
 
@@ -187,7 +157,6 @@ def pytest_configure(config: pytest.Config) -> None:
         problem
         for problem in (
             _stale("imported by hornlab_mesher", _imported_mesher(), pin),
-            _stale("read by path from tests/test_wg_mesh_sizing.py", SIBLING_MESHER, pin),
         )
         if problem is not None
     ]

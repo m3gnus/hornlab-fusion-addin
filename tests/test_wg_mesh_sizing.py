@@ -1,26 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
-import sys
-
 import pytest
-
-
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT.parent / "hornlab-waveguide-mesher" / "hornlab_mesher" / "mesh_sizing.py"
-
-
-def _load():
-    spec = importlib.util.spec_from_file_location("mesh_sizing", SCRIPT)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-M = _load()
+from hornlab_mesher import mesh_sizing as M
 
 
 def test_role_size_uses_explicit_mm_knob():

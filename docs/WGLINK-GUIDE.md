@@ -22,7 +22,7 @@ For add-in development, install from this repository's checkout instead:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python scripts/install_fusion_wg_metal_addin.py --addin WGLink --symlink
+.venv/bin/python scripts/install_wglink_addin.py --symlink
 ```
 
 Use the symlink install for development. Update resamples spline profiles by invoking this

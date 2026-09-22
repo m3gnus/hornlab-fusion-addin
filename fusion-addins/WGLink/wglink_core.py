@@ -2558,8 +2558,8 @@ def _subprocess_env() -> dict[str, str]:
     MEASURED 2026-08-10: the repo venv's python died at startup with
     ``Fatal Python error: Failed to import encodings module`` because Fusion
     exports its own ``PYTHONHOME``/``PYTHONPATH`` and the child inherited them,
-    so it looked for its standard library inside Fusion's runtime. Same list
-    WGMetalPipeline already strips for the same reason.
+    so it looked for its standard library inside Fusion's runtime. These
+    variables can break any child Python process started from Fusion.
     """
 
     env = dict(os.environ)

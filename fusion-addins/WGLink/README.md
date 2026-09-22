@@ -742,8 +742,7 @@ path: it needs no hornlab-fusion-addin checkout and no second virtualenv.
 For development, run from this repository checkout:
 
 ```sh
-.venv/bin/python scripts/install_fusion_wg_metal_addin.py \
-  --addin WGLink --symlink
+.venv/bin/python scripts/install_wglink_addin.py --symlink
 ```
 
 The symlinked install is recommended because Update must invoke the repository

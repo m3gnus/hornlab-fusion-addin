@@ -254,16 +254,17 @@ _loaded_identity = wglink_live.loaded_identity(
 # (E). Off, none of them starts or registers, so nothing between the user's
 # commands can inspect the document, publish status or apply a WG request.
 #
-# Off is a key in WGLink's own settings file (``SETTINGS_PATH``), because
-# Fusion does not inherit a shell's environment:
+# The gate is off by default. The owner may enable it with a JSON boolean in
+# WGLink's own settings file (``SETTINGS_PATH``); Fusion does not inherit a
+# shell's environment:
 #
-#     {"automatic_coordination": false}
+#     {"automatic_coordination": true}
 #
-# Anything else -- the key absent, or not a JSON boolean -- is on, today's
-# behaviour. Restart Fusion (or the add-in) for a change to take effect.
+# Missing and invalid values stay off. Restart Fusion (or the add-in) for a
+# change to take effect.
 ACTIVATION_SETTING = "automatic_coordination"
 _activation: dict[str, object] = {
-    "automaticCoordination": True,
+    "automaticCoordination": False,
     "setting": "default",
     "settingsKey": ACTIVATION_SETTING,
 }
@@ -600,25 +601,24 @@ def _save_settings(settings: dict[str, object]) -> None:
 def _read_activation() -> dict[str, object]:
     """The activation gate as the owner set it, read from the settings file.
 
-    Called once per start. A value that is not a JSON boolean is reported as
-    ``invalid`` and leaves coordination on: the default is today's behaviour,
-    and a typo must not switch a subsystem off silently.
+    Called once per start. Only an explicit JSON ``true`` enables automatic
+    coordination. Invalid values are reported and leave the gate off.
     """
 
     settings = _load_settings()
     state: dict[str, object] = {"settingsKey": ACTIVATION_SETTING}
     if ACTIVATION_SETTING not in settings:
-        return {**state, "automaticCoordination": True, "setting": "default"}
+        return {**state, "automaticCoordination": False, "setting": "default"}
     value = settings[ACTIVATION_SETTING]
     if isinstance(value, bool):
         return {**state, "automaticCoordination": value, "setting": "settings"}
-    return {**state, "automaticCoordination": True, "setting": "invalid"}
+    return {**state, "automaticCoordination": False, "setting": "invalid"}
 
 
 def _coordinating() -> bool:
     """Whether this registration runs automatic coordination (read at start)."""
 
-    return _activation.get("automaticCoordination") is not False
+    return _activation.get("automaticCoordination") is True
 
 
 def _discovered_bundles() -> list:
@@ -4546,8 +4546,9 @@ def _start_without_coordination() -> None:
     """
 
     _log(
-        f"[{PANEL_NAME}] automatic coordination is off ({ACTIVATION_SETTING} = false in "
-        f"{SETTINGS_PATH.name}). WGLink acts only when you run one of its commands."
+        f"[{PANEL_NAME}] automatic coordination is off "
+        f"({ACTIVATION_SETTING}: {_activation.get('setting')}). "
+        "WGLink acts only when you run one of its commands."
     )
     try:
         snapshot = _fusion_snapshot()

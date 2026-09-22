@@ -504,26 +504,26 @@ read, so neither `id(document)` nor holding the object says anything durable
 about the document. A document that cannot be named at all is cached under
 nothing and reports "cannot tell".
 
-## Automatic coordination, and switching it off
+## Automatic coordination, and switching it on
 
 WGLink runs five engines that act without a user command: the four-second
 watch tick, owner-candidate promotion, the live session's send and poll
 workers, and the live custom event. Together they resolve every managed link
 on a timer, publish status every tick, apply WG's handoffs and return requests,
-and offer newer exports. That is **automatic coordination**, and it is on by
-default, exactly as before.
+and offer newer exports. That is **automatic coordination**, and it is off by
+default.
 
-The owner can switch it off in WGLink's own settings file,
+The owner can switch it on in WGLink's own settings file,
 `~/.hornlab/WGLink/settings.json` (Fusion does not inherit a shell, so this is
 not an environment variable):
 
 ```json
-{"automatic_coordination": false}
+{"automatic_coordination": true}
 ```
 
 The value is read once when the add-in starts; restart Fusion or the add-in to
-change it. Anything other than a JSON `false` leaves coordination on (a value
-that is not a boolean is reported as `invalid`). With it off:
+change it. A missing or invalid value leaves coordination off; only a JSON
+`true` enables it. An invalid value is reported as `invalid`. With it off:
 
 - none of the five engines starts or registers. The live layer stays in the
   tree, dormant: its threads are not started and its event is not registered;

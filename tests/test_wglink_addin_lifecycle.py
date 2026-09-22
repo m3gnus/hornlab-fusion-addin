@@ -354,6 +354,10 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     monkeypatch.setattr(
         module, "SETTINGS_PATH", Path(tempfile.mkdtemp(prefix="wglink-settings-")) / "settings.json"
     )
+    # This file exercises the existing automatic engines. Opt in explicitly;
+    # the production default is off. Activation tests remove this setting.
+    module.SETTINGS_PATH.write_text('{"automatic_coordination": true}', encoding="utf-8")
+    module._activation = module._read_activation()
     return module
 
 

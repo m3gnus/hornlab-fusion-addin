@@ -10,7 +10,7 @@ otherwise pass every idle test while measuring nothing.
 registered, several times, after the thing a user might do (switch document,
 edit, reopen, restart WG). That is everything Fusion can call back into; with
 coordination on it includes the watch tick, and the tick's work shows up
-attributed to the tick, which is today's baseline.
+attributed to the tick for an explicitly enabled installation.
 """
 
 from __future__ import annotations
@@ -33,11 +33,20 @@ from test_wglink_addin_lifecycle import (
     _fake_body,
     _fake_face,
     _linked_document,
-    _load_instance,
+    _load_instance as _load_legacy_instance,
     _per_request_folders,
     _per_request_handoff,
     _recording,
 )
+
+
+def _load_instance(monkeypatch, name: str, ui, app=None):
+    """Activation tests begin without the legacy engine fixture's opt-in."""
+
+    module = _load_legacy_instance(monkeypatch, name, ui, app)
+    module.SETTINGS_PATH.unlink()
+    module._activation = module._read_activation()
+    return module
 
 
 ENGINE_THREADS = {
@@ -135,23 +144,19 @@ def _started_threads(before: set[threading.Thread]) -> set[str]:
 @pytest.mark.parametrize(
     ("settings", "coordinating", "setting"),
     [
-        (None, True, "default"),
-        ({}, True, "default"),
+        (None, False, "default"),
+        ({}, False, "default"),
         ({ACTIVATION: True}, True, "settings"),
         ({ACTIVATION: False}, False, "settings"),
-        ({ACTIVATION: "false"}, True, "invalid"),
-        ({ACTIVATION: 0}, True, "invalid"),
+        ({ACTIVATION: "false"}, False, "invalid"),
+        ({ACTIVATION: 0}, False, "invalid"),
     ],
     ids=["no-file", "no-key", "true", "false", "string", "zero"],
 )
-def test_the_gate_is_on_unless_the_owner_writes_false(
+def test_the_gate_is_off_unless_the_owner_writes_true(
     monkeypatch, settings, coordinating: bool, setting: str
 ) -> None:
-    """Default is today's behaviour; only a JSON ``false`` switches coordination off.
-
-    A value that is not a boolean is reported as invalid and changes nothing: a
-    typo must not turn a subsystem off without anyone noticing.
-    """
+    """Only a JSON ``true`` switches coordination on. Invalid values stay off."""
 
     module = _load_instance(
         monkeypatch, f"WGLink_gate_{setting}_{coordinating}", _UI(_Panels(), _Definitions(reserve_ids=False))
@@ -231,7 +236,7 @@ def test_with_coordination_on_every_engine_starts_as_before(
     pickup check, which is behind neither gate (M1 transfer contract C8).
     """
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_engines_on", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_engines_on", coordination=True)
     before = set(threading.enumerate())
     fixture.module.run(None)
     try:
@@ -248,7 +253,7 @@ def test_with_coordination_on_every_engine_starts_as_before(
         fixture.module.stop(None)
 
 
-@pytest.mark.parametrize("coordination", [False, None], ids=["off", "on"])
+@pytest.mark.parametrize("coordination", [False, True], ids=["off", "on"])
 def test_a_standby_registration_promotes_itself_only_with_coordination_on(
     monkeypatch, tmp_path: Path, coordination: bool | None
 ) -> None:
@@ -264,9 +269,9 @@ def test_a_standby_registration_promotes_itself_only_with_coordination_on(
     try:
         assert standby._owned is False
         started = standby._candidate_thread is not None
-        assert started is (coordination is None)
-        assert (standby._candidate_event_id in owner.app.events) is (coordination is None)
-        assert ("WGLinkOwnerCandidate" in _started_threads(before)) is (coordination is None)
+        assert started is coordination
+        assert (standby._candidate_event_id in owner.app.events) is coordination
+        assert ("WGLinkOwnerCandidate" in _started_threads(before)) is coordination
     finally:
         standby.stop(None)
         owner.module.stop(None)
@@ -357,7 +362,7 @@ def test_with_coordination_on_the_same_scenario_reaches_them(
 ) -> None:
     """Positive control: the spies are wired, and the tick reaches every consumer."""
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_reach_on", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_reach_on", coordination=True)
     reached = _spy_timer_only(monkeypatch, fixture.module)
     fixture.module.run(None)
     try:
@@ -690,7 +695,7 @@ def test_an_unread_document_refuses_a_handoff_rather_than_inserting(
 ) -> None:
     """Without evidence the already-linked and already-applied checks cannot run."""
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_trap_handoff", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_trap_handoff", coordination=True)
     module = fixture.module
     ipc, bundles = _per_request_folders(monkeypatch, module, tmp_path / "x")
     _per_request_handoff(ipc, bundles, instance_id=None)
@@ -779,7 +784,7 @@ def test_with_coordination_on_the_tick_is_attributed_to_the_tick(
 ) -> None:
     """Today's baseline, and the evidence the scenario above could have failed."""
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_scenarios_on", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_scenarios_on", coordination=True)
     module = fixture.module
     module.run(None)
     try:
@@ -799,7 +804,7 @@ def test_with_coordination_on_the_tick_is_attributed_to_the_tick(
 
 
 @pytest.mark.parametrize(
-    ("coordination", "reported"), [(False, False), (None, True)], ids=["off", "on"]
+    ("coordination", "reported"), [(False, False), (None, False), (True, True)], ids=["off", "default", "on"]
 )
 def test_the_heartbeat_says_how_the_add_in_is_configured(
     monkeypatch, tmp_path: Path, coordination: bool | None, reported: bool
@@ -812,7 +817,7 @@ def test_the_heartbeat_says_how_the_add_in_is_configured(
         )
         activation = status["diagnostics"]["activation"]
         assert activation["automaticCoordination"] is reported
-        assert activation["setting"] == ("settings" if coordination is False else "default")
+        assert activation["setting"] == ("default" if coordination is None else "settings")
         assert activation["settingsKey"] == ACTIVATION
         assert ("watchIntervalSeconds" in status["diagnostics"]) is reported
         # Start-up is bounded and counted as such, never as between-commands work.
@@ -911,7 +916,7 @@ def test_back_to_back_commands_each_pay_for_their_refresh_with_coordination_off(
 def test_with_coordination_on_the_tick_keeps_its_duty_cycle(monkeypatch, tmp_path: Path) -> None:
     """The control: only the gate-off carrier pays unthrottled."""
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_m1_throttle_on", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_m1_throttle_on", coordination=True)
     module = fixture.module
     module._request_geometry_refresh("test", module._active_document_id())
     module._service_geometry_refresh()
@@ -931,7 +936,7 @@ def test_a_gate_on_watch_tick_defers_a_recent_expensive_measurement(
 ) -> None:
     """The gate-on tick keeps an explicit refresh inside its duty cycle."""
 
-    fixture = _boundary(monkeypatch, tmp_path, "WGLink_tick_throttle_gate", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, "WGLink_tick_throttle_gate", coordination=True)
     module = fixture.module
     clock = types.SimpleNamespace(value=100.0)
     monkeypatch.setattr(module.time, "monotonic", lambda: clock.value)
@@ -1032,7 +1037,7 @@ def test_a_pickup_check_held_behind_any_busy_holder_is_re_driven_when_it_ends(
 ) -> None:
     """Review M2 and R01: every place that clears ``_command_busy`` re-drives."""
 
-    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_m2_{holder.__name__}", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_m2_{holder.__name__}", coordination=True)
     module = fixture.module
     fixture.ui.dialog_result = "no"
     for name in ("_fusion_snapshot", "_settle_claims", "_notice_outdated_wg", "_notice_deliveries",
@@ -1062,6 +1067,8 @@ def test_candidate_promotion_is_counted_between_commands(monkeypatch) -> None:
     ipc = Path(__import__("tempfile").mkdtemp())
     for module in (first, second):
         monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: ipc)
+    _write_gate(first, True)
+    _write_gate(second, True)
     first.run(None)
     second.run(None)
     candidate = second._candidate_handler
@@ -1083,7 +1090,7 @@ def test_an_adopted_live_claim_is_never_judged_against_unread_links(
 ) -> None:
     """Review R02: the live-path half of the trap."""
 
-    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r02_{inspected}", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r02_{inspected}", coordination=True)
     module = fixture.module
     reports: list[tuple] = []
     client = types.SimpleNamespace(
@@ -1116,7 +1123,7 @@ def test_status_publication_is_counted_whoever_calls_it(
 ) -> None:
     """Review R04: counted on entry, before the lease check can return."""
 
-    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r04_{owner}", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_r04_{owner}", coordination=True)
     module = fixture.module
     monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: owner)
     with module.wglink_activity.because("command:probe"):
@@ -1134,7 +1141,7 @@ def test_a_refresh_for_an_unreadable_document_is_an_attempt_not_no_links(
 ) -> None:
     """Review L7: "could not read" is recorded and retried at the retry rate."""
 
-    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_l7_{readable}", coordination=None)
+    fixture = _boundary(monkeypatch, tmp_path, f"WGLink_l7_{readable}", coordination=True)
     module = fixture.module
     document_id = module._active_document_id()
     if not readable:

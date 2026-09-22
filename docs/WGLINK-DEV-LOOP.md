@@ -20,9 +20,12 @@ Run**. A full Fusion restart is not needed.
 python scripts/dev_sync_wglink.py --status
 ```
 
-`--status` prints the commit the *running* add-in reports through its own
-heartbeat, which is what proves the restart picked the edit up, and the wall
-clock of its last watch tick. `--watch` re-syncs on every save.
+`--status` compares the installed file hash with this checkout and prints the
+commit reported by the running add-in, when Fusion has published status. Check
+that the installed hash matches and that the running commit is the new commit
+after restarting WGLink. With automatic coordination off, status is published
+at startup and after commands; there is no periodic tick. `--watch` re-syncs
+on every save.
 
 ## Do not register the repository as a second add-in
 
@@ -35,9 +38,11 @@ exactly one registration at exactly one path.
 
 ## Reading the heartbeat
 
-The add-in republishes `.fusion-status.json` in WG's IPC folder on every watch
-tick — every four seconds, on Fusion's main thread. Under `diagnostics` it
-carries what that tick cost:
+With `automatic_coordination` explicitly set to `true`, the add-in republishes
+`.fusion-status.json` in WG's IPC folder on every four-second watch tick on
+Fusion's main thread. The default is off, so startup and explicit commands
+publish status without a watch tick. Under `diagnostics` an enabled tick
+reports its cost:
 
 ```json
 "diagnostics": {

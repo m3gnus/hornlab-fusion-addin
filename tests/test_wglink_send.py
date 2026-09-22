@@ -2262,6 +2262,100 @@ def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_
     assert timeline.markerPosition == 1
 
 
+def test_fusion_timeline_adapter_matches_token_drift_via_design_lookup(send_module):
+    shell = half_body(
+        "Split result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
+    )
+    shell.entityToken = "body-before"
+    later_handle = types.SimpleNamespace(entityToken="body-after")
+    canonical = object()
+    root = component("Root", [shell])
+    root.yZConstructionPlane = types.SimpleNamespace(
+        name="YZ Plane", entityToken="plane-yz"
+    )
+    feature = types.SimpleNamespace(
+        objectType="adsk::fusion::SplitBodyFeature",
+        name="Split Body 3",
+        isSuppressed=False,
+        bodies=Collection([later_handle]),
+        splitBodies=Collection([later_handle]),
+        splittingTool=root.yZConstructionPlane,
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=lambda _before: None),
+    )
+    timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
+    timeline.markerPosition = 1
+    design = types.SimpleNamespace(
+        timeline=timeline,
+        findEntityByToken=lambda token: Collection([canonical])
+        if token in {"body-before", "body-after"}
+        else Collection(),
+    )
+
+    provenance = send_module.read_cut_provenance(
+        design,
+        [({"object_id": "body-before"}, shell)],
+        "root-component",
+        root,
+    )
+
+    assert provenance[0]["plane"] == "x0"
+    assert provenance[0]["kept_side"] == "positive"
+
+
+def test_fusion_timeline_restoration_failure_cannot_return_provenance(send_module):
+    shell = half_body(
+        "Split result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
+    )
+    root = component("Root", [shell])
+    root.yZConstructionPlane = types.SimpleNamespace(
+        name="YZ Plane", entityToken="plane-yz"
+    )
+
+    class Timeline(Collection):
+        def __init__(self, values):
+            super().__init__(values)
+            self._marker = 1
+            self.restoration_blocked = False
+
+        @property
+        def markerPosition(self):
+            return self._marker
+
+        @markerPosition.setter
+        def markerPosition(self, value):
+            if self.restoration_blocked:
+                raise RuntimeError("timeline is stuck")
+            self._marker = value
+
+    timeline = Timeline([])
+
+    def roll_before(_before):
+        timeline._marker = 0
+        timeline.restoration_blocked = True
+
+    feature = types.SimpleNamespace(
+        objectType="adsk::fusion::SplitBodyFeature",
+        name="Split Body 3",
+        isSuppressed=False,
+        bodies=Collection([shell]),
+        splitBodies=Collection([shell]),
+        splittingTool=root.yZConstructionPlane,
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=roll_before),
+    )
+    timeline.append(types.SimpleNamespace(index=0, entity=feature))
+    design = types.SimpleNamespace(timeline=timeline)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="could not restore"):
+        send_module.read_cut_provenance(
+            design,
+            [({"object_id": shell.entityToken}, shell)],
+            "root-component",
+            root,
+        )
+
+
 @pytest.mark.parametrize(
     "orientation, expected",
     [(0, "+y"), (1, "+z")],
@@ -2564,6 +2658,37 @@ def test_the_manifest_and_its_own_fingerprint_place_the_link_in_one_frame(
         == manifest["instances"][0]["assembly_from_link"]
     )
     assert manifest["assembly"]["signature_hash"] == state["hash"]
+
+
+def test_return_state_hash_binds_automatic_cut_evidence_and_document_up(
+    send_module, monkeypatch
+):
+    shell = body("Return state", faces=[face("HF")])
+    root = component("Return state", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+    evidence = {"value": [{"plane": "x0", "kept_side": "positive"}]}
+    orientation = {"value": "+y"}
+    monkeypatch.setattr(
+        send_module,
+        "read_cut_provenance",
+        lambda *_args: list(evidence["value"]),
+    )
+    monkeypatch.setattr(
+        send_module, "fusion_document_up", lambda _app: orientation["value"]
+    )
+    options = {"selection": "root", "automatic_domain": True, "document_up": True}
+
+    original = send_module.return_state(app, options)
+    evidence["value"] = []
+    without_cut = send_module.return_state(app, options)
+    evidence["value"] = [{"plane": "x0", "kept_side": "positive"}]
+    orientation["value"] = "+z"
+    z_up = send_module.return_state(app, options)
+
+    assert original["state"]["cut_provenance"]
+    assert original["state"]["document_up"] == "+y"
+    assert len({original["hash"], without_cut["hash"], z_up["hash"]}) == 3
 
 
 def test_selecting_a_nested_wrappers_own_occurrence_really_is_the_recovery(

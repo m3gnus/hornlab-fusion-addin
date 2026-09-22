@@ -357,6 +357,16 @@ def _load_instance(monkeypatch, name: str, ui: _UI, app: _Application | None = N
     return module
 
 
+def _modern_manifest_features(monkeypatch, module) -> None:
+    """Keep unrelated lifecycle tests focused on their own boundary."""
+
+    monkeypatch.setattr(
+        module,
+        "_required_manifest_features",
+        lambda: {"automatic_domain": True, "document_up": True},
+    )
+
+
 def test_send_writes_to_wgs_workspace_and_never_overwrites(monkeypatch, tmp_path: Path) -> None:
     """WG only ingests from its own workspace, so the destination is not a choice.
 
@@ -372,6 +382,7 @@ def test_send_writes_to_wgs_workspace_and_never_overwrites(monkeypatch, tmp_path
     expected = tmp_path / "selected-workspace" / "wgreturn"
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: expected)
     monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+    _modern_manifest_features(monkeypatch, module)
 
     options = module._send_options(types.SimpleNamespace())
 
@@ -399,10 +410,11 @@ def test_every_source_path_declares_identity_only_when_wg_advertises_it(
         f"WGLink_identity_gate_{declared}_{bool(capabilities)}",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
-    if capabilities is not None:
-        (tmp_path / "wg-capabilities.json").write_text(
-            json.dumps(capabilities), encoding="utf-8"
-        )
+    capabilities = {"schemaVersion": 1, **dict(capabilities or {})}
+    capabilities.update({"automaticDomain": 1, "documentUp": 1})
+    (tmp_path / "wg-capabilities.json").write_text(
+        json.dumps(capabilities), encoding="utf-8"
+    )
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
     monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
     monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
@@ -451,6 +463,53 @@ def test_send_options_negotiate_automatic_domain_and_document_up_together(
     assert options["automatic_domain"] is True
     assert options["document_up"] is True
     assert "domain" not in options
+
+
+@pytest.mark.parametrize("operation", ["send", "solve"])
+def test_send_and_solve_refuse_a_wg_without_the_m1_manifest_contract(
+    monkeypatch, tmp_path: Path, operation: str
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        f"WGLink_old_wg_{operation}",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    (tmp_path / "wg-capabilities.json").write_text(
+        json.dumps({"schemaVersion": 1}), encoding="utf-8"
+    )
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+
+    with pytest.raises(module.wglink_core.WgLinkError, match="newer Waveguide Generator"):
+        module._send_options(types.SimpleNamespace())
+
+
+def test_send_preflight_states_that_an_old_wg_is_incompatible(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_old_wg_preflight",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    (tmp_path / "wg-capabilities.json").write_text(
+        json.dumps({"schemaVersion": 1}), encoding="utf-8"
+    )
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+    surveyed: list[object] = []
+    monkeypatch.setattr(
+        module.wglink_send,
+        "preflight_scope",
+        lambda *_args: surveyed.append(True),
+    )
+    box = types.SimpleNamespace(formattedText="")
+
+    module._sync_preflight(_dialog_inputs(preflight=box))
+
+    assert surveyed == []
+    assert "newer Waveguide Generator" in box.formattedText
 
 
 def test_send_refuses_when_wg_has_no_selected_workspace(monkeypatch) -> None:
@@ -1093,6 +1152,7 @@ def test_the_send_dialog_states_the_export_before_ok(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch, "WGLink_preflight_sync", _UI(_Panels(), _Definitions(reserve_ids=False))
     )
+    _modern_manifest_features(monkeypatch, module)
     box = types.SimpleNamespace(formattedText="")
     monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
     monkeypatch.setattr(module.wglink_send, "preflight_scope", lambda _app, _options: {
@@ -1122,6 +1182,7 @@ def test_refresh_body_inventory_resurveys_visibility_while_dialog_is_open(
         "WGLink_preflight_visibility_refresh",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
+    _modern_manifest_features(monkeypatch, module)
     box = types.SimpleNamespace(formattedText="")
     inputs = _dialog_inputs(preflight=box)
     monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
@@ -1172,6 +1233,7 @@ def test_a_model_that_cannot_be_surveyed_leaves_the_dialog_usable(monkeypatch) -
     module = _load_instance(
         monkeypatch, "WGLink_preflight_failure", _UI(_Panels(), _Definitions(reserve_ids=False))
     )
+    _modern_manifest_features(monkeypatch, module)
     box = types.SimpleNamespace(formattedText="")
     monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
 
@@ -2166,6 +2228,7 @@ def _heartbeat_snapshot(fixture) -> dict[str, object]:
 
 def _pending_return(fixture, monkeypatch, tmp_path, **overrides):
     module = fixture.module
+    _modern_manifest_features(monkeypatch, module)
     published = fixture.published[0]
     fields = {
         "request_id": "request-a",
@@ -4272,6 +4335,7 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
     app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
     app.activeDocument = types.SimpleNamespace(name="Tritonia V")
     module = _load_instance(monkeypatch, "WGLink_return_exact_document", ui, app)
+    _modern_manifest_features(monkeypatch, module)
     _claim_in_place(monkeypatch, module)
     request = types.SimpleNamespace(
         design_id="wgd-a",
@@ -4307,10 +4371,11 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
         "request_id": "request-a",
         "anchor_instance_id": "instance-a",
         "capture_document": True,
-        # No capability file advertises sourceIdentity here.
+        # This focused fixture stubs the required M1 capability gate; source
+        # identity remains absent independently.
         "source_identity": False,
-        "automatic_domain": False,
-        "document_up": False,
+        "automatic_domain": True,
+        "document_up": True,
     }]
     assert acknowledged == [request]
     assert ui.messages == []
@@ -4382,6 +4447,9 @@ def _refusing_handoff(monkeypatch, module, tmp_path: Path) -> Path:
     monkeypatch.setattr(module.wglink_workspace, "bundle_folder", lambda: bundle_root)
     monkeypatch.setattr(
         module.wglink_workspace, "ipc_folder", lambda **_kwargs: bundle_root
+    )
+    (bundle_root / "wg-capabilities.json").write_text(
+        json.dumps(_LIVE_CAPABILITIES), encoding="utf-8"
     )
 
     def refuse(*_args: object, **_kwargs: object) -> None:
@@ -4691,6 +4759,7 @@ def _per_request_folders(monkeypatch, module, tmp_path: Path) -> tuple[Path, Pat
     # it: these tests are about delivery, not the state guard.
     (ipc / "wg-capabilities.json").write_text(json.dumps({
         "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3,
+        "automaticDomain": 1, "documentUp": 1,
     }))
     _unmoved_live_state(monkeypatch, module, "sha256:state-b")
     return ipc, bundles
@@ -5063,6 +5132,49 @@ def test_a_per_request_return_request_runs_in_its_session_and_is_consumed(
     assert ui.messages == []
 
 
+def test_a_return_request_from_an_old_wg_is_refused_before_export(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module, ui = _design_module(monkeypatch, "WGLink_old_wg_return")
+    ipc, _bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    (ipc / "wg-capabilities.json").write_text(
+        json.dumps({
+            "schemaVersion": 1,
+            "solveCommandDelivery": 3,
+            "fusionRequestDelivery": 3,
+        }),
+        encoding="utf-8",
+    )
+    _publish_like_wg(
+        ipc,
+        ".fusion-return-request.json",
+        ".fusion-return-requests",
+        "req-old-wg",
+        1,
+        {
+            "target": "fusion360",
+            "sessionId": module._watch_session_id,
+            "designId": "wgd-a",
+            "documentId": "fusion:doc-a",
+            "instanceId": "instance-a",
+            "expectedReturnStateHash": "sha256:state-a",
+        },
+    )
+    monkeypatch.setattr(module, "_active_document_id", lambda: "fusion:doc-a")
+    monkeypatch.setattr(module, "_document_links", lambda *_a, **_k: [{
+        "design_id": "wgd-a", "instance_id": "instance-a",
+    }])
+    _unmoved_live_state(monkeypatch, module, "sha256:state-a")
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    sent: list[object] = []
+    monkeypatch.setattr(module.wglink_send, "send", lambda *_a, **_k: sent.append(True))
+
+    assert module._apply_pending_return_request() == module.HANDLED
+
+    assert sent == []
+    assert "newer Waveguide Generator" in ui.messages[0][1]
+
+
 def test_a_return_wg_asked_for_declares_source_identity_when_wg_reads_it(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -5071,6 +5183,7 @@ def test_a_return_wg_asked_for_declares_source_identity_when_wg_reads_it(
     (ipc / "wg-capabilities.json").write_text(json.dumps({
         "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3,
         "sourceIdentity": 1,
+        "automaticDomain": 1, "documentUp": 1,
     }))
     _publish_like_wg(
         ipc,
@@ -5749,7 +5862,12 @@ class _OutboxClient(_IdleDispatch):
 
 
 _LIVE_CAPABILITIES = {
-    "schemaVersion": 1, "solveCommandDelivery": 3, "fusionRequestDelivery": 3, "liveProtocol": 1,
+    "schemaVersion": 1,
+    "solveCommandDelivery": 3,
+    "fusionRequestDelivery": 3,
+    "liveProtocol": 1,
+    "automaticDomain": 1,
+    "documentUp": 1,
 }
 
 

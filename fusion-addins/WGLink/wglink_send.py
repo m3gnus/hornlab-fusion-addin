@@ -1374,12 +1374,23 @@ def return_state(app: object, options: dict[str, Any] | None = None) -> dict[str
         instances=instances,
         sources=sources,
     )
+    automatic_domain = bool(opts.get("automatic_domain"))
+    cut_state = (
+        read_cut_provenance(
+            design, included_pairs, walk["export_frame"], walk["geometry"]
+        )
+        if automatic_domain
+        else []
+    )
+    document_up = fusion_document_up(app) if bool(opts.get("document_up")) else None
     state = {
         "selection": scope["selection"],
         "bodies": bodies,
         "fem_air_volumes": scope["fem_air_volumes"],
         "instances": instances,
         "sources": source_state,
+        **({"domain": {"kind": "automatic"}, "cut_provenance": cut_state} if automatic_domain else {}),
+        **({"document_up": document_up} if document_up is not None else {}),
     }
     return {
         "hash": _canonical_hash(state),
@@ -3059,30 +3070,37 @@ _ORIGIN_PLANE_ATTRIBUTES = {
 _AXIS_FOR_ORIGIN_PLANE = {"YZ": 0, "XZ": 1, "XY": 2}
 
 
-def _same_fusion_entity(left: object, right: object) -> bool:
+def _same_fusion_entity(left: object, right: object, design: object) -> bool:
     """Best-effort identity check across Fusion's fresh Python wrappers."""
 
-    if left is right:
-        return True
     left = getattr(left, "nativeObject", None) or left
     right = getattr(right, "nativeObject", None) or right
-    try:
-        if left == right:
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    left_token = wglink_core._entity_token(left)
-    right_token = wglink_core._entity_token(right)
-    return bool(left_token and right_token and left_token == right_token)
+    # Autodesk documents that one entity's token string may change. Resolve
+    # each token and compare the entities returned; never compare the strings.
+    resolved: list[list[object]] = []
+    for candidate in (left, right):
+        aliases = [candidate]
+        token = wglink_core._entity_token(candidate)
+        if token:
+            aliases.extend(wglink_core._find_by_token(design, token))
+        resolved.append(aliases)
+    for candidate in resolved[0]:
+        for target in resolved[1]:
+            try:
+                if candidate is target or candidate == target:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+    return False
 
 
-def _origin_plane_name(entity: object, component: object) -> str | None:
+def _origin_plane_name(entity: object, component: object, design: object) -> str | None:
     for name, attribute in _ORIGIN_PLANE_ATTRIBUTES.items():
         try:
             origin = getattr(component, attribute)
         except Exception:  # noqa: BLE001
             continue
-        if _same_fusion_entity(entity, origin):
+        if _same_fusion_entity(entity, origin, design):
             return name
     # Exact browser names are a fallback for old wrappers that expose neither
     # stable equality nor an entity token for origin construction geometry.
@@ -3101,17 +3119,19 @@ def _parameter_value(parameter: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _cut_tool_descriptor(entity: object, component: object) -> tuple[str, str, bool] | None:
+def _cut_tool_descriptor(
+    entity: object, component: object, design: object
+) -> tuple[str, str, bool] | None:
     """Describe an origin plane or a zero-offset construction plane."""
 
-    direct = _origin_plane_name(entity, component)
+    direct = _origin_plane_name(entity, component, design)
     if direct is not None:
         return "origin-plane", direct, True
     definition = getattr(entity, "definition", None)
     if definition is None:
         return None
     base = getattr(definition, "planarEntity", None)
-    origin = _origin_plane_name(base, component) if base is not None else None
+    origin = _origin_plane_name(base, component, design) if base is not None else None
     if origin is None:
         return None
     kind = str(getattr(definition, "objectType", "") or "")
@@ -3122,7 +3142,9 @@ def _cut_tool_descriptor(entity: object, component: object) -> tuple[str, str, b
     return "construction-plane", origin, coincident
 
 
-def _extrude_profile_plane(feature: object, component: object) -> tuple[str, str, bool] | None:
+def _extrude_profile_plane(
+    feature: object, component: object, design: object
+) -> tuple[str, str, bool] | None:
     profiles = wglink_core._items(getattr(feature, "profile", None))
     if not profiles and getattr(feature, "profile", None) is not None:
         profiles = [feature.profile]
@@ -3130,7 +3152,11 @@ def _extrude_profile_plane(feature: object, component: object) -> tuple[str, str
     for profile in profiles:
         sketch = getattr(profile, "parentSketch", None)
         reference = getattr(sketch, "referencePlane", None)
-        descriptor = _cut_tool_descriptor(reference, component) if reference is not None else None
+        descriptor = (
+            _cut_tool_descriptor(reference, component, design)
+            if reference is not None
+            else None
+        )
         if descriptor is not None:
             found.append(descriptor)
     return found[0] if found and all(item == found[0] for item in found) else None
@@ -3160,17 +3186,6 @@ def _kept_side(body: object, origin_plane: str) -> str | None:
     return None
 
 
-def _body_aliases(body: object, object_id: str) -> set[str]:
-    aliases = {object_id}
-    for candidate in (body, getattr(body, "nativeObject", None)):
-        if candidate is None:
-            continue
-        token = wglink_core._entity_token(candidate)
-        if token:
-            aliases.add(token)
-    return aliases
-
-
 def _fusion_cut_descriptors(
     design: object,
     included_pairs: list[tuple[dict[str, Any], object]],
@@ -3185,14 +3200,11 @@ def _fusion_cut_descriptors(
         marker = int(timeline.markerPosition)
     except Exception:  # noqa: BLE001
         marker = len(wglink_core._items(timeline))
-    aliases: dict[str, str] = {}
     sides: dict[tuple[str, str], str] = {}
     bodies_by_id: dict[str, object] = {}
     for record, body in included_pairs:
         object_id = str(record["object_id"])
         bodies_by_id[object_id] = body
-        for alias in _body_aliases(body, object_id):
-            aliases[alias] = object_id
         for plane in _ORIGIN_PLANE_ATTRIBUTES:
             side = _kept_side(body, plane)
             if side is not None:
@@ -3213,9 +3225,11 @@ def _fusion_cut_descriptors(
             index = fallback_index
         affected: set[str] = set()
         for candidate in wglink_core._items(getattr(feature, "bodies", None)):
-            for alias in _body_aliases(candidate, ""):
-                if alias in aliases:
-                    affected.add(aliases[alias])
+            affected.update(
+                object_id
+                for object_id, body in bodies_by_id.items()
+                if _same_fusion_entity(candidate, body, design)
+            )
         snapshots.append((feature, {
             "timeline_index": index,
             "marker_position": marker,
@@ -3239,19 +3253,23 @@ def _fusion_cut_descriptors(
             if component is None:
                 continue
             if descriptor["feature_kind"] == "split-body":
-                tool = _cut_tool_descriptor(getattr(feature, "splittingTool", None), component)
+                tool = _cut_tool_descriptor(
+                    getattr(feature, "splittingTool", None), component, design
+                )
                 participants = getattr(feature, "splitBodies", None)
             else:
-                tool = _extrude_profile_plane(feature, component)
+                tool = _extrude_profile_plane(feature, component, design)
                 participants = getattr(feature, "participantBodies", None)
             for candidate in wglink_core._items(participants):
-                for alias in _body_aliases(candidate, ""):
-                    if alias in aliases:
-                        affected.add(aliases[alias])
+                affected.update(
+                    object_id
+                    for object_id, body in bodies_by_id.items()
+                    if _same_fusion_entity(candidate, body, design)
+                )
             # Contract planes are in the STEP export frame. A feature in a
             # child component has that meaning only while the occurrence is
             # untransformed; otherwise its local x0/y0/z0 is a different plane.
-            if not _same_fusion_entity(component, export_component):
+            if not _same_fusion_entity(component, export_component, design):
                 affected = {
                     object_id
                     for object_id in affected
@@ -3280,8 +3298,17 @@ def _fusion_cut_descriptors(
     finally:
         try:
             timeline.markerPosition = marker
-        except Exception:  # noqa: BLE001
-            pass
+            restored = int(timeline.markerPosition)
+        except Exception as exc:  # noqa: BLE001
+            raise wglink_core.WgLinkError(
+                "Fusion could not restore the design timeline after reading cut provenance; "
+                "the export was cancelled. Restore the timeline marker, then try again."
+            ) from exc
+        if restored != marker:
+            raise wglink_core.WgLinkError(
+                "Fusion did not restore the design timeline after reading cut provenance; "
+                "the export was cancelled. Restore the timeline marker, then try again."
+            )
     return descriptors
 
 

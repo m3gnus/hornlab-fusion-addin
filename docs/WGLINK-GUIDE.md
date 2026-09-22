@@ -221,8 +221,10 @@ validated automatic cutting.
 
 The automatic contract is negotiated. A capable WG receives
 `assembly.domain = {"kind":"automatic"}` under `domain-automatic-v1`, plus any
-recorded `assembly.cut_provenance`. An older WG receives neither field and keeps
-the earlier absent-domain behaviour.
+recorded `assembly.cut_provenance`. This WGLink version refuses Send, Solve and
+WG-requested returns against an older WG, because silently omitting those fields
+would change the model-domain meaning and discard the cut evidence. Update and
+restart WG before exporting.
 
 Sources need no adjustment. A half model's drive face is already half its full
 area, which is exactly what WG's own cutter would have produced, and the solver

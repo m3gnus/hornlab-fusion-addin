@@ -63,11 +63,19 @@ def _boundary(monkeypatch, tmp_path: Path, name: str, *, coordination: bool | No
 
     ui = _UI(_Panels(), _Definitions(reserve_ids=False), dialog_result="yes")
     app = _Application(ui)
+    app.preferences = types.SimpleNamespace(
+        generalPreferences=types.SimpleNamespace(defaultModelingOrientation=0)
+    )
     module = _load_instance(monkeypatch, name, ui, app)
     if coordination is not None:
         _write_gate(module, coordination)
     ipc = tmp_path / "ipc"
     ipc.mkdir(parents=True, exist_ok=True)
+    (ipc / module.wglink_watch.CAPABILITIES_FILENAME).write_text(json.dumps({
+        "schemaVersion": 1,
+        "automaticDomain": 1,
+        "documentUp": 1,
+    }))
     monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: ipc)
     design, body = _linked_document(module)
     body.revisionId = "revision-1"

@@ -100,6 +100,8 @@ def _capabilities(**overrides: Any) -> dict[str, Any]:
         "fusionRequestDelivery": 3,
         "sourceIdentity": 1,
         "liveProtocol": 1,
+        "automaticDomain": 1,
+        "documentUp": 1,
     }
     document.update(overrides)
     return {key: value for key, value in document.items() if value is not ...}

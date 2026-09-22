@@ -766,6 +766,27 @@ def _manifest_feature_enabled(name: str) -> bool:
         return False
 
 
+def _required_manifest_features() -> dict[str, bool]:
+    """The M1 manifest features this add-in requires WG to understand."""
+
+    missing = [
+        label
+        for capability, label in (
+            (wglink_watch.AUTOMATIC_DOMAIN, "automatic CAD domains"),
+            (wglink_watch.DOCUMENT_UP, "Fusion's modelling orientation"),
+        )
+        if not _manifest_feature_enabled(capability)
+    ]
+    if missing:
+        raise wglink_core.WgLinkError(
+            "This WGLink build needs a newer Waveguide Generator before it can "
+            "Send or Solve: the running WG does not advertise "
+            + " and ".join(missing)
+            + ". Update and restart WG, then try again."
+        )
+    return {"automatic_domain": True, "document_up": True}
+
+
 def _no_workspace_text(action: str = "send again") -> str:
     """Why there is no CAD Link folder to use, told apart the way WG tells it.
 
@@ -805,10 +826,7 @@ def _send_options(command_inputs: object) -> dict[str, object]:
         "overwrite": False,
         "capture_document": wglink_workspace.capture_document(),
         "source_identity": _source_identity_enabled(),
-        "automatic_domain": _manifest_feature_enabled(
-            wglink_watch.AUTOMATIC_DOMAIN
-        ),
-        "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
+        **_required_manifest_features(),
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -859,11 +877,7 @@ def _sync_preflight(command_inputs: object) -> None:
         options: dict[str, object] = {
             "selection": _send_selection(command_inputs),
             "source_identity": _source_identity_enabled(),
-            "automatic_domain": _manifest_feature_enabled(
-                wglink_watch.AUTOMATIC_DOMAIN
-            ),
-            "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
-            "display_automatic_domain": True,
+            **_required_manifest_features(),
         }
         anchor = _input(command_inputs, "anchor_instance_id")
         try:
@@ -1888,7 +1902,19 @@ def _geometry_change_key(design: object, records: dict) -> tuple:
     alone; the stored export id and edit version catch an Update.
     """
 
-    parts: list[object] = [_source_authoring_generation, _source_identity_enabled()]
+    automatic_domain = _manifest_feature_enabled(wglink_watch.AUTOMATIC_DOMAIN)
+    document_up = _manifest_feature_enabled(wglink_watch.DOCUMENT_UP)
+    parts: list[object] = [
+        _source_authoring_generation,
+        _source_identity_enabled(),
+        automatic_domain,
+        document_up,
+    ]
+    if document_up:
+        try:
+            parts.append(wglink_send.fusion_document_up(_app()))
+        except Exception:  # noqa: BLE001 - an unreadable preference still changes the key
+            parts.append("unreadable-document-up")
     try:
         parts.append(int(design.timeline.count))
     except Exception:  # noqa: BLE001 - a product without a timeline still keys
@@ -1922,6 +1948,10 @@ def _measure_geometry_state(app: object, records: dict) -> dict[str, object]:
                 "selection": "root",
                 **({"anchor_instance_id": first_instance} if first_instance else {}),
                 "source_identity": _source_identity_enabled(),
+                "automatic_domain": _manifest_feature_enabled(
+                    wglink_watch.AUTOMATIC_DOMAIN
+                ),
+                "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
             },
         )
         document_signature_hash = str(return_state.get("hash") or "")
@@ -2916,10 +2946,7 @@ def _execute_return_request(
             "anchor_instance_id": request.instance_id,
             "capture_document": wglink_workspace.capture_document(),
             "source_identity": _source_identity_enabled(),
-            "automatic_domain": _manifest_feature_enabled(
-                wglink_watch.AUTOMATIC_DOMAIN
-            ),
-            "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
+            **_required_manifest_features(),
         }
         # The last safe point: the export has no interruption mechanism, so a
         # dismissal that arrives from here on is deferred to the next boundary.

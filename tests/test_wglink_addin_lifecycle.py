@@ -559,6 +559,36 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
     ]
 
 
+def test_model_domain_choice_is_remembered_per_document_for_the_session(
+    monkeypatch,
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_domain_memory",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    active = {"id": "fusion:document-a"}
+    monkeypatch.setattr(module, "_active_document_id", lambda: active["id"])
+
+    chosen = module.wglink_author.domain_choices()[2]
+    changed = types.SimpleNamespace(id="model_domain")
+    inputs = _dialog_inputs(model_domain=_chosen(chosen))
+    module.CommandInputChangedHandler("solve").notify(
+        types.SimpleNamespace(input=changed, inputs=inputs)
+    )
+    assert module._send_domain(_dialog_inputs()) == ("y0",)
+
+    def selected_for_current_document() -> list[str]:
+        _added, listed = _build_dialog(module, "solve")
+        return [label for label, selected in listed["model_domain"] if selected]
+
+    assert selected_for_current_document() == [chosen]
+    active["id"] = "fusion:document-b"
+    assert selected_for_current_document() == [module.wglink_author.domain_choices()[0]]
+    active["id"] = "fusion:document-a"
+    assert selected_for_current_document() == [chosen]
+
+
 class _SelectionInput:
     """A Fusion selection input, read back the way the handlers read it."""
 

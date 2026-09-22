@@ -974,10 +974,16 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         for item in candidates
         if item.get("body_kind") in {"solid", "surface"}
         and item.get("kind") == "body"
+        and item.get("visible") is not False
         and item.get("declaration") != "exclude"
         and not _is_managed_helper(item)
     ]
-    if len(exterior) == 1:
+    declared_roles = any(
+        item.get("body_kind") in {"solid", "surface"}
+        and item.get("declaration") is not None
+        for item in candidates
+    )
+    if len(exterior) == 1 and not declared_roles:
         exterior[0]["only_enclosing_exterior"] = True
     _mark_uncovered_helper_sources(candidates)
     return {

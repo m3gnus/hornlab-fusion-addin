@@ -379,8 +379,11 @@ def test_an_unclassified_surface_body_points_at_the_command_that_fixes_it(author
         sources=[],
     ))
 
-    assert "Export is blocked" in summary.warnings[0]
-    assert author.DECLARE_BODY_HINT in summary.warnings[0]
+    assert summary.text().startswith("⚠ Export is blocked")
+    assert author.DECLARE_BODY_HINT in summary.text()
+    assert "Bodies included: none" not in summary.text()
+    assert "Sources: none" not in summary.text()
+    assert author.NO_SOURCE_WARNING not in summary.text()
 
 
 def test_mixed_body_kinds_are_counted_by_name(author):

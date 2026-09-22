@@ -603,7 +603,9 @@ NO_SOURCE_WARNING = (
     "No drivable source: use Set WG Source… to mark a face LF, MF, HF, or "
     "PASSIVE_CARDIOID. The export refuses without one."
 )
-DECLARE_BODY_HINT = "Use Declare Body… to classify it or leave it out."
+DECLARE_BODY_HINT = (
+    "Use Declare Body… (Manage menu) → Exterior shell, or exclude the body."
+)
 LOG_HINT = (
     "The full traceback is in Fusion's Text Commands palette "
     "(View → Show Text Commands)."
@@ -627,14 +629,16 @@ class Preflight:
     def text(self) -> str:
         blocks = list(self.lines)
         if self.warnings:
-            blocks.append("")
+            if blocks:
+                blocks.append("")
             blocks.extend(f"⚠ {warning}" for warning in self.warnings)
         return "\n".join(blocks)
 
     def html(self) -> str:
         rows = [html.escape(line) for line in self.lines]
         if self.warnings:
-            rows.append("")
+            if rows:
+                rows.append("")
             rows.extend(
                 f"<b>⚠ {html.escape(warning)}</b>" for warning in self.warnings
             )
@@ -684,6 +688,15 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
         else ()
     )
 
+    if scope_error:
+        warning = f"Export is blocked: {scope_error}"
+        if (
+            "unclassified" in scope_error.casefold()
+            and DECLARE_BODY_HINT not in scope_error
+        ):
+            warning += f" {DECLARE_BODY_HINT}"
+        return Preflight(lines=(), warnings=(warning,), frame=())
+
     lines = [
         "Scope: root assembly" if selection == "root" else f"Scope: {selection}",
         f"Bodies included: {_body_count_phrase(included)}",
@@ -721,11 +734,6 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     warnings: list[str] = []
     if domain_error:
         warnings.append(f"Model domain: {domain_error}")
-    if scope_error:
-        warning = f"Export is blocked: {scope_error}"
-        if "unclassified" in scope_error.casefold():
-            warning += f" {DECLARE_BODY_HINT}"
-        warnings.append(warning)
     if not sources:
         warnings.append(source_error or NO_SOURCE_WARNING)
 

@@ -300,6 +300,11 @@ def plan_export_scope(
     refusals: list[dict[str, Any]] = []
     degraded = False
     construction: dict[str, Any] | None = None
+    body_role_declared = any(
+        _plain_descriptor(raw, label=f"scope candidate {index}").get("declaration")
+        is not None
+        for index, raw in enumerate(candidates)
+    )
 
     for index, raw_candidate in enumerate(candidates):
         candidate = _plain_descriptor(
@@ -517,15 +522,33 @@ def plan_export_scope(
             continue
 
         if body_kind in {"solid", "surface"} and candidate.get("visible") is False:
+            painted = tuple(candidate.get("source_face_roles") or ())
+            if painted:
+                # Hiding a body is how a user leaves it out, but a painted
+                # source on it would silently vanish from the solve. That is
+                # missing required geometry, not an intentional exclusion.
+                record = _skipped_record(
+                    candidate,
+                    index,
+                    kind="hidden_source_body",
+                    reason=(
+                        f"hidden body {name!r} carries painted source face(s) "
+                        f"{', '.join(painted)}; show the body to solve with them, "
+                        "or clear the paint with Set WG Source…"
+                    ),
+                    severity="degraded",
+                )
+                skipped.append((record, candidate))
+                degraded = True
+                continue
             record = _skipped_record(
                 candidate,
                 index,
                 kind="hidden_body",
                 reason="hidden bodies are excluded by policy",
-                severity="degraded",
+                severity="info",
             )
             skipped.append((record, candidate))
-            degraded = True
             continue
 
         if body_kind == "solid" and candidate.get("visible") is True:
@@ -572,13 +595,32 @@ def plan_export_scope(
             continue
 
         if body_kind == "surface" and candidate.get("visible") is True:
+            if (
+                candidate.get("only_enclosing_exterior") is True
+                and not body_role_declared
+            ):
+                included.append(
+                    _included_record(
+                        candidate,
+                        index,
+                        external_reference=external,
+                        reason=(
+                            "the only visible body is taken as the exterior shell"
+                            + external_note
+                        ),
+                        severity="degraded" if stale_external else "info",
+                    )
+                )
+                degraded = degraded or stale_external
+                continue
             refusals.append(
                 _refusal_record(
                     candidate,
                     index,
                     reason=(
                         f"visible surface body {name!r} is unclassified; mark it "
-                        "'exterior-shell' or exclude it" + external_note
+                        "'exterior-shell' or exclude it. Use Declare Body… "
+                        "(Manage menu) → Exterior shell" + external_note
                     ),
                 )
             )

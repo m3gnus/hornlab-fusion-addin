@@ -161,9 +161,10 @@ requirements:
 1. **A drive source.** Mark the throat or diaphragm face with
    **Set WG Source…**. Hand-painting an appearance named exactly `LF`, `MF`,
    `HF`, or `PASSIVE_CARDIOID` onto the face does the same thing.
-2. **Closed solids.** An open surface body must be classified with
-   **Declare Body…** (`exterior-shell` or `exclude`), or the export refuses
-   it as unclassified.
+2. **Exterior bodies.** One visible, undeclared solid or surface body is taken
+   as the exterior shell. With multiple visible bodies, classify open surfaces
+   with **Declare Body…** (`exterior-shell` or `exclude`); otherwise the export
+   refuses them as unclassified. Hidden bodies are intentionally left out.
 3. **The solver frame.** With no link to anchor the model, WG assumes it
    radiates along **+Z**, throat at the **origin**, centred on x = 0 and
    y = 0 so mirror symmetry can be found. The Send/Solve dialogs show a

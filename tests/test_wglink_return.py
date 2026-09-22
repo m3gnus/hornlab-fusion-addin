@@ -176,7 +176,7 @@ def _worked_example() -> dict:
                     "name": "jig_left",
                     "kind": "hidden_body",
                     "reason": "hidden bodies are excluded by policy",
-                    "severity": "degraded",
+                    "severity": "info",
                 },
                 {
                     "object_id": "construction-1",
@@ -187,7 +187,7 @@ def _worked_example() -> dict:
                 },
             ],
             "fem_air_volumes": [],
-            "status": "degraded",
+            "status": "clean",
         },
         instances=[_instance()],
         sources=[
@@ -306,6 +306,7 @@ class Candidate:
     declaration: str | None = None
     wglink_managed: bool = False
     wglink_role: str | None = None
+    source_face_roles: tuple[str, ...] = ()
 
 
 def test_s1_suppressed_object_skips_degraded_with_reason():
@@ -413,10 +414,10 @@ def test_a_hidden_linked_solid_is_skipped_exactly_as_a_hidden_local_one(external
 
     assert _verdicts(linked)[1:] == _verdicts(local)[1:] == (("hidden_body",), ())
     assert linked.included == ()
-    assert linked.status == "degraded"
+    assert linked.status == ("degraded" if external == "resolved-stale" else "clean")
     record = linked.skipped[0]
     assert record["external_reference"] == external
-    assert record["severity"] == "degraded"
+    assert record["severity"] == ("degraded" if external == "resolved-stale" else "info")
     assert "hidden bodies are excluded by policy" in record["reason"]
 
 
@@ -618,15 +619,35 @@ def test_s8_visible_wglink_helper_refuses_and_names_the_body():
     assert "Hiding a folder that contains it will not work" in message
 
 
-def test_s9_hidden_brep_body_skips_degraded_with_ratified_reason():
+def test_s9_hidden_brep_body_skips_as_information_with_ratified_reason():
     plan = plan_export_scope(
         "root",
         [Candidate("hidden", "jig_left", "solid", False)],
     )
 
-    assert plan.status == "degraded"
+    assert plan.status == "clean"
     assert plan.skipped[0]["kind"] == "hidden_body"
+    assert plan.skipped[0]["severity"] == "info"
     assert plan.skipped[0]["reason"] == "hidden bodies are excluded by policy"
+
+
+def test_a_hidden_body_carrying_a_painted_source_is_not_a_quiet_exclusion():
+    # Positive control for S9: hiding a body is information only while it
+    # takes nothing the solve needs with it.
+    plan = plan_export_scope(
+        "root",
+        [
+            Candidate("cabinet", "speaker", "solid", True),
+            Candidate(
+                "hidden", "tweeter", "solid", False, source_face_roles=("HF",)
+            ),
+        ],
+    )
+
+    assert plan.status == "degraded"
+    assert plan.skipped[0]["kind"] == "hidden_source_body"
+    assert plan.skipped[0]["severity"] == "degraded"
+    assert "HF" in plan.skipped[0]["reason"]
 
 
 def test_s10_visible_brep_solid_includes_with_reason():
@@ -672,10 +693,13 @@ def test_s11_declared_or_managed_surface_includes_with_reason(candidate, phrase)
     assert phrase in plan.included[0]["reason"]
 
 
-def test_s12_unclassified_visible_surface_refuses_with_one_declaration_remedy():
+def test_s12_two_unclassified_visible_surfaces_refuse_with_one_declaration_remedy():
     plan = plan_export_scope(
         "root",
-        [Candidate("helper-shell", "mystery helper", "surface", True)],
+        [
+            Candidate("shell", "horn shell", "surface", True),
+            Candidate("helper-shell", "mystery helper", "surface", True),
+        ],
     )
 
     with pytest.raises(
@@ -684,6 +708,25 @@ def test_s12_unclassified_visible_surface_refuses_with_one_declaration_remedy():
     ) as exc:
         plan.manifest_scope()
     assert exc.value.reasons[0]["decision"] == "refuse"
+
+
+def test_s12_the_only_visible_undeclared_surface_is_the_exterior_shell():
+    plan = plan_export_scope(
+        "root",
+        [
+            {
+                "object_id": "shell",
+                "name": "horn shell",
+                "body_kind": "surface",
+                "visible": True,
+                "only_enclosing_exterior": True,
+            }
+        ],
+    )
+
+    assert plan.refusals == ()
+    assert plan.included[0]["body_kind"] == "surface"
+    assert "only visible body" in plan.included[0]["reason"]
 
 
 @pytest.mark.parametrize(

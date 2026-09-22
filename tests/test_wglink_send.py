@@ -612,7 +612,7 @@ def test_preflight_reports_a_missing_source_instead_of_raising_it(
     assert report["source_bounds_mm"] is None
 
 
-def test_preflight_reports_an_unclassified_surface_body_as_scope_text(
+def test_preflight_accepts_the_only_visible_surface_body_as_the_exterior_shell(
     send_module, monkeypatch
 ):
     shell = body("Shell", solid=False, faces=[face("HF")])
@@ -620,14 +620,47 @@ def test_preflight_reports_an_unclassified_surface_body_as_scope_text(
 
     report = send_module.preflight_scope(app)
 
+    assert report["scope_error"] is None
+    assert report["included"] == [{"name": "Speaker/Shell", "body_kind": "surface"}]
+    assert [source["role"] for source in report["sources"]] == ["HF"]
+
+
+def test_one_visible_surface_and_one_hidden_solid_use_the_surface_as_the_exterior(
+    send_module, monkeypatch
+):
+    shell = body("Shell", solid=False, faces=[face("HF")])
+    hidden = body("Body11", visible=False)
+    app = _design_of(component("Speaker", [shell, hidden]), monkeypatch, send_module)
+
+    walk = send_module._scope_walk(send_module.wglink_core._design(app), "root")
+    candidates = {item["name"]: item for item in walk["candidates"]}
+    assert candidates["Shell"]["only_enclosing_exterior"] is True
+    assert candidates["Body11"]["only_enclosing_exterior"] is False
+
+    report = send_module.preflight_scope(app)
+
+    assert report["scope_error"] is None
+    assert report["included"] == [{"name": "Speaker/Shell", "body_kind": "surface"}]
+    assert [source["role"] for source in report["sources"]] == ["HF"]
+
+
+def test_two_visible_undeclared_surfaces_still_refuse(send_module, monkeypatch):
+    first = body("First shell", solid=False, faces=[face("HF")])
+    second = body("Second shell", solid=False)
+    app = _design_of(component("Speaker", [first, second]), monkeypatch, send_module)
+
+    report = send_module.preflight_scope(app)
+
     assert "unclassified" in report["scope_error"]
     assert report["included"] == [] and report["sources"] == []
 
     # Declare Body is the remedy, and it unblocks the same scope.
-    send_module.declare_body(shell, "exterior-shell")
+    send_module.declare_body(first, "exterior-shell")
+    send_module.declare_body(second, "exclude")
+    second.isVisible = False
     cleared = send_module.preflight_scope(app)
     assert cleared["scope_error"] is None
-    assert cleared["included"] == [{"name": "Speaker/Shell", "body_kind": "surface"}]
+    assert cleared["included"] == [{"name": "Speaker/First shell", "body_kind": "surface"}]
     assert [source["role"] for source in cleared["sources"]] == ["HF"]
 
 

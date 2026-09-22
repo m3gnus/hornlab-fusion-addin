@@ -200,32 +200,29 @@ therefore shows models it imported earlier as changed; send them again. Painted
 sources marked before this release are refused until you re-run
 **Set WG Source…** on them.
 
-## 5. Returning a model you already cut in half
+## 5. Automatic model domain
 
-WG normally finds a model's mirror symmetry and cuts it down itself. A model
-that arrives **already** cut is different: there is nothing left to remove, and
-nothing in the geometry distinguishes a deliberate half from an open shell. Left
-undeclared, the half is solved as a full model with a large hole in it — a wrong
-answer rather than an error.
+There is no Model domain dropdown. Send and Solve show **Automatic (WG
+decides)** in pre-flight, and WG chooses the smallest safe domain from the solve
+mesh.
 
-So say it. **Model domain** on the Send/Solve dialog offers the full model
-(the default), a half cut on x = 0 or on y = 0, and a quarter cut on both.
+For a model already cut on an origin plane, WGLink reads the Fusion timeline
+during that explicit Send or Solve. A live, unsuppressed **Split Body** or cut
+extrude on the YZ, XZ or XY origin plane is recorded with its feature name and
+the side the exported body kept. A construction plane counts only when it is
+coincident with an origin plane (for example an offset of zero). Pre-flight
+shows evidence such as **Cut: Split Body 3 at x = 0**.
 
-Three requirements, and WGLink checks the first two before it exports:
+WG revalidates that evidence against the solve mesh. Supported positive-side,
+open cuts can be mirrored; negative-side, capped, leaking or otherwise unsafe
+cuts are refused with a remedy. With no surviving cut evidence, a pre-cut shape
+is solved as shown rather than guessed to be symmetric. Full models keep WG's
+validated automatic cutting.
 
-1. **Keep the positive side.** WG keeps x ≥ 0 and y ≥ 0, so a half that lives
-   on the negative side is refused with the remedy: mirror it first.
-2. **Do not straddle the plane.** A declaration that the exported bodies
-   contradict is refused, and the refusal states the measurement it was
-   refused on.
-3. **Leave the cut face open.** The plane is where the solver's mirror goes;
-   capping it turns the mirror into a rigid wall. WG re-derives this from the
-   mesh it builds and refuses a declaration the mesh denies, so a capped or
-   leaking half never solves silently.
-
-The declaration travels in the return manifest as `assembly.domain`, gated by
-the `reduced-domain-v1` required feature: a WG that predates the feature refuses
-the bundle instead of solving it whole.
+The automatic contract is negotiated. A capable WG receives
+`assembly.domain = {"kind":"automatic"}` under `domain-automatic-v1`, plus any
+recorded `assembly.cut_provenance`. An older WG receives neither field and keeps
+the earlier absent-domain behaviour.
 
 Sources need no adjustment. A half model's drive face is already half its full
 area, which is exactly what WG's own cutter would have produced, and the solver
@@ -241,11 +238,16 @@ frame. Fusion's STEP export takes a Component and writes it in its own
 coordinates; it offers no way to export an occurrence in its assembly
 placement. So the bundle states which frame it is in
 (`coordinate_system.export_frame`), and every coordinate in it — the bounding
-box, each instance placement, the declared-domain measurement — is read from
+box, each instance placement, and cut plane — is read from
 the native bodies, which Fusion defines as the bodies "outside the context of
 an assembly". A moved or jointed wrapper occurrence therefore returns
 correctly, which is the ordinary WGLink round trip: Insert places the wrapper,
 you move and joint it, and Solve in WG returns it.
+
+When WG advertises support, the return also records Fusion's current general
+Y-up or Z-up modelling orientation as `coordinate_system.document_up`. This is
+captured at export, so changing the preference later does not reinterpret an
+older return.
 
 The one shape this cannot do is a **placed occurrence that itself contains
 sub-assemblies**. Its children's bodies are native to their own components, and

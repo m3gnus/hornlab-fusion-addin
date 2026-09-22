@@ -429,6 +429,30 @@ def test_every_source_path_declares_identity_only_when_wg_advertises_it(
     assert previewed == [declared]
 
 
+def test_send_options_negotiate_automatic_domain_and_document_up_together(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_manifest_features",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    (tmp_path / "wg-capabilities.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "automaticDomain": 1,
+        "documentUp": 1,
+    }), encoding="utf-8")
+    monkeypatch.setattr(module.wglink_workspace, "ipc_folder", lambda **_kwargs: tmp_path)
+    monkeypatch.setattr(module.wglink_workspace, "return_folder", lambda: tmp_path)
+    monkeypatch.setattr(module, "_send_selection", lambda _inputs: "root")
+
+    options = module._send_options(types.SimpleNamespace())
+
+    assert options["automatic_domain"] is True
+    assert options["document_up"] is True
+    assert "domain" not in options
+
+
 def test_send_refuses_when_wg_has_no_selected_workspace(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch,
@@ -510,9 +534,8 @@ def test_the_send_dialog_asks_only_for_scope(monkeypatch) -> None:
     assert bool_inputs == [
         ("refresh_preflight", "Refresh body inventory", False, "", False)
     ]
-    # Two read-only boxes: what the domain dropdown means, and what the export
-    # will do before the user commits to it.
-    assert [args[0] for args in text_boxes] == ["model_domain_help", "preflight"]
+    # The domain is automatic, so there is no domain dropdown or help box.
+    assert [args[0] for args in text_boxes] == ["preflight"]
     assert all(args[-1] is True for args in text_boxes)
 
 
@@ -552,41 +575,19 @@ def test_solve_in_wg_shares_the_send_dialog(monkeypatch) -> None:
     assert added == [
         "send_selection",
         "anchor_instance_id",
-        "model_domain",
-        "model_domain_help",
         "preflight",
         "refresh_preflight",
     ]
 
 
-def test_model_domain_choice_is_remembered_per_document_for_the_session(
-    monkeypatch,
-) -> None:
+def test_removed_model_domain_code_is_not_kept_as_dead_state(monkeypatch) -> None:
     module = _load_instance(
         monkeypatch,
-        "WGLink_domain_memory",
+        "WGLink_no_domain_memory",
         _UI(_Panels(), _Definitions(reserve_ids=False)),
     )
-    active = {"id": "fusion:document-a"}
-    monkeypatch.setattr(module, "_active_document_id", lambda: active["id"])
-
-    chosen = module.wglink_author.domain_choices()[2]
-    changed = types.SimpleNamespace(id="model_domain")
-    inputs = _dialog_inputs(model_domain=_chosen(chosen))
-    module.CommandInputChangedHandler("solve").notify(
-        types.SimpleNamespace(input=changed, inputs=inputs)
-    )
-    assert module._send_domain(_dialog_inputs()) == ("y0",)
-
-    def selected_for_current_document() -> list[str]:
-        _added, listed = _build_dialog(module, "solve")
-        return [label for label, selected in listed["model_domain"] if selected]
-
-    assert selected_for_current_document() == [chosen]
-    active["id"] = "fusion:document-b"
-    assert selected_for_current_document() == [module.wglink_author.domain_choices()[0]]
-    active["id"] = "fusion:document-a"
-    assert selected_for_current_document() == [chosen]
+    assert not hasattr(module, "_domain_choice_by_document")
+    assert not hasattr(module, "_send_domain")
 
 
 class _SelectionInput:
@@ -4306,6 +4307,8 @@ def test_a_targeted_return_exports_only_the_exact_live_link(
         "capture_document": True,
         # No capability file advertises sourceIdentity here.
         "source_identity": False,
+        "automatic_domain": False,
+        "document_up": False,
     }]
     assert acknowledged == [request]
     assert ui.messages == []

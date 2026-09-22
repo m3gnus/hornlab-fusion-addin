@@ -28,6 +28,12 @@ meshing and solves run:
 - [Headless reruns, sweeps, and A/B compare](docs/HEADLESS.md)
 - [Pipeline, dialog, and output reference](fusion-addins/WGMetalPipeline/README.md)
 
+WGLink's Send and Solve dialogs use an automatic model domain; there is no
+manual Model dropdown. With a current Waveguide Generator, explicit exports
+also record surviving Fusion origin-plane cut history and the Y-up/Z-up
+modelling orientation. Older WG versions receive neither new manifest feature
+and retain their previous absent-domain behaviour.
+
 ## Install
 
 ```bash

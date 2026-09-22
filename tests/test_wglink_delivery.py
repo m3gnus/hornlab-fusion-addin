@@ -51,6 +51,30 @@ ADVERTISED = {
 }
 
 
+@pytest.mark.parametrize(
+    "field, capability, expected",
+    [
+        ("automaticDomain", 1, True),
+        ("automaticDomain", 0, False),
+        ("automaticDomain", True, False),
+        ("documentUp", 1, True),
+        ("documentUp", "1", False),
+    ],
+)
+def test_manifest_features_are_used_only_when_wg_advertises_them(
+    ipc: Path, field: str, capability: Any, expected: bool
+) -> None:
+    _write(ipc / CAPABILITIES, {"schemaVersion": 1, field: capability})
+
+    assert wglink_watch.wg_manifest_feature(ipc, field) is expected
+
+
+def test_manifest_features_are_absent_for_an_old_or_unreadable_wg(ipc: Path) -> None:
+    assert wglink_watch.wg_manifest_feature(ipc, "automaticDomain") is False
+    _write(ipc / CAPABILITIES, {"schemaVersion": 2, "automaticDomain": 1})
+    assert wglink_watch.wg_manifest_feature(ipc, "automaticDomain") is False
+
+
 @pytest.fixture(autouse=True)
 def _nothing_reaches_the_real_wg_folder(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("WG2_DATA_DIR", str(tmp_path / "wg-data"))

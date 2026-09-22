@@ -510,3 +510,16 @@ def test_the_preflight_states_a_verified_domain_and_warns_about_a_refused_one(au
         warning.startswith("Model domain: ") for warning in refused.warnings
     )
     assert not any(line.startswith("Domain:") for line in refused.lines)
+
+
+def test_automatic_domain_and_recorded_cuts_are_visible_in_preflight(author):
+    summary = author.preflight_summary(clean_scope(
+        domain={"kind": "automatic"},
+        cut_provenance=[{
+            "feature": {"kind": "split-body", "name": "Split Body 3"},
+            "plane": "x0",
+        }],
+    ))
+
+    assert "Domain: Automatic (WG decides)" in summary.lines
+    assert "Cut: Split Body 3 at x = 0" in summary.lines

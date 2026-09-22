@@ -1090,6 +1090,59 @@ def test_the_feature_without_a_declared_domain_is_refused():
         validate_return_manifest(manifest)
 
 
+def test_automatic_domain_is_paired_with_its_feature_and_states_nothing_else():
+    manifest = _worked_example()
+    manifest["assembly"]["domain"] = {"kind": "automatic"}
+    manifest["required_features"].append("domain-automatic-v1")
+    validate_return_manifest(manifest)
+
+    without_feature = deepcopy(manifest)
+    without_feature["required_features"].remove("domain-automatic-v1")
+    with pytest.raises(WgReturnError, match="domain-automatic-v1 is required exactly"):
+        validate_return_manifest(without_feature)
+
+    manifest["assembly"]["domain"]["cut_planes"] = []
+    with pytest.raises(WgReturnError, match="states nothing else"):
+        validate_return_manifest(manifest)
+
+
+def test_cut_provenance_and_document_up_follow_the_wg_reader_contract():
+    manifest = _worked_example()
+    body_id = manifest["scope"]["included"][0]["object_id"]
+    manifest["required_features"].extend(["domain-automatic-v1", "document-up-v1"])
+    manifest["coordinate_system"]["document_up"] = "+y"
+    manifest["assembly"]["domain"] = {"kind": "automatic"}
+    manifest["assembly"]["cut_provenance"] = [{
+        "body_object_id": body_id,
+        "feature": {"kind": "split-body", "name": "Split Body 3"},
+        "tool": {"kind": "origin-plane", "origin_plane": "YZ"},
+        "plane": "x0",
+        "kept_side": "negative",
+        "export_frame": "root-component",
+    }]
+    validate_return_manifest(manifest)
+
+    old_wg_shape = deepcopy(manifest)
+    old_wg_shape["required_features"] = [
+        feature for feature in old_wg_shape["required_features"]
+        if feature not in {"domain-automatic-v1", "document-up-v1"}
+    ]
+    old_wg_shape["coordinate_system"].pop("document_up")
+    old_wg_shape["assembly"].pop("domain")
+    old_wg_shape["assembly"].pop("cut_provenance")
+    validate_return_manifest(old_wg_shape)
+
+
+def test_document_up_is_feature_paired_and_only_y_or_z():
+    manifest = _worked_example()
+    manifest["required_features"].append("document-up-v1")
+    with pytest.raises(WgReturnError, match="document-up-v1 is required exactly"):
+        validate_return_manifest(manifest)
+    manifest["coordinate_system"]["document_up"] = "+x"
+    with pytest.raises(WgReturnError, match=r"\+y.*\+z"):
+        validate_return_manifest(manifest)
+
+
 def test_evidence_that_contradicts_the_declaration_is_refused():
     with pytest.raises(WgReturnError, match="negative side of y0"):
         validate_return_manifest(

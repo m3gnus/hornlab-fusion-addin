@@ -2190,6 +2190,112 @@ def test_an_undeclared_return_carries_no_domain_and_no_feature(
     assert report["domain"] is None
 
 
+@pytest.mark.parametrize("automatic", [False, True], ids=["old-wg", "new-wg"])
+def test_automatic_domain_is_written_only_for_a_capable_wg(
+    send_module, tmp_path, monkeypatch, automatic
+):
+    shell = half_body("Automatic", faces=[face("HF")])
+    root = component("Automatic", [shell])
+    design, app, _manager = _contract_design(root)
+    design.timeline = Collection()
+    design.timeline.markerPosition = 0
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(app, {
+        "output_folder": str(tmp_path),
+        "capture_document": False,
+        "automatic_domain": automatic,
+    })
+    manifest = report["manifest"]
+
+    if automatic:
+        assert manifest["assembly"]["domain"] == {"kind": "automatic"}
+        assert "domain-automatic-v1" in manifest["required_features"]
+    else:
+        assert "domain" not in manifest["assembly"]
+        assert "cut_provenance" not in manifest["assembly"]
+        assert "domain-automatic-v1" not in manifest["required_features"]
+
+
+def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_marker(
+    send_module,
+):
+    shell = half_body(
+        "Split result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
+    )
+    root = component("Root", [shell])
+    root.yZConstructionPlane = types.SimpleNamespace(
+        name="YZ Plane", entityToken="plane-yz"
+    )
+    root.xZConstructionPlane = types.SimpleNamespace(
+        name="XZ Plane", entityToken="plane-xz"
+    )
+    root.xYConstructionPlane = types.SimpleNamespace(
+        name="XY Plane", entityToken="plane-xy"
+    )
+    rolled: list[bool] = []
+    feature = types.SimpleNamespace(
+        objectType="adsk::fusion::SplitBodyFeature",
+        name="Split Body 3",
+        isSuppressed=False,
+        bodies=Collection([shell]),
+        splitBodies=Collection([shell]),
+        splittingTool=root.yZConstructionPlane,
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=rolled.append),
+    )
+    timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
+    timeline.markerPosition = 1
+    design = types.SimpleNamespace(timeline=timeline)
+
+    provenance = send_module.read_cut_provenance(
+        design,
+        [({"object_id": shell.entityToken}, shell)],
+        "root-component",
+        root,
+    )
+
+    assert provenance[0]["feature"]["name"] == "Split Body 3"
+    assert provenance[0]["plane"] == "x0"
+    assert provenance[0]["kept_side"] == "positive"
+    assert rolled == [True]
+    assert timeline.markerPosition == 1
+
+
+@pytest.mark.parametrize(
+    "orientation, expected",
+    [(0, "+y"), (1, "+z")],
+    ids=["y-up", "z-up"],
+)
+def test_document_up_is_recorded_only_under_the_capability(
+    send_module, tmp_path, monkeypatch, orientation, expected
+):
+    shell = body("Up", faces=[face("HF")])
+    root = component("Up", [shell])
+    design, app, _manager = _contract_design(root)
+    app.preferences = types.SimpleNamespace(
+        generalPreferences=types.SimpleNamespace(defaultModelingOrientation=orientation)
+    )
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    modern = send_module.send(app, {
+        "output_folder": str(tmp_path),
+        "capture_document": False,
+        "document_up": True,
+    })["manifest"]
+    legacy = send_module.send(app, {
+        "output_folder": str(tmp_path),
+        "capture_document": False,
+        "request_id": "legacy",
+        "document_up": False,
+    })["manifest"]
+
+    assert modern["coordinate_system"]["document_up"] == expected
+    assert "document-up-v1" in modern["required_features"]
+    assert "document_up" not in legacy["coordinate_system"]
+    assert "document-up-v1" not in legacy["required_features"]
+
+
 def test_a_quarter_declares_both_planes_in_a_fixed_order(send_module):
     assert send_module.resolve_domain_planes("y0+x0") == ("x0", "y0")
     assert send_module.resolve_domain_planes(["y0", "x0"]) == ("x0", "y0")
@@ -2212,6 +2318,20 @@ def test_the_preflight_previews_a_domain_refusal_instead_of_raising(
 
     assert report["domain"] is None
     assert "negative side" in report["domain_error"]
+
+
+def test_old_wg_preflight_still_calls_the_domain_automatic_without_new_evidence(
+    send_module, monkeypatch
+):
+    shell = half_body("Old WG", faces=[face("HF")])
+    root = component("Old WG", [shell])
+    design, app, _manager = _contract_design(root)
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.preflight_scope(app, {"display_automatic_domain": True})
+
+    assert report["domain"] == {"kind": "automatic"}
+    assert report["cut_provenance"] == []
 
 
 # --- a MANAGED link sent by selecting its own occurrence --------------------

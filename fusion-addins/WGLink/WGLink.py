@@ -133,7 +133,6 @@ _owned = False
 WATCH_INTERVAL_SECONDS = 4.0
 _installed_source_cache: dict[str, object] | None = None
 _geometry_state_cache: dict[str, object] | None = None
-_domain_choice_by_document: dict[str, str] = {}
 # At most one pending geometry refresh per add-in instance. A refresh is asked
 # for by something a user or WG did -- startup, a document switch, a finished
 # command -- and is paid for once on the next tick that may run it. The
@@ -743,39 +742,6 @@ def _send_selection(command_inputs: object) -> object:
     return "root"
 
 
-def _send_domain(command_inputs: object) -> tuple[str, ...]:
-    """The declared model domain, preserving this document's last choice.
-
-    Fusion can transiently leave ``selectedItem`` unreadable while rebuilding a
-    dialog. In that case retain the session choice instead of silently changing
-    a half or quarter model back to Full.
-    """
-
-    item = _input(command_inputs, "model_domain")
-    try:
-        return wglink_author.resolve_domain_choice(str(item.selectedItem.name))
-    except Exception:  # noqa: BLE001
-        return wglink_author.resolve_domain_choice(_remembered_domain_choice())
-
-
-def _remember_domain_choice(command_inputs: object) -> None:
-    document_id = _active_document_id()
-    if document_id is None:
-        return
-    choice = _selected_name(command_inputs, "model_domain", "")
-    if choice in wglink_author.domain_choices():
-        _domain_choice_by_document[document_id] = choice
-
-
-def _remembered_domain_choice() -> str:
-    choices = wglink_author.domain_choices()
-    document_id = _active_document_id()
-    if document_id is None:
-        return choices[0]
-    choice = _domain_choice_by_document.get(document_id)
-    return choice if choice in choices else choices[0]
-
-
 def _source_identity_enabled() -> bool:
     """Whether this return declares ``source-identity-v1``.
 
@@ -787,6 +753,15 @@ def _source_identity_enabled() -> bool:
 
     try:
         return wglink_watch.wg_source_identity(wglink_workspace.ipc_folder())
+    except Exception:  # noqa: BLE001 - an unreadable capability declares nothing
+        return False
+
+
+def _manifest_feature_enabled(name: str) -> bool:
+    try:
+        return wglink_watch.wg_manifest_feature(
+            wglink_workspace.ipc_folder(), name
+        )
     except Exception:  # noqa: BLE001 - an unreadable capability declares nothing
         return False
 
@@ -829,8 +804,11 @@ def _send_options(command_inputs: object) -> dict[str, object]:
         "output_folder": str(output),
         "overwrite": False,
         "capture_document": wglink_workspace.capture_document(),
-        "domain": list(_send_domain(command_inputs)),
         "source_identity": _source_identity_enabled(),
+        "automatic_domain": _manifest_feature_enabled(
+            wglink_watch.AUTOMATIC_DOMAIN
+        ),
+        "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
     }
     anchor_input = _input(command_inputs, "anchor_instance_id")
     try:
@@ -880,8 +858,12 @@ def _sync_preflight(command_inputs: object) -> None:
     try:
         options: dict[str, object] = {
             "selection": _send_selection(command_inputs),
-            "domain": list(_send_domain(command_inputs)),
             "source_identity": _source_identity_enabled(),
+            "automatic_domain": _manifest_feature_enabled(
+                wglink_watch.AUTOMATIC_DOMAIN
+            ),
+            "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
+            "display_automatic_domain": True,
         }
         anchor = _input(command_inputs, "anchor_instance_id")
         try:
@@ -1675,15 +1657,6 @@ class CommandInputChangedHandler(adsk.core.InputChangedEventHandler):
                 _sync_preflight(inputs)
             elif input_id == "anchor_instance_id":
                 _sync_preflight(inputs)
-            elif input_id == "model_domain":
-                _remember_domain_choice(inputs)
-                _sync_help(
-                    inputs,
-                    "model_domain_help",
-                    "model_domain",
-                    wglink_author.domain_help_text,
-                )
-                _sync_preflight(inputs)
             elif input_id == "refresh_preflight":
                 # Fusion body/occurrence visibility can change while this modal
                 # is open without producing a command-input event. Re-survey on
@@ -1743,24 +1716,6 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 )
                 anchor.isVisible = False
                 _sync_anchor_choices(inputs)
-                # A model the author already cut has to say so: WG cannot tell a
-                # deliberate half from an open shell, and solving one as the
-                # other is a wrong answer rather than an error.
-                domain = inputs.addDropDownCommandInput(
-                    "model_domain",
-                    "Model domain",
-                    adsk.core.DropDownStyles.TextListDropDownStyle,
-                )
-                remembered_domain = _remembered_domain_choice()
-                for index, choice in enumerate(wglink_author.domain_choices()):
-                    domain.listItems.add(choice, choice == remembered_domain)
-                inputs.addTextBoxCommandInput(
-                    "model_domain_help",
-                    "",
-                    wglink_author.domain_help_text(remembered_domain),
-                    3,
-                    True,
-                )
                 # State the export before it happens: what goes in, whether it
                 # is linked, which sources drive it, and -- for an unlinked
                 # model, whose assembly frame WG solves as-is -- how far the
@@ -2961,6 +2916,10 @@ def _execute_return_request(
             "anchor_instance_id": request.instance_id,
             "capture_document": wglink_workspace.capture_document(),
             "source_identity": _source_identity_enabled(),
+            "automatic_domain": _manifest_feature_enabled(
+                wglink_watch.AUTOMATIC_DOMAIN
+            ),
+            "document_up": _manifest_feature_enabled(wglink_watch.DOCUMENT_UP),
         }
         # The last safe point: the export has no interruption mechanism, so a
         # dismissal that arrives from here on is deferred to the next boundary.

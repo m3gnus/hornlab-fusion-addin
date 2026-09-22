@@ -50,6 +50,8 @@ FUSION_REQUEST_DELIVERY = "fusionRequestDelivery"
 # as an integer of at least 1. The add-in declares the feature only then: a WG
 # that does not advertise it refuses the bundle as an unknown required feature.
 SOURCE_IDENTITY = "sourceIdentity"
+AUTOMATIC_DOMAIN = "automaticDomain"
+DOCUMENT_UP = "documentUp"
 # Every Fusion-bound request file, and a WG-bound solve file written for a WG
 # that reads nothing newer, carries this schema version. Not bumped for the
 # WG request inbox: it also governs how this add-in reads WG's own requests.
@@ -223,6 +225,21 @@ def wg_source_identity(ipc_folder: Path | None) -> bool:
     ):
         return False
     value = payload.get(SOURCE_IDENTITY)
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def wg_manifest_feature(ipc_folder: Path | None, name: str) -> bool:
+    """Whether WG advertises a version-1 optional return-manifest feature."""
+
+    if ipc_folder is None:
+        return False
+    payload = _read_json(Path(ipc_folder) / CAPABILITIES_FILENAME)
+    if not isinstance(payload, Mapping):
+        return False
+    schema = payload.get("schemaVersion")
+    if isinstance(schema, bool) or schema != CAPABILITIES_SCHEMA_VERSION:
+        return False
+    value = payload.get(name)
     return not isinstance(value, bool) and isinstance(value, int) and value >= 1
 
 

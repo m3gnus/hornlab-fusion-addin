@@ -26,12 +26,18 @@ SUPPORTED_RETURN_FEATURES = frozenset(
         "fem-air-volume-v1",
         "reduced-domain-v1",
         "source-identity-v1",
+        "document-up-v1",
+        "domain-automatic-v1",
     }
 )
 # With this feature every ``sources[].id`` is a CAD-authored identity that WG
 # bounds: trimmed, at most 25 UTF-8 bytes, and the whole gmsh physical name WG
 # writes for the source (worst-case tag 9999) at most 128 bytes.
 SOURCE_IDENTITY_FEATURE = "source-identity-v1"
+DOCUMENT_UP_FEATURE = "document-up-v1"
+DOCUMENT_UP_AXES = ("+y", "+z")
+DOMAIN_AUTOMATIC_FEATURE = "domain-automatic-v1"
+DOMAIN_AUTOMATIC = "automatic"
 SOURCE_IDENTITY_MAX_BYTES = 25
 GMSH_PHYSICAL_NAME_MAX_BYTES = 128
 BASE_RETURN_FEATURES = (
@@ -61,6 +67,72 @@ DOMAIN_KIND_FOR_PLANES = {
 }
 DOMAIN_KINDS = ("full", "half", "quarter")
 REDUCED_DOMAIN_FEATURE = "reduced-domain-v1"
+CUT_FEATURE_KINDS = ("split-body", "extrude-cut", "other")
+CUT_TOOL_KINDS = ("origin-plane", "construction-plane")
+CUT_ORIGIN_PLANES = {"YZ": "x0", "XZ": "y0", "XY": "z0"}
+CUT_KEPT_SIDES = ("positive", "negative")
+
+
+def classify_cut_provenance(
+    descriptors: Sequence[Mapping[str, Any]],
+    included_object_ids: set[str],
+    export_frame: str,
+) -> list[dict[str, Any]]:
+    """Turn plain timeline observations into contract-shaped cut evidence.
+
+    Fusion inspection lives in ``wglink_send``. This function deliberately
+    knows only JSON-like descriptors, which keeps every classification rule
+    executable without Fusion.
+    """
+
+    if export_frame not in EXPORT_FRAMES:
+        raise WgReturnError(
+            "cut provenance export_frame must be one of " + ", ".join(EXPORT_FRAMES)
+        )
+    result: list[dict[str, Any]] = []
+    for raw in descriptors:
+        descriptor = dict(raw)
+        index = descriptor.get("timeline_index")
+        marker = descriptor.get("marker_position")
+        if descriptor.get("suppressed") is True:
+            continue
+        if (
+            isinstance(index, int)
+            and not isinstance(index, bool)
+            and isinstance(marker, int)
+            and not isinstance(marker, bool)
+            and index >= marker
+        ):
+            continue
+        feature_kind = str(descriptor.get("feature_kind") or "")
+        if feature_kind not in CUT_FEATURE_KINDS:
+            continue
+        tool_kind = str(descriptor.get("tool_kind") or "")
+        origin_plane = str(descriptor.get("origin_plane") or "")
+        if tool_kind not in CUT_TOOL_KINDS or origin_plane not in CUT_ORIGIN_PLANES:
+            continue
+        if tool_kind == "construction-plane" and descriptor.get("coincident") is not True:
+            continue
+        name = str(descriptor.get("feature_name") or "").strip()
+        if not name or len(name) > 200:
+            continue
+        sides = descriptor.get("kept_sides")
+        if not isinstance(sides, Mapping):
+            continue
+        for object_id in descriptor.get("body_object_ids") or ():
+            body_id = str(object_id)
+            side = sides.get(body_id)
+            if body_id not in included_object_ids or side not in CUT_KEPT_SIDES:
+                continue
+            result.append({
+                "body_object_id": body_id,
+                "feature": {"kind": feature_kind, "name": name},
+                "tool": {"kind": tool_kind, "origin_plane": origin_plane},
+                "plane": CUT_ORIGIN_PLANES[origin_plane],
+                "kept_side": side,
+                "export_frame": export_frame,
+            })
+    return result
 
 
 def canonical_domain_planes(planes: Sequence[Any]) -> tuple[str, ...]:
@@ -952,7 +1024,7 @@ def _validate_source(
         label=label,
     )
     source_id = _string(record["id"], label=f"{label}.id")
-    role = _string(record["role"], label=f"{label}.role")
+    _string(record["role"], label=f"{label}.role")
     if "instance_id" in record and record["instance_id"] is not None:
         linked_instance = _string(record["instance_id"], label=f"{label}.instance_id")
         if linked_instance not in instance_ids:
@@ -1051,7 +1123,9 @@ def _validate_source(
     return source_id, channel_id
 
 
-def validate_domain_record(value: object) -> tuple[str, ...]:
+def validate_domain_record(
+    value: object, *, automatic_feature: bool = False
+) -> tuple[str, ...]:
     """Check ``assembly.domain`` and return the planes it declares.
 
     A missing member is the full domain, so every bundle written before this
@@ -1067,10 +1141,28 @@ def validate_domain_record(value: object) -> tuple[str, ...]:
     """
 
     if value is None:
+        if automatic_feature:
+            raise WgReturnError(
+                f"{DOMAIN_AUTOMATIC_FEATURE} is required exactly when "
+                "assembly.domain.kind is 'automatic'"
+            )
         return ()
     domain = _mapping(value, label="assembly.domain")
+    kind = _string(domain.get("kind"), label="assembly.domain.kind")
+    if (kind == DOMAIN_AUTOMATIC) != automatic_feature:
+        raise WgReturnError(
+            f"{DOMAIN_AUTOMATIC_FEATURE} is required exactly when "
+            "assembly.domain.kind is 'automatic'"
+        )
+    if kind == DOMAIN_AUTOMATIC:
+        extra = sorted(set(domain) - {"kind"})
+        if extra:
+            raise WgReturnError(
+                "assembly.domain automatic states nothing else; got "
+                + ", ".join(extra)
+            )
+        return ()
     _required(domain, ("kind", "cut_planes", "declared_by"), label="assembly.domain")
-    kind = _string(domain["kind"], label="assembly.domain.kind")
     if kind not in DOMAIN_KINDS:
         raise WgReturnError(
             "assembly.domain.kind must be one of " + ", ".join(DOMAIN_KINDS)
@@ -1120,6 +1212,45 @@ def validate_domain_record(value: object) -> tuple[str, ...]:
                 f"{label} shows no geometry on the positive side of {plane}"
             )
     return planes
+
+
+def _validate_cut_provenance(value: object, included_ids: set[str]) -> None:
+    entries = _list(value, label="assembly.cut_provenance")
+    for index, raw in enumerate(entries):
+        label = f"assembly.cut_provenance[{index}]"
+        entry = _mapping(raw, label=label)
+        allowed = {
+            "body_object_id", "feature", "tool", "plane", "kept_side", "export_frame"
+        }
+        extra = sorted(set(entry) - allowed)
+        if extra:
+            raise WgReturnError(f"{label} has unknown members: {', '.join(extra)}")
+        _required(entry, tuple(allowed), label=label)
+        body_id = _string(entry["body_object_id"], label=f"{label}.body_object_id")
+        if body_id not in included_ids:
+            raise WgReturnError(f"{label}.body_object_id must name a scope.included body")
+        feature = _mapping(entry["feature"], label=f"{label}.feature")
+        _required(feature, ("kind", "name"), label=f"{label}.feature")
+        if feature["kind"] not in CUT_FEATURE_KINDS:
+            raise WgReturnError(f"{label}.feature.kind is invalid")
+        name = _string(feature["name"], label=f"{label}.feature.name")
+        if name is None or not name.strip() or len(name) > 200:
+            raise WgReturnError(f"{label}.feature.name must be at most 200 characters")
+        tool = _mapping(entry["tool"], label=f"{label}.tool")
+        _required(tool, ("kind", "origin_plane"), label=f"{label}.tool")
+        if tool["kind"] not in CUT_TOOL_KINDS:
+            raise WgReturnError(f"{label}.tool.kind is invalid")
+        origin = _string(tool["origin_plane"], label=f"{label}.tool.origin_plane")
+        if origin not in CUT_ORIGIN_PLANES:
+            raise WgReturnError(f"{label}.tool.origin_plane is invalid")
+        if entry["plane"] != CUT_ORIGIN_PLANES[origin]:
+            raise WgReturnError(
+                f"{label}.plane must be {CUT_ORIGIN_PLANES[origin]} for {origin}"
+            )
+        if entry["kept_side"] not in CUT_KEPT_SIDES:
+            raise WgReturnError(f"{label}.kept_side is invalid")
+        if entry["export_frame"] not in EXPORT_FRAMES:
+            raise WgReturnError(f"{label}.export_frame is invalid")
 
 
 def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
@@ -1215,6 +1346,17 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
                 "coordinate_system.export_frame must be one of "
                 + ", ".join(EXPORT_FRAMES)
             )
+    has_document_up = DOCUMENT_UP_FEATURE in features
+    if ("document_up" in coordinate) != has_document_up:
+        raise WgReturnError(
+            f"{DOCUMENT_UP_FEATURE} is required exactly when "
+            "coordinate_system.document_up is present"
+        )
+    if "document_up" in coordinate and coordinate["document_up"] not in DOCUMENT_UP_AXES:
+        raise WgReturnError(
+            "coordinate_system.document_up must be one of "
+            + ", ".join(DOCUMENT_UP_AXES)
+        )
 
     assembly = _mapping(root["assembly"], label="assembly")
     _required(assembly, ("file", "n_bodies_expected", "bbox_mm"), label="assembly")
@@ -1229,7 +1371,10 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
     high = _point(bbox[1], label="assembly.bbox_mm[1]")
     if any(float(left) > float(right) for left, right in zip(low, high)):
         raise WgReturnError("assembly.bbox_mm minimum exceeds maximum")
-    domain_planes = validate_domain_record(assembly.get("domain"))
+    automatic_feature = DOMAIN_AUTOMATIC_FEATURE in features
+    domain_planes = validate_domain_record(
+        assembly.get("domain"), automatic_feature=automatic_feature
+    )
 
     files = _mapping(root["files"], label="files")
     if not files:
@@ -1349,6 +1494,15 @@ def validate_return_manifest(manifest: Mapping[str, Any]) -> None:
         raise WgReturnError(
             f"{REDUCED_DOMAIN_FEATURE} is required exactly when assembly.domain "
             "declares a reduced domain"
+        )
+    if "cut_provenance" in assembly:
+        if not automatic_feature:
+            raise WgReturnError(
+                f"assembly.cut_provenance is accepted only with {DOMAIN_AUTOMATIC_FEATURE}"
+            )
+        _validate_cut_provenance(
+            assembly["cut_provenance"],
+            {str(item["object_id"]) for item in included if isinstance(item, Mapping)},
         )
 
     instances = _list(root["instances"], label="instances")

@@ -30,10 +30,13 @@ if __package__:
     from . import wglink_activity, wglink_author, wglink_core
     from .wglink_return import (
         BASE_RETURN_FEATURES,
+        DOCUMENT_UP_FEATURE,
+        DOMAIN_AUTOMATIC_FEATURE,
         DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
         canonical_domain_planes,
+        classify_cut_provenance,
         dumps_return_manifest,
         plan_export_scope,
     )
@@ -43,10 +46,13 @@ else:
     import wglink_core
     from wglink_return import (
         BASE_RETURN_FEATURES,
+        DOCUMENT_UP_FEATURE,
+        DOMAIN_AUTOMATIC_FEATURE,
         DOMAIN_KIND_FOR_PLANES,
         WgReturnError,
         build_return_manifest,
         canonical_domain_planes,
+        classify_cut_provenance,
         dumps_return_manifest,
         plan_export_scope,
     )
@@ -1168,6 +1174,7 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         "source_error": None,
         "domain": None,
         "domain_error": None,
+        "cut_provenance": [],
         "bounds_mm": None,
         "source_bounds_mm": None,
     }
@@ -1237,13 +1244,24 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
             "face_count": int(observed.get("face_count") or 0),
             "instance_id": source.get("instance_id"),
         })
-    try:
-        report["domain"] = plan_domain(
-            resolve_domain_planes(opts.get("domain")), measured_bodies
+    if bool(opts.get("automatic_domain")):
+        report["domain"] = {"kind": "automatic"}
+        report["cut_provenance"] = read_cut_provenance(
+            design, included_pairs, walk["export_frame"], walk["geometry"]
         )
-    except wglink_core.WgLinkError as exc:
-        # The preview's whole job is to say this before OK rather than after.
-        report["domain_error"] = str(exc)
+    elif bool(opts.get("display_automatic_domain")):
+        # An older WG still performs its established automatic cut from an
+        # absent domain. The preview describes that user-facing behaviour but
+        # records no new field and reads no timeline evidence for that WG.
+        report["domain"] = {"kind": "automatic"}
+    else:
+        try:
+            report["domain"] = plan_domain(
+                resolve_domain_planes(opts.get("domain")), measured_bodies
+            )
+        except wglink_core.WgLinkError as exc:
+            # The preview's whole job is to say this before OK rather than after.
+            report["domain_error"] = str(exc)
     bounds = None
     for body in measured_bodies:
         bounds = _merge_bounds(bounds, body)
@@ -3033,6 +3051,273 @@ DOMAIN_TOLERANCE_REL = 1.0e-4
 DOMAIN_TOLERANCE_FLOOR_MM = 0.05
 DOMAIN_AXIS_FOR_PLANE = {"x0": 0, "y0": 1}
 DOMAIN_PLANE_LABEL = {"x0": "x = 0", "y0": "y = 0"}
+_ORIGIN_PLANE_ATTRIBUTES = {
+    "YZ": "yZConstructionPlane",
+    "XZ": "xZConstructionPlane",
+    "XY": "xYConstructionPlane",
+}
+_AXIS_FOR_ORIGIN_PLANE = {"YZ": 0, "XZ": 1, "XY": 2}
+
+
+def _same_fusion_entity(left: object, right: object) -> bool:
+    """Best-effort identity check across Fusion's fresh Python wrappers."""
+
+    if left is right:
+        return True
+    left = getattr(left, "nativeObject", None) or left
+    right = getattr(right, "nativeObject", None) or right
+    try:
+        if left == right:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    left_token = wglink_core._entity_token(left)
+    right_token = wglink_core._entity_token(right)
+    return bool(left_token and right_token and left_token == right_token)
+
+
+def _origin_plane_name(entity: object, component: object) -> str | None:
+    for name, attribute in _ORIGIN_PLANE_ATTRIBUTES.items():
+        try:
+            origin = getattr(component, attribute)
+        except Exception:  # noqa: BLE001
+            continue
+        if _same_fusion_entity(entity, origin):
+            return name
+    # Exact browser names are a fallback for old wrappers that expose neither
+    # stable equality nor an entity token for origin construction geometry.
+    shown = str(getattr(entity, "name", "") or "").strip().upper()
+    return next((name for name in _ORIGIN_PLANE_ATTRIBUTES if shown == f"{name} PLANE"), None)
+
+
+def _parameter_value(parameter: object) -> float | None:
+    try:
+        value = parameter.value
+    except Exception:  # noqa: BLE001
+        value = parameter
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _cut_tool_descriptor(entity: object, component: object) -> tuple[str, str, bool] | None:
+    """Describe an origin plane or a zero-offset construction plane."""
+
+    direct = _origin_plane_name(entity, component)
+    if direct is not None:
+        return "origin-plane", direct, True
+    definition = getattr(entity, "definition", None)
+    if definition is None:
+        return None
+    base = getattr(definition, "planarEntity", None)
+    origin = _origin_plane_name(base, component) if base is not None else None
+    if origin is None:
+        return None
+    kind = str(getattr(definition, "objectType", "") or "")
+    offset = _parameter_value(getattr(definition, "offset", None))
+    coincident = offset is not None and abs(offset) <= 1.0e-9
+    if "ByPlaneDefinition" in kind:
+        coincident = True
+    return "construction-plane", origin, coincident
+
+
+def _extrude_profile_plane(feature: object, component: object) -> tuple[str, str, bool] | None:
+    profiles = wglink_core._items(getattr(feature, "profile", None))
+    if not profiles and getattr(feature, "profile", None) is not None:
+        profiles = [feature.profile]
+    found: list[tuple[str, str, bool]] = []
+    for profile in profiles:
+        sketch = getattr(profile, "parentSketch", None)
+        reference = getattr(sketch, "referencePlane", None)
+        descriptor = _cut_tool_descriptor(reference, component) if reference is not None else None
+        if descriptor is not None:
+            found.append(descriptor)
+    return found[0] if found and all(item == found[0] for item in found) else None
+
+
+def _feature_kind(feature: object) -> str | None:
+    object_type = str(getattr(feature, "objectType", "") or "")
+    if object_type.endswith("::SplitBodyFeature") or object_type.endswith("SplitBodyFeature"):
+        return "split-body"
+    if object_type.endswith("::ExtrudeFeature") or object_type.endswith("ExtrudeFeature"):
+        operation = getattr(feature, "operation", None)
+        cut_value = getattr(getattr(adsk.fusion, "FeatureOperations", None), "CutFeatureOperation", 1)
+        if operation == cut_value or "CutFeatureOperation" in str(operation):
+            return "extrude-cut"
+    return None
+
+
+def _kept_side(body: object, origin_plane: str) -> str | None:
+    values = wglink_core._bbox_values(body)
+    axis = _AXIS_FOR_ORIGIN_PLANE[origin_plane]
+    minimum, maximum = float(values[axis]), float(values[axis + 3])
+    tolerance = max(DOMAIN_TOLERANCE_FLOOR_MM, DOMAIN_TOLERANCE_REL * math.dist(values[:3], values[3:]))
+    if minimum >= -tolerance and maximum > tolerance:
+        return "positive"
+    if maximum <= tolerance and minimum < -tolerance:
+        return "negative"
+    return None
+
+
+def _body_aliases(body: object, object_id: str) -> set[str]:
+    aliases = {object_id}
+    for candidate in (body, getattr(body, "nativeObject", None)):
+        if candidate is None:
+            continue
+        token = wglink_core._entity_token(candidate)
+        if token:
+            aliases.add(token)
+    return aliases
+
+
+def _fusion_cut_descriptors(
+    design: object,
+    included_pairs: list[tuple[dict[str, Any], object]],
+    export_component: object,
+) -> list[dict[str, Any]]:
+    """Thin Fusion adapter: inspect the active timeline into plain records."""
+
+    timeline = getattr(design, "timeline", None)
+    if timeline is None:
+        return []
+    try:
+        marker = int(timeline.markerPosition)
+    except Exception:  # noqa: BLE001
+        marker = len(wglink_core._items(timeline))
+    aliases: dict[str, str] = {}
+    sides: dict[tuple[str, str], str] = {}
+    bodies_by_id: dict[str, object] = {}
+    for record, body in included_pairs:
+        object_id = str(record["object_id"])
+        bodies_by_id[object_id] = body
+        for alias in _body_aliases(body, object_id):
+            aliases[alias] = object_id
+        for plane in _ORIGIN_PLANE_ATTRIBUTES:
+            side = _kept_side(body, plane)
+            if side is not None:
+                sides[(object_id, plane)] = side
+
+    snapshots: list[tuple[object, dict[str, Any], set[str]]] = []
+    for fallback_index, item in enumerate(wglink_core._items(timeline)):
+        try:
+            feature = item.entity
+        except Exception:  # noqa: BLE001 - one unreadable entry is no evidence
+            continue
+        kind = _feature_kind(feature) if feature is not None else None
+        if kind is None:
+            continue
+        try:
+            index = int(getattr(item, "index"))
+        except Exception:  # noqa: BLE001
+            index = fallback_index
+        affected: set[str] = set()
+        for candidate in wglink_core._items(getattr(feature, "bodies", None)):
+            for alias in _body_aliases(candidate, ""):
+                if alias in aliases:
+                    affected.add(aliases[alias])
+        snapshots.append((feature, {
+            "timeline_index": index,
+            "marker_position": marker,
+            "suppressed": bool(getattr(feature, "isSuppressed", False)),
+            "feature_kind": kind,
+            "feature_name": str(getattr(feature, "name", "") or ""),
+        }, affected))
+
+    descriptors: list[dict[str, Any]] = []
+    try:
+        for feature, descriptor, affected in snapshots:
+            if descriptor["suppressed"] or descriptor["timeline_index"] >= marker:
+                continue
+            timeline_object = getattr(feature, "timelineObject", None)
+            try:
+                if timeline_object is not None:
+                    timeline_object.rollTo(True)
+            except Exception:  # noqa: BLE001
+                pass
+            component = getattr(feature, "parentComponent", None)
+            if component is None:
+                continue
+            if descriptor["feature_kind"] == "split-body":
+                tool = _cut_tool_descriptor(getattr(feature, "splittingTool", None), component)
+                participants = getattr(feature, "splitBodies", None)
+            else:
+                tool = _extrude_profile_plane(feature, component)
+                participants = getattr(feature, "participantBodies", None)
+            for candidate in wglink_core._items(participants):
+                for alias in _body_aliases(candidate, ""):
+                    if alias in aliases:
+                        affected.add(aliases[alias])
+            # Contract planes are in the STEP export frame. A feature in a
+            # child component has that meaning only while the occurrence is
+            # untransformed; otherwise its local x0/y0/z0 is a different plane.
+            if not _same_fusion_entity(component, export_component):
+                affected = {
+                    object_id
+                    for object_id in affected
+                    if _is_identity_placement(
+                        _occurrence_placement(
+                            getattr(bodies_by_id[object_id], "assemblyContext", None)
+                        )
+                    )
+                }
+            if tool is None:
+                continue
+            tool_kind, origin_plane, coincident = tool
+            kept_sides = {
+                object_id: sides[(object_id, origin_plane)]
+                for object_id in affected
+                if (object_id, origin_plane) in sides
+            }
+            descriptors.append({
+                **descriptor,
+                "tool_kind": tool_kind,
+                "origin_plane": origin_plane,
+                "coincident": coincident,
+                "body_object_ids": sorted(affected),
+                "kept_sides": kept_sides,
+            })
+    finally:
+        try:
+            timeline.markerPosition = marker
+        except Exception:  # noqa: BLE001
+            pass
+    return descriptors
+
+
+def read_cut_provenance(
+    design: object,
+    included_pairs: list[tuple[dict[str, Any], object]],
+    export_frame: str,
+    export_component: object,
+) -> list[dict[str, Any]]:
+    descriptors = _fusion_cut_descriptors(design, included_pairs, export_component)
+    return classify_cut_provenance(
+        descriptors,
+        {str(record["object_id"]) for record, _body in included_pairs},
+        export_frame,
+    )
+
+
+def fusion_document_up(app: object) -> str:
+    """Read Fusion's general modelling-orientation preference at export."""
+
+    try:
+        orientation = app.preferences.generalPreferences.defaultModelingOrientation
+    except Exception as exc:  # noqa: BLE001
+        raise wglink_core.WgLinkError(
+            f"Could not read Fusion's modelling orientation: {exc}."
+        ) from exc
+    orientations = getattr(adsk.core, "DefaultModelingOrientations", None)
+    y_up = getattr(orientations, "YUpModelingOrientation", 0)
+    z_up = getattr(orientations, "ZUpModelingOrientation", 1)
+    if orientation == y_up and not isinstance(orientation, bool):
+        return "+y"
+    if orientation == z_up and not isinstance(orientation, bool):
+        return "+z"
+    raise wglink_core.WgLinkError(
+        f"Fusion reported an unsupported modelling orientation: {orientation!r}."
+    )
 
 
 def resolve_domain_planes(value: object) -> tuple[str, ...]:
@@ -3385,7 +3670,8 @@ def send(
     output_value = options.get("output_folder")
     if not isinstance(output_value, (str, os.PathLike)) or not str(output_value).strip():
         raise wglink_core.WgLinkError("options['output_folder'] must name the return output folder.")
-    domain_planes = resolve_domain_planes(options.get("domain"))
+    automatic_domain = bool(options.get("automatic_domain"))
+    domain_planes = () if automatic_domain else resolve_domain_planes(options.get("domain"))
     # Declared only when WG advertises it (WGLink.py reads the capability file).
     source_identity = bool(options.get("source_identity"))
     design = wglink_core._design(app)
@@ -3449,7 +3735,16 @@ def send(
         )
         if instance_body is not None:
             record["source_body"] = instance_body
-    domain = plan_domain(domain_planes, measured_bodies)
+    domain = {"kind": "automatic"} if automatic_domain else plan_domain(
+        domain_planes, measured_bodies
+    )
+    cut_provenance = (
+        read_cut_provenance(
+            design, included_pairs, walk["export_frame"], walk["geometry"]
+        )
+        if automatic_domain
+        else []
+    )
     observed_at = _utc_timestamp()
     # One resolution of the export-frame placements, shared by the manifest's
     # instance records and by the declared-domain reduction beside them.
@@ -3565,6 +3860,9 @@ def send(
             # assembly_from_link -- readable without inferring anything.
             "export_frame": walk["export_frame"],
         }
+        document_up = fusion_document_up(app) if bool(options.get("document_up")) else None
+        if document_up is not None:
+            coordinate["document_up"] = document_up
         if anchor is not None:
             coordinate["solver_anchor_instance_id"] = anchor
         manifest = build_return_manifest(
@@ -3587,16 +3885,18 @@ def send(
                 "bbox_mm": _bbox(measured_bodies),
                 "signature_hash": return_state_hash,
                 **({"domain": domain} if domain is not None else {}),
+                **({"cut_provenance": cut_provenance} if cut_provenance else {}),
             },
             files=files,
             scope=scope,
             instances=instance_records,
             sources=sources,
-            required_features=(
-                [*BASE_RETURN_FEATURES, SOURCE_IDENTITY_FEATURE]
-                if source_identity
-                else None
-            ),
+            required_features=[
+                *BASE_RETURN_FEATURES,
+                *([SOURCE_IDENTITY_FEATURE] if source_identity else []),
+                *([DOMAIN_AUTOMATIC_FEATURE] if automatic_domain else []),
+                *([DOCUMENT_UP_FEATURE] if document_up is not None else []),
+            ],
         )
         (temp / "wgreturn.json").write_text(
             dumps_return_manifest(manifest), encoding="utf-8"

@@ -682,6 +682,9 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     source_error = str(scope.get("source_error") or "").strip()
     domain_error = str(scope.get("domain_error") or "").strip()
     domain = scope.get("domain")
+    automatic_domain = (
+        isinstance(domain, Mapping) and domain.get("kind") == "automatic"
+    )
     domain_planes = (
         tuple(str(plane) for plane in (domain.get("cut_planes") or []))
         if isinstance(domain, Mapping)
@@ -730,6 +733,18 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
         lines.append("Sources: none")
     if domain_planes:
         lines.append(f"Domain: {domain_phrase(domain_planes)} ✓")
+    elif automatic_domain:
+        lines.append("Domain: Automatic (WG decides)")
+    for raw_cut in scope.get("cut_provenance") or ():
+        if not isinstance(raw_cut, Mapping):
+            continue
+        feature = raw_cut.get("feature")
+        name = str(feature.get("name") or "").strip() if isinstance(feature, Mapping) else ""
+        plane = {"x0": "x = 0", "y0": "y = 0", "z0": "z = 0"}.get(
+            str(raw_cut.get("plane") or "")
+        )
+        if name and plane:
+            lines.append(f"Cut: {name} at {plane}")
 
     warnings: list[str] = []
     if domain_error:

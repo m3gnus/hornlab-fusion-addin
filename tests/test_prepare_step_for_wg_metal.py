@@ -227,6 +227,53 @@ def test_occ_healing_fallback_reraises_original_with_rejection_reasons(capsys):
         )
 
 
+def test_auto_cut_opposite_side_fallback_tries_each_equivalent_domain(capsys):
+    module = _load_script()
+    attempts = []
+
+    def run_attempt(*, auto_cut_reflect_planes):
+        attempts.append(auto_cut_reflect_planes)
+        if auto_cut_reflect_planes == ("x0", "z0"):
+            return {
+                "auto_reduce_planes": ("x0", "z0"),
+                "mesh_generation_error": None,
+            }
+        return {
+            "auto_reduce_planes": ("x0", "z0"),
+            "mesh_generation_error": RuntimeError("side did not mesh"),
+        }
+
+    state, reflected = module._try_auto_cut_opposite_sides(
+        run_attempt,
+        accepted_planes=("x0", "z0"),
+    )
+
+    assert state is not None
+    assert reflected == ("x0", "z0")
+    assert attempts == [("x0",), ("z0",), ("x0", "z0")]
+    stderr = capsys.readouterr().err
+    assert stderr.count("symmetry-equivalent side") == 3
+
+
+def test_auto_cut_opposite_side_fallback_rejects_a_changed_symmetry_verdict():
+    module = _load_script()
+
+    def run_attempt(*, auto_cut_reflect_planes):
+        assert auto_cut_reflect_planes == ("x0",)
+        return {
+            "auto_reduce_planes": (),
+            "mesh_generation_error": None,
+        }
+
+    state, reflected = module._try_auto_cut_opposite_sides(
+        run_attempt,
+        accepted_planes=("x0",),
+    )
+
+    assert state is None
+    assert reflected is None
+
+
 def test_anchor_surface_order_fails_loudly_on_bad_input():
     module = _load_script()
 

@@ -389,6 +389,69 @@ def _auto_reduce_geometry(
     return result.planes, result.parent_to_children, result.report
 
 
+def _auto_cut_opposite_side_variants(
+    planes: tuple[str, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Return the non-default side choices for an automatic reduction.
+
+    The normal OCC cut keeps the positive side of every accepted plane.  A
+    nominally symmetric STEP can nevertheless contain exporter damage on only
+    one side (for example, a repeated bridge edge in one face wire).  Reflecting
+    the input before the positive-side cut selects the geometrically equivalent
+    opposite side while keeping the solver's reduced-domain convention.
+    """
+    variants: list[tuple[str, ...]] = []
+    for mask in range(1, 1 << len(planes)):
+        variants.append(
+            tuple(plane for index, plane in enumerate(planes) if mask & (1 << index))
+        )
+    return tuple(variants)
+
+
+def _reflect_occ_geometry_across_planes(planes: tuple[str, ...]) -> None:
+    """Reflect the imported OCC model so its opposite side becomes positive."""
+    axis_for_plane = {"x0": 0, "y0": 1, "z0": 2}
+    matrix = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    for plane in planes:
+        matrix[5 * axis_for_plane[plane]] = -1.0
+    entities = gmsh.model.getEntities(3) or gmsh.model.getEntities(2)
+    gmsh.model.occ.affineTransform(entities, matrix)
+    gmsh.model.occ.synchronize()
+
+
+def _try_auto_cut_opposite_sides(
+    run_attempt,
+    *,
+    accepted_planes: tuple[str, ...],
+) -> tuple[dict[str, object] | None, tuple[str, ...] | None]:
+    """Try symmetry-equivalent input sides after the default side will not mesh."""
+    for reflected_planes in _auto_cut_opposite_side_variants(accepted_planes):
+        print(
+            "gmsh mesh generation failed on the default auto-cut side; retrying "
+            "the symmetry-equivalent side across " + ",".join(reflected_planes),
+            file=sys.stderr,
+        )
+        try:
+            state = run_attempt(auto_cut_reflect_planes=reflected_planes)
+        except Exception as exc:
+            print(
+                "symmetry-equivalent side retry was rejected "
+                f"({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+            )
+            continue
+        if tuple(state.get("auto_reduce_planes", ())) != accepted_planes:
+            continue
+        if state.get("mesh_generation_error") is None:
+            return state, reflected_planes
+    return None, None
+
+
 _evaluate_plane_symmetry = evaluate_occ_plane_symmetry
 _sample_surface_points = sample_occ_surface_points
 _remap_after_cut = remap_surface_tags
@@ -954,6 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
         *,
         occ_healing_options: tuple[str, ...] = (),
         surface_order_reference: list[SurfaceGeometry] | None = None,
+        auto_cut_reflect_planes: tuple[str, ...] = (),
     ) -> dict[str, object]:
         gmsh.initialize()
         try:
@@ -963,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
                 gmsh.option.setNumber(option_name, 1)
             gmsh.open(str(step_path))
             gmsh.model.occ.synchronize()
+            if auto_cut_reflect_planes:
+                _reflect_occ_geometry_across_planes(auto_cut_reflect_planes)
             sorted_surfaces = [tag for dim, tag in sorted(gmsh.model.getEntities(2))]
             surface_geoms = _gmsh_surface_geometries(sorted_surfaces)
             if surface_order_reference is None:
@@ -1209,6 +1275,8 @@ def main(argv: list[str] | None = None) -> int:
                     "mesh_generation_error": exc,
                     "mesh_generation_traceback": exc.__traceback__,
                     "surface_geoms": surface_geoms,
+                    "auto_reduce": auto_reduce_report,
+                    "auto_reduce_planes": auto_reduce_planes,
                 }
             duplicate_node_stats = _remove_duplicate_nodes_for_current_gmsh_model()
             gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -1272,6 +1340,24 @@ def main(argv: list[str] | None = None) -> int:
     geometry_healing_mode = "none"
     gmsh_state = _run_gmsh_attempt()
     mesh_generation_error = gmsh_state.get("mesh_generation_error")
+    if mesh_generation_error is not None:
+        accepted_planes = tuple(gmsh_state.get("auto_reduce_planes", ()))
+        opposite_side_planes: tuple[str, ...] | None = None
+        if accepted_planes:
+            opposite_state, opposite_side_planes = _try_auto_cut_opposite_sides(
+                _run_gmsh_attempt,
+                accepted_planes=accepted_planes,
+            )
+            if opposite_state is not None:
+                gmsh_state = opposite_state
+                mesh_generation_error = None
+                auto_reduce_report = dict(gmsh_state["auto_reduce"])
+                auto_reduce_report["input_side_reflected_across"] = list(
+                    opposite_side_planes or ()
+                )
+                auto_reduce_report["side_selection"] = "symmetry-equivalent-opposite"
+                gmsh_state["auto_reduce"] = auto_reduce_report
+
     if mesh_generation_error is not None:
         original_mesh_error = mesh_generation_error
         original_traceback = gmsh_state.get("mesh_generation_traceback")

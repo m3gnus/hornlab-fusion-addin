@@ -2484,20 +2484,50 @@ def test_fusion_timeline_adapter_matches_token_drift_via_design_lookup(send_modu
     assert provenance[0]["kept_side"] == "positive"
 
 
-def test_extrude_cut_uses_current_definitions_and_omits_offset_start(send_module):
-    shell = half_body(
-        "Extruded result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
-    )
+@pytest.mark.parametrize(
+    "sketch_plane, face_axis, start_offset, face_position, expected",
+    [
+        ("XY", 0, False, 0.0, "x0"),  # XY profile removes the x sidewall, not z0.
+        ("XY", 2, False, 0.0, "z0"),
+        ("YZ", 0, False, 0.0, "x0"),
+        ("XY", 0, True, 0.0, None),
+        ("XY", 0, False, 5.0, None),  # An x=5 cut is not an origin cut.
+    ],
+)
+def test_extrude_cut_uses_current_result_faces_not_sketch_plane(
+    send_module, sketch_plane, face_axis, start_offset, face_position, expected
+):
+    low = [face_position if axis == face_axis else -20.0 for axis in range(3)]
+    high = [40.0 if axis == face_axis else 20.0 for axis in range(3)]
+    shell = half_body("Extruded result", low=low, high=high)
     root = component("Root", [shell])
     root.yZConstructionPlane = types.SimpleNamespace(name="YZ Plane", entityToken="plane-yz")
+    root.xYConstructionPlane = types.SimpleNamespace(name="XY Plane", entityToken="plane-xy")
     profile = types.SimpleNamespace(parentSketch=types.SimpleNamespace(
-        referencePlane=root.yZConstructionPlane
+        referencePlane=root.xYConstructionPlane if sketch_plane == "XY" else root.yZConstructionPlane
     ))
+    face_low = [-1.0, -1.0, -1.0]
+    face_high = [1.0, 1.0, 1.0]
+    face_low[face_axis] = face_high[face_axis] = face_position / 10.0
+    normal = [0.0, 0.0, 0.0]
+    normal[face_axis] = 1.0
+    result_face = types.SimpleNamespace(
+        geometry=types.SimpleNamespace(objectType="adsk::core::Plane", normal=point(*normal)),
+        boundingBox=box(tuple(face_low), tuple(face_high)),
+        entityToken="result-cut-face",
+    )
+    shell.faces = Collection([result_face])
+    send_module.adsk.core.Plane = types.SimpleNamespace(
+        cast=lambda geometry: geometry if getattr(geometry, "objectType", "") == "adsk::core::Plane" else None
+    )
     feature = types.SimpleNamespace(
         objectType="adsk::fusion::ExtrudeFeature", operation=1,
         name="Extrude Cut", isSuppressed=False, bodies=Collection([shell]),
-        participantBodies=Collection([shell]), profile=profile,
-        startExtent=types.SimpleNamespace(objectType="ProfilePlaneStartDefinition"),
+        participantBodies=Collection([shell]), profile=profile, faces=Collection([result_face]),
+        startExtent=types.SimpleNamespace(
+            objectType="OffsetStartDefinition" if start_offset else "ProfilePlaneStartDefinition",
+            offset=types.SimpleNamespace(value=1.0) if start_offset else None,
+        ),
         extentOne=types.SimpleNamespace(objectType="ThroughAllExtentDefinition"),
         parentComponent=root,
         timelineObject=types.SimpleNamespace(rollTo=lambda _before: pytest.fail("timeline rolled")),
@@ -2507,13 +2537,77 @@ def test_extrude_cut_uses_current_definitions_and_omits_offset_start(send_module
     design = types.SimpleNamespace(timeline=timeline)
     pair = [({"object_id": shell.entityToken}, shell)]
 
-    assert send_module.read_cut_provenance(design, pair, "root-component", root)[0]["plane"] == "x0"
-    feature.startExtent = types.SimpleNamespace(
-        objectType="OffsetStartDefinition", offset=types.SimpleNamespace(value=1.0)
-    )
     unread = []
-    assert send_module.read_cut_provenance(design, pair, "root-component", root, unread) == []
-    assert unread == ["Extrude Cut: tool or affected bodies unavailable at current marker"]
+    provenance = send_module.read_cut_provenance(design, pair, "root-component", root, unread)
+    if expected is None:
+        assert provenance == []
+        assert unread == [f"Extrude Cut: cut plane unavailable at current marker for {shell.entityToken}"]
+    else:
+        assert [item["plane"] for item in provenance] == [expected]
+        assert provenance[0]["kept_side"] == "positive"
+        assert unread == []
+    assert timeline.markerPosition == 1
+
+
+def test_xy_profile_sidewall_probe_writes_x0_or_omits_when_face_is_not_current(
+    send_module, tmp_path, monkeypatch
+):
+    painted = face("HF")
+    cut_face = face("unpainted")
+    cut_face.geometry = types.SimpleNamespace(
+        objectType="adsk::core::Plane", normal=point(1.0, 0.0, 0.0)
+    )
+    cut_face.boundingBox = box((0.0, -2.0, 0.0), (0.0, 2.0, 3.0))
+    cut_face.entityToken = "x-cut-face"
+    shell = half_body(
+        "Result", low=(0.0, -20.0, 0.0), high=(40.0, 20.0, 30.0),
+        faces=[painted, cut_face],
+    )
+    root = component("Root", [shell])
+    root.xYConstructionPlane = types.SimpleNamespace(name="XY Plane", entityToken="xy")
+    send_module.adsk.core.Plane = types.SimpleNamespace(
+        cast=lambda geometry: geometry if getattr(geometry, "objectType", "") == "adsk::core::Plane" else None
+    )
+    feature = types.SimpleNamespace(
+        objectType="ExtrudeFeature", operation=1,
+        name="XY profile removes negative x", isSuppressed=False,
+        bodies=Collection([shell]), participantBodies=Collection([shell]),
+        profile=types.SimpleNamespace(parentSketch=types.SimpleNamespace(
+            referencePlane=root.xYConstructionPlane
+        )),
+        faces=Collection([cut_face]),
+        startExtent=types.SimpleNamespace(objectType="ProfilePlaneStartDefinition"),
+        extentOne=types.SimpleNamespace(objectType="ThroughAllExtentDefinition"),
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=lambda _: pytest.fail("timeline rolled")),
+    )
+    design, app, _manager = _contract_design(root)
+    design.timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
+    design.timeline.markerPosition = 1
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    current = send_module.send(app, {
+        "output_folder": str(tmp_path / "current"),
+        "capture_document": False, "automatic_domain": True,
+    })
+    assert [item["plane"] for item in current["manifest"]["assembly"]["cut_provenance"]] == ["x0"]
+    assert current["cut_provenance_unread"] == []
+
+    shell.faces = Collection([painted])
+    stale = send_module.send(app, {
+        "output_folder": str(tmp_path / "stale"),
+        "capture_document": False, "automatic_domain": True,
+    })
+    assert "cut_provenance" not in stale["manifest"]["assembly"]
+    assert stale["cut_provenance_unread"] == [
+        "XY profile removes negative x: cut plane unavailable at current marker for token-Result"
+    ]
+    old_assembly = current["manifest"]["assembly"].copy()
+    new_assembly = stale["manifest"]["assembly"].copy()
+    assert old_assembly.pop("signature_hash") != new_assembly.pop("signature_hash")
+    old_assembly.pop("cut_provenance")
+    assert old_assembly == new_assembly
+    assert design.timeline.markerPosition == 1
 
 
 def test_unreadable_cut_evidence_is_reported_and_omitted_without_marker_write(send_module):

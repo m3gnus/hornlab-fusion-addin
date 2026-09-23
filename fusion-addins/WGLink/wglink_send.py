@@ -3182,38 +3182,71 @@ def _cut_tool_descriptor(
     return "construction-plane", origin, coincident
 
 
-def _extrude_profile_plane(
-    feature: object, component: object, design: object
-) -> tuple[str, str, bool] | None:
-    # A profile's sketch plane is not the cut's start plane when the extrusion
-    # starts from an offset or another entity. These definition reads are safe
-    # at the current marker; if Fusion cannot expose them, omit the evidence.
+def _extrude_start_is_readable(feature: object) -> bool:
+    # An offset start can create a coincident-looking face without proving the
+    # cut at the origin. Never use the profile's reference plane as evidence.
     start = getattr(feature, "startExtent", None)
     extent = getattr(feature, "extentOne", None)
     if start is None or extent is None:
-        return None
+        return False
     start_kind = str(getattr(start, "objectType", "") or "")
     if start_kind.endswith("OffsetStartDefinition"):
         offset = _parameter_value(getattr(start, "offset", None))
         if offset is None or abs(offset) > 1.0e-9:
-            return None
+            return False
     elif not start_kind.endswith("ProfilePlaneStartDefinition"):
+        return False
+    return True
+
+
+def _origin_plane_of_cut_face(face: object, body: object) -> str | None:
+    """Identify a planar result face lying on one origin plane, in mm."""
+
+    geometry = getattr(face, "geometry", None)
+    try:
+        plane = adsk.core.Plane.cast(geometry)
+    except Exception:  # noqa: BLE001 - unavailable geometry is no evidence
         return None
-    profiles = wglink_core._items(getattr(feature, "profile", None))
-    if not profiles and getattr(feature, "profile", None) is not None:
-        profiles = [feature.profile]
-    found: list[tuple[str, str, bool]] = []
-    for profile in profiles:
-        sketch = getattr(profile, "parentSketch", None)
-        reference = getattr(sketch, "referencePlane", None)
-        descriptor = (
-            _cut_tool_descriptor(reference, component, design)
-            if reference is not None
-            else None
+    if plane is None:
+        return None
+    try:
+        normal = _xyz(plane.normal, scale=1.0)
+        length = math.sqrt(sum(value * value for value in normal))
+        values = wglink_core._bbox_values(body)
+        face_values = wglink_core._bbox_values(face)
+        tolerance = max(
+            DOMAIN_TOLERANCE_FLOOR_MM,
+            DOMAIN_TOLERANCE_REL * math.dist(values[:3], values[3:]),
         )
-        if descriptor is not None:
-            found.append(descriptor)
-    return found[0] if found and all(item == found[0] for item in found) else None
+    except Exception:  # noqa: BLE001
+        return None
+    if not math.isfinite(length) or length <= 0:
+        return None
+    matches = [
+        name for name, axis in _AXIS_FOR_ORIGIN_PLANE.items()
+        if abs(normal[axis]) / length >= 1.0 - 1.0e-6
+        and abs(face_values[axis]) <= tolerance
+        and abs(face_values[axis + 3]) <= tolerance
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _extrude_result_plane(feature: object, body: object, design: object) -> str | None:
+    """Use only faces made by this cut and still present on the kept body."""
+
+    if not _extrude_start_is_readable(feature):
+        return None
+    created = wglink_core._items(getattr(feature, "faces", None))
+    found: set[str] = set()
+    for face in wglink_core._items(getattr(body, "faces", None)):
+        if not any(_same_fusion_entity(face, item, design) for item in created):
+            maker = getattr(face, "createdByFeature", None)
+            if maker is None or not _same_fusion_entity(maker, feature, design):
+                continue
+        plane = _origin_plane_of_cut_face(face, body)
+        if plane is not None:
+            found.add(plane)
+    return next(iter(found)) if len(found) == 1 else None
 
 
 def _feature_kind(feature: object) -> str | None:
@@ -3312,7 +3345,7 @@ def _fusion_cut_descriptors(
                 )
                 participants = getattr(feature, "splitBodies", None)
             else:
-                tool = _extrude_profile_plane(feature, component, design)
+                tool = None
                 participants = getattr(feature, "participantBodies", None)
             affected: set[str] = set()
             for candidate in [
@@ -3324,7 +3357,7 @@ def _fusion_cut_descriptors(
                     for object_id, body in bodies_by_id.items()
                     if _same_fusion_entity(candidate, body, design)
                 )
-            if tool is None or not affected:
+            if (descriptor["feature_kind"] == "split-body" and tool is None) or not affected:
                 if unread is not None:
                     unread.append(f"{descriptor['feature_name']}: tool or affected bodies unavailable at current marker")
                 continue
@@ -3341,20 +3374,31 @@ def _fusion_cut_descriptors(
                         )
                     )
                 }
-            tool_kind, origin_plane, coincident = tool
-            kept_sides = {
-                object_id: sides[(object_id, origin_plane)]
-                for object_id in affected
-                if (object_id, origin_plane) in sides
-            }
-            descriptors.append({
-                **descriptor,
-                "tool_kind": tool_kind,
-                "origin_plane": origin_plane,
-                "coincident": coincident,
-                "body_object_ids": sorted(affected),
-                "kept_sides": kept_sides,
-            })
+            for object_id in sorted(affected):
+                body = bodies_by_id[object_id]
+                if descriptor["feature_kind"] == "extrude-cut":
+                    origin_plane = _extrude_result_plane(feature, body, design)
+                    body_tool = ("origin-plane", origin_plane, True) if origin_plane else None
+                else:
+                    body_tool = tool
+                if body_tool is None or not body_tool[2]:
+                    if unread is not None:
+                        unread.append(f"{descriptor['feature_name']}: cut plane unavailable at current marker for {object_id}")
+                    continue
+                tool_kind, origin_plane, coincident = body_tool
+                side = sides.get((object_id, origin_plane))
+                if side is None:
+                    if unread is not None:
+                        unread.append(f"{descriptor['feature_name']}: kept side unavailable at current marker for {object_id}")
+                    continue
+                descriptors.append({
+                    **descriptor,
+                    "tool_kind": tool_kind,
+                    "origin_plane": origin_plane,
+                    "coincident": coincident,
+                    "body_object_ids": [object_id],
+                    "kept_sides": {object_id: side},
+                })
         except Exception:  # noqa: BLE001 - incomplete advisory evidence is omitted
             if unread is not None:
                 unread.append(f"{descriptor['feature_name']}: feature evidence unreadable at current marker")

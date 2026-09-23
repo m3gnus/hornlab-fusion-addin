@@ -208,10 +208,13 @@ mesh.
 
 For a model already cut on an origin plane, WGLink reads the Fusion timeline
 during that explicit Send or Solve. A live, unsuppressed **Split Body** or cut
-extrude on the YZ, XZ or XY origin plane is recorded with its feature name and
-the side the exported body kept. A construction plane counts only when it is
-coincident with an origin plane (for example an offset of zero). Pre-flight
-shows evidence such as **Cut: Split Body 3 at x = 0**.
+extrude whose current result has a planar cut face on the YZ, XZ or XY origin
+plane is recorded with its feature name and the side the exported body kept.
+The extrude sketch plane alone does not establish the cut plane. A Split Body
+tool on an origin plane is also recorded; a construction plane counts only when
+it is coincident with an origin plane (for example an offset of zero). If the
+cut face cannot be read at the current timeline marker, its advisory descriptor
+is omitted. Pre-flight shows evidence such as **Cut: Split Body 3 at x = 0**.
 
 WG revalidates that evidence against the solve mesh. Supported positive-side,
 open cuts can be mirrored; negative-side, capped, leaking or otherwise unsafe

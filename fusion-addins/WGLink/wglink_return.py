@@ -17,6 +17,8 @@ from pathlib import PurePosixPath
 import re
 from typing import Any
 
+MANAGE_DROPDOWN_NAME = "Manage WG Link…"
+SCOPE_REASON_UNCLASSIFIED_VISIBLE_SURFACE = "unclassified_visible_surface"
 
 SUPPORTED_RETURN_FEATURES = frozenset(
     {
@@ -342,10 +344,16 @@ _EXTERNAL_NOTES = {
 
 
 def _refusal_record(
-    candidate: Mapping[str, Any], index: int, *, reason: str
+    candidate: Mapping[str, Any],
+    index: int,
+    *,
+    reason: str,
+    reason_code: str | None = None,
 ) -> dict[str, Any]:
     record = _scope_identity(candidate, index)
     record.update({"decision": "refuse", "reason": reason})
+    if reason_code is not None:
+        record["reason_code"] = reason_code
     return record
 
 
@@ -708,9 +716,10 @@ def plan_export_scope(
                         f"visible surface body {name!r} is not classified. "
                         "If it is a modelling or cutting helper, hide the body "
                         "itself in the browser; if it is part of the acoustic "
-                        "exterior, select it and use Manage → Declare Body… → "
-                        "Exterior shell" + external_note
+                        f"exterior, select it and use {MANAGE_DROPDOWN_NAME} → "
+                        "Declare Body… → Exterior shell" + external_note
                     ),
+                    reason_code=SCOPE_REASON_UNCLASSIFIED_VISIBLE_SURFACE,
                 )
             )
             continue

@@ -33,6 +33,8 @@ if __package__:
         DOCUMENT_UP_FEATURE,
         DOMAIN_AUTOMATIC_FEATURE,
         DOMAIN_KIND_FOR_PLANES,
+        MANAGE_DROPDOWN_NAME,
+        SCOPE_REASON_UNCLASSIFIED_VISIBLE_SURFACE,
         WgReturnError,
         build_return_manifest,
         canonical_domain_planes,
@@ -49,6 +51,8 @@ else:
         DOCUMENT_UP_FEATURE,
         DOMAIN_AUTOMATIC_FEATURE,
         DOMAIN_KIND_FOR_PLANES,
+        MANAGE_DROPDOWN_NAME,
+        SCOPE_REASON_UNCLASSIFIED_VISIBLE_SURFACE,
         WgReturnError,
         build_return_manifest,
         canonical_domain_planes,
@@ -1171,6 +1175,9 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         "included": [],
         "sources": [],
         "scope_error": None,
+        "scope_reason_codes": [],
+        "has_unclassified_visible_surface_refusal": False,
+        "manage_dropdown_name": MANAGE_DROPDOWN_NAME,
         "source_error": None,
         "domain": None,
         "domain_error": None,
@@ -1183,6 +1190,15 @@ def preflight_scope(app: object, options: dict[str, Any] | None = None) -> dict[
         scope = plan_export_scope(walk["selection"], walk["candidates"]).manifest_scope()
     except WgReturnError as exc:
         report["scope_error"] = str(exc)
+        report["scope_reason_codes"] = list(dict.fromkeys(
+            str(reason["reason_code"])
+            for reason in exc.reasons
+            if reason.get("reason_code")
+        ))
+        report["has_unclassified_visible_surface_refusal"] = (
+            SCOPE_REASON_UNCLASSIFIED_VISIBLE_SURFACE
+            in report["scope_reason_codes"]
+        )
         return report
 
     included_pairs = [

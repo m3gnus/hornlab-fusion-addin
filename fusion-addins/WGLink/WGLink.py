@@ -4407,7 +4407,7 @@ def _icon_folder(operation: str) -> str:
 
 
 MANAGE_DROPDOWN_ID = "hornlab_wglink_manage"
-MANAGE_DROPDOWN_NAME = "Manage WG Link…"
+MANAGE_DROPDOWN_NAME = wglink_send.MANAGE_DROPDOWN_NAME
 
 
 def _manage_dropdown(panel: object) -> object | None:

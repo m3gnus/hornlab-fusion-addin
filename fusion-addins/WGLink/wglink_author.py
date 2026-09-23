@@ -532,9 +532,6 @@ NO_SOURCE_WARNING = (
     "No drivable source: use Set WG Source… to mark a face LF, MF, HF, or "
     "PASSIVE_CARDIOID. The export refuses without one."
 )
-DECLARE_BODY_HINT = (
-    "Use Declare Body… (Manage menu) → Exterior shell, or exclude the body."
-)
 LOG_HINT = (
     "The full traceback is in Fusion's Text Commands palette "
     "(View → Show Text Commands)."
@@ -608,6 +605,10 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
         item for item in (scope.get("sources") or []) if isinstance(item, Mapping)
     ]
     scope_error = str(scope.get("scope_error") or "").strip()
+    has_unclassified_surface_refusal = (
+        scope.get("has_unclassified_visible_surface_refusal") is True
+    )
+    manage_dropdown_name = str(scope.get("manage_dropdown_name") or "").strip()
     source_error = str(scope.get("source_error") or "").strip()
     domain_error = str(scope.get("domain_error") or "").strip()
     domain = scope.get("domain")
@@ -623,10 +624,11 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     if scope_error:
         warning = f"Export is blocked: {scope_error}"
         if (
-            "unclassified" in scope_error.casefold()
-            and DECLARE_BODY_HINT not in scope_error
+            has_unclassified_surface_refusal
+            and manage_dropdown_name
+            and manage_dropdown_name not in scope_error
         ):
-            warning += f" {DECLARE_BODY_HINT}"
+            warning += f" Declare Body… is under {manage_dropdown_name}."
         return Preflight(lines=(), warnings=(warning,), frame=())
 
     lines = [

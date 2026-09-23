@@ -654,7 +654,7 @@ def test_two_visible_undeclared_surfaces_still_refuse(send_module, monkeypatch):
     assert "not classified" in report["scope_error"]
     assert "hide the body itself in the browser" in report["scope_error"]
     assert (
-        "select it and use Manage → Declare Body… → Exterior shell"
+        "select it and use Manage WG Link… → Declare Body… → Exterior shell"
         in report["scope_error"]
     )
     assert report["included"] == [] and report["sources"] == []
@@ -667,6 +667,28 @@ def test_two_visible_undeclared_surfaces_still_refuse(send_module, monkeypatch):
     assert cleared["scope_error"] is None
     assert cleared["included"] == [{"name": "Speaker/First shell", "body_kind": "surface"}]
     assert [source["role"] for source in cleared["sources"]] == ["HF"]
+
+
+def test_unclassified_surface_name_does_not_add_exclusion_advice(
+    send_module, monkeypatch
+):
+    shell = body("shell", solid=False)
+    helper = body("unclassified helper", solid=False)
+    app = _design_of(component("Speaker", [shell, helper]), monkeypatch, send_module)
+
+    report = send_module.preflight_scope(app)
+    summary = send_module.wglink_author.preflight_summary(report)
+
+    assert report["scope_reason_codes"] == ["unclassified_visible_surface"]
+    assert report["has_unclassified_visible_surface_refusal"] is True
+    assert "visible surface body 'Speaker/shell'" in report["scope_error"]
+    assert (
+        "visible surface body 'Speaker/unclassified helper'"
+        in report["scope_error"]
+    )
+    assert "exclude" not in summary.text().casefold()
+    assert "Manage WG Link… → Declare Body… → Exterior shell" in summary.text()
+    assert "Declare Body… is under Manage WG Link…." not in summary.text()
 
 
 def test_step_body_counter_handles_solid_shell_mixed_and_ignores_names(send_module):

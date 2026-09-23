@@ -733,12 +733,16 @@ def test_s12_two_unclassified_visible_surfaces_refuse_with_both_remedies():
     assert [reason["reason"] for reason in reasons] == [
         "visible surface body 'horn shell' is not classified. If it is a modelling "
         "or cutting helper, hide the body itself in the browser; if it is part of "
-        "the acoustic exterior, select it and use Manage → Declare Body… → "
-        "Exterior shell",
+        "the acoustic exterior, select it and use Manage WG Link… → "
+        "Declare Body… → Exterior shell",
         "visible surface body 'mystery helper' is not classified. If it is a "
         "modelling or cutting helper, hide the body itself in the browser; if it "
-        "is part of the acoustic exterior, select it and use Manage → Declare "
-        "Body… → Exterior shell",
+        "is part of the acoustic exterior, select it and use "
+        "Manage WG Link… → Declare Body… → Exterior shell",
+    ]
+    assert [reason["reason_code"] for reason in reasons] == [
+        "unclassified_visible_surface",
+        "unclassified_visible_surface",
     ]
     assert str(exc.value).count("visible surface body '") == 2
     assert "\n" not in str(exc.value)

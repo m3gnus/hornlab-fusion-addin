@@ -120,7 +120,8 @@ def test_a_wholly_unstamped_group_is_adopted_once_the_user_confirms(
     send_module, tmp_path, monkeypatch
 ):
     a, b = stamped_face("LF"), stamped_face("LF")
-    _painted_document(send_module, monkeypatch, [a, b])
+    design = _painted_document(send_module, monkeypatch, [a, b])
+    original_bodies = tuple(design.rootComponent.bRepBodies)
     confirmer = _Confirmer(True)
 
     manifest = _send_with(send_module, tmp_path, confirmer)
@@ -129,6 +130,7 @@ def test_a_wholly_unstamped_group_is_adopted_once_the_user_confirms(
     (source,) = manifest["sources"]
     assert source["id"].startswith("wgs-")
     assert stamp_of(a)["id"] == stamp_of(b)["id"] == source["id"]
+    assert tuple(design.rootComponent.bRepBodies) == original_bodies
 
 
 def test_an_adopted_group_records_the_count_it_was_marked_on(
@@ -311,7 +313,8 @@ def test_a_read_only_face_leaves_every_adopted_stamp_as_it_was(
     a, b = stamped_face("LF"), stamped_face("LF")
     locked = stamped_face("LF")
     locked.attributes = _ReadOnlyAttributes()
-    _painted_document(send_module, monkeypatch, [a, b, locked])
+    design = _painted_document(send_module, monkeypatch, [a, b, locked])
+    original_bodies = tuple(design.rootComponent.bRepBodies)
 
     with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
         _send_with(send_module, tmp_path, _Confirmer(True))
@@ -319,4 +322,5 @@ def test_a_read_only_face_leaves_every_adopted_stamp_as_it_was(
     assert "Every source identity stamp was restored" in str(refusal.value)
     assert a.attributes.values == b.attributes.values == {}
     assert locked.attributes.values == {}
+    assert tuple(design.rootComponent.bRepBodies) == original_bodies
     assert _nothing_was_written(tmp_path)

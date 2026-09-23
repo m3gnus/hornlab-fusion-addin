@@ -669,6 +669,70 @@ def test_two_visible_undeclared_surfaces_still_refuse(send_module, monkeypatch):
     assert [source["role"] for source in cleared["sources"]] == ["HF"]
 
 
+@pytest.mark.parametrize("bad_visibility", ["raises", "non_bool"])
+def test_unreadable_body_visibility_refuses_by_property(
+    send_module, bad_visibility
+):
+    class BadVisibility:
+        @property
+        def isVisible(self):
+            if bad_visibility == "raises":
+                raise RuntimeError("Fusion visibility unavailable")
+            return "False"
+
+    shell = body("Body5", solid=False)
+
+    class VisibilityBody:
+        def __getattr__(self, name):
+            if name == "isVisible":
+                return BadVisibility().isVisible
+            return getattr(shell, name)
+
+    wrapped = VisibilityBody()
+    wrapped.isLightBulbOn = False
+    design = types.SimpleNamespace(rootComponent=component("Speaker", [wrapped]))
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
+        send_module._scope_walk(design, "root")
+    assert "Speaker/Body5" in str(refusal.value)
+    assert "isVisible" in str(refusal.value)
+    assert "visible surface body" not in str(refusal.value)
+
+
+def test_nameless_hidden_surface_is_not_mistaken_for_visible(send_module):
+    unnamed = body("", solid=False, visible=False)
+    design = types.SimpleNamespace(rootComponent=component("Speaker", [unnamed]))
+
+    walk = send_module._scope_walk(design, "root")
+
+    assert walk["candidates"][0]["name"] == "body 1"
+    assert walk["candidates"][0]["visible"] is False
+
+
+@pytest.mark.parametrize("bad_visibility", ["raises", "non_bool"])
+def test_unreadable_occurrence_visibility_names_occurrence(
+    send_module, bad_visibility
+):
+    class VisibilityOccurrence:
+        name = "Horn:1"
+        fullPathName = "Speaker/Horn:1"
+        isLightBulbOn = False
+        component = component("Horn", [body("shell", solid=False)])
+
+        @property
+        def isVisible(self):
+            if bad_visibility == "raises":
+                raise RuntimeError("Fusion visibility unavailable")
+            return None
+
+    root = component("Speaker")
+    root.occurrences.append(VisibilityOccurrence())
+    design = types.SimpleNamespace(rootComponent=root)
+    with pytest.raises(send_module.wglink_core.WgLinkError) as refusal:
+        send_module._scope_walk(design, "root")
+    assert "Speaker/Horn:1" in str(refusal.value)
+    assert "isVisible" in str(refusal.value)
+
+
 def test_unclassified_surface_name_does_not_add_exclusion_advice(
     send_module, monkeypatch
 ):

@@ -380,6 +380,25 @@ def _bool(entity: object, names: tuple[str, ...], default: bool) -> bool:
     return default
 
 
+def _visible(entity: object, path: str, kind: str) -> bool:
+    """Read Fusion's final visibility, never a bulb or an assumed default."""
+
+    try:
+        value = entity.isVisible
+    except Exception as exc:  # noqa: BLE001
+        raise wglink_core.WgLinkError(
+            f"Could not read isVisible for {kind} {path!r}: {exc}. "
+            "Check this object's visibility in Fusion and retry."
+        ) from exc
+    if not isinstance(value, bool):
+        raise wglink_core.WgLinkError(
+            f"Could not read isVisible for {kind} {path!r}: "
+            f"expected bool, got {type(value).__name__}. "
+            "Check this object's visibility in Fusion and retry."
+        )
+    return value
+
+
 def _external_reference(occurrence: object | None) -> str:
     if occurrence is None:
         return "none"
@@ -525,7 +544,7 @@ def _fusion_would_export(candidate: dict[str, Any]) -> bool:
     LIMITATION, and it is not closable from inside this module. Autodesk
     documents that hiding a body GROUP does not exclude its members: "such
     objects while invisible will be exported as if they were visible."
-    ``_scope_walk`` reads ``isVisible`` first (``isLightBulbOn`` as fallback),
+    ``_scope_walk`` requires a boolean ``isVisible`` reading,
     and ``isVisible`` reads False for exactly such a body. So this predicate is
     right for an individually-hidden body and wrong for a group-hidden one --
     it under-predicts the file rather than over-predicting it. Treat it as a
@@ -619,14 +638,14 @@ def _fem_bodies_fusion_would_export(
 
     if left_out or _bool(occurrence, ("isSuppressed",), False):
         return []
-    if not _bool(occurrence, ("isVisible", "isLightBulbOn"), True):
+    if occurrence is not None and not _visible(occurrence, path, "occurrence"):
         return []
     owner = occurrence if _collection(occurrence, "bRepBodies") else component
     names: list[str] = []
     for body in _collection(owner, "bRepBodies"):
         if _bool(body, ("isSuppressed",), False):
             continue
-        if not _bool(body, ("isVisible", "isLightBulbOn"), True):
+        if not _visible(body, f"{path}/{getattr(body, 'name', '') or 'unnamed body'}", "B-rep body"):
             continue
         names.append(f"{path}/{getattr(body, 'name', '') or 'unnamed body'}")
     children = (
@@ -786,6 +805,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         *,
         mesh: bool = False,
         suppressed: bool = False,
+        hidden: bool = False,
     ) -> None:
         nonlocal serial
         serial += 1
@@ -793,11 +813,12 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         object_id = _object_id(body, f"body-{serial:04d}")
         if object_id in bodies:
             object_id = f"{object_id}@{path}"
-        visible = _bool(body, ("isVisible", "isLightBulbOn"), True)
+        body_path = f"{path}/{name}" if path else name
+        visible = _visible(body, body_path, "mesh body" if mesh else "B-rep body")
         if occurrence is not None:
-            visible = visible and _bool(
-                occurrence, ("isVisible", "isLightBulbOn"), True
-            )
+            occurrence_visible = _visible(occurrence, path, "occurrence")
+            visible = visible and occurrence_visible
+        visible = visible and not hidden
         # An occurrence PROXY exposes an empty attribute collection (measured
         # in Fusion 2704: the probe read zero attributes off the proxy while
         # the native body carried the whole payload), so identity is read from
@@ -814,7 +835,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
             "declaration": read_declaration(native),
             "component": _component_name(component),
             "name": name,
-            "path": f"{path}/{name}" if path else name,
+            "path": body_path,
             "object_id": object_id,
             "wglink_managed": bool(instance_id or managed_role),
             "wglink_role": managed_role,
@@ -884,10 +905,10 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
 
         body_owner = occurrence if _collection(occurrence, "bRepBodies") else component
         for body in _collection(body_owner, "bRepBodies"):
-            add_body(body, component, path, occurrence, suppressed=suppressed)
+            add_body(body, component, path, occurrence, suppressed=suppressed, hidden=hidden)
         mesh_owner = occurrence if _collection(occurrence, "meshBodies") else component
         for body in _collection(mesh_owner, "meshBodies"):
-            add_body(body, component, path, occurrence, mesh=True, suppressed=suppressed)
+            add_body(body, component, path, occurrence, mesh=True, suppressed=suppressed, hidden=hidden)
         construction_count += sum(
             len(_collection(component, name))
             for name in ("constructionPlanes", "constructionAxes", "sketches")
@@ -929,9 +950,7 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
                 )
                 continue
             # Only the FEM check reads this; ``add_body`` keeps its own reading.
-            child_hidden = hidden or not _bool(
-                child, ("isVisible", "isLightBulbOn"), True
-            )
+            child_hidden = not _visible(child, child_path, "occurrence") or hidden
             walk_component(
                 child_component, child_path, child, child_suppressed, child_hidden
             )

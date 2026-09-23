@@ -3185,6 +3185,20 @@ def _cut_tool_descriptor(
 def _extrude_profile_plane(
     feature: object, component: object, design: object
 ) -> tuple[str, str, bool] | None:
+    # A profile's sketch plane is not the cut's start plane when the extrusion
+    # starts from an offset or another entity. These definition reads are safe
+    # at the current marker; if Fusion cannot expose them, omit the evidence.
+    start = getattr(feature, "startExtent", None)
+    extent = getattr(feature, "extentOne", None)
+    if start is None or extent is None:
+        return None
+    start_kind = str(getattr(start, "objectType", "") or "")
+    if start_kind.endswith("OffsetStartDefinition"):
+        offset = _parameter_value(getattr(start, "offset", None))
+        if offset is None or abs(offset) > 1.0e-9:
+            return None
+    elif not start_kind.endswith("ProfilePlaneStartDefinition"):
+        return None
     profiles = wglink_core._items(getattr(feature, "profile", None))
     if not profiles and getattr(feature, "profile", None) is not None:
         profiles = [feature.profile]
@@ -3230,8 +3244,14 @@ def _fusion_cut_descriptors(
     design: object,
     included_pairs: list[tuple[dict[str, Any], object]],
     export_component: object,
+    unread: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Thin Fusion adapter: inspect the active timeline into plain records."""
+    """Inspect only feature data available at the current marker.
+
+    Cut provenance is advisory. A feature whose tool or affected bodies cannot
+    be read now contributes no evidence; inspecting its historical state would
+    roll and recompute the user's design.
+    """
 
     timeline = getattr(design, "timeline", None)
     if timeline is None:
@@ -3239,7 +3259,9 @@ def _fusion_cut_descriptors(
     try:
         marker = int(timeline.markerPosition)
     except Exception:  # noqa: BLE001
-        marker = len(wglink_core._items(timeline))
+        if unread is not None:
+            unread.append("timeline marker unreadable; cut provenance omitted")
+        return []
     sides: dict[tuple[str, str], str] = {}
     bodies_by_id: dict[str, object] = {}
     for record, body in included_pairs:
@@ -3250,48 +3272,40 @@ def _fusion_cut_descriptors(
             if side is not None:
                 sides[(object_id, plane)] = side
 
-    snapshots: list[tuple[object, dict[str, Any], set[str]]] = []
+    descriptors: list[dict[str, Any]] = []
     for fallback_index, item in enumerate(wglink_core._items(timeline)):
         try:
             feature = item.entity
         except Exception:  # noqa: BLE001 - one unreadable entry is no evidence
             continue
-        kind = _feature_kind(feature) if feature is not None else None
+        try:
+            kind = _feature_kind(feature) if feature is not None else None
+        except Exception:  # noqa: BLE001 - an unreadable feature is no evidence
+            continue
         if kind is None:
             continue
         try:
             index = int(getattr(item, "index"))
         except Exception:  # noqa: BLE001
             index = fallback_index
-        affected: set[str] = set()
-        for candidate in wglink_core._items(getattr(feature, "bodies", None)):
-            affected.update(
-                object_id
-                for object_id, body in bodies_by_id.items()
-                if _same_fusion_entity(candidate, body, design)
-            )
-        snapshots.append((feature, {
-            "timeline_index": index,
-            "marker_position": marker,
-            "suppressed": bool(getattr(feature, "isSuppressed", False)),
-            "feature_kind": kind,
-            "feature_name": str(getattr(feature, "name", "") or ""),
-        }, affected))
-
-    descriptors: list[dict[str, Any]] = []
-    try:
-        for feature, descriptor, affected in snapshots:
-            if descriptor["suppressed"] or descriptor["timeline_index"] >= marker:
-                continue
-            timeline_object = getattr(feature, "timelineObject", None)
-            try:
-                if timeline_object is not None:
-                    timeline_object.rollTo(True)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            descriptor = {
+                "timeline_index": index,
+                "marker_position": marker,
+                "suppressed": bool(getattr(feature, "isSuppressed", False)),
+                "feature_kind": kind,
+                "feature_name": str(getattr(feature, "name", "") or ""),
+            }
+        except Exception:  # noqa: BLE001 - an unreadable feature is no evidence
+            if unread is not None:
+                unread.append(f"timeline feature {index}: metadata unreadable at current marker")
+            continue
+        if descriptor["suppressed"] or index >= marker:
+            continue
+        try:
             component = getattr(feature, "parentComponent", None)
             if component is None:
-                continue
+                raise ValueError("parent component unavailable")
             if descriptor["feature_kind"] == "split-body":
                 tool = _cut_tool_descriptor(
                     getattr(feature, "splittingTool", None), component, design
@@ -3300,12 +3314,20 @@ def _fusion_cut_descriptors(
             else:
                 tool = _extrude_profile_plane(feature, component, design)
                 participants = getattr(feature, "participantBodies", None)
-            for candidate in wglink_core._items(participants):
+            affected: set[str] = set()
+            for candidate in [
+                *wglink_core._items(getattr(feature, "bodies", None)),
+                *wglink_core._items(participants),
+            ]:
                 affected.update(
                     object_id
                     for object_id, body in bodies_by_id.items()
                     if _same_fusion_entity(candidate, body, design)
                 )
+            if tool is None or not affected:
+                if unread is not None:
+                    unread.append(f"{descriptor['feature_name']}: tool or affected bodies unavailable at current marker")
+                continue
             # Contract planes are in the STEP export frame. A feature in a
             # child component has that meaning only while the occurrence is
             # untransformed; otherwise its local x0/y0/z0 is a different plane.
@@ -3319,8 +3341,6 @@ def _fusion_cut_descriptors(
                         )
                     )
                 }
-            if tool is None:
-                continue
             tool_kind, origin_plane, coincident = tool
             kept_sides = {
                 object_id: sides[(object_id, origin_plane)]
@@ -3335,20 +3355,9 @@ def _fusion_cut_descriptors(
                 "body_object_ids": sorted(affected),
                 "kept_sides": kept_sides,
             })
-    finally:
-        try:
-            timeline.markerPosition = marker
-            restored = int(timeline.markerPosition)
-        except Exception as exc:  # noqa: BLE001
-            raise wglink_core.WgLinkError(
-                "Fusion could not restore the design timeline after reading cut provenance; "
-                "the export was cancelled. Restore the timeline marker, then try again."
-            ) from exc
-        if restored != marker:
-            raise wglink_core.WgLinkError(
-                "Fusion did not restore the design timeline after reading cut provenance; "
-                "the export was cancelled. Restore the timeline marker, then try again."
-            )
+        except Exception:  # noqa: BLE001 - incomplete advisory evidence is omitted
+            if unread is not None:
+                unread.append(f"{descriptor['feature_name']}: feature evidence unreadable at current marker")
     return descriptors
 
 
@@ -3357,8 +3366,9 @@ def read_cut_provenance(
     included_pairs: list[tuple[dict[str, Any], object]],
     export_frame: str,
     export_component: object,
+    unread: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    descriptors = _fusion_cut_descriptors(design, included_pairs, export_component)
+    descriptors = _fusion_cut_descriptors(design, included_pairs, export_component, unread)
     return classify_cut_provenance(
         descriptors,
         {str(record["object_id"]) for record, _body in included_pairs},
@@ -3805,9 +3815,11 @@ def send(
     domain = {"kind": "automatic"} if automatic_domain else plan_domain(
         domain_planes, measured_bodies
     )
+    unread_cut_provenance: list[str] = []
     cut_provenance = (
         read_cut_provenance(
-            design, included_pairs, walk["export_frame"], walk["geometry"]
+            design, included_pairs, walk["export_frame"], walk["geometry"],
+            unread_cut_provenance,
         )
         if automatic_domain
         else []
@@ -3990,6 +4002,7 @@ def send(
         "return_id": manifest["return"]["id"],
         "bundle_path": str(target),
         "domain": domain,
+        "cut_provenance_unread": unread_cut_provenance,
         "document_captured": capture_document and document_capture_error is None,
         "document_capture_error": document_capture_error,
         "scope": manifest["scope"],

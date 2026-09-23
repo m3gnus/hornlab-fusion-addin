@@ -2388,13 +2388,17 @@ def test_automatic_domain_is_written_only_for_a_capable_wg(
     if automatic:
         assert manifest["assembly"]["domain"] == {"kind": "automatic"}
         assert "domain-automatic-v1" in manifest["required_features"]
+        assert "cut_provenance" not in manifest["assembly"]
+        sys.modules["wglink_return"].loads_return_manifest(
+            (Path(report["bundle_path"]) / "wgreturn.json").read_text(encoding="utf-8")
+        )
     else:
         assert "domain" not in manifest["assembly"]
         assert "cut_provenance" not in manifest["assembly"]
         assert "domain-automatic-v1" not in manifest["required_features"]
 
 
-def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_marker(
+def test_fusion_timeline_adapter_reads_a_live_origin_plane_split_without_rolling(
     send_module,
 ):
     shell = half_body(
@@ -2410,7 +2414,8 @@ def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_
     root.xYConstructionPlane = types.SimpleNamespace(
         name="XY Plane", entityToken="plane-xy"
     )
-    rolled: list[bool] = []
+    def forbid_roll(_before):
+        pytest.fail("cut provenance rolled the timeline")
     feature = types.SimpleNamespace(
         objectType="adsk::fusion::SplitBodyFeature",
         name="Split Body 3",
@@ -2419,7 +2424,7 @@ def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_
         splitBodies=Collection([shell]),
         splittingTool=root.yZConstructionPlane,
         parentComponent=root,
-        timelineObject=types.SimpleNamespace(rollTo=rolled.append),
+        timelineObject=types.SimpleNamespace(rollTo=forbid_roll),
     )
     timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
     timeline.markerPosition = 1
@@ -2435,7 +2440,6 @@ def test_fusion_timeline_adapter_records_a_live_origin_plane_split_and_restores_
     assert provenance[0]["feature"]["name"] == "Split Body 3"
     assert provenance[0]["plane"] == "x0"
     assert provenance[0]["kept_side"] == "positive"
-    assert rolled == [True]
     assert timeline.markerPosition == 1
 
 
@@ -2458,7 +2462,7 @@ def test_fusion_timeline_adapter_matches_token_drift_via_design_lookup(send_modu
         splitBodies=Collection([later_handle]),
         splittingTool=root.yZConstructionPlane,
         parentComponent=root,
-        timelineObject=types.SimpleNamespace(rollTo=lambda _before: None),
+        timelineObject=types.SimpleNamespace(rollTo=lambda _before: pytest.fail("timeline rolled")),
     )
     timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
     timeline.markerPosition = 1
@@ -2480,7 +2484,39 @@ def test_fusion_timeline_adapter_matches_token_drift_via_design_lookup(send_modu
     assert provenance[0]["kept_side"] == "positive"
 
 
-def test_fusion_timeline_restoration_failure_cannot_return_provenance(send_module):
+def test_extrude_cut_uses_current_definitions_and_omits_offset_start(send_module):
+    shell = half_body(
+        "Extruded result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
+    )
+    root = component("Root", [shell])
+    root.yZConstructionPlane = types.SimpleNamespace(name="YZ Plane", entityToken="plane-yz")
+    profile = types.SimpleNamespace(parentSketch=types.SimpleNamespace(
+        referencePlane=root.yZConstructionPlane
+    ))
+    feature = types.SimpleNamespace(
+        objectType="adsk::fusion::ExtrudeFeature", operation=1,
+        name="Extrude Cut", isSuppressed=False, bodies=Collection([shell]),
+        participantBodies=Collection([shell]), profile=profile,
+        startExtent=types.SimpleNamespace(objectType="ProfilePlaneStartDefinition"),
+        extentOne=types.SimpleNamespace(objectType="ThroughAllExtentDefinition"),
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=lambda _before: pytest.fail("timeline rolled")),
+    )
+    timeline = Collection([types.SimpleNamespace(index=0, entity=feature)])
+    timeline.markerPosition = 1
+    design = types.SimpleNamespace(timeline=timeline)
+    pair = [({"object_id": shell.entityToken}, shell)]
+
+    assert send_module.read_cut_provenance(design, pair, "root-component", root)[0]["plane"] == "x0"
+    feature.startExtent = types.SimpleNamespace(
+        objectType="OffsetStartDefinition", offset=types.SimpleNamespace(value=1.0)
+    )
+    unread = []
+    assert send_module.read_cut_provenance(design, pair, "root-component", root, unread) == []
+    assert unread == ["Extrude Cut: tool or affected bodies unavailable at current marker"]
+
+
+def test_unreadable_cut_evidence_is_reported_and_omitted_without_marker_write(send_module):
     shell = half_body(
         "Split result", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0)
     )
@@ -2493,7 +2529,7 @@ def test_fusion_timeline_restoration_failure_cannot_return_provenance(send_modul
         def __init__(self, values):
             super().__init__(values)
             self._marker = 1
-            self.restoration_blocked = False
+            self.marker_writes = 0
 
         @property
         def markerPosition(self):
@@ -2501,36 +2537,134 @@ def test_fusion_timeline_restoration_failure_cannot_return_provenance(send_modul
 
         @markerPosition.setter
         def markerPosition(self, value):
-            if self.restoration_blocked:
-                raise RuntimeError("timeline is stuck")
-            self._marker = value
+            self.marker_writes += 1
+            pytest.fail("cut provenance wrote the marker")
 
     timeline = Timeline([])
-
-    def roll_before(_before):
-        timeline._marker = 0
-        timeline.restoration_blocked = True
 
     feature = types.SimpleNamespace(
         objectType="adsk::fusion::SplitBodyFeature",
         name="Split Body 3",
         isSuppressed=False,
-        bodies=Collection([shell]),
-        splitBodies=Collection([shell]),
-        splittingTool=root.yZConstructionPlane,
+        bodies=Collection(),
+        splitBodies=Collection(),
+        splittingTool=None,
         parentComponent=root,
-        timelineObject=types.SimpleNamespace(rollTo=roll_before),
+        timelineObject=types.SimpleNamespace(rollTo=lambda _before: pytest.fail("timeline rolled")),
     )
     timeline.append(types.SimpleNamespace(index=0, entity=feature))
     design = types.SimpleNamespace(timeline=timeline)
 
-    with pytest.raises(send_module.wglink_core.WgLinkError, match="could not restore"):
-        send_module.read_cut_provenance(
-            design,
-            [({"object_id": shell.entityToken}, shell)],
-            "root-component",
-            root,
-        )
+    unread = []
+    assert send_module.read_cut_provenance(
+        design,
+        [({"object_id": shell.entityToken}, shell)],
+        "root-component",
+        root,
+        unread,
+    ) == []
+    assert unread == ["Split Body 3: tool or affected bodies unavailable at current marker"]
+    assert timeline.marker_writes == 0
+
+
+@pytest.mark.parametrize("operation", ["send", "solve"])
+def test_full_export_never_mutates_model_except_requested_source_stamp(
+    send_module, tmp_path, monkeypatch, operation
+):
+    """Both UI operations use this export; traps record even swallowed attempts."""
+
+    attempted = []
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            attempted.append(name)
+            raise AssertionError(f"model mutation: {name}")
+        return call
+
+    class GuardedEntity(types.SimpleNamespace):
+        def __setattr__(self, name, value):
+            if getattr(self, "_sealed", False):
+                attempted.append(f"{self._label}.{name}=")
+                raise AssertionError(f"model mutation: {self._label}.{name}")
+            super().__setattr__(name, value)
+
+        def __getattr__(self, name):
+            if name in {"deleteMe", "suppress", "unsuppress", "moveToComponent",
+                        "copyToComponent", "createForAssemblyContext"}:
+                return forbidden(f"{self._label}.{name}")
+            raise AttributeError(name)
+
+    class GuardedCollection(Collection):
+        def append(self, _value):
+            return forbidden("collection.append")()
+
+        def add(self, *_args):
+            return forbidden("collection.add")()
+
+        def remove(self, _value):
+            return forbidden("collection.remove")()
+
+        def clear(self):
+            return forbidden("collection.clear")()
+
+        def deleteMe(self):
+            return forbidden("collection.deleteMe")()
+
+    class GuardedTimeline(GuardedCollection):
+        @property
+        def markerPosition(self):
+            return 1
+
+        @markerPosition.setter
+        def markerPosition(self, _value):
+            attempted.append("timeline.markerPosition=")
+            raise AssertionError("timeline marker write")
+
+        def rollTo(self, *_args):
+            return forbidden("timeline.rollTo")()
+
+    class GuardedAttributes(Attributes):
+        def add(self, group, name, value):
+            if (group, name) != (send_module.wglink_core.ATTRIBUTE_GROUP,
+                                  send_module.SOURCE_IDENTITY_ATTRIBUTE):
+                attempted.append(f"attribute.add({group}, {name})")
+                raise AssertionError("non-stamp attribute write")
+            assert json.loads(value)["schema"] == send_module.SOURCE_IDENTITY_SCHEMA
+            super().add(group, name, value)
+
+    painted = face("HF")
+    painted.attributes = GuardedAttributes()
+    painted.edges = GuardedCollection(painted.edges)
+    shell = GuardedEntity(**vars(half_body(
+        "Guarded", low=(0.0, -20.0, -30.0), high=(40.0, 20.0, 30.0),
+        faces=[painted],
+    )))
+    shell._label = "body"
+    shell.faces = GuardedCollection(shell.faces)
+    root = component("Guarded", [shell])
+    root.yZConstructionPlane = types.SimpleNamespace(name="YZ Plane", entityToken="plane-yz")
+    feature = GuardedEntity(
+        _label="feature", objectType="adsk::fusion::SplitBodyFeature",
+        name="Split Body", isSuppressed=False, bodies=GuardedCollection([shell]),
+        splitBodies=GuardedCollection([shell]), splittingTool=root.yZConstructionPlane,
+        parentComponent=root,
+        timelineObject=types.SimpleNamespace(rollTo=forbidden("feature.rollTo")),
+    )
+    shell._sealed = True
+    feature._sealed = True
+    design, app, _manager = _contract_design(root)
+    design.timeline = GuardedTimeline([types.SimpleNamespace(index=0, entity=feature)])
+    monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
+
+    report = send_module.send(app, {
+        "output_folder": str(tmp_path / operation), "capture_document": False,
+        "automatic_domain": True, "source_identity": True,
+    }, confirm_adoption=lambda role, count: (role, count) == ("HF", 1))
+
+    assert report["manifest"]["assembly"]["cut_provenance"][0]["plane"] == "x0"
+    assert report["cut_provenance_unread"] == []
+    assert len(painted.attributes.values) == 1
+    assert attempted == []
 
 
 @pytest.mark.parametrize(

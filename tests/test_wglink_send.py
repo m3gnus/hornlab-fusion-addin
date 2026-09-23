@@ -651,7 +651,12 @@ def test_two_visible_undeclared_surfaces_still_refuse(send_module, monkeypatch):
 
     report = send_module.preflight_scope(app)
 
-    assert "unclassified" in report["scope_error"]
+    assert "not classified" in report["scope_error"]
+    assert "hide the body itself in the browser" in report["scope_error"]
+    assert (
+        "select it and use Manage → Declare Body… → Exterior shell"
+        in report["scope_error"]
+    )
     assert report["included"] == [] and report["sources"] == []
 
     # Declare Body is the remedy, and it unblocks the same scope.

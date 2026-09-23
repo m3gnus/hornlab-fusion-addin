@@ -464,7 +464,7 @@ def test_an_undeclared_visible_linked_surface_is_refused_exactly_as_a_local_one(
 
     assert _verdicts(linked)[1:] == _verdicts(local)[1:] == ((), ("refuse",))
     assert linked.included == ()
-    with pytest.raises(WgReturnError, match="Supplier part.*unclassified"):
+    with pytest.raises(WgReturnError, match="Supplier part.*not classified"):
         linked.manifest_scope()
 
 
@@ -716,7 +716,7 @@ def test_s11_declared_or_managed_surface_includes_with_reason(candidate, phrase)
     assert phrase in plan.included[0]["reason"]
 
 
-def test_s12_two_unclassified_visible_surfaces_refuse_with_one_declaration_remedy():
+def test_s12_two_unclassified_visible_surfaces_refuse_with_both_remedies():
     plan = plan_export_scope(
         "root",
         [
@@ -725,12 +725,23 @@ def test_s12_two_unclassified_visible_surfaces_refuse_with_one_declaration_remed
         ],
     )
 
-    with pytest.raises(
-        WgReturnError,
-        match="mystery helper.*mark it 'exterior-shell' or exclude it",
-    ) as exc:
+    with pytest.raises(WgReturnError) as exc:
         plan.manifest_scope()
-    assert exc.value.reasons[0]["decision"] == "refuse"
+
+    reasons = exc.value.reasons
+    assert [reason["decision"] for reason in reasons] == ["refuse", "refuse"]
+    assert [reason["reason"] for reason in reasons] == [
+        "visible surface body 'horn shell' is not classified. If it is a modelling "
+        "or cutting helper, hide the body itself in the browser; if it is part of "
+        "the acoustic exterior, select it and use Manage → Declare Body… → "
+        "Exterior shell",
+        "visible surface body 'mystery helper' is not classified. If it is a "
+        "modelling or cutting helper, hide the body itself in the browser; if it "
+        "is part of the acoustic exterior, select it and use Manage → Declare "
+        "Body… → Exterior shell",
+    ]
+    assert str(exc.value).count("visible surface body '") == 2
+    assert "\n" not in str(exc.value)
 
 
 def test_s12_the_only_visible_undeclared_surface_is_the_exterior_shell():

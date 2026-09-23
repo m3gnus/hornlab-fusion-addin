@@ -705,9 +705,11 @@ def plan_export_scope(
                     candidate,
                     index,
                     reason=(
-                        f"visible surface body {name!r} is unclassified; mark it "
-                        "'exterior-shell' or exclude it. Use Declare Body… "
-                        "(Manage menu) → Exterior shell" + external_note
+                        f"visible surface body {name!r} is not classified. "
+                        "If it is a modelling or cutting helper, hide the body "
+                        "itself in the browser; if it is part of the acoustic "
+                        "exterior, select it and use Manage → Declare Body… → "
+                        "Exterior shell" + external_note
                     ),
                 )
             )

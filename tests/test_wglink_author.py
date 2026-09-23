@@ -372,15 +372,25 @@ def test_the_exports_own_source_refusal_is_preferred_when_it_reported_one(author
     assert summary.warnings[0] == "Return export has no drivable source."
 
 
-def test_an_unclassified_surface_body_points_at_the_command_that_fixes_it(author):
+def test_an_unclassified_surface_body_points_at_both_correct_remedies(author):
     summary = author.preflight_summary(clean_scope(
-        scope_error="visible surface body 'Shell' is unclassified; mark it 'exterior-shell' or exclude it",
+        scope_error=(
+            "visible surface body 'Shell' is not classified. If it is a modelling "
+            "or cutting helper, hide the body itself in the browser; if it is "
+            "part of the acoustic exterior, select it and use Manage → Declare "
+            "Body… → Exterior shell"
+        ),
         included=[],
         sources=[],
     ))
 
     assert summary.text().startswith("⚠ Export is blocked")
-    assert author.DECLARE_BODY_HINT in summary.text()
+    assert "hide the body itself in the browser" in summary.text()
+    assert (
+        "select it and use Manage → Declare Body… → Exterior shell"
+        in summary.text()
+    )
+    assert author.DECLARE_BODY_HINT not in summary.text()
     assert "Bodies included: none" not in summary.text()
     assert "Sources: none" not in summary.text()
     assert author.NO_SOURCE_WARNING not in summary.text()

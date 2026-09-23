@@ -733,6 +733,92 @@ def test_unreadable_occurrence_visibility_names_occurrence(
     assert "isVisible" in str(refusal.value)
 
 
+@pytest.mark.parametrize("selected", [False, True])
+def test_hidden_selected_bodyless_occurrence_hides_descendant_bodies(
+    send_module, selected
+):
+    child_component = component("Child", [body("shell", solid=False)])
+    child = types.SimpleNamespace(
+        name="parent/child",
+        fullPathName="parent/child",
+        component=child_component,
+        objectType="adsk::fusion::Occurrence",
+        transform2=transform(),
+        isVisible=True,
+        isSuppressed=False,
+    )
+    parent_component = component("Parent")
+    parent_component.occurrences.append(child)
+    parent = types.SimpleNamespace(
+        name="parent",
+        fullPathName="parent",
+        component=parent_component,
+        objectType="adsk::fusion::Occurrence",
+        transform2=transform(),
+        isVisible=False,
+        isSuppressed=False,
+    )
+    root = component("Root")
+    root.occurrences.append(parent)
+
+    walk = send_module._scope_walk(
+        types.SimpleNamespace(rootComponent=root), parent if selected else "root"
+    )
+
+    assert walk["candidates"][0]["visible"] is False
+
+
+@pytest.mark.parametrize("value", [None, "False", 0, 1])
+def test_selected_bodyless_occurrence_visibility_must_be_bool(
+    send_module, value
+):
+    child = types.SimpleNamespace(
+        name="parent/child",
+        fullPathName="parent/child",
+        component=component("Child", [body("shell", solid=False)]),
+        objectType="adsk::fusion::Occurrence",
+        transform2=transform(),
+        isVisible=True,
+        isSuppressed=False,
+    )
+    parent_component = component("Parent")
+    parent_component.occurrences.append(child)
+    parent = types.SimpleNamespace(
+        name="parent",
+        fullPathName="parent",
+        component=parent_component,
+        objectType="adsk::fusion::Occurrence",
+        transform2=transform(),
+        isVisible=value,
+        isSuppressed=False,
+    )
+    root = component("Root")
+    root.occurrences.append(parent)
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="isVisible"):
+        send_module._scope_walk(types.SimpleNamespace(rootComponent=root), parent)
+
+
+@pytest.mark.parametrize("value", [None, "False", 0, 1])
+def test_selected_empty_occurrence_visibility_is_validated_without_descendants(
+    send_module, value
+):
+    occurrence = types.SimpleNamespace(
+        name="empty",
+        fullPathName="empty",
+        component=component("Empty"),
+        objectType="adsk::fusion::Occurrence",
+        transform2=transform(),
+        isVisible=value,
+        isSuppressed=False,
+    )
+
+    with pytest.raises(send_module.wglink_core.WgLinkError, match="isVisible"):
+        send_module._scope_walk(
+            types.SimpleNamespace(rootComponent=component("Root")), occurrence
+        )
+
+
 def test_unclassified_surface_name_does_not_add_exclusion_advice(
     send_module, monkeypatch
 ):

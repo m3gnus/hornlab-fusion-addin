@@ -965,6 +965,10 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
         )
     else:
         occurrence = selected_entity
+        occurrence_path = _occurrence_path(occurrence)
+        occurrence_visible = _visible(
+            occurrence, occurrence_path, "occurrence"
+        )
         component = getattr(occurrence, "component", None)
         external = _external_reference(occurrence)
         if component is None or external == "unresolved":
@@ -972,20 +976,21 @@ def _scope_walk(design: object, selection_value: object) -> dict[str, Any]:
                 {
                     "kind": "body",
                     "body_kind": "solid",
-                    "visible": True,
+                    "visible": occurrence_visible,
                     "external_reference": "unresolved",
-                    "component": _occurrence_path(occurrence),
-                    "name": _occurrence_path(occurrence),
-                    "path": _occurrence_path(occurrence),
+                    "component": occurrence_path,
+                    "name": occurrence_path,
+                    "path": occurrence_path,
                     "object_id": _object_id(occurrence, "occurrence-0001"),
                 }
             )
         else:
             walk_component(
                 component,
-                _occurrence_path(occurrence),
+                occurrence_path,
                 occurrence,
                 _bool(occurrence, ("isSuppressed",), False),
+                hidden=not occurrence_visible,
                 export_scope=True,
             )
 

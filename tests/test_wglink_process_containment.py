@@ -233,7 +233,15 @@ _FOREIGN = "import time\ntime.sleep(120)\n"
 
 def test_a_contained_timeout_leaves_every_process_it_did_not_start(core, tmp_path: Path) -> None:
     """Stand-ins for Fusion's world: one process in the caller's own group (as
-    Fusion's other children are) and one in a session of its own."""
+    Fusion's other children are) and one in a session of its own.
+
+    The grandchild this test's own command starts is reaped in ``finally``
+    regardless of which assertion below fails or raises -- otherwise a single
+    failing assertion here leaves that ticking process, and its "ticks" file,
+    running for as long as the host survives. It is not enough for the code
+    under test to have already killed it by the time we get to ``finally``;
+    the teardown must not *assume* that and must verify it before returning.
+    """
 
     same_group = subprocess.Popen([sys.executable, "-c", _FOREIGN])
     own_session = subprocess.Popen(
@@ -241,18 +249,27 @@ def test_a_contained_timeout_leaves_every_process_it_did_not_start(core, tmp_pat
         **({"start_new_session": True} if os.name != "nt" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}),
     )
     command, pid_file, _tick_file = _command(tmp_path, "devnull")
+    grandchild: int | None = None
     try:
         with pytest.raises(subprocess.TimeoutExpired):
             core._run_contained(command, cwd=str(tmp_path), env=dict(os.environ), timeout=3.0)
+        _wait_for(pid_file)
+        assert pid_file.exists(), "the child never started its grandchild"
         grandchild = int(pid_file.read_text())
         assert _gone_within(grandchild, 10.0)
         assert same_group.poll() is None and _alive(same_group.pid)
         assert own_session.poll() is None and _alive(own_session.pid)
         assert _alive(os.getpid())
     finally:
+        if grandchild is not None:
+            _stop(grandchild)
         for process in (same_group, own_session):
             process.kill()
             process.wait(timeout=30)
+        if grandchild is not None:
+            assert _gone_within(grandchild, 10.0), (
+                "the test's own grandchild survived teardown"
+            )
 
 
 # -- structural: the add-in signals nothing it did not start ----------------------

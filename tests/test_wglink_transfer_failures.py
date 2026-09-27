@@ -269,7 +269,7 @@ def test_a_rename_that_landed_and_raised_is_not_reported_as_not_asked(
     assert payload["kind"] == SOLVE and payload["returnId"] == "wgr_1"
     assert _staging(fixture.ipc / ".wg-solve-requests") == []
     title, text = fixture.ui.messages[-1]
-    assert title == "WGLink" and f"request {payload['operationId'][:8]}" in text
+    assert title == "WGLink" and "Sent to WG — solving there" in text
     assert _outcome(fixture) == "requested"
     assert len(fixture.timers) == 1
 
@@ -737,7 +737,7 @@ def test_control_a_solve_file_of_the_schema_attempted_says_sent(
     _run(fixture.module, "solve")
 
     assert staged == [attempted] * 3
-    assert "Sent to Waveguide Generator" in fixture.ui.messages[-1][1]
+    assert "Sent to WG — solving there" in fixture.ui.messages[-1][1]
     assert _outcome(fixture) == "requested"
 
 

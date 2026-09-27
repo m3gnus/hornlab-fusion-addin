@@ -1124,17 +1124,18 @@ def _summary(operation: str, report: dict[str, object]) -> str:
         scope = report.get("scope", {})
         status = scope.get("status", "?") if isinstance(scope, dict) else "?"
         request_id = str(report.get("request_id") or "")
-        sent = (
-            f"Sent to Waveguide Generator (request {request_id[:8]}). "
-            if request_id
-            else ""
-        )
-        closing = sent + (
-            "Waveguide Generator will prepare this model and start solving it. "
-            "It stops and asks if the ingestion reports something blocking."
-            if report.get("solve_requested")
-            else "Waveguide Generator will open this return."
-        )
+        if report.get("solve_requested"):
+            # Handed off: WG owns progress and results from here, so this is
+            # the one confirmation Fusion shows -- not a second progress bar
+            # racing WG's own.
+            closing = "Sent to WG — solving there. Progress and results appear in Waveguide Generator."
+        else:
+            sent = (
+                f"Sent to Waveguide Generator (request {request_id[:8]}). "
+                if request_id
+                else ""
+            )
+            closing = sent + "Waveguide Generator will open this return."
         if report.get("delivery_unconfirmed"):
             closing = _unconfirmed_text(request_id)
         message = (

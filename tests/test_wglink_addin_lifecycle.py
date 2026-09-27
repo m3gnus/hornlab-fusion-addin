@@ -940,6 +940,48 @@ def test_send_shows_and_closes_progress_around_the_slow_export(
     )
 
 
+def test_solve_confirms_the_handoff_and_shows_only_one_progress_dialog(
+    monkeypatch,
+) -> None:
+    """Solving happens in WG from here on, so Fusion states that once and
+
+    closes its own (single) progress dialog -- it must never keep a second,
+    competing progress bar running alongside WG's.
+    """
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    module = _load_instance(monkeypatch, "WGLink_solve_progress", ui)
+    monkeypatch.setattr(module, "_send_options", lambda _inputs: {"selection": "root"})
+
+    def send(_app: object, _options: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        return {
+            "bundle_path": "/workspace/wgreturn/test.wgreturn",
+            "return_id": "wgr_test",
+            "scope": {"status": "clean"},
+            "sources": [],
+        }
+
+    monkeypatch.setattr(module.wglink_send, "send", send)
+    monkeypatch.setattr(module, "_submit_to_wg", lambda _report, _kind: "req-solve-progress")
+
+    module.CommandExecuteHandler("solve").notify(
+        types.SimpleNamespace(
+            command=types.SimpleNamespace(commandInputs=_dialog_inputs()),
+        )
+    )
+
+    # Exactly one progress dialog was ever created, and it was hidden -- no
+    # second one appears once the confirmation is shown.
+    assert len(ui.progress_dialogs) == 1
+    dialog = ui.progress_dialogs[0]
+    assert dialog.events[0][:2] == ("show", "Solve in WG")
+    assert dialog.events[-1][0] == "hide"
+
+    title, text = ui.messages[-1]
+    assert title == "WGLink"
+    assert "Sent to WG — solving there. Progress and results appear in Waveguide Generator." in text
+
+
 def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(
     monkeypatch,
 ) -> None:

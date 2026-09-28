@@ -1134,3 +1134,31 @@ def validate_structure(manifest: Mapping[str, Any], profile: str) -> Mapping[str
     if profile == WG_INGRESS:
         return _wg_validate_manifest(manifest)
     raise ValueError(f"unknown structure profile: {profile!r}")
+
+# Public vocabulary used by both loose-module and package-style add-in imports.
+SUPPORTED_RETURN_FEATURES = _addin_SUPPORTED_RETURN_FEATURES
+SOURCE_IDENTITY_FEATURE = _addin_SOURCE_IDENTITY_FEATURE
+DOCUMENT_UP_FEATURE = _addin_DOCUMENT_UP_FEATURE
+DOCUMENT_UP_AXES = _addin_DOCUMENT_UP_AXES
+DOMAIN_AUTOMATIC_FEATURE = _addin_DOMAIN_AUTOMATIC_FEATURE
+DOMAIN_AUTOMATIC = _addin_DOMAIN_AUTOMATIC
+SOURCE_IDENTITY_MAX_BYTES = _addin_SOURCE_IDENTITY_MAX_BYTES
+GMSH_PHYSICAL_NAME_MAX_BYTES = _addin_GMSH_PHYSICAL_NAME_MAX_BYTES
+BASE_RETURN_FEATURES = _addin_BASE_RETURN_FEATURES
+EXPORT_FRAMES = _addin_EXPORT_FRAMES
+DOMAIN_PLANES = _addin_DOMAIN_PLANES
+DOMAIN_KIND_FOR_PLANES = _addin_DOMAIN_KIND_FOR_PLANES
+DOMAIN_KINDS = _addin_DOMAIN_KINDS
+REDUCED_DOMAIN_FEATURE = _addin_REDUCED_DOMAIN_FEATURE
+CUT_FEATURE_KINDS = _addin_CUT_FEATURE_KINDS
+CUT_TOOL_KINDS = _addin_CUT_TOOL_KINDS
+CUT_ORIGIN_PLANES = _addin_CUT_ORIGIN_PLANES
+CUT_KEPT_SIDES = _addin_CUT_KEPT_SIDES
+
+
+def canonical_domain_planes(planes: Sequence[Any]) -> tuple[str, ...]:
+    return _addin_canonical_domain_planes(planes)
+
+
+def validate_domain_record(value: object, *, automatic_feature: bool = False) -> tuple[str, ...]:
+    return _addin_validate_domain_record(value, automatic_feature=automatic_feature)

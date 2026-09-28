@@ -28,6 +28,11 @@ import html
 import math
 from typing import Any, Mapping, Sequence
 
+if __package__:
+    from . import wglink_protocol
+else:
+    import wglink_protocol
+
 
 class AuthorError(Exception):
     """A refusal the user can act on. WGLink.py shows it like a WgLinkError.
@@ -39,7 +44,7 @@ class AuthorError(Exception):
 
 # ---------------------------------------------------------------- source roles
 
-SOURCE_ROLES = ("LF", "MF", "HF", "PASSIVE_CARDIOID")
+SOURCE_ROLES = wglink_protocol.SOURCE_ROLES
 DEFAULT_SOURCE_ROLE = "HF"
 CLEAR_SOURCE_LABEL = "Clear WG source"
 
@@ -47,7 +52,7 @@ CLEAR_SOURCE_LABEL = "Clear WG source"
 # Choosing or typing it still has to work -- and still has to land on the new
 # canonical role -- so existing habits and any saved dropdown selection do not
 # start erroring.
-LEGACY_SOURCE_ROLE_ALIASES = {"PORT_EXIT": "PASSIVE_CARDIOID"}
+LEGACY_SOURCE_ROLE_ALIASES = wglink_protocol.LEGACY_SOURCE_ROLE_ALIASES
 
 # Every appearance name that counts as an already-painted source: the current
 # roles plus every retired spelling. Recognition (a face someone already
@@ -55,7 +60,7 @@ LEGACY_SOURCE_ROLE_ALIASES = {"PORT_EXIT": "PASSIVE_CARDIOID"}
 # offers ``SOURCE_ROLES``. Keeping the two separate is what lets a face
 # painted ``PORT_EXIT`` years ago keep reporting ``PORT_EXIT`` -- recognised,
 # never silently renamed.
-RECOGNISED_SOURCE_ROLES = SOURCE_ROLES + tuple(LEGACY_SOURCE_ROLE_ALIASES)
+RECOGNISED_SOURCE_ROLES = wglink_protocol.RECOGNISED_SOURCE_ROLES
 
 _ROLE_MEANING = {
     "LF": "LF drive",

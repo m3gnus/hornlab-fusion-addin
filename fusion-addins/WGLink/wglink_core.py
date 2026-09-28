@@ -24,6 +24,11 @@ import uuid
 
 import adsk.core
 import adsk.fusion
+
+if __package__:
+    from . import wglink_protocol
+else:
+    import wglink_protocol
 if __package__:
     from . import wglink_activity, wglink_workspace
     from .wglink_bundle import (
@@ -233,7 +238,7 @@ def _kind(entity: object) -> str | None:
 
 
 def _json(value: object) -> str:
-    return json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True)
+    return wglink_protocol.canonical_json(value, wglink_protocol.ASCII_STRICT)
 
 
 def _attributes(entity: object) -> object | None:

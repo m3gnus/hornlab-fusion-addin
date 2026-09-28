@@ -55,6 +55,11 @@ import urllib.error
 import urllib.request
 import uuid
 
+if __package__:
+    from . import wglink_protocol
+else:
+    import wglink_protocol
+
 
 LIVE_PREFIX = "/api/cadlink/live"
 INSTALLATION_HEADER = "X-WGLink-Installation"
@@ -67,7 +72,7 @@ ENDPOINT_SCHEMA_VERSION = 1
 INSTALLATION_SCHEMA_VERSION = 1
 LIVE_PROTOCOL = 1
 LIVE_PROTOCOL_CAPABILITY = "liveProtocol"
-DELIVERY_VERSION = 3
+DELIVERY_VERSION = wglink_protocol.FUSION_REQUEST_DELIVERY_VERSION
 CAD_APPLICATION = "fusion360"
 CLIENT_LABEL = "wglink-client"
 SERVER_LABEL = "wglink-server"

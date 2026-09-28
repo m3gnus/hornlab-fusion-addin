@@ -213,17 +213,17 @@ def _worked_example() -> dict:
     )
 
 
-def test_return_module_imports_only_the_standard_library():
-    source = ROOT / "fusion-addins" / "WGLink" / "wglink_return.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".", 1)[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".", 1)[0])
-
-    assert imported <= sys.stdlib_module_names | {"__future__"}
+def test_return_modules_import_only_stdlib_and_the_local_protocol():
+    for filename in ("wglink_return.py", "wglink_protocol.py"):
+        source = ROOT / "fusion-addins" / "WGLink" / filename
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        assert imported <= sys.stdlib_module_names | {"__future__", "wglink_protocol"}
 
 
 def test_surface_fingerprint_accepts_the_observer_null_volume():

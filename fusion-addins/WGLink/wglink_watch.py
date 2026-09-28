@@ -34,13 +34,18 @@ import time
 from typing import Any, Iterable, Mapping, TypeVar
 import uuid
 
+if __package__:
+    from . import wglink_protocol
+else:
+    import wglink_protocol
+
 
 FUSION_STATUS_FILENAME = ".fusion-status.json"
 
 # The delivery version this add-in speaks, published in its heartbeat. WG
 # refuses an add-in that reports anything lower, and this add-in refuses a WG
 # that advertises anything lower.
-DELIVERY_VERSION = 3
+DELIVERY_VERSION = wglink_protocol.FUSION_REQUEST_DELIVERY_VERSION
 # WG's advertisement of the delivery versions it reads.
 CAPABILITIES_FILENAME = "wg-capabilities.json"
 CAPABILITIES_SCHEMA_VERSION = 1
@@ -55,12 +60,12 @@ DOCUMENT_UP = "documentUp"
 # Every Fusion-bound request file, and a WG-bound solve file written for a WG
 # that reads nothing newer, carries this schema version. Not bumped for the
 # WG request inbox: it also governs how this add-in reads WG's own requests.
-REQUEST_SCHEMA_VERSION = 3
+REQUEST_SCHEMA_VERSION = wglink_protocol.SOLVE_COMMAND_SCHEMA_VERSION
 # The WG request inbox (M1 transfer contract, C2/C3): one file per Send or
 # Solve, the two differing only in ``kind``. Written only for a WG whose
 # ``solveCommandDelivery`` is at least this, because a schema-3 reader ignores
 # ``kind`` and would start a solve for a plain Send.
-WG_REQUEST_SCHEMA_VERSION = 4
+WG_REQUEST_SCHEMA_VERSION = wglink_protocol.WG_REQUEST_SCHEMA_VERSION
 KIND_RECEIVE_SNAPSHOT = "receive_snapshot"
 KIND_PREPARE_AND_SOLVE = "prepare_and_solve"
 WG_REQUEST_KINDS = (KIND_RECEIVE_SNAPSHOT, KIND_PREPARE_AND_SOLVE)

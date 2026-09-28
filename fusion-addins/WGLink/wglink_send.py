@@ -27,6 +27,11 @@ import adsk.core
 import adsk.fusion
 
 if __package__:
+    from . import wglink_protocol
+else:
+    import wglink_protocol
+
+if __package__:
     from . import wglink_activity, wglink_author, wglink_core
     from .wglink_return import (
         BASE_RETURN_FEATURES,
@@ -66,7 +71,7 @@ DECLARATION_ATTRIBUTE = "return_declaration"
 # The two managed roles that name a final exterior body. Every other managed
 # role is a helper WGLink built on the way there; wglink_return skips those, so
 # nothing here may mark one as a body the export depends on.
-EXTERIOR_ROLES = frozenset({"waveguide", "enclosure"})
+EXTERIOR_ROLES = wglink_protocol.EXTERIOR_ROLES
 DECLARATIONS = frozenset(wglink_author.BODY_DECLARATIONS)
 FEM_COMPONENT_NAME = "FEM_MF_AIR"
 # One definition, shared with the authoring commands: the dialog that paints a
@@ -75,8 +80,8 @@ FEM_COMPONENT_NAME = "FEM_MF_AIR"
 # painted face is accepted as, which also covers retired spellings such as
 # PORT_EXIT so an old export keeps recognising -- and reporting -- its
 # original role.
-SOURCE_ROLES = wglink_author.SOURCE_ROLES
-RECOGNISED_SOURCE_ROLES = wglink_author.RECOGNISED_SOURCE_ROLES
+SOURCE_ROLES = wglink_protocol.SOURCE_ROLES
+RECOGNISED_SOURCE_ROLES = wglink_protocol.RECOGNISED_SOURCE_ROLES
 SOURCE_RESOLUTION_MM = {
     "HF": 4.0,
     "MF": 15.0,
@@ -112,8 +117,8 @@ ADAPTER_VERSION = _adapter_version()
 
 
 def _canonical_hash(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    encoded = wglink_protocol.canonical_json(
+        value, wglink_protocol.ASCII_STRICT
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -2267,7 +2272,7 @@ def _connected_components(faces: list[object]) -> int:
 #   Fusion copies an attribute onto both halves of a split face and onto a pasted
 #   or patterned copy, which is what makes a split or copy visible here.
 
-SOURCE_IDENTITY_FEATURE = "source-identity-v1"
+SOURCE_IDENTITY_FEATURE = wglink_protocol.SOURCE_IDENTITY_FEATURE
 SOURCE_IDENTITY_ATTRIBUTE = "source_identity"
 SOURCE_IDENTITY_SCHEMA = 1
 SOURCE_IDENTITY_PREFIX = "wgs-"
@@ -2276,8 +2281,8 @@ SOURCE_IDENTITY_PREFIX = "wgs-"
 SOURCE_IDENTITY_CHARACTERS = 20
 # WG's bounds (``server/cadlink/wgreturn.py``): the id itself, and the whole gmsh
 # physical name ingestion writes for the source with the worst-case tag.
-SOURCE_IDENTITY_MAX_BYTES = 25
-GMSH_PHYSICAL_NAME_MAX_BYTES = 128
+SOURCE_IDENTITY_MAX_BYTES = wglink_protocol.SOURCE_IDENTITY_MAX_BYTES
+GMSH_PHYSICAL_NAME_MAX_BYTES = wglink_protocol.GMSH_PHYSICAL_NAME_MAX_BYTES
 WORST_CASE_SOURCE_TAG = 9999
 _THROAT_IDENTITY_NAMESPACE = "wglink-throat-source-v1|"
 
@@ -2303,14 +2308,7 @@ def _throat_source_identity(instance_id: str) -> str:
     )
 
 
-def source_physical_name(tag: int, source_id: str, instance_id: object, role: str) -> str:
-    """The mesh physical name WG's ingestion gives a source (WG ``_physical_name``)."""
-
-    instance = "null" if instance_id is None else str(instance_id)
-    return (
-        f"wg-import-v1|tag={tag}|source_id={source_id}|"
-        f"instance_id={instance}|role={role}"
-    )
+source_physical_name = wglink_protocol.source_physical_name
 
 
 def _check_source_identities(sources: list[dict[str, Any]]) -> None:

@@ -232,9 +232,6 @@ def test_an_empty_body_selection_is_refused(author):
         author.plan_body_declaration([], "exclude")
 
 
-# ------------------------------------------------------------- solver frame
-
-
 def clean_scope(**overrides):
     scope = {
         "selection": "root",
@@ -250,72 +247,18 @@ def clean_scope(**overrides):
     return scope
 
 
-def codes(findings):
-    return [finding.code for finding in findings]
-
-
-def test_a_model_in_the_solver_frame_reports_no_findings(author):
-    scope = clean_scope()
-
-    assert author.frame_findings(scope["bounds_mm"], scope["source_bounds_mm"]) == []
-
-
-def test_a_model_pointing_the_wrong_way_names_the_axis(author):
-    findings = author.frame_findings(
-        bounds((-100.0, -100.0, -180.0), (100.0, 100.0, 0.0)),
-        bounds((-12.7, -12.7, 0.0), (12.7, 12.7, 0.0)),
-    )
-
-    assert codes(findings) == [author.FRAME_AXIS]
-    assert "+Z" in findings[0].message
-
-
-def test_a_sourceless_model_entirely_behind_the_origin_still_names_the_axis(author):
-    findings = author.frame_findings(bounds((-10.0, -10.0, -50.0), (10.0, 10.0, -5.0)))
-
-    assert codes(findings) == [author.FRAME_AXIS]
-
-
-def test_a_throat_off_the_origin_plane_is_reported_with_its_offset(author):
-    findings = author.frame_findings(
-        bounds((-100.0, -100.0, 25.0), (100.0, 100.0, 205.0)),
-        bounds((-12.7, -12.7, 25.0), (12.7, 12.7, 25.0)),
-    )
-
-    assert codes(findings) == [author.FRAME_THROAT_Z]
-    assert "z = 25.0 mm" in findings[0].message
-
-
-def test_an_off_centre_bounding_box_names_both_axes(author):
-    findings = author.frame_findings(
-        bounds((0.0, 40.0, 0.0), (200.0, 240.0, 180.0)),
-        bounds((87.3, 127.3, 0.0), (112.7, 152.7, 0.0)),
-    )
-
-    assert codes(findings) == [author.FRAME_CENTRING]
-    assert "x = 100.0 mm" in findings[0].message
-    assert "y = 140.0 mm" in findings[0].message
-
-
-def test_a_small_centring_offset_stays_quiet(author):
-    findings = author.frame_findings(
-        bounds((-99.5, -100.0, 0.0), (100.5, 100.0, 180.0)),
-        bounds((-12.7, -12.7, 0.0), (12.7, 12.7, 0.0)),
-    )
-
-    assert findings == []
-
-
-def test_unreadable_bounds_produce_no_findings_rather_than_a_guess(author):
-    assert author.frame_findings(None, None) == []
-    assert author.frame_findings({"min": [0, 0], "max": [1, 1, 1]}) == []
-    assert author.frame_findings({"min": [0, 0, float("nan")], "max": [1, 1, 1]}) == []
-
-
 # ---------------------------------------------------------------- pre-flight
 
 
-def test_a_clean_unlinked_scope_states_the_frame_and_warns_about_nothing(author):
+# The unlinked solver-frame preflight copy (the ``frame_findings`` warnings and
+# the affirmative "Solver frame … ✓" line) was removed. These are the exact
+# strings a clean, in-frame scope used to add as the dialog's fifth line --
+# pinned here so a later change cannot bring either one back unnoticed.
+REMOVED_AFFIRMATIVE_FRAME_LINE = "Solver frame: axis +Z, throat at z = 0 ✓"
+REMOVED_FRAME_WARNING_PREFIX = "Solver frame: "
+
+
+def test_a_clean_unlinked_scope_no_longer_states_the_frame(author):
     summary = author.preflight_summary(clean_scope())
 
     assert summary.warnings == ()
@@ -323,13 +266,13 @@ def test_a_clean_unlinked_scope_states_the_frame_and_warns_about_nothing(author)
     assert "Bodies included: 1 solid" in summary.lines[1]
     assert "unlinked (Fusion-first) return" in summary.lines[2]
     assert "Source: HF — 506.7 mm² over 1 face" in summary.lines[3]
-    assert "Solver frame: axis +Z" in summary.lines[4]
+    # Before: a 5th line, REMOVED_AFFIRMATIVE_FRAME_LINE, was appended here.
+    # After: the dialog stops at 4 lines.
+    assert len(summary.lines) == 4
+    assert REMOVED_AFFIRMATIVE_FRAME_LINE not in summary.lines
 
 
-def test_a_linked_scope_names_its_links_and_skips_the_frame_check(author):
-    """A linked return carries its own throat frame, so the convention does not
-    apply to the assembly frame at all."""
-
+def test_a_linked_scope_names_its_links(author):
     summary = author.preflight_summary(clean_scope(
         instance_ids=["wgi_one", "wgi_two"],
         sources=[{"role": "HF", "area_mm2": 506.7, "face_count": 1, "instance_id": "wgi_one"}],
@@ -338,21 +281,24 @@ def test_a_linked_scope_names_its_links_and_skips_the_frame_check(author):
 
     assert "WG links in scope: 2 (wgi_one, wgi_two)" in summary.lines[2]
     assert "from link wgi_one" in summary.lines[3]
-    assert summary.frame == ()
     assert summary.warnings == ()
 
 
-def test_every_frame_finding_reaches_the_dialog_as_a_warning(author):
+def test_a_model_off_the_solver_frame_gets_no_preflight_warning(author):
+    """Before: an off-frame unlinked scope added one ``"Solver frame: …"``
+    warning per finding (axis, throat-z, centring). After: this copy is gone
+    entirely, so the same scope now warns about nothing."""
+
     summary = author.preflight_summary(clean_scope(
         bounds_mm=bounds((0.0, 40.0, -180.0), (200.0, 240.0, 25.0)),
         source_bounds_mm=bounds((87.3, 127.3, 25.0), (112.7, 152.7, 25.0)),
     ))
 
-    assert codes(summary.frame) == [
-        author.FRAME_AXIS, author.FRAME_THROAT_Z, author.FRAME_CENTRING
-    ]
-    assert len(summary.warnings) == 3
-    assert all(warning.startswith("Solver frame: ") for warning in summary.warnings)
+    assert summary.warnings == ()
+    assert not any(
+        warning.startswith(REMOVED_FRAME_WARNING_PREFIX) for warning in summary.warnings
+    )
+    assert not any(line.startswith(REMOVED_FRAME_WARNING_PREFIX) for line in summary.lines)
 
 
 def test_a_scope_with_no_source_warns_before_ok_instead_of_after(author):
@@ -488,25 +434,6 @@ def test_historical_declared_domain_phrases_remain_readable(author):
     assert author.domain_phrase(["x0", "y0"]).startswith("quarter model")
 
 
-def test_a_declared_half_is_not_told_to_re_centre_itself(author):
-    """The centring advice is exactly wrong for a half, and destructive.
-
-    A half about y = 0 occupies y >= 0 by definition. Telling its author to
-    centre it on y = 0 is telling them to undo the cut.
-    """
-
-    half = bounds((-100.0, 0.0, 0.0), (100.0, 100.0, 180.0))
-    source = bounds((-12.7, 0.0, 0.0), (12.7, 12.7, 0.0))
-
-    assert codes(author.frame_findings(half, source)) == [author.FRAME_CENTRING]
-    assert author.frame_findings(half, source, ("y0",)) == []
-    # The other axis is still judged: a declaration is not a blanket waiver.
-    off_centre = bounds((10.0, 0.0, 0.0), (210.0, 100.0, 180.0))
-    assert codes(author.frame_findings(off_centre, source, ("y0",))) == [
-        author.FRAME_CENTRING
-    ]
-
-
 def test_the_preflight_states_a_verified_domain_and_warns_about_a_refused_one(author):
     summary = author.preflight_summary(
         clean_scope(
@@ -518,7 +445,6 @@ def test_the_preflight_states_a_verified_domain_and_warns_about_a_refused_one(au
 
     assert any("Domain: half model, already cut on y = 0" in line for line in summary.lines)
     assert summary.warnings == ()
-    assert any("centred on x = 0" in line for line in summary.lines)
 
     refused = author.preflight_summary(
         clean_scope(domain=None, domain_error="the bodies reach 90 mm onto the negative side")

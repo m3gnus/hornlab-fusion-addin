@@ -17,8 +17,8 @@ The two conventions this module encodes are not invented here:
 * an unlinked ("Fusion-first") return is solved in the assembly frame itself:
   radiation along +Z, throat at z = 0, model centred on x = 0 and y = 0.  The
   solver hard-codes that identity frame; see ``assembly_frame_is_solver_frame``
-  in the generator's ``server/solver/metal.py``.  Nothing here changes it -- the
-  pre-flight only reports how far the model sits from it.
+  in the generator's ``server/solver/metal.py``.  Nothing here changes it, and
+  the pre-flight no longer comments on how the model sits relative to it.
 """
 
 from __future__ import annotations
@@ -414,123 +414,6 @@ def plan_body_declaration(
     )
 
 
-# ------------------------------------------------------------- solver frame
-
-FRAME_AXIS = "axis"
-FRAME_THROAT_Z = "throat-z"
-FRAME_CENTRING = "centring"
-
-# An unlinked return carries no throat frame, so the solver adopts the assembly
-# frame unchanged. These tolerances only decide when to *say something*; the
-# solver itself never checks and never refuses.
-THROAT_Z_TOLERANCE_MM = 1.0
-CENTRING_TOLERANCE_MM = 1.0
-CENTRING_RELATIVE_TOLERANCE = 0.02
-
-
-@dataclass(frozen=True)
-class FrameFinding:
-    """One way the model departs from WG's unlinked solver frame."""
-
-    code: str
-    message: str
-
-
-def _vector(value: object) -> tuple[float, float, float] | None:
-    if not isinstance(value, (list, tuple)) or len(value) != 3:
-        return None
-    numbers = []
-    for item in value:
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            return None
-        number = float(item)
-        if not math.isfinite(number):
-            return None
-        numbers.append(number)
-    return (numbers[0], numbers[1], numbers[2])
-
-
-def _bounds(value: object) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    if not isinstance(value, Mapping):
-        return None
-    low = _vector(value.get("min"))
-    high = _vector(value.get("max"))
-    if low is None or high is None:
-        return None
-    if any(high[axis] < low[axis] for axis in range(3)):
-        return None
-    return low, high
-
-
-def frame_findings(
-    bounds_mm: object,
-    source_bounds_mm: object = None,
-    domain_planes: Sequence[str] = (),
-) -> list[FrameFinding]:
-    """Compare a model's extent against WG's unlinked solver frame.
-
-    Advisory only, and only meaningful for an unlinked return: a linked return
-    carries its own throat frame and is transformed into the solver frame on
-    ingestion.
-
-    ``domain_planes`` names the planes the export declares it was already cut
-    on. A half is *correctly* off-centre about its own cut plane -- it occupies
-    the positive side and nothing else -- so the centring advice would be
-    exactly wrong there, and telling a user to re-centre a half is telling them
-    to break it.
-    """
-
-    reduced_axes = {AXIS_FOR_DOMAIN_PLANE[str(plane)] for plane in domain_planes}
-
-    bounds = _bounds(bounds_mm)
-    if bounds is None:
-        return []
-    low, high = bounds
-    findings: list[FrameFinding] = []
-    source = _bounds(source_bounds_mm)
-    throat_z = None if source is None else 0.5 * (source[0][2] + source[1][2])
-
-    if throat_z is not None:
-        if (high[2] - throat_z) < (throat_z - low[2]):
-            findings.append(FrameFinding(
-                FRAME_AXIS,
-                "the model extends toward -Z from its source face, but WG "
-                "radiates an unlinked model along +Z. Rotate the model so the "
-                "mouth faces +Z.",
-            ))
-        if abs(throat_z) > THROAT_Z_TOLERANCE_MM:
-            findings.append(FrameFinding(
-                FRAME_THROAT_Z,
-                f"the source face sits at z = {throat_z:.1f} mm, but WG puts an "
-                "unlinked model's throat at z = 0. Move the model along Z.",
-            ))
-    elif high[2] <= 0.0 and low[2] < 0.0:
-        findings.append(FrameFinding(
-            FRAME_AXIS,
-            "the model lies entirely at negative z, but WG radiates an unlinked "
-            "model along +Z. Rotate the model so the mouth faces +Z.",
-        ))
-
-    offsets = []
-    for axis, name in ((0, "x"), (1, "y")):
-        if axis in reduced_axes:
-            continue
-        centre = 0.5 * (low[axis] + high[axis])
-        extent = high[axis] - low[axis]
-        tolerance = max(
-            CENTRING_TOLERANCE_MM, CENTRING_RELATIVE_TOLERANCE * abs(extent)
-        )
-        if abs(centre) > tolerance:
-            offsets.append(f"{name} = {centre:.1f} mm")
-    if offsets:
-        findings.append(FrameFinding(
-            FRAME_CENTRING,
-            f"the bounding box is centred on {' and '.join(offsets)}, but WG "
-            "expects an unlinked model centred on x = 0 and y = 0.",
-        ))
-    return findings
-
-
 # ----------------------------------------------------------------- pre-flight
 
 NO_SOURCE_WARNING = (
@@ -555,7 +438,6 @@ class Preflight:
 
     lines: tuple[str, ...]
     warnings: tuple[str, ...]
-    frame: tuple[FrameFinding, ...]
 
     def text(self) -> str:
         blocks = list(self.lines)
@@ -634,7 +516,7 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
             and manage_dropdown_name not in scope_error
         ):
             warning += f" Declare Body… is under {manage_dropdown_name}."
-        return Preflight(lines=(), warnings=(warning,), frame=())
+        return Preflight(lines=(), warnings=(warning,))
 
     lines = [
         "Scope: root assembly" if selection == "root" else f"Scope: {selection}",
@@ -688,29 +570,7 @@ def preflight_summary(scope: Mapping[str, Any]) -> Preflight:
     if not sources:
         warnings.append(source_error or NO_SOURCE_WARNING)
 
-    findings: list[FrameFinding] = []
-    if not instance_ids:
-        findings = frame_findings(
-            scope.get("bounds_mm"),
-            scope.get("source_bounds_mm"),
-            domain_planes,
-        )
-        if findings:
-            warnings.extend(f"Solver frame: {item.message}" for item in findings)
-        elif _bounds(scope.get("bounds_mm")) is not None:
-            centred = " and ".join(
-                f"{name} = 0"
-                for axis, name in ((0, "x"), (1, "y"))
-                if axis not in {AXIS_FOR_DOMAIN_PLANE[plane] for plane in domain_planes}
-            )
-            lines.append(
-                "Solver frame: axis +Z, throat at z = 0"
-                + (f", centred on {centred}" if centred else "")
-                + " ✓"
-            )
-    return Preflight(
-        lines=tuple(lines), warnings=tuple(warnings), frame=tuple(findings)
-    )
+    return Preflight(lines=tuple(lines), warnings=tuple(warnings))
 
 
 # ------------------------------------------------------- user-facing failures

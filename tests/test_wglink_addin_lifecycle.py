@@ -1216,8 +1216,8 @@ def test_the_send_dialog_states_the_export_before_ok(monkeypatch) -> None:
 
     assert "1 solid" in box.formattedText
     assert "unlinked (Fusion-first) return" in box.formattedText
-    # Both the missing source and the wrong-way frame are stated before OK.
-    assert box.formattedText.count("<b>⚠") == 2
+    # The missing source is stated before OK.
+    assert box.formattedText.count("<b>⚠") == 1
 
 
 def test_refresh_body_inventory_resurveys_visibility_while_dialog_is_open(

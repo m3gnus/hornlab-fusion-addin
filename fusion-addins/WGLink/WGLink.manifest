@@ -6,7 +6,7 @@
   "description": {
     "": "Insert, update, audit, send, relink, and detach native Waveguide Generator links."
   },
-  "version": "0.1.1",
+  "version": "0.2.0",
   "runOnStartup": true,
   "supportedOS": "windows|mac",
   "editEnabled": true

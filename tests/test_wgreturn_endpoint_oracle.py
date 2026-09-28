@@ -24,10 +24,13 @@ from wglink_return import WgReturnError, validate_return_manifest  # noqa: E402
 def _inputs():
     return {
         "unicode_negative_zero": {"é": -0.0, "x": "雪"},
+        "non_ascii": {"é": "λ", "x": "雪"},
+        "negative_zero": {"x": -0.0},
         "large_integer": {"n": 2**100 + 12345, "z": [0, -0.0]},
         "nested": {"b": [True, None, {"a": "λ"}], "a": 1.25},
         "nan": {"x": float("nan")},
-        "infinity": {"x": float("inf")},
+        "positive_infinity": {"x": float("inf")},
+        "negative_infinity": {"x": float("-inf")},
     }
 
 
@@ -101,3 +104,11 @@ def test_canonical_sites_call_production_functions(golden, monkeypatch):
     assert _capture_json(monkeypatch, send_hash, value) == golden["send_hash"]
     assert _capture_json(monkeypatch, core_json, value) == golden["core_json"]
     assert _capture_json(monkeypatch, fingerprint_hash, value) == golden["fingerprint_hash"]
+
+
+def test_oracle_provenance_hashes_match_committed_fixtures():
+    provenance = json.loads((ORACLE / "PROVENANCE.json").read_text("utf-8"))
+    assert provenance["generator"] == "scripts/generate_wgreturn_endpoint_oracle.py"
+    for name, expected in provenance["sha256"].items():
+        actual = hashlib.sha256((ORACLE / name).read_bytes()).hexdigest()
+        assert actual == expected, name

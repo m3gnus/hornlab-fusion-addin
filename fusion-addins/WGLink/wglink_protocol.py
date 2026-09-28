@@ -37,6 +37,18 @@ LEGACY_SOURCE_ROLE_ALIASES = {"PORT_EXIT": "PASSIVE_CARDIOID"}
 RECOGNISED_SOURCE_ROLES = SOURCE_ROLES + tuple(LEGACY_SOURCE_ROLE_ALIASES)
 EXTERIOR_ROLES = frozenset({"waveguide", "enclosure"})
 
+# With source-identity-v1, each sources[].id is a CAD-authored identity that WG
+# bounds: trimmed, at most 25 UTF-8 bytes, and a complete gmsh physical name
+# (including the largest physical tag) at most 128 bytes.
+# A domain declaration says the exported bodies are already the reduced domain:
+# CAD made the cut and the solver supplies the missing half by mirroring. Only
+# planes supported by that mirror are declarable, and the retained side is
+# positive to match hornlab_mesher.step_prepare, which keeps x >= 0 and y >= 0.
+# A reader that does not know this vocabulary must refuse the bundle rather
+# than solve a half as an open full-domain shell.
+# The export frame names the component coordinates used for assembly.step;
+# every coordinate in the manifest is expressed in that frame.
+
 
 class ProtocolValidationError(ValueError):
     """An endpoint-specific structural refusal; str() is the endpoint message."""
@@ -127,7 +139,8 @@ def _addin__list(value: object, *, label: str) -> list[Any]:
 def _addin__required(record: Mapping[str, Any], keys: Sequence[str], *, label: str) -> None:
     missing = [key for key in keys if key not in record]
     if missing:
-        raise ProtocolValidationError(f'{label} is missing required field(s): {', '.join(missing)}')
+        fields = ', '.join(missing)
+        raise ProtocolValidationError(f'{label} is missing required field(s): {fields}')
 
 def _addin__string(value: object, *, label: str, nullable: bool=False) -> str | None:
     if value is None and nullable:
@@ -234,13 +247,16 @@ def _addin__validate_instance(value: object, *, index: int) -> str:
     _addin__string(record['parameter_prefix'], label=f'{label}.parameter_prefix')
     _addin__matrix(record['assembly_from_link'], label=f'{label}.assembly_from_link')
     if record['chirality'] != 'original':
-        raise ProtocolValidationError(f'{label}.chirality {record['chirality']!r} is unsupported; mirrored links have no producer and must be recreated without mirroring')
+        chirality = record['chirality']
+        raise ProtocolValidationError(f"{label}.chirality {chirality!r} is unsupported; mirrored links have no producer and must be recreated without mirroring")
     optional_strings = ('lineage_id', 'design_hash', 'geometry_hash', 'origin_bundle_id', 'occurrence_path')
     for key in optional_strings:
         if key in record:
             _addin__string(record[key], label=f'{label}.{key}', nullable=True)
     if 'formula' in record:
         _addin__string(record['formula'], label=f'{label}.formula', nullable=True)
+    # instances[].config is WG-authored provenance echoed by CAD, not a CAD
+    # verdict. Its schema may use names forbidden in the surrounding evidence.
     if 'config' in record and record['config'] is not None:
         _addin__mapping(record['config'], label=f'{label}.config')
     if 'edit_version' in record and record['edit_version'] is not None:
@@ -387,7 +403,8 @@ def _addin__validate_cut_provenance(value: object, included_ids: set[str]) -> No
         allowed = {'body_object_id', 'feature', 'tool', 'plane', 'kept_side', 'export_frame'}
         extra = sorted(set(entry) - allowed)
         if extra:
-            raise ProtocolValidationError(f'{label} has unknown members: {', '.join(extra)}')
+            members = ', '.join(extra)
+            raise ProtocolValidationError(f'{label} has unknown members: {members}')
         _addin__required(entry, tuple(allowed), label=label)
         body_id = _addin__string(entry['body_object_id'], label=f'{label}.body_object_id')
         if body_id not in included_ids:
@@ -584,7 +601,8 @@ def _addin_validate_return_manifest(manifest: Mapping[str, Any]) -> None:
             if len(source_id.encode('utf-8')) > _addin_SOURCE_IDENTITY_MAX_BYTES:
                 raise ProtocolValidationError(f'sources[{index}].id must be at most {_addin_SOURCE_IDENTITY_MAX_BYTES} UTF-8 bytes under {_addin_SOURCE_IDENTITY_FEATURE}')
             instance = source.get('instance_id')
-            name = f'wg-import-v1|tag=9999|source_id={source_id}|instance_id={('null' if instance is None else instance)}|role={source['role']}'
+            instance_text = 'null' if instance is None else instance
+            name = f"wg-import-v1|tag=9999|source_id={source_id}|instance_id={instance_text}|role={source['role']}"
             if len(name.encode('utf-8')) > _addin_GMSH_PHYSICAL_NAME_MAX_BYTES:
                 raise ProtocolValidationError(f'sources[{index}] would need a mesh physical name longer than {_addin_GMSH_PHYSICAL_NAME_MAX_BYTES} UTF-8 bytes under {_addin_SOURCE_IDENTITY_FEATURE}')
     if len(source_ids) != len(set(source_ids)):
@@ -719,12 +737,12 @@ def _wg__domain(value: Any, *, automatic_feature: bool=False) -> tuple[str, ...]
     if kind == _wg_DOMAIN_AUTOMATIC:
         extra = sorted(set(domain) - {'kind'})
         if extra:
-            _wg__fail(path, f'an automatic domain states nothing else, got {', '.join(extra)}')
+            _wg__fail(path, f"an automatic domain states nothing else, got {', '.join(extra)}")
         return ()
     names = [_wg__string(item, f'{path}.cut_planes[{index}]') for index, item in enumerate(_wg__list(_wg__required(domain, 'cut_planes', path), f'{path}.cut_planes'))]
     unknown = [name for name in names if name not in _wg_DOMAIN_PLANES]
     if unknown:
-        _wg__fail(f'{path}.cut_planes', f'may only name {', '.join(_wg_DOMAIN_PLANES)}')
+        _wg__fail(f'{path}.cut_planes', f"may only name {', '.join(_wg_DOMAIN_PLANES)}")
     if len(set(names)) != len(names):
         _wg__fail(f'{path}.cut_planes', 'must not repeat a plane')
     planes = tuple((plane for plane in _wg_DOMAIN_PLANES if plane in set(names)))
@@ -767,31 +785,31 @@ def _wg__cut_provenance(value: Any, included_ids: set[str]) -> None:
         allowed = {'body_object_id', 'feature', 'tool', 'plane', 'kept_side', 'export_frame'}
         extra = sorted(set(entry) - allowed)
         if extra:
-            _wg__fail(entry_path, f'unknown member(s): {', '.join(extra)}')
+            _wg__fail(entry_path, f"unknown member(s): {', '.join(extra)}")
         body = _wg__string(_wg__required(entry, 'body_object_id', entry_path), f'{entry_path}.body_object_id')
         if body not in included_ids:
             _wg__fail(f'{entry_path}.body_object_id', 'must name a $.scope.included body')
         feature = _wg__mapping(_wg__required(entry, 'feature', entry_path), f'{entry_path}.feature')
         if _wg__string(_wg__required(feature, 'kind', f'{entry_path}.feature'), f'{entry_path}.feature.kind') not in _wg_CUT_FEATURE_KINDS:
-            _wg__fail(f'{entry_path}.feature.kind', f'must be one of {', '.join(_wg_CUT_FEATURE_KINDS)}')
+            _wg__fail(f'{entry_path}.feature.kind', f"must be one of {', '.join(_wg_CUT_FEATURE_KINDS)}")
         name = _wg__string(_wg__required(feature, 'name', f'{entry_path}.feature'), f'{entry_path}.feature.name')
         if not name or not name.strip() or len(name) > 200:
             _wg__fail(f'{entry_path}.feature.name', 'must be a non-empty name of at most 200 characters')
         tool = _wg__mapping(_wg__required(entry, 'tool', entry_path), f'{entry_path}.tool')
         if _wg__string(_wg__required(tool, 'kind', f'{entry_path}.tool'), f'{entry_path}.tool.kind') not in _wg_CUT_TOOL_KINDS:
-            _wg__fail(f'{entry_path}.tool.kind', f'must be one of {', '.join(_wg_CUT_TOOL_KINDS)}')
+            _wg__fail(f'{entry_path}.tool.kind', f"must be one of {', '.join(_wg_CUT_TOOL_KINDS)}")
         origin = _wg__string(_wg__required(tool, 'origin_plane', f'{entry_path}.tool'), f'{entry_path}.tool.origin_plane')
         if origin not in _wg_CUT_ORIGIN_PLANES:
-            _wg__fail(f'{entry_path}.tool.origin_plane', f'must be one of {', '.join(_wg_CUT_ORIGIN_PLANES)}')
+            _wg__fail(f'{entry_path}.tool.origin_plane', f"must be one of {', '.join(_wg_CUT_ORIGIN_PLANES)}")
         plane = _wg__string(_wg__required(entry, 'plane', entry_path), f'{entry_path}.plane')
         if plane not in _wg_CUT_ORIGIN_PLANES.values():
             _wg__fail(f'{entry_path}.plane', 'must be one of x0, y0, z0')
         if _wg_CUT_ORIGIN_PLANES[str(origin)] != plane:
             _wg__fail(f'{entry_path}.plane', f'the {origin} plane is {_wg_CUT_ORIGIN_PLANES[str(origin)]}, not {plane}')
         if _wg__string(_wg__required(entry, 'kept_side', entry_path), f'{entry_path}.kept_side') not in _wg_CUT_KEPT_SIDES:
-            _wg__fail(f'{entry_path}.kept_side', f'must be one of {', '.join(_wg_CUT_KEPT_SIDES)}')
+            _wg__fail(f'{entry_path}.kept_side', f"must be one of {', '.join(_wg_CUT_KEPT_SIDES)}")
         if _wg__string(_wg__required(entry, 'export_frame', entry_path), f'{entry_path}.export_frame') not in _wg_EXPORT_FRAMES:
-            _wg__fail(f'{entry_path}.export_frame', f'must be one of {', '.join(_wg_EXPORT_FRAMES)}')
+            _wg__fail(f'{entry_path}.export_frame', f"must be one of {', '.join(_wg_EXPORT_FRAMES)}")
 
 def _wg__bbox(value: Any, path: str) -> list[list[float]]:
     rows = _wg__list(value, path)
@@ -999,10 +1017,10 @@ def _wg_validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         _wg__fail('$.required_features', 'feature names must be unique')
     unknown = sorted(set(feature_names) - _wg_SUPPORTED_FEATURES)
     if unknown:
-        _wg__fail('$.required_features', f'unknown required feature(s): {', '.join(unknown)}')
+        _wg__fail('$.required_features', f"unknown required feature(s): {', '.join(unknown)}")
     missing_features = sorted(_wg_REQUIRED_BASE_FEATURES - set(feature_names))
     if missing_features:
-        _wg__fail('$.required_features', f'missing required feature(s): {', '.join(missing_features)}')
+        _wg__fail('$.required_features', f"missing required feature(s): {', '.join(missing_features)}")
     returned = _wg__mapping(_wg__required(manifest, 'return', '$'), '$.return')
     return_id = _wg__string(_wg__required(returned, 'id', '$.return'), '$.return.id')
     if return_id is None or _wg__RETURN_ID.fullmatch(return_id) is None:
@@ -1023,13 +1041,13 @@ def _wg_validate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     if 'export_frame' in coordinates:
         frame = _wg__string(coordinates['export_frame'], '$.coordinate_system.export_frame')
         if frame not in _wg_EXPORT_FRAMES:
-            _wg__fail('$.coordinate_system.export_frame', f'must be one of {', '.join(_wg_EXPORT_FRAMES)}')
+            _wg__fail('$.coordinate_system.export_frame', f"must be one of {', '.join(_wg_EXPORT_FRAMES)}")
     if ('document_up' in coordinates) != (_wg_DOCUMENT_UP_FEATURE in feature_names):
         _wg__fail('$.required_features', f'{_wg_DOCUMENT_UP_FEATURE} is required exactly when $.coordinate_system.document_up is present')
     if 'document_up' in coordinates:
         up = _wg__string(coordinates['document_up'], '$.coordinate_system.document_up')
         if up not in _wg_DOCUMENT_UP_AXES:
-            _wg__fail('$.coordinate_system.document_up', f'must be one of {', '.join(_wg_DOCUMENT_UP_AXES)}')
+            _wg__fail('$.coordinate_system.document_up', f"must be one of {', '.join(_wg_DOCUMENT_UP_AXES)}")
     assembly = _wg__mapping(_wg__required(manifest, 'assembly', '$'), '$.assembly')
     _wg__string(_wg__required(assembly, 'file', '$.assembly'), '$.assembly.file')
     _wg__integer(_wg__required(assembly, 'n_bodies_expected', '$.assembly'), '$.assembly.n_bodies_expected', minimum=1)

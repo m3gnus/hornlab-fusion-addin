@@ -8,6 +8,8 @@
   ],
   "sha256": {
     "cases.json": "1254265d0ef286bc13a937c7cf04f745693c8c3551e3316d237f609ed1e8cb22",
-    "goldens.json": "c06cb3255ca8f4c959254d09a3cc9fd060f8fa8903397c9a196ebd718219c35b"
-  }
+    "goldens.json": "c06cb3255ca8f4c959254d09a3cc9fd060f8fa8903397c9a196ebd718219c35b",
+    "wg_ingress_cases.json": "16bf36b4e4223e8dcc358c5030f03b376a3789931d7aa8e57ae79f0096e0662b"
+  },
+  "wg_ingress_source": "waveguide-generator 12db5a557a6a86d969a120a95b7de37eb5260980"
 }

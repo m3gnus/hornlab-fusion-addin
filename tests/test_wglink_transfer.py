@@ -9,6 +9,7 @@ reader -- which ignores ``kind`` -- can never be handed a Send.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -624,3 +625,192 @@ def test_start_up_converts_before_any_live_thread_starts(
         assert _outbox(ipc) == []
     finally:
         module.stop(None)
+
+
+# -- H8: the request is written only after the bundle is whole ------------------
+#
+# These run the real export (`wglink_send.send`, with its real staging folder
+# and its real final `os.replace`) and the real request writer, and look at the
+# workspace at the instant each one acts.
+
+
+def _real_export(monkeypatch, tmp_path: Path, name: str):
+    from test_wglink_send import ContractExportManager, Collection, body, component, face
+
+    ui = _UI(_Panels(), _Definitions(reserve_ids=False))
+    app = _Application(ui)
+    app.activeProduct = types.SimpleNamespace(objectType="adsk::fusion::Design")
+    module = _load_instance(monkeypatch, name, ui, app)
+    ipc, _bundles = _per_request_folders(monkeypatch, module, tmp_path)
+    _advertise(ipc, 4)
+    workspace = tmp_path / "workspace"
+    monkeypatch.setattr(module.wglink_workspace, "capture_document", lambda: False)
+    monkeypatch.setattr(module, "_required_manifest_features", lambda: {})
+    root = component("Speaker", [body("cabinet", faces=[face("LF")])])
+    design = types.SimpleNamespace(
+        rootComponent=root,
+        exportManager=ContractExportManager(),
+        findAttributes=lambda _group, _name: Collection(),
+    )
+    monkeypatch.setattr(module.wglink_core, "_design", lambda _app: design)
+    app.version = "2704.1.53"
+    app.activeDocument = types.SimpleNamespace(name="Speaker")
+    monkeypatch.setattr(module, "_start_timer", lambda delay, function: None)
+    monkeypatch.setattr(module, "_owns_active_ipc_lease", lambda: True)
+    return types.SimpleNamespace(module=module, ui=ui, ipc=ipc, workspace=workspace)
+
+
+def _sha(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _record_the_order(monkeypatch, fixture) -> list[dict]:
+    """Wrap the final bundle rename and the request write; record what is on disk.
+
+    Each request attempt appends the state of the bundle it names, read at the
+    moment the request is about to become visible.
+    """
+
+    module = fixture.module
+    events: list[dict] = []
+    real_publish = module.wglink_send._publish
+    real_request = module.wglink_watch.publish_wg_request
+
+    def publish(temp, target, overwrite):
+        real_publish(temp, target, overwrite)
+        events.append({"event": "bundle", "target": Path(target)})
+
+    def request(path, payload):
+        bundle = fixture.workspace / payload["bundlePath"]
+        manifest = json.loads((bundle / "wgreturn.json").read_text(encoding="utf-8")) if bundle.is_dir() else {}
+        members = {
+            member: (bundle / member).is_file() and _sha(bundle / member) == record["sha256"]
+            for member, record in manifest.get("files", {}).items()
+        }
+        events.append({
+            "event": "request",
+            "bundle_published_first": any(e["event"] == "bundle" for e in events),
+            "bundle_is_dir": bundle.is_dir(),
+            "manifest_hash_matches": bundle.is_dir() and _sha(bundle / "wgreturn.json") == payload["manifestSha256"],
+            "members": members,
+            "siblings": sorted(p.name for p in bundle.parent.iterdir() if p.name.startswith(".")),
+            "request_visible": path.exists(),
+        })
+        return real_request(path, payload)
+
+    monkeypatch.setattr(module.wglink_send, "_publish", publish)
+    monkeypatch.setattr(module.wglink_watch, "publish_wg_request", request)
+    return events
+
+
+@pytest.mark.parametrize("operation", ["send", "solve"])
+def test_the_request_becomes_visible_only_after_the_whole_bundle_is_in_place(
+    monkeypatch, tmp_path: Path, operation: str
+) -> None:
+    """H8: at the moment WG could see the request, its bundle is final and hashes to it."""
+
+    fixture = _real_export(monkeypatch, tmp_path, f"WGLink_order_{operation}")
+    events = _record_the_order(monkeypatch, fixture)
+
+    _run(fixture.module, operation)
+
+    assert [e["event"] for e in events] == ["bundle", "request"]
+    request = events[1]
+    assert request["bundle_published_first"]
+    assert request["bundle_is_dir"]
+    assert request["manifest_hash_matches"]
+    assert request["members"] and all(request["members"].values()), request["members"]
+    assert "assembly.step" in request["members"]
+    # No staging folder and no replaced-bundle backup is left beside it.
+    assert request["siblings"] == []
+    assert request["request_visible"] is False
+    [payload] = _inbox(fixture.ipc)
+    assert _sha(fixture.workspace / payload["bundlePath"] / "wgreturn.json") == payload["manifestSha256"]
+
+
+def test_every_retry_of_the_request_also_finds_the_bundle_whole(monkeypatch, tmp_path: Path) -> None:
+    fixture = _real_export(monkeypatch, tmp_path, "WGLink_order_retry")
+    monkeypatch.setattr(fixture.module, "_retry_pause", lambda _seconds: None)
+    events = _record_the_order(monkeypatch, fixture)
+    recorded = fixture.module.wglink_watch.publish_wg_request
+    attempts: list[int] = []
+
+    def flaky(path, payload):
+        attempts.append(1)
+        if len(attempts) == 1:
+            recorded(path, payload)  # the file lands, the rename then reports an error
+            raise OSError("reported an error after it landed")
+        return recorded(path, payload)
+
+    monkeypatch.setattr(fixture.module.wglink_watch, "publish_wg_request", flaky)
+
+    _run(fixture.module, "send")
+
+    requests = [e for e in events if e["event"] == "request"]
+    assert len(requests) == 2
+    for request in requests:
+        assert request["bundle_published_first"] and request["manifest_hash_matches"]
+        assert all(request["members"].values()) and request["siblings"] == []
+
+
+def _request_files(ipc: Path) -> list[str]:
+    inbox = ipc / ".wg-solve-requests"
+    return sorted(p.name for p in inbox.iterdir()) if inbox.exists() else []
+
+
+def test_a_failure_between_the_bundle_and_the_request_leaves_no_request_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _real_export(monkeypatch, tmp_path, "WGLink_order_write_fails")
+    monkeypatch.setattr(fixture.module, "_retry_pause", lambda _seconds: None)
+
+    def refuse(_path, _payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(fixture.module.wglink_watch, "_write_json_atomically", refuse)
+
+    _run(fixture.module, "solve")
+
+    assert _request_files(fixture.ipc) == []  # no request, and no staging litter
+    [bundle] = [p for p in (fixture.workspace / "wgreturn").iterdir() if not p.name.startswith(".")]
+    assert (bundle / "wgreturn.json").is_file() and (bundle / "assembly.step").is_file()
+    assert fixture.ui.messages[-1][0] == "WGLink refused"
+
+
+def test_a_failure_taking_the_return_reference_leaves_no_request_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fixture = _real_export(monkeypatch, tmp_path, "WGLink_order_reference_fails")
+
+    def unreadable(_bundle, _workspace):
+        raise OSError("manifest unreadable")
+
+    monkeypatch.setattr(fixture.module.wglink_watch, "return_reference", unreadable)
+
+    _run(fixture.module, "send")
+
+    assert _request_files(fixture.ipc) == []
+    assert fixture.ui.messages[-1][0] == "WGLink refused"
+
+
+def test_a_bundle_that_could_not_be_published_is_never_requested(monkeypatch, tmp_path: Path) -> None:
+    fixture = _real_export(monkeypatch, tmp_path, "WGLink_order_bundle_fails")
+    requested: list[Path] = []
+    real_request = fixture.module.wglink_watch.publish_wg_request
+    monkeypatch.setattr(
+        fixture.module.wglink_watch,
+        "publish_wg_request",
+        lambda path, payload: requested.append(path) or real_request(path, payload),
+    )
+
+    def refuse(_temp, _target, _overwrite):
+        raise OSError("rename refused")
+
+    monkeypatch.setattr(fixture.module.wglink_send, "_publish", refuse)
+
+    _run(fixture.module, "send")
+
+    assert requested == []
+    assert _request_files(fixture.ipc) == []
+    assert not [p for p in (fixture.workspace / "wgreturn").iterdir() if p.name.endswith(".wgreturn")]
+    assert fixture.ui.messages[-1][0] == "WGLink refused"

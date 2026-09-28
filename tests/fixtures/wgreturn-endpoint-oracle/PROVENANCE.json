@@ -1,0 +1,13 @@
+{
+  "base": "99488a00ed2ec4475567785f7c46f49f2d7e9e8f",
+  "endpoint": "validate_return_manifest",
+  "golden_functions": [
+    "wglink_send._canonical_hash",
+    "wglink_core._json",
+    "WGLink._fingerprint_hash (isolated source extraction)"
+  ],
+  "sha256": {
+    "cases.json": "1254265d0ef286bc13a937c7cf04f745693c8c3551e3316d237f609ed1e8cb22",
+    "goldens.json": "c06cb3255ca8f4c959254d09a3cc9fd060f8fa8903397c9a196ebd718219c35b"
+  }
+}

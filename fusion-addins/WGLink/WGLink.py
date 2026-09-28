@@ -1126,7 +1126,17 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             # Handed off: WG owns progress and results from here, so this is
             # the one confirmation Fusion shows -- not a second progress bar
             # racing WG's own.
-            closing = "Sent to WG — solving there. Progress and results appear in Waveguide Generator."
+            if report.get("acknowledgement_expected"):
+                closing = wglink_watch.written_to_inbox_text(request_id)
+            else:
+                closing = (
+                    f"Sent to WG (request {request_id[:8]}). Progress and results "
+                    "appear in Waveguide Generator."
+                    if request_id
+                    else "Sent to WG. Progress and results appear in Waveguide Generator."
+                )
+        elif report.get("acknowledgement_expected"):
+            closing = wglink_watch.written_to_inbox_text(request_id)
         else:
             sent = (
                 f"Sent to Waveguide Generator (request {request_id[:8]}). "
@@ -1284,22 +1294,99 @@ def _submit_to_wg(report: dict[str, object], kind: str) -> str:
         _begin_request(channel, request_id, DELIVERY)["outcome"] = "unconfirmed"
         report["delivery_unconfirmed"] = True
     # Unconfirmed included: if the file is there after a minute, WG never took it.
-    _schedule_pickup_check(path, channel, request_id)
+    if wglink_watch.wg_acknowledges(ipc):
+        # WG will say whether it accepted or refused: say only "written" until it does.
+        report["acknowledgement_expected"] = True
+        _schedule_pickup_check(
+            path, channel, request_id, ack=(ipc, kind, manifest)
+        )
+    else:
+        _schedule_pickup_check(path, channel, request_id)
     return request_id
 
 
-def _schedule_pickup_check(path: Path, channel: str, request_id: str) -> None:
+def _schedule_pickup_check(
+    path: Path,
+    channel: str,
+    request_id: str,
+    ack: tuple[Path, str, str] | None = None,
+) -> None:
     """The one follow-up a Send or Solve makes: did WG take the file? (C6)
 
     A one-shot timer, then the follow-up event onto the main thread, counted
     under the command that wrote the request. It reads whether one file still
     exists and nothing else -- no document, no link, no geometry -- and it runs
     whether or not automatic coordination is on.
+
+    Against a WG that advertises acknowledgements (``ack`` is the inbox, the
+    request kind and its manifest hash), the same timer machinery re-arms every
+    few seconds until WG's acknowledgement file appears or the wait ends: one
+    timer at a time, no thread of its own.
     """
 
+    if ack is None:
+        _start_pickup_timer(
+            wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS,
+            wglink_activity.carrying(lambda: _pickup_check(path, channel, request_id)),
+        )
+        return
+    started = time.monotonic()
     _start_pickup_timer(
-        wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS,
-        wglink_activity.carrying(lambda: _pickup_check(path, channel, request_id)),
+        wglink_watch.ACK_POLL_SECONDS,
+        wglink_activity.carrying(
+            lambda: _acknowledgement_check(path, channel, request_id, ack, started)
+        ),
+    )
+
+
+def _acknowledgement_check(
+    path: Path,
+    channel: str,
+    request_id: str,
+    ack: tuple[Path, str, str],
+    started: float,
+) -> None:
+    """One look for WG's acknowledgement; re-arms itself until there is an answer.
+
+    accepted -> "WG accepted" (logged, no prompt); refused -> WG's reason verbatim. The request file
+    still waiting after the pickup window is the existing "not picked up" notice.
+    The file gone for the whole wait with no acknowledgement is "taken, not
+    confirmed" -- never "refused", never "solving".
+    """
+
+    ipc, kind, manifest = ack
+    wglink_activity.record(wglink_activity.PICKUP_CHECK)
+    result = wglink_watch.read_acknowledgement(
+        ipc, request_id, kind=kind, manifest_sha256=manifest
+    )
+    if result is not None:
+        outcome, reason = result
+        if outcome == wglink_watch.ACK_ACCEPTED:
+            _note_outcome(channel, request_id, "accepted")
+            # Good news is not worth a prompt: WG shows the operation itself.
+            _log(f"[{PANEL_NAME}] request {request_id[:8]}: {wglink_watch.ACK_ACCEPTED_TEXT}")
+        else:
+            _note_outcome(channel, request_id, "refused")
+            _modal(
+                reason or "WG refused the request.",
+                f"{PANEL_NAME} request refused",
+            )
+        return
+    elapsed = time.monotonic() - started
+    if path.exists():
+        if elapsed >= wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS:
+            _note_outcome(channel, request_id, "notTaken")
+            _modal(wglink_watch.REQUEST_NOT_TAKEN_MESSAGE, f"{PANEL_NAME} request waiting")
+            return
+    elif elapsed >= wglink_watch.ACK_WAIT_SECONDS:
+        _note_outcome(channel, request_id, "takenUnconfirmed")
+        _modal(wglink_watch.ACK_UNCONFIRMED_TEXT, f"{PANEL_NAME} request not confirmed")
+        return
+    _start_pickup_timer(
+        wglink_watch.ACK_POLL_SECONDS,
+        wglink_activity.carrying(
+            lambda: _acknowledgement_check(path, channel, request_id, ack, started)
+        ),
     )
 
 

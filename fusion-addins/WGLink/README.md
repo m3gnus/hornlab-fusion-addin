@@ -243,7 +243,12 @@ Commands and requests cross through WG's machine-local IPC folder,
   Solve writes the schema-3 file as before and **Send is refused**, because a
   schema-3 reader ignores `kind` and would start a solve. A WG that advertises
   nothing is "not collecting requests", and both refuse. The outcome is said at
-  command time: "Sent to Waveguide Generator (request …)", or why WG was not
+  command time: "Written to WG's inbox (request …)" when WG advertises
+  `solveAcknowledgement` (then WGLink looks for WG's
+  `.wg-solve-acks/<requestId>.json` every few seconds and says "WG accepted the
+  request", WG's own refusal reason, or after two minutes with the file gone and
+  no acknowledgement "taken but not confirmed" -- never "solving"), "Sent to
+  Waveguide Generator (request …)" for an older WG, or why WG was not
   asked. Pressing Send again is a new request. A second request never
   replaces one WG has not read yet. The file is staged under a hidden name,
   synced and renamed into place, so WG never sees part of one. The request is

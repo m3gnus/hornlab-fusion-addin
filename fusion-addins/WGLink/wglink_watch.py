@@ -50,6 +50,18 @@ DELIVERY_VERSION = wglink_protocol.FUSION_REQUEST_DELIVERY_VERSION
 CAPABILITIES_FILENAME = "wg-capabilities.json"
 CAPABILITIES_SCHEMA_VERSION = 1
 SOLVE_COMMAND_DELIVERY = "solveCommandDelivery"
+# WG writes one acknowledgement file per request when it advertises this as an
+# integer of at least 1: ``<ipc>/.wg-solve-acks/<requestId>.json``.
+SOLVE_ACKNOWLEDGEMENT = "solveAcknowledgement"
+ACK_DIRECTORY = ".wg-solve-acks"
+ACK_SCHEMA_VERSION = 1
+ACK_ACCEPTED = "accepted"
+ACK_REFUSED = "refused"
+# How often the acknowledgement is looked for, and how long after the request
+# is written the add-in waits for one once WG has taken the file. An
+# acknowledgement can lag the file's disappearance by about 30 delivery passes.
+ACK_POLL_SECONDS = 5.0
+ACK_WAIT_SECONDS = 120.0
 FUSION_REQUEST_DELIVERY = "fusionRequestDelivery"
 # WG reads returns that require ``source-identity-v1`` when it advertises this
 # as an integer of at least 1. The add-in declares the feature only then: a WG
@@ -127,6 +139,75 @@ def requests_not_taken_at_startup_message(count: int) -> str:
         "running). The requests wait in the WGLink folder and are handled once WG "
         "takes them."
     )
+
+
+def written_to_inbox_text(request_id: str) -> str:
+    return (
+        f"Written to WG's inbox (request {str(request_id)[:8]}) -- waiting for WG to "
+        "accept it. WG says here when it has."
+    )
+
+
+ACK_ACCEPTED_TEXT = (
+    "WG accepted the request. Progress and results appear in Waveguide Generator."
+)
+ACK_UNCONFIRMED_TEXT = (
+    "WG took the request but has not confirmed it. Check WG's CAD Link panel "
+    "before sending this model again."
+)
+
+
+def wg_acknowledges(ipc_folder: Path) -> bool:
+    """Whether WG advertises that it writes an acknowledgement for each request."""
+
+    payload = _read_json(Path(ipc_folder) / CAPABILITIES_FILENAME)
+    if not isinstance(payload, Mapping):
+        return False
+    schema = payload.get("schemaVersion")
+    if isinstance(schema, bool) or schema != CAPABILITIES_SCHEMA_VERSION:
+        return False
+    if SOLVE_COMMAND_DELIVERY not in payload:
+        return False
+    value = payload.get(SOLVE_ACKNOWLEDGEMENT)
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def read_acknowledgement(
+    ipc_folder: Path,
+    request_id: str,
+    *,
+    kind: str | None = None,
+    manifest_sha256: str | None = None,
+) -> tuple[str, str | None] | None:
+    """WG's outcome for one request: ``(outcome, reason)``, or None for "not yet".
+
+    Opens, reads and closes the file at once (a held handle delays WG's own
+    replace on Windows). A missing folder or file, a parse failure, another
+    schema version, an outcome this add-in does not know, ids that are not this
+    request's, or a ``kind`` / ``manifestSha256`` that names another request
+    all read as "not yet". Every other field is ignored.
+    """
+
+    if not _PLAIN_ID.fullmatch(str(request_id)):
+        return None
+    payload = _read_json(Path(ipc_folder) / ACK_DIRECTORY / f"{request_id}.json")
+    if not isinstance(payload, Mapping):
+        return None
+    schema = payload.get("schemaVersion")
+    if isinstance(schema, bool) or schema != ACK_SCHEMA_VERSION:
+        return None
+    for field in ("commandId", "operationId"):
+        if payload.get(field, request_id) != request_id:
+            return None
+    if kind is not None and payload.get("kind", kind) != kind:
+        return None
+    if manifest_sha256 is not None and payload.get("manifestSha256", manifest_sha256) != manifest_sha256:
+        return None
+    outcome = payload.get("outcome")
+    if outcome not in (ACK_ACCEPTED, ACK_REFUSED):
+        return None
+    reason = payload.get("reason")
+    return outcome, reason if isinstance(reason, str) and reason.strip() else None
 
 
 class WgOutdatedError(RuntimeError):

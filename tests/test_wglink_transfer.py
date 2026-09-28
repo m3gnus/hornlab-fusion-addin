@@ -259,7 +259,7 @@ def test_send_and_solve_write_one_request_differing_only_in_kind(
     title, text = fixture.ui.messages[-1]
     assert title == "WGLink"
     if operation == "solve":
-        assert "Sent to WG — solving there. Progress and results appear in Waveguide Generator." in text
+        assert "Progress and results appear in Waveguide Generator." in text
     else:
         assert f"Sent to Waveguide Generator (request {payload['operationId'][:8]})" in text
     assert fixture.module._request_trace["correlationId"] == payload["operationId"]
@@ -310,7 +310,7 @@ def test_a_solve_to_a_wg_that_reads_only_schema_3_still_solves(monkeypatch, tmp_
     [payload] = _inbox(fixture.ipc)
     assert payload["schemaVersion"] == 3 and "kind" not in payload
     assert (
-        "Sent to WG — solving there. Progress and results appear in Waveguide Generator."
+        "Progress and results appear in Waveguide Generator."
         in fixture.ui.messages[-1][1]
     )
 

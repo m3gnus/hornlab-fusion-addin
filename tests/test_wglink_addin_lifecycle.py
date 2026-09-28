@@ -979,7 +979,7 @@ def test_solve_confirms_the_handoff_and_shows_only_one_progress_dialog(
 
     title, text = ui.messages[-1]
     assert title == "WGLink"
-    assert "Sent to WG — solving there. Progress and results appear in Waveguide Generator." in text
+    assert "Progress and results appear in Waveguide Generator." in text
 
 
 def test_setting_a_source_paints_the_role_appearance_and_leaves_matches_alone(

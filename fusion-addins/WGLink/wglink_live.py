@@ -557,6 +557,11 @@ DELETE_RETRY_STEP_SECONDS = 0.01
 #: disk stays whole and unchanged, and the write is re-attempted.
 REPLACE_RETRY_SECONDS = 0.5
 REPLACE_RETRY_STEP_SECONDS = 0.01
+#: The reading side of the same collision: while another handle replaces an
+#: item, Windows can refuse to open it for a moment. A file that is there but
+#: unreadable is retried for this long before it is treated as not an item.
+READ_RETRY_SECONDS = 0.5
+READ_RETRY_STEP_SECONDS = 0.01
 #: WG retains the return into its own storage before it answers a delivery.
 DELIVERY_TIMEOUT_SECONDS = 30.0
 #: WG answers ``503 snapshot_not_readable`` for at most 30 s from the first
@@ -693,6 +698,29 @@ def delivery_body(item: Mapping[str, Any]) -> dict[str, Any]:
     return body
 
 
+def _read_item_file(path: Path) -> Any:
+    """Read one outbox file; a file that exists but cannot be opened is retried.
+
+    A momentary refusal (an in-flight replace, a scanner) must not turn a real
+    item into a "foreign file": foreign files are left out of the listing, and
+    an old one is removed by the worker. Content that is not valid JSON is not
+    retried -- the writes are atomic, so it is genuinely not an item.
+    """
+
+    deadline = time.monotonic() + READ_RETRY_SECONDS
+    while True:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeError, ValueError, TypeError):
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError:
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(READ_RETRY_STEP_SECONDS)
+
+
 class Outbox:
     """``<ipc>/.wglink-outbox/<operationId>.json``: one private file per item.
 
@@ -726,7 +754,7 @@ class Outbox:
         items: list[dict[str, Any]] = []
         foreign: list[Path] = []
         for path in self._names()[: OUTBOX_MAX_ITEMS * 4]:
-            item = _read_json(path)
+            item = _read_item_file(path)
             if valid_item(item) and path.stem == item["operationId"]:
                 items.append(dict(item))
             else:

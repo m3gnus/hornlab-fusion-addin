@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 import types
 
 import pytest
@@ -522,7 +523,7 @@ def _queued(ipc: Path, kind: str, operation_id: str, *, file_written: bool = Fal
         bundle_path="wgreturn/speaker.wgreturn",
         manifest_sha256="sha256:" + "b" * 64,
         requested_at="2026-09-20T12:00:00Z",
-        created_at="2026-09-20T12:00:00.000Z",
+        created_at=wglink_live._utc_millis(time.time()),
         return_id="wgr_9" if kind == wglink_live.KIND_SOLVE else None,
         file_written=file_written,
     )

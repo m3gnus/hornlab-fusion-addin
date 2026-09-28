@@ -25,9 +25,11 @@ import errno
 import json
 import os
 from pathlib import Path
+import pathlib
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import types
 
@@ -1161,3 +1163,55 @@ def test_nothing_waiting_means_no_check_no_timer_and_no_notice(monkeypatch, tmp_
         assert _startup_checks(fixture.module) == {}
     finally:
         fixture.module.stop(None)
+
+
+def test_a_listing_made_while_an_item_is_being_replaced_still_sees_the_item(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The interleaving behind the windows-latest failure of the raises/on test.
+
+    With no WG to talk to, the live worker writes a queued solve as its v3 file
+    and replaces the item to record it, while another thread lists the outbox. On Windows the open is refused for the
+    moment the replace is in flight; the listing used to file the item as
+    "foreign" and leave it out. Here the replace is held open by an event and
+    reads from the listing thread are refused exactly while it is.
+    """
+
+    _queued(tmp_path, wglink_live.KIND_SOLVE, "solve-1")
+    outbox = wglink_live.Outbox(tmp_path)
+    [item] = outbox.scan()[0]
+    in_flight = threading.Event()
+    let_go = threading.Event()
+    real_replace = os.replace
+    real_read_text = pathlib.Path.read_text
+    listing_thread = threading.current_thread()
+    refused: list[str] = []
+
+    def held_replace(source, destination, *args, **kwargs):
+        in_flight.set()
+        assert let_go.wait(10)
+        try:
+            return real_replace(source, destination, *args, **kwargs)
+        finally:
+            in_flight.clear()
+
+    def read_text(self, *args, **kwargs):
+        if in_flight.is_set() and threading.current_thread() is listing_thread:
+            refused.append(self.name)
+            raise PermissionError(errno.EACCES, "sharing violation", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(wglink_live.os, "replace", held_replace)
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    writer = threading.Thread(target=outbox.write, args=({**item, "fileWritten": True},))
+    writer.start()
+    try:
+        assert in_flight.wait(10)
+        threading.Timer(0.1, let_go.set).start()
+        items, foreign = outbox.scan()
+    finally:
+        let_go.set()
+        writer.join(10)
+    assert refused, "the listing never met the in-flight replace"
+    assert [entry["operationId"] for entry in items] == ["solve-1"]
+    assert foreign == []

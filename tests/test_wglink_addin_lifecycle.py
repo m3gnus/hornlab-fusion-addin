@@ -1317,14 +1317,10 @@ def test_an_unexpected_failure_shows_one_line_and_logs_the_traceback(
     assert "Traceback" in logged and "RuntimeError" in logged
 
 
-def test_adopting_pre_stamp_paint_is_asked_for_and_says_what_is_not_carried(
+def test_unsaved_adoption_question_explains_random_identity(
     monkeypatch,
 ) -> None:
-    """The one question Send may put, and the one thing it must not overstate.
-
-    Adoption mints a *new* identity, so WG has no setup recorded against it.
-    Saying the source is restored would claim a continuity that does not exist.
-    """
+    """The question is reserved for a document with no saved lineage."""
 
     ui = _UI(_Panels(), _Definitions(reserve_ids=False), dialog_result="yes")
     module = _load_instance(monkeypatch, "WGLink_adopt_yes", ui)
@@ -1335,11 +1331,33 @@ def test_adopting_pre_stamp_paint_is_asked_for_and_says_what_is_not_carried(
     (title, text), = ui.messages
     assert "adopt LF source" in title
     assert "2 face(s) painted LF" in text
-    assert "before WG source identities existed" in text
-    assert "asks for its setup once" in text
-    assert "cannot be carried across" in text
+    assert "carry no WG source identity" in text
+    assert "unsaved document has no stable lineage" in text
+    assert "may ask for its setup" in text
+    assert "Save the document to keep source identities" in text
     # The heartbeat's cached source ids are about to change.
     assert module._source_authoring_generation == before + 1
+
+
+def test_send_solve_summary_states_adoption_and_save_only_for_unsaved(monkeypatch) -> None:
+    module = _load_instance(
+        monkeypatch,
+        "WGLink_adoption_summary",
+        _UI(_Panels(), _Definitions(reserve_ids=False)),
+    )
+    report = {
+        "scope": {"status": "complete"},
+        "sources": [{"role": "LF"}, {"role": "HF"}],
+        "adopted_sources": ["LF", "HF"],
+    }
+
+    saved = module._summary("send", report)
+    unsaved = module._summary("solve", {**report, "save_source_identities": True})
+
+    assert "LF, HF: painted sources identified for this document." in saved
+    assert "Save the document to keep source identities" not in saved
+    assert "LF, HF: painted sources identified for this document." in unsaved
+    assert "Save the document to keep source identities." in unsaved
 
 
 def test_declining_the_adoption_question_changes_nothing(monkeypatch) -> None:

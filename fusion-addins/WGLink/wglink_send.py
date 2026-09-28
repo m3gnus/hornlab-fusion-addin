@@ -2285,6 +2285,7 @@ SOURCE_IDENTITY_MAX_BYTES = wglink_protocol.SOURCE_IDENTITY_MAX_BYTES
 GMSH_PHYSICAL_NAME_MAX_BYTES = wglink_protocol.GMSH_PHYSICAL_NAME_MAX_BYTES
 WORST_CASE_SOURCE_TAG = 9999
 _THROAT_IDENTITY_NAMESPACE = "wglink-throat-source-v1|"
+_PAINTED_IDENTITY_NAMESPACE = "wglink-painted-source-v1|"
 
 
 def _base32_identity(value: int) -> str:
@@ -2302,6 +2303,25 @@ def _mint_source_identity() -> str:
 def _throat_source_identity(instance_id: str) -> str:
     digest = hashlib.sha256(
         (_THROAT_IDENTITY_NAMESPACE + str(instance_id)).encode("utf-8")
+    ).digest()
+    return _base32_identity(
+        int.from_bytes(digest, "big") >> (256 - 5 * SOURCE_IDENTITY_CHARACTERS)
+    )
+
+
+def _painted_source_identity_seed(design: object, role: str) -> str | None:
+    """A saved document's stable first identity for one painted role."""
+
+    try:
+        value = design.parentDocument.dataFile.id
+        data_file_id = str(value).strip() if value is not None else ""
+    except Exception:  # noqa: BLE001 - unsaved/local documents are normal
+        return None
+    if not data_file_id:
+        return None
+    canonical = _canonical_source_role(role) or role
+    digest = hashlib.sha256(
+        (_PAINTED_IDENTITY_NAMESPACE + data_file_id + "|" + canonical).encode("utf-8")
     ).digest()
     return _base32_identity(
         int.from_bytes(digest, "big") >> (256 - 5 * SOURCE_IDENTITY_CHARACTERS)
@@ -2422,6 +2442,8 @@ def _painted_source_identity(
     design: object | None = None,
     *,
     adopt: Callable[[str, int], bool] | None = None,
+    adopt_seeded: bool = False,
+    adopted: list[tuple[str, bool]] | None = None,
 ) -> str:
     """Resolve one painted role group to its single authored identity, or refuse.
 
@@ -2429,10 +2451,8 @@ def _painted_source_identity(
     given, lets a refusal tell a face that is gone from one that is only outside
     what is being sent -- the remedies differ.
 
-    ``adopt`` is the caller's way of asking the user one question, and only the
-    export supplies one. Without it nothing here writes to the document, which
-    is what keeps the preview and the fingerprint read-only by construction
-    rather than by convention.
+    Only the export sets ``adopt_seeded`` or supplies ``adopt``. Both are absent
+    in previews and fingerprints, which therefore remain read-only.
     """
 
     canonical = _canonical_source_role(role) or role
@@ -2455,8 +2475,9 @@ def _painted_source_identity(
         #
         # When *no* face carries the attribute at all, the group is paint that
         # predates source identities. There is no competing identity to
-        # mis-bind to and the paint is the only evidence and is unanimous, so
-        # the user is asked once and the group is adopted. "Carries the
+        # mis-bind to and the paint is unanimous. A saved document supplies
+        # a stable identity; an unsaved one needs confirmation before minting.
+        # "Carries the
         # attribute" is deliberately stricter than "parses": a value that will
         # not parse is a corruption, and it establishes nothing about whether
         # the face is already claimed.
@@ -2465,11 +2486,17 @@ def _painted_source_identity(
             wglink_core._attribute(native, SOURCE_IDENTITY_ATTRIBUTE) is None
             for native in natives
         )
-        if pre_stamp and adopt is not None and design is not None:
-            if adopt(canonical, len(natives)):
-                return _adopt_painted_source(design, natives, canonical)
+        seed = _painted_source_identity_seed(design, canonical) if design is not None else None
+        if pre_stamp and design is not None:
+            if (seed is not None and adopt_seeded) or (
+                seed is None and adopt is not None and adopt(canonical, len(natives))
+            ):
+                identity = _adopt_painted_source(design, natives, canonical, seed)
+                if adopted is not None:
+                    adopted.append((canonical, seed is None))
+                return identity
             # Declined: nothing was written, and the refusal stands as before.
-        elif pre_stamp:
+        if pre_stamp and seed is None and adopt is None:
             refusal = (
                 f"{refusal} These faces predate WG source identities, so Send "
                 f"offers to adopt them as this document's {canonical} source."
@@ -2711,7 +2738,8 @@ def assign_source_identity(design: object, faces: list[object], role: str) -> di
                     edit.write(native, _new_stamp(identity, canonical, total))
                 return {"identity": identity, "stamped": len(joining), "kept": True}
 
-        identity = _mint_source_identity()
+        seed = _painted_source_identity_seed(design, canonical) if not groups else None
+        identity = seed or _mint_source_identity()
         for group in groups.values():
             for member, _attribute, _stamp in group:
                 if not any(_same_live_entity(member, native) for native in selected):
@@ -2733,10 +2761,12 @@ def _new_stamp(identity: str, role: str, faces: int) -> dict[str, Any]:
     }
 
 
-def _adopt_painted_source(design: object, natives: list[object], canonical: str) -> str:
+def _adopt_painted_source(
+    design: object, natives: list[object], canonical: str, seed: str | None
+) -> str:
     """Give paint that predates source identities one identity, once, together.
 
-    Minted and stamped exactly as ``assign_source_identity`` mints and stamps --
+    Derived or minted and stamped as ``assign_source_identity`` does --
     one identity, one nonce per face, and the same transaction -- so there is
     one identity scheme and one stamp shape, not two. A face in an externally
     referenced (read-only) component refuses the write, and ``_StampEdit`` puts
@@ -2749,12 +2779,11 @@ def _adopt_painted_source(design: object, natives: list[object], canonical: str)
     looking for no others; paint of the same role outside the export is not
     adopted, and a wider export later says so.
 
-    The caller has already established that no face here carries the attribute,
-    and has already asked.
+    The caller has already established that no face here carries the attribute.
     """
 
     def body(edit: _StampEdit) -> str:
-        identity = _mint_source_identity()
+        identity = seed or _mint_source_identity()
         for native in natives:
             edit.write(native, _new_stamp(identity, canonical, len(natives)))
         return identity
@@ -2990,6 +3019,8 @@ def _sources(
     source_identity: bool = False,
     design: object | None = None,
     adopt: Callable[[str, int], bool] | None = None,
+    adopt_seeded: bool = False,
+    adopted: list[tuple[str, bool]] | None = None,
 ) -> list[dict[str, Any]]:
     """Every drivable source the return carries.
 
@@ -3049,7 +3080,9 @@ def _sources(
             continue
         source_id, drive_id = _source_ids(role, used)
         if source_identity:
-            source_id = _painted_source_identity(role, faces, design, adopt=adopt)
+            source_id = _painted_source_identity(
+                role, faces, design, adopt=adopt, adopt_seeded=adopt_seeded, adopted=adopted
+            )
         sources.append(
             {
                 "id": source_id,
@@ -3775,13 +3808,8 @@ def send(
 ) -> dict[str, Any]:
     """Write one return bundle and return a JSON-serialisable export report.
 
-    ``confirm_adoption(role, faces)`` is how the add-in's UI asks the one
-    question this export may put to the user: whether a role group painted
-    before WG source identities existed should be adopted as this document's
-    source for that role. It is a callback rather than a dialog raised here
-    because this module stays head-less; a caller that supplies none -- a
-    script, a test, a shell without Fusion's modal API -- gets the refusal it
-    always got.
+    ``confirm_adoption(role, faces)`` asks before adopting paint in an unsaved
+    document, whose source identity cannot be derived from document lineage.
     """
 
     if not isinstance(options, dict):
@@ -3882,6 +3910,7 @@ def send(
         )
         for record in records
     ]
+    adopted_sources: list[tuple[str, bool]] = []
     sources = _sources(
         records,
         included_bodies,
@@ -3895,6 +3924,8 @@ def send(
         source_identity=source_identity,
         design=design,
         adopt=confirm_adoption,
+        adopt_seeded=True,
+        adopted=adopted_sources,
     )
     # After ``_sources``, deliberately: an adoption above has already written
     # its stamps, so the fingerprint is taken of the document as it now is
@@ -4050,6 +4081,8 @@ def send(
         "scope": manifest["scope"],
         "instances": manifest["instances"],
         "sources": manifest["sources"],
+        "adopted_sources": [role for role, _random in adopted_sources],
+        "save_source_identities": any(random for _role, random in adopted_sources),
         "files": manifest["files"],
         "manifest": manifest,
     }

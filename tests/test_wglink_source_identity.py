@@ -13,6 +13,7 @@ can prove.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import sys
 import types
@@ -101,10 +102,13 @@ class _Found:
 class FakeDesign(types.SimpleNamespace):
     """A design whose attribute search walks every entity it was told about."""
 
-    def __init__(self, root, entities=()):
+    def __init__(self, root, entities=(), data_file_id=None):
         super().__init__(
             rootComponent=root,
             exportManager=ContractExportManager(),
+            parentDocument=types.SimpleNamespace(
+                dataFile=None if data_file_id is None else types.SimpleNamespace(id=data_file_id)
+            ),
         )
         self.entities = list(entities)
 
@@ -143,12 +147,32 @@ def _app(name="Identity"):
     )
 
 
-def _painted_document(send_module, monkeypatch, faces):
+def _painted_document(send_module, monkeypatch, faces, *, data_file_id=None):
     cabinet = solid("cabinet", faces)
     root = component("Identity", [cabinet])
-    design = FakeDesign(root, faces)
+    design = FakeDesign(root, faces, data_file_id=data_file_id)
     monkeypatch.setattr(send_module.wglink_core, "_design", lambda _app: design)
     return design
+
+
+def painted_seed(data_file_id, role):
+    digest = hashlib.sha256(
+        f"wglink-painted-source-v1|{data_file_id}|{role}".encode("utf-8")
+    ).digest()
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    value = int.from_bytes(digest, "big") >> 156
+    return "wgs-" + "".join(alphabet[(value >> shift) & 31] for shift in range(95, -1, -5))
+
+
+def test_first_set_source_uses_saved_document_seed(send_module, monkeypatch):
+    face_value = stamped_face("LF")
+    design = _painted_document(
+        send_module, monkeypatch, [face_value], data_file_id="lineage-one"
+    )
+
+    result = send_module.assign_source_identity(design, [face_value], "LF")
+
+    assert result["identity"] == stamp_of(face_value)["id"] == painted_seed("lineage-one", "LF")
 
 
 def _send(send_module, tmp_path, *, identity=True, request="r"):

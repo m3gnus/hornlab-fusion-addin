@@ -36,6 +36,7 @@ from test_wglink_source_identity import (
     _painted_document,
     _send,
     put_stamp,
+    painted_seed,
     stamp_of,
     stamped_face,
 )
@@ -131,6 +132,127 @@ def test_a_wholly_unstamped_group_is_adopted_once_the_user_confirms(
     assert source["id"].startswith("wgs-")
     assert stamp_of(a)["id"] == stamp_of(b)["id"] == source["id"]
     assert tuple(design.rootComponent.bRepBodies) == original_bodies
+
+
+def test_saved_paint_reuses_its_seed_after_stamps_are_lost(
+    send_module, tmp_path, monkeypatch
+):
+    low, high = stamped_face("LF"), stamped_face("HF")
+    _painted_document(
+        send_module, monkeypatch, [low, high], data_file_id="saved-lineage"
+    )
+    never = _Confirmer(False)
+
+    first = _send_with(send_module, tmp_path, never, request="one")
+    for face_value in (low, high):
+        face_value.attributes.values.clear()  # close and reopen without saving
+    second = _send_with(send_module, tmp_path, never, request="two")
+
+    assert never.asked == []
+    expected = {
+        role: painted_seed("saved-lineage", role) for role in ("LF", "HF")
+    }
+    assert {source["role"]: source["id"] for source in first["sources"]} == expected
+    assert {source["role"]: source["id"] for source in second["sources"]} == expected
+
+
+def test_saved_paint_preview_and_fingerprint_do_not_write(
+    send_module, monkeypatch
+):
+    face_value = stamped_face("LF")
+    _painted_document(
+        send_module, monkeypatch, [face_value], data_file_id="saved-lineage"
+    )
+
+    preview = send_module.preflight_scope(_app(), {"source_identity": True})
+    state = send_module.return_state(_app(), {"source_identity": True})
+
+    assert preview["source_error"]
+    assert state["hash"] is None
+    assert face_value.attributes.values == {}
+
+
+def test_saved_lineages_get_different_ids(send_module, monkeypatch):
+    first = _painted_document(
+        send_module, monkeypatch, [stamped_face("LF")], data_file_id="first"
+    )
+    second = _painted_document(
+        send_module, monkeypatch, [stamped_face("LF")], data_file_id="second"
+    )
+
+    assert send_module._painted_source_identity_seed(first, "LF") != send_module._painted_source_identity_seed(second, "LF")
+
+
+def test_saved_legacy_role_uses_canonical_seed_and_reports_adoption(
+    send_module, tmp_path, monkeypatch
+):
+    face_value = stamped_face("PORT_EXIT")
+    _painted_document(
+        send_module, monkeypatch, [face_value], data_file_id="saved-lineage"
+    )
+    confirmer = _Confirmer(False)
+
+    report = send_module.send(
+        _app(),
+        {
+            "output_folder": str(tmp_path),
+            "capture_document": False,
+            "source_identity": True,
+        },
+        confirm_adoption=confirmer,
+    )
+
+    assert confirmer.asked == []
+    assert report["adopted_sources"] == ["PASSIVE_CARDIOID"]
+    assert report["save_source_identities"] is False
+    assert report["sources"][0]["id"] == painted_seed("saved-lineage", "PASSIVE_CARDIOID")
+
+
+def test_unsaved_paint_still_requires_confirmation_and_mints_randomly(
+    send_module, tmp_path, monkeypatch
+):
+    face_value = stamped_face("LF")
+    _painted_document(send_module, monkeypatch, [face_value])
+    confirmer = _Confirmer(True)
+
+    first = _send_with(send_module, tmp_path, confirmer, request="one")
+    face_value.attributes.values.clear()
+    second = _send_with(send_module, tmp_path, confirmer, request="two")
+
+    assert confirmer.asked == [("LF", 1), ("LF", 1)]
+    assert first["sources"][0]["id"] != second["sources"][0]["id"]
+
+
+def test_old_random_stamp_stays_authoritative_in_saved_document(
+    send_module, tmp_path, monkeypatch
+):
+    face_value = stamped_face("HF")
+    _painted_document(
+        send_module, monkeypatch, [face_value], data_file_id="saved-lineage"
+    )
+    old_id = put_stamp([face_value], "HF", identity="wgs-OLD00000000000000000")
+
+    manifest = _send_with(send_module, tmp_path, _Confirmer(False))
+
+    assert manifest["sources"][0]["id"] == old_id
+    assert old_id != painted_seed("saved-lineage", "HF")
+
+
+def test_unresolvable_saved_source_reassignment_mints_new_id(
+    send_module, monkeypatch
+):
+    original, copied = stamped_face("LF"), stamped_face("LF")
+    design = _painted_document(
+        send_module, monkeypatch, [original, copied], data_file_id="saved-lineage"
+    )
+    first = send_module.assign_source_identity(design, [original], "LF")
+    copied.attributes.values = dict(original.attributes.values)  # split or copy
+
+    reassigned = send_module.assign_source_identity(design, [original, copied], "LF")
+
+    assert first["identity"] == painted_seed("saved-lineage", "LF")
+    assert reassigned["identity"] != first["identity"]
+    assert stamp_of(original)["id"] == stamp_of(copied)["id"] == reassigned["identity"]
 
 
 def test_an_adopted_group_records_the_count_it_was_marked_on(

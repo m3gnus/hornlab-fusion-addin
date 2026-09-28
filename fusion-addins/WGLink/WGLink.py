@@ -502,7 +502,7 @@ def _confirm_detach() -> bool:
 
 
 def _confirm_source_adoption(role: str, faces: int) -> bool:
-    """Ask before adopting paint that predates WG source identities.
+    """Ask before assigning a random identity to paint in an unsaved document.
 
     Asked once per painted role group, because that is the only unit the
     question is answerable in: a document can be unambiguous in one role and
@@ -526,13 +526,11 @@ def _confirm_source_adoption(role: str, faces: int) -> bool:
     if not callable(message_box):
         return False
     answer = message_box(
-        f"{faces} face(s) painted {role} were marked before WG source "
-        "identities existed, so they carry none.\n\n"
+        f"{faces} face(s) painted {role} carry no WG source identity.\n\n"
         f"Adopt them as this document's {role} source?\n\n"
-        f"This gives {role} a new source identity. Waveguide Generator treats "
-        "it as a new source and asks for its setup once; the setup an earlier "
-        "export had cannot be carried across, because the identity it was "
-        "recorded against did not exist yet.",
+        f"This unsaved document has no stable lineage yet. {role} will get a "
+        "new source identity; Waveguide Generator may ask for its setup. "
+        "Save the document to keep source identities.",
         f"{PANEL_NAME} — adopt {role} source",
         yes_no,
         question,
@@ -1145,6 +1143,11 @@ def _summary(operation: str, report: dict[str, object]) -> str:
             f"Sources: {len(report.get('sources', []))}\n\n"
             f"{closing}"
         )
+        adopted = report.get("adopted_sources")
+        if isinstance(adopted, list) and adopted:
+            message += f"\n\n{', '.join(str(role) for role in adopted)}: painted sources identified for this document."
+            if report.get("save_source_identities"):
+                message += " Save the document to keep source identities."
         if status == "degraded" and isinstance(scope, dict):
             skipped = scope.get("skipped", [])
             names = []
@@ -1584,6 +1587,9 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                     confirm_adoption=_confirm_source_adoption,
                 )
                 exported = True
+                if report.get("adopted_sources") and not report.get("save_source_identities"):
+                    global _source_authoring_generation
+                    _source_authoring_generation += 1
                 # One path for both: the return is published, then one request
                 # file hands it to WG. Send and Solve differ only in its kind.
                 solve = self.operation == "solve"

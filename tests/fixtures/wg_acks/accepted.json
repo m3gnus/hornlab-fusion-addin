@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-29T00:00:32Z",
+  "commandId": "0a1b2c3d-1111-4111-8111-000000000001",
+  "digest": "d3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33f",
+  "jobId": null,
+  "kind": "prepare_and_solve",
+  "manifestSha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operationId": "0a1b2c3d-1111-4111-8111-000000000001",
+  "outcome": "accepted",
+  "reason": null,
+  "schemaVersion": 1
+}

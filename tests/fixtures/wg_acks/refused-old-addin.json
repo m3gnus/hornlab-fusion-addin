@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-29T00:00:32Z",
+  "commandId": "0a1b2c3d-1111-4111-8111-000000000002",
+  "digest": "d3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33fd3adb33f",
+  "jobId": null,
+  "kind": "prepare_and_solve",
+  "manifestSha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "operationId": "0a1b2c3d-1111-4111-8111-000000000002",
+  "outcome": "refused",
+  "reason": "This solve request came from a WGLink add-in older than this Waveguide Generator, which it no longer accepts. Restart Fusion so it loads the WGLink that WG installed, then use Solve in WG again.",
+  "schemaVersion": 1
+}

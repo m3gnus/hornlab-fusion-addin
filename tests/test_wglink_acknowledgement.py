@@ -265,3 +265,70 @@ def test_without_the_capability_the_legacy_path_stays_and_never_says_solving(
     [(delay, _function)] = fixture.timers
     assert delay == wglink_watch.SOLVE_PICKUP_NOTICE_SECONDS
     assert _tick(fixture) == ["WGLink request waiting"]  # today's not-taken notice only
+
+
+# -- packaged pair: files written by WG's real write_acknowledgement() ------------
+
+FIXTURES = ROOT / "tests" / "fixtures" / "wg_acks"
+PACKAGED = {
+    "accepted": "accepted",
+    "refused-old-addin": "refused",
+    "refused-invalid": "refused",
+    "refused-conflict": "refused",
+}
+
+
+def _packaged(name: str) -> dict:
+    return json.loads((FIXTURES / f"{name}.json").read_text())
+
+
+@pytest.mark.parametrize("name", sorted(PACKAGED))
+def test_the_reader_understands_what_wgs_writer_produced(tmp_path: Path, name: str) -> None:
+    payload = _packaged(name)
+    _write_ack(tmp_path, payload["commandId"], payload)
+
+    outcome, reason = wglink_watch.read_acknowledgement(
+        tmp_path,
+        payload["commandId"],
+        kind=payload["kind"],
+        manifest_sha256=payload["manifestSha256"],
+    )
+
+    assert outcome == PACKAGED[name]
+    assert reason == payload["reason"]
+    if outcome == "refused":
+        assert reason  # WG's text, shown verbatim
+    # A request of another kind or manifest under the same id is not this ack's.
+    assert wglink_watch.read_acknowledgement(tmp_path, payload["commandId"], kind="other") is None
+    assert (
+        wglink_watch.read_acknowledgement(
+            tmp_path, payload["commandId"], manifest_sha256="sha256:" + "f" * 64
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("name", sorted(PACKAGED))
+def test_a_packaged_ack_drives_the_ui(monkeypatch, tmp_path: Path, name: str) -> None:
+    fixture, request_id = _acknowledging(monkeypatch, tmp_path, f"WGLink_ack_packaged_{name}")
+    [request] = _inbox(fixture.ipc)
+    _claim(fixture, request_id)
+    # Only what names this request changes: its id, manifest and kind.
+    payload = dict(
+        _packaged(name),
+        commandId=request_id,
+        operationId=request_id,
+        manifestSha256=request["manifestSha256"],
+        kind=request["kind"],
+    )
+    _write_ack(fixture.ipc, request_id, payload)
+    logged: list[str] = []
+    monkeypatch.setattr(fixture.module, "_log", logged.append)
+
+    titles = _tick(fixture)
+
+    if PACKAGED[name] == "accepted":
+        assert titles == [] and len(logged) == 1
+    else:
+        assert titles == ["WGLink request refused"]
+        assert fixture.ui.messages[-1][1] == payload["reason"]
